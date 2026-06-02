@@ -74,6 +74,19 @@ POST http://127.0.0.1:8000/orchestrator/test
 }
 ```
 
+
+## Hybrid RAG
+
+По умолчанию knowledge retrieval работает с локальным hashing fallback. Для реальных локальных embeddings можно установить retrieval extra и включить `fastembed`:
+
+```powershell
+uv sync --extra dev --extra retrieval
+```
+
+```env
+AI_SERVER_EMBEDDINGS_PROVIDER=fastembed
+AI_SERVER_FASTEMBED_CACHE_DIR=var/embedding_models
+```
 ## Документы
 
 - `docs/00-vision.md` - цель и границы проекта.
@@ -83,4 +96,5 @@ POST http://127.0.0.1:8000/orchestrator/test
 - `docs/04-security-and-policies.md` - безопасность, доступы, подтверждения.
 - docs/05-mvp-roadmap.md - первая дорожная карта.
 - docs/06-hybrid-rag.md - hybrid retrieval, RAG и skills.
+
 

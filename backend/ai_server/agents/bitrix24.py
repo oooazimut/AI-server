@@ -43,6 +43,7 @@ class Bitrix24Specialist:
                             "score": hit.score,
                             "keyword_score": hit.keyword_score,
                             "vector_score": hit.vector_score,
+                            "embedding_provider": hit.embedding_provider,
                         }
                         for hit in retrieval_hits
                     ],
@@ -145,3 +146,5 @@ def _unique(values: list[str]) -> list[str]:
         if value not in result:
             result.append(value)
     return result
+
+

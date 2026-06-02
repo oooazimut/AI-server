@@ -31,3 +31,5 @@ def test_bitrix_specialist_includes_retrieval_hits():
     retrieval_hits = result.actions_taken[0].details["retrieval_hits"]
     assert retrieval_hits
     assert retrieval_hits[0]["score"] > 0
+    assert retrieval_hits[0]["embedding_provider"] == "local_hashing"
+

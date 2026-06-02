@@ -4,10 +4,10 @@ from collections import Counter
 import math
 from pathlib import Path
 import re
-from typing import Protocol
 
 from pydantic import BaseModel, Field
 
+from .embeddings import EmbeddingProvider, create_embedding_provider
 from .knowledge import MarkdownKnowledgeBase
 from .models import AgentManifest
 
@@ -28,38 +28,8 @@ class RetrievalHit(BaseModel):
     score: float
     keyword_score: float
     vector_score: float
+    embedding_provider: str = ""
     matched_terms: list[str] = Field(default_factory=list)
-
-
-class Vectorizer(Protocol):
-    def embed(self, text: str) -> dict[int, float]:
-        """Return a sparse vector suitable for cosine similarity."""
-
-
-class LocalHashingVectorizer:
-    """Deterministic local vectorizer used until real embeddings are connected.
-
-    This is not a semantic embedding model. It gives us a vector-retrieval contract,
-    tests and ranking behavior that can later be swapped for pgvector/Qdrant +
-    embeddings without changing agent code.
-    """
-
-    def __init__(self, *, dimensions: int = 512) -> None:
-        self.dimensions = dimensions
-
-    def embed(self, text: str) -> dict[int, float]:
-        features = _tokenize(text)
-        normalized = _normalize(text)
-        features.extend(_char_ngrams(normalized, size=4, limit=1200))
-        if not features:
-            return {}
-
-        counts = Counter(features)
-        vector: dict[int, float] = {}
-        for feature, count in counts.items():
-            index = hash(feature) % self.dimensions
-            vector[index] = vector.get(index, 0.0) + (1.0 + math.log(count))
-        return _normalize_vector(vector)
 
 
 class HybridKnowledgeRetriever:
@@ -67,12 +37,12 @@ class HybridKnowledgeRetriever:
         self,
         *,
         knowledge_base: MarkdownKnowledgeBase | None = None,
-        vectorizer: Vectorizer | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
         keyword_weight: float = 0.65,
         vector_weight: float = 0.35,
     ) -> None:
         self.knowledge_base = knowledge_base or MarkdownKnowledgeBase()
-        self.vectorizer = vectorizer or LocalHashingVectorizer()
+        self.embedding_provider = embedding_provider or create_embedding_provider()
         self.keyword_weight = keyword_weight
         self.vector_weight = vector_weight
 
@@ -94,20 +64,21 @@ class HybridKnowledgeRetriever:
 
         query_terms = _tokenize(query)
         idf = _inverse_document_frequency(chunks)
-        query_vector = self.vectorizer.embed(query)
+        query_vector = self.embedding_provider.embed(query)
 
         raw_hits: list[RetrievalHit] = []
         max_keyword_score = 0.0
         for chunk in chunks:
             keyword_score, matched_terms = _keyword_score(chunk, query_terms, idf)
             max_keyword_score = max(max_keyword_score, keyword_score)
-            vector_score = _cosine(query_vector, self.vectorizer.embed(_chunk_vector_text(chunk)))
+            vector_score = _cosine(query_vector, self.embedding_provider.embed(_chunk_vector_text(chunk)))
             raw_hits.append(
                 RetrievalHit(
                     chunk=chunk,
                     score=0.0,
                     keyword_score=keyword_score,
                     vector_score=vector_score,
+                    embedding_provider=self.embedding_provider.name,
                     matched_terms=matched_terms,
                 )
             )
@@ -210,22 +181,8 @@ def _tokenize(value: str) -> list[str]:
     return re.findall(r"[0-9a-zа-яё_\.]{2,}", _normalize(value), flags=re.IGNORECASE)
 
 
-def _char_ngrams(value: str, *, size: int, limit: int) -> list[str]:
-    compact = re.sub(r"\s+", " ", value).strip()
-    if len(compact) < size:
-        return []
-    return [compact[index : index + size] for index in range(min(len(compact) - size + 1, limit))]
-
-
 def _normalize(value: str) -> str:
     return re.sub(r"\s+", " ", value.casefold().replace("ё", "е")).strip()
-
-
-def _normalize_vector(vector: dict[int, float]) -> dict[int, float]:
-    norm = math.sqrt(sum(value * value for value in vector.values()))
-    if norm == 0:
-        return {}
-    return {index: value / norm for index, value in vector.items()}
 
 
 def _cosine(left: dict[int, float], right: dict[int, float]) -> float:

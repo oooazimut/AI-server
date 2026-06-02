@@ -41,11 +41,31 @@ keyword/BM25-like search
 Сейчас реализован `HybridKnowledgeRetriever`:
 
 - keyword-score по токенам и секциям markdown;
-- local hashing vector-score как временный заменяемый vector layer;
+- vector-score через pluggable `EmbeddingProvider`;
+- default provider: `LocalHashingEmbeddingProvider` для разработки и тестов;
+- production-ready provider: `FastEmbedEmbeddingProvider` для реальных локальных embeddings;
 - общий итоговый score;
 - endpoint ручной проверки: `GET /agents/{agent_id}/knowledge/search?q=...`.
 
-Важно: local hashing vectorizer - не полноценная semantic embedding model. Он нужен, чтобы уже сейчас закрепить контракт hybrid retrieval и тесты. Следующий production-шаг - заменить vectorizer на реальные embeddings и хранение в pgvector или Qdrant.
+Hashing provider - fallback, а не semantic model. Он нужен, чтобы проект всегда стартовал локально и чтобы контракт retrieval был покрыт тестами.
+
+## Как включить реальные локальные embeddings
+
+Установить optional retrieval-зависимости:
+
+```powershell
+uv sync --extra dev --extra retrieval
+```
+
+Включить fastembed-провайдер:
+
+```env
+AI_SERVER_EMBEDDINGS_PROVIDER=fastembed
+AI_SERVER_FASTEMBED_MODEL=
+AI_SERVER_FASTEMBED_CACHE_DIR=var/embedding_models
+```
+
+`AI_SERVER_FASTEMBED_MODEL` можно оставить пустым, тогда `fastembed` возьмет модель по умолчанию. Для production на русском контенте нужно отдельно выбрать и закрепить multilingual embedding model, затем зафиксировать ее в env/config.
 
 ## Будущий production-вариант
 
@@ -64,3 +84,4 @@ access filters + rerank
   ↓
 context for specialist
 ```
+
