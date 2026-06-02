@@ -30,31 +30,59 @@
 - Tool Gateway выполняет Bitrix REST вызовы и применяет policy layer.
 - Worker runtime запускает процессы, хранит state и отдаёт status endpoints.
 
-## State
+## Runtime `var`
 
-Runtime state из старого `var/` не переносится как исходный код, но учитывается
-как контракт данных:
+Runtime state из старого `var/` является частью боевого cutover. Он не хранится
+в Git, но должен быть перенесён в новый `AI-server/var` после остановки старого
+сервиса:
 
 - `var/search_index.sqlite`;
 - `var/search_content`;
 - `var/webhook_event_queue.sqlite`;
+- `var/dialog_state.sqlite`;
+- `var/bitrix_oauth.sqlite`;
+- `var/bitrix_write_audit.jsonl`;
 - `var/quality_control_state.json`;
 - `var/supervisor_state.json`;
 - `var/vehicle_usage.sqlite`;
 - `var/search_indexer_state.json`;
-- `var/search_indexer.lock`.
+- `var/attachments`;
+- `var/document_drafts`.
 
-OAuth state и вложения считаются чувствительными данными и не копируются без
-отдельного решения.
+Не переносим как состояние сервиса:
+
+- stale lock-файлы, например `var/search_indexer.lock`;
+- dev/ngrok логи;
+- временные `tmp*` каталоги.
+
+OAuth state, старые диалоги, audit, вложения и индексы чувствительны, но для
+боевого переезда их нужно переносить. Ограничение только в том, что они не
+коммитятся и копируются не из живого пишущего процесса, а в момент cutover.
+
+План миграции:
+
+```powershell
+uv run python scripts/import_bitrix_var.py --profile cutover
+```
+
+Фактическое копирование после остановки старого сервиса:
+
+```powershell
+uv run python scripts/import_bitrix_var.py --profile cutover --execute
+```
+
+Перед заменой существующих файлов скрипт переносит старые target-файлы в
+`var/legacy/backups/<timestamp>/`, если не указан `--no-backup`.
 
 ## Порядок технического переноса
 
 1. Зарегистрировать automation manifests и API чтения каталога.
-2. Вынести общий Bitrix client/OAuth/event parser в `integrations/bitrix`.
-3. Перенести очередь webhook-событий и processor как первый реальный worker.
-4. Подключить portal search indexer, потому что он кормит RAG и поиск.
-5. Перенести `quality_control` и `supervisor` через policy layer и dry-run.
-6. Отдельно решить судьбу `vehicle_usage`: оставить в Bitrix-домене или выделить
+2. Встроить `var/` как runtime-контур и подготовить cutover-миграцию.
+3. Вынести общий Bitrix client/OAuth/event parser в `integrations/bitrix`.
+4. Перенести очередь webhook-событий и processor как первый реальный worker.
+5. Подключить portal search indexer, потому что он кормит RAG и поиск.
+6. Перенести `quality_control` и `supervisor` через policy layer и dry-run.
+7. Отдельно решить судьбу `vehicle_usage`: оставить в Bitrix-домене или выделить
    самостоятельного специалиста.
 
 Устаревший `event_poller` из старого проекта не переносится. Для Bitrix24

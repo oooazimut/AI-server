@@ -52,6 +52,9 @@ backend/ai_server/
   skills.py
   registry.py
   models.py
+var/
+  README.md
+  ...
 ```
 
 ## Быстрый запуск прототипа
@@ -96,6 +99,24 @@ uv sync --extra dev --extra retrieval
 ```env
 AI_SERVER_EMBEDDINGS_PROVIDER=fastembed
 AI_SERVER_FASTEMBED_CACHE_DIR=var/embedding_models
+```
+
+## Runtime var и cutover
+
+`var/` - локальный runtime-контур сервера. В Git хранится только каркас каталога,
+а реальные данные остаются локальными: индексы, очереди, OAuth, старые диалоги,
+audit, вложения и drafts.
+
+План переноса из старого `BitrixAIAgent/var`:
+
+```powershell
+uv run python scripts/import_bitrix_var.py --profile cutover
+```
+
+Фактический перенос выполнять после остановки старого сервиса:
+
+```powershell
+uv run python scripts/import_bitrix_var.py --profile cutover --execute
 ```
 ## Документы
 
