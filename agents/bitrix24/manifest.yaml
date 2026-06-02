@@ -1,0 +1,40 @@
+id: bitrix24
+name: Специалист Битрикс24
+version: 0.1.0
+kind: specialist
+description: Работает с задачами, проектами, CRM, чатами, комментариями, документами и локальным индексом портала Битрикс24.
+handoff_description: Использовать для запросов про Битрикс24, задачи, проекты, CRM, документы портала, поиск по порталу, заявки и комментарии.
+entrypoint: backend.ai_server.agents.bitrix24.Bitrix24Specialist
+instructions_file: agents/bitrix24/instructions.md
+skills_path: agents/bitrix24/skills
+knowledge_path: agents/bitrix24/knowledge/topics
+capabilities:
+  - bitrix24
+  - crm_tasks
+  - ticket_creation
+  - portal_search
+  - document_search
+  - document_drafts
+  - projects_crm
+tools:
+  - knowledge_base
+  - bitrix_api
+  - portal_search
+  - document_access
+  - task_closure
+data_scopes:
+  - bitrix24_tasks
+  - bitrix24_crm
+  - bitrix24_disk
+  - portal_search_index
+allowed_actions:
+  - read_task
+  - search_portal_index
+  - create_ticket_draft
+  - add_internal_comment_draft
+approval_required:
+  - bitrix_write
+  - close_task
+  - send_external_message
+  - delete_bitrix_entity
+  - document_write

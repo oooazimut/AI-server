@@ -1,0 +1,25 @@
+id: internal_orchestrator
+name: Внутренний оркестратор
+version: 0.1.0
+kind: orchestrator
+description: Принимает запросы сотрудников, выбирает специалистов, собирает результат и контролирует подтверждения.
+handoff_description: Использовать для входящих внутренних запросов сотрудников из Битрикс24-чата или web-интерфейса.
+entrypoint: backend.ai_server.orchestrators.internal.InternalOrchestrator
+instructions_file: agents/internal_orchestrator/instructions.md
+skills_path: agents/internal_orchestrator/skills
+channels:
+  - bitrix24_chat
+  - web
+capabilities:
+  - internal_request_routing
+  - task_decomposition
+  - approval_coordination
+tools: []
+data_scopes:
+  - employee_identity
+  - agent_registry
+allowed_actions:
+  - delegate_to_specialist
+  - request_human_approval
+approval_required:
+  - external_model_with_sensitive_data

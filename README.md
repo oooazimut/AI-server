@@ -2,16 +2,49 @@
 
 Корпоративный сервер ИИ-агентов для офисных и клиентских сценариев.
 
-Идея проекта: один или несколько входных операторов принимают сообщения из рабочих каналов, а дальше передают задачи узким специалистам: Битрикс24, бухгалтерия, ПТО, сети, склад, разработка, CAD. Специалисты работают через ограниченные инструменты и политики доступа.
+Первый MVP: разделить старый автономный `BitrixAIAgent` на две роли:
 
-## Стартовая архитектура
+- `internal_orchestrator` - входная точка и маршрутизатор для сотрудников;
+- `bitrix24` - узкий специалист по Битрикс24 со своими instructions, skills, knowledge topics и tools.
 
-- `internal_orchestrator` - внутренний оркестратор для сотрудников.
-- `support_operator` - клиентский оператор техподдержки.
-- `Agent Registry` - реестр подключенных специалистов и их возможностей.
-- `Tool Gateway` - единая точка доступа к 1С, Битрикс24, сетевым устройствам, файлам и скриптам.
-- `Model Gateway` - выбор локальной или облачной модели по политике данных.
-- `Audit Log` - журнал действий, решений, вызовов инструментов и подтверждений.
+## Архитектура
+
+```text
+Bitrix24 chat / local test
+  ↓
+Internal Orchestrator
+  ↓
+Agent Registry
+  ↓
+Bitrix24 Specialist
+  ↓
+Tool Gateway + Policy Layer
+  ↓
+Bitrix REST / Portal Search / Documents
+```
+
+## Структура
+
+```text
+agents/
+  internal_orchestrator/
+    manifest.yaml
+    instructions.md
+    skills/
+  bitrix24/
+    manifest.yaml
+    instructions.md
+    skills/
+    knowledge/topics/
+backend/ai_server/
+  agents/
+  orchestrators/
+  tools/
+  knowledge.py
+  skills.py
+  registry.py
+  models.py
+```
 
 ## Быстрый запуск прототипа
 
@@ -26,8 +59,19 @@ uvicorn backend.ai_server.main:app --reload
 Проверка:
 
 ```text
-GET http://127.0.0.1:8000/health
-GET http://127.0.0.1:8000/agents
+GET  http://127.0.0.1:8000/health
+GET  http://127.0.0.1:8000/agents
+GET  http://127.0.0.1:8000/agents/bitrix24/skills
+POST http://127.0.0.1:8000/orchestrator/test
+```
+
+Пример `POST /orchestrator/test`:
+
+```json
+{
+  "text": "Найди просроченные задачи в Битриксе",
+  "user_id": "9"
+}
 ```
 
 ## Документы

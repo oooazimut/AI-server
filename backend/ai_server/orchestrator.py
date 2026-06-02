@@ -3,7 +3,18 @@ from .models import AgentManifest
 
 KEYWORD_CAPABILITY_HINTS = {
     "битрикс": "bitrix24",
-    "задач": "bitrix24",
+    "bitrix": "bitrix24",
+    "задач": "crm_tasks",
+    "заявк": "ticket_creation",
+    "документ": "document_search",
+    "файл": "document_search",
+    "диск": "document_search",
+    "смет": "document_search",
+    "проект": "projects_crm",
+    "групп": "projects_crm",
+    "crm": "projects_crm",
+    "сделк": "projects_crm",
+    "лид": "projects_crm",
     "камера": "ip_camera_diagnostics",
     "регистратор": "recorder_diagnostics",
     "роутер": "network_equipment",
@@ -16,11 +27,7 @@ KEYWORD_CAPABILITY_HINTS = {
 
 
 def suggest_agents(request: str, manifests: list[AgentManifest]) -> list[AgentManifest]:
-    """Small deterministic router for the prototype.
-
-    Production routing will use policies, user rights, model routing and agent self-checks.
-    """
-    text = request.lower()
+    text = request.casefold()
     wanted_capabilities = {
         capability
         for keyword, capability in KEYWORD_CAPABILITY_HINTS.items()
@@ -30,8 +37,4 @@ def suggest_agents(request: str, manifests: list[AgentManifest]) -> list[AgentMa
     if not wanted_capabilities:
         return [agent for agent in manifests if agent.kind in {"orchestrator", "operator"}]
 
-    return [
-        agent
-        for agent in manifests
-        if wanted_capabilities.intersection(agent.capabilities)
-    ]
+    return [agent for agent in manifests if wanted_capabilities.intersection(agent.capabilities)]
