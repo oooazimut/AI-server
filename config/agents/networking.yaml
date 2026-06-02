@@ -1,0 +1,35 @@
+id: networking
+name: Сетевой специалист
+kind: specialist
+description: Диагностика сетей, IP-камер, регистраторов, роутеров, VPN и типовых проблем связи.
+entrypoint: backend.ai_server.agents.networking
+capabilities:
+  - ip_camera_diagnostics
+  - recorder_diagnostics
+  - network_equipment
+  - safe_remote_remediation
+tools:
+  - check_camera_status
+  - check_recorder_status
+  - restart_camera
+  - restart_recorder
+  - sync_device_time
+  - check_video_stream
+  - collect_network_logs
+data_scopes:
+  - support_dialog
+  - device_inventory
+  - network_status
+allowed_actions:
+  - check_status
+  - collect_logs
+  - restart_camera
+  - sync_device_time
+  - request_client_check
+approval_required:
+  - restart_recorder
+  - change_router_config
+  - change_nat_or_firewall
+  - change_device_password
+  - firmware_update
+  - factory_reset

@@ -1,0 +1,25 @@
+id: programmer
+name: Программист
+kind: specialist
+description: Разработка, анализ кода, тесты, скрипты, CI и помощь с репозиториями.
+entrypoint: backend.ai_server.agents.programmer
+capabilities:
+  - software_development
+  - code_review
+  - automation_scripts
+tools:
+  - inspect_repository
+  - run_tests
+  - create_patch
+  - read_logs
+data_scopes:
+  - source_code
+  - ci_logs
+allowed_actions:
+  - read_code
+  - propose_patch
+  - run_safe_tests
+approval_required:
+  - push_to_remote
+  - deploy_service
+  - delete_repository_file
