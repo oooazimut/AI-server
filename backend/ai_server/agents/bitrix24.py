@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask
+from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
 from ai_server.tools.bitrix import BitrixToolset
 from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
@@ -14,28 +15,44 @@ class Bitrix24Specialist:
         *,
         knowledge_base: MarkdownKnowledgeBase | None = None,
         skill_store: SkillStore | None = None,
+        retriever: HybridKnowledgeRetriever | None = None,
         tools: BitrixToolset | None = None,
     ) -> None:
         self.manifest = manifest
         self.knowledge_base = knowledge_base or MarkdownKnowledgeBase()
         self.skill_store = skill_store or SkillStore()
+        self.retriever = retriever or HybridKnowledgeRetriever(knowledge_base=self.knowledge_base)
         self.tools = tools or BitrixToolset()
 
     async def handle(self, task: AgentTask) -> AgentResult:
         text = task.request.casefold()
         selected_skills = self._select_skills(text)
         selected_topics = self._select_knowledge_topics(text)
+        retrieval_hits = self.retriever.search(self.manifest, task.request, limit=3)
         actions_taken = [
             ActionRecord(
                 name="load_bitrix_specialist_context",
                 status="completed",
-                details={"skills": selected_skills, "knowledge_topics": selected_topics},
+                details={
+                    "skills": selected_skills,
+                    "knowledge_topics": selected_topics,
+                    "retrieval_hits": [
+                        {
+                            "topic": hit.chunk.topic,
+                            "section": hit.chunk.section,
+                            "score": hit.score,
+                            "keyword_score": hit.keyword_score,
+                            "vector_score": hit.vector_score,
+                        }
+                        for hit in retrieval_hits
+                    ],
+                },
             )
         ]
 
         approval_actions = self._approval_actions(text)
         status = "needs_human" if approval_actions else "completed"
-        answer = self._answer(selected_skills, selected_topics, bool(approval_actions))
+        answer = self._answer(selected_skills, selected_topics, retrieval_hits, bool(approval_actions))
 
         return AgentResult(
             status=status,
@@ -43,10 +60,10 @@ class Bitrix24Specialist:
             answer=answer,
             actions_taken=actions_taken,
             actions_requiring_approval=approval_actions,
-            confidence=0.72 if selected_skills else 0.48,
+            confidence=0.74 if selected_skills else 0.48,
             logs=[
                 "Bitrix24 specialist was separated from the old autonomous BitrixAIAgent runtime.",
-                "Current MVP uses deterministic routing; LLM tool loop will be added behind the same contract.",
+                "Knowledge context is selected through hybrid retrieval over the agent package.",
             ],
         )
 
@@ -101,7 +118,7 @@ class Bitrix24Specialist:
             )
         ]
 
-    def _answer(self, selected_skills: list[str], selected_topics: list[str], needs_approval: bool) -> str:
+    def _answer(self, selected_skills: list[str], selected_topics: list[str], retrieval_hits: list, needs_approval: bool) -> str:
         if not selected_skills:
             return (
                 "Я Битрикс24-специалист. Вижу запрос, но пока не уверен, какой Bitrix-сценарий нужен. "
@@ -112,6 +129,9 @@ class Bitrix24Specialist:
         parts.append("Подходящие skills: " + ", ".join(selected_skills) + ".")
         if selected_topics:
             parts.append("Подключаемые знания: " + ", ".join(selected_topics) + ".")
+        if retrieval_hits:
+            labels = [f"{hit.chunk.topic}/{hit.chunk.section}" for hit in retrieval_hits[:2]]
+            parts.append("Hybrid RAG подобрал фрагменты: " + "; ".join(labels) + ".")
         if needs_approval:
             parts.append("Запрос похож на изменение в Bitrix24, поэтому выполнение должно идти через черновик и подтверждение.")
         else:

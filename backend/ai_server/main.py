@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException, Query
 
 from .knowledge import MarkdownKnowledgeBase
 from .models import AgentTask, AgentTestRequest, UserContext
+from .retrieval import HybridKnowledgeRetriever
 from .orchestrator import suggest_agents
 from .orchestrators.internal import InternalOrchestrator
 from .registry import get_agent_manifest, load_agent_manifests, summarize_agents
@@ -54,6 +55,19 @@ def agent_knowledge_topics(agent_id: str):
     return MarkdownKnowledgeBase().list_topics(manifest)
 
 
+@app.get("/agents/{agent_id}/knowledge/search")
+def agent_knowledge_search(
+    agent_id: str,
+    q: str = Query(..., min_length=1),
+    limit: int = Query(default=5, ge=1, le=20),
+    topic: str | None = None,
+):
+    manifest = get_agent_manifest(agent_id)
+    if manifest is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+    return HybridKnowledgeRetriever().search(manifest, q, limit=limit, topic=topic)
+
+
 @app.get("/route-preview")
 def route_preview(q: str = Query(..., min_length=1)):
     manifests = load_agent_manifests()
@@ -71,3 +85,4 @@ async def orchestrator_test(body: AgentTestRequest):
         request=body.text,
     )
     return await InternalOrchestrator(manifests).handle(task)
+

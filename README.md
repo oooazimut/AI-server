@@ -81,4 +81,6 @@ POST http://127.0.0.1:8000/orchestrator/test
 - `docs/02-agents.md` - роли агентов и контракт взаимодействия.
 - `docs/03-client-support-flow.md` - клиентский сценарий техподдержки.
 - `docs/04-security-and-policies.md` - безопасность, доступы, подтверждения.
-- `docs/05-mvp-roadmap.md` - первая дорожная карта.
+- docs/05-mvp-roadmap.md - первая дорожная карта.
+- docs/06-hybrid-rag.md - hybrid retrieval, RAG и skills.
+
