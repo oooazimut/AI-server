@@ -40,6 +40,7 @@ def summarize_agents(manifests: list[AgentManifest]) -> list[AgentSummary]:
             kind=agent.kind,
             capabilities=agent.capabilities,
             tools=agent.tools,
+            automations=[automation.id for automation in agent.automations],
             handoff_description=agent.handoff_description,
         )
         for agent in manifests

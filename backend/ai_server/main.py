@@ -9,6 +9,11 @@ from .orchestrator import suggest_agents
 from .orchestrators.internal import InternalOrchestrator
 from .registry import get_agent_manifest, load_agent_manifests, summarize_agents
 from .skills import SkillStore
+from .workers.registry import (
+    get_automation_manifest,
+    load_automation_manifests,
+    summarize_automations,
+)
 
 
 app = FastAPI(title="AI Server", version="0.1.0")
@@ -66,6 +71,29 @@ def agent_knowledge_search(
     if manifest is None:
         raise HTTPException(status_code=404, detail="agent not found")
     return HybridKnowledgeRetriever().search(manifest, q, limit=limit, topic=topic)
+
+
+@app.get("/agents/{agent_id}/automations")
+def agent_automations(agent_id: str):
+    manifest = get_agent_manifest(agent_id)
+    if manifest is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+    return summarize_automations(load_automation_manifests(agent_id=agent_id))
+
+
+@app.get("/automations")
+def automations(agent_id: str | None = None):
+    if agent_id is not None and get_agent_manifest(agent_id) is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+    return summarize_automations(load_automation_manifests(agent_id=agent_id))
+
+
+@app.get("/automations/{automation_id}")
+def automation_detail(automation_id: str):
+    automation = get_automation_manifest(automation_id)
+    if automation is None:
+        raise HTTPException(status_code=404, detail="automation not found")
+    return automation
 
 
 @app.get("/route-preview")

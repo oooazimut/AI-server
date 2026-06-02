@@ -8,6 +8,7 @@ entrypoint: backend.ai_server.agents.bitrix24.Bitrix24Specialist
 instructions_file: agents/bitrix24/instructions.md
 skills_path: agents/bitrix24/skills
 knowledge_path: agents/bitrix24/knowledge/topics
+automations_path: agents/bitrix24/automations
 capabilities:
   - bitrix24
   - crm_tasks
@@ -22,6 +23,236 @@ tools:
   - portal_search
   - document_access
   - task_closure
+automations:
+  - id: bitrix_webhook_event_queue
+    name: Очередь вебхуков Битрикс24
+    kind: event_worker
+    trigger: queue
+    description: Принимает события Битрикс24, дедуплицирует их, хранит в SQLite-очереди и обрабатывает с ретраями.
+    source_project: BitrixAIAgent
+    source_modules:
+      - app.agent.webhook_event_queue
+      - app.agent.webhook_event_processor
+    entrypoint: backend.ai_server.workers.bitrix.webhook_event_queue.WebhookEventQueueWorker
+    status_endpoint: /automations/bitrix_webhook_event_queue
+    enabled_by_default: true
+    dependencies:
+      - bitrix_event_webhook
+      - bitrix_api
+    tools:
+      - bitrix_api
+      - bitrix_event_parser
+    data_scopes:
+      - bitrix24_events
+      - bitrix24_chats
+      - bitrix24_tasks
+      - bitrix24_disk
+    state_paths:
+      - var/webhook_event_queue.sqlite
+    emits:
+      - queued_webhook_event
+      - processed_webhook_event
+    notes:
+      - Это транспортный worker, а не чатовый агент.
+      - Через него должны проходить quality-control и поисковые disk-события.
+  - id: bitrix_portal_search_indexer
+    name: Периодическая индексация портала Битрикс24
+    kind: data_pipeline
+    trigger: schedule
+    description: По расписанию синхронизирует задачи, проекты, диск и содержимое документов в локальный поисковый индекс.
+    source_project: BitrixAIAgent
+    source_modules:
+      - app.agent.search_indexer
+      - app.agent.portal_search
+    entrypoint: backend.ai_server.workers.bitrix.search_indexer.PortalSearchIndexerWorker
+    schedule_hint: metadata/content/delta intervals from settings
+    status_endpoint: /automations/bitrix_portal_search_indexer
+    enabled_by_default: true
+    dependencies:
+      - bitrix_api
+      - portal_search_index
+    tools:
+      - bitrix_api
+      - portal_search
+    data_scopes:
+      - bitrix24_tasks
+      - bitrix24_projects
+      - bitrix24_disk
+      - portal_search_index
+    state_paths:
+      - var/search_index.sqlite
+      - var/search_content
+      - var/search_indexer_state.json
+      - var/search_indexer.lock
+    emits:
+      - portal_index_updated
+  - id: bitrix_search_webhook_indexer
+    name: Индексация файлов по webhook-событиям
+    kind: event_worker
+    trigger: webhook
+    description: Обновляет или удаляет элементы локального индекса при событиях изменения файлов на диске Битрикс24.
+    source_project: BitrixAIAgent
+    source_modules:
+      - app.agent.search_webhook_indexer
+      - app.agent.portal_search
+    entrypoint: backend.ai_server.workers.bitrix.search_webhook_indexer.SearchWebhookIndexerWorker
+    status_endpoint: /automations/bitrix_search_webhook_indexer
+    enabled_by_default: true
+    dependencies:
+      - bitrix_webhook_event_queue
+      - portal_search_index
+    tools:
+      - bitrix_api
+      - portal_search
+    data_scopes:
+      - bitrix24_disk
+      - portal_search_index
+    state_paths:
+      - var/search_index.sqlite
+      - var/search_content
+    emits:
+      - portal_index_file_updated
+  - id: bitrix_reconciler
+    name: Сверка потерянных событий Битрикс24
+    kind: scheduled_worker
+    trigger: schedule
+    description: Периодически сверяет недавно изменённые задачи и дельту диска, чтобы компенсировать потерянные webhook-события.
+    source_project: BitrixAIAgent
+    source_modules:
+      - app.agent.reconciler
+    entrypoint: backend.ai_server.workers.bitrix.reconciler.BitrixReconcilerWorker
+    schedule_hint: reconcile interval from settings
+    status_endpoint: /automations/bitrix_reconciler
+    enabled_by_default: true
+    dependencies:
+      - bitrix_webhook_event_queue
+      - bitrix_portal_search_indexer
+    tools:
+      - bitrix_api
+      - portal_search
+    data_scopes:
+      - bitrix24_tasks
+      - bitrix24_disk
+      - portal_search_index
+    emits:
+      - reconciled_task_event
+      - reconciled_disk_delta
+  - id: bitrix_task_supervisor
+    name: Контроль просроченных задач
+    kind: business_workflow
+    trigger: schedule
+    description: Находит просроченные активные задачи и отправляет уведомления руководителям или ответственным с учётом cooldown.
+    source_project: BitrixAIAgent
+    source_modules:
+      - app.agent.supervisor
+    entrypoint: backend.ai_server.workers.bitrix.supervisor.TaskSupervisorWorker
+    schedule_hint: supervisor interval from settings
+    status_endpoint: /automations/bitrix_task_supervisor
+    enabled_by_default: false
+    human_approval_required: false
+    dependencies:
+      - bitrix_api
+    tools:
+      - bitrix_api
+    data_scopes:
+      - bitrix24_tasks
+      - bitrix24_users
+    state_paths:
+      - var/supervisor_state.json
+    emits:
+      - overdue_tasks_digest
+      - overdue_task_reminder
+    notes:
+      - В боевом режиме пишет уведомления в Битрикс24, поэтому должен идти через policy layer и dry-run настройки.
+  - id: bitrix_task_quality_control
+    name: Контроль качества закрытия задач
+    kind: business_workflow
+    trigger: webhook
+    description: Проверяет результат закрытия задачи, валидирует шаблон, может вернуть задачу в работу, одобрить её или уведомить директора.
+    source_project: BitrixAIAgent
+    source_modules:
+      - app.agent.quality_control
+      - app.agent.task_closure
+    entrypoint: backend.ai_server.workers.bitrix.quality_control.TaskQualityControlWorker
+    status_endpoint: /automations/bitrix_task_quality_control
+    enabled_by_default: false
+    uses_llm: true
+    requires_oauth_actor: true
+    human_approval_required: true
+    dependencies:
+      - bitrix_webhook_event_queue
+      - bitrix_oauth
+      - llm_gateway
+    tools:
+      - bitrix_api
+      - llm_gateway
+    data_scopes:
+      - bitrix24_tasks
+      - bitrix24_comments
+      - bitrix24_users
+    state_paths:
+      - var/quality_control_state.json
+    emits:
+      - quality_control_checked
+      - quality_control_action_planned
+      - quality_control_action_applied
+    notes:
+      - Это автономная Bitrix-автоматизация, а не отдельный чатовый субагент.
+      - Автоматические write-действия допустимы только через служебного OAuth actor и явную политику.
+  - id: bitrix_vehicle_usage
+    name: Учёт использования служебных машин
+    kind: business_workflow
+    trigger: schedule
+    description: По расписанию запрашивает у сотрудников данные по машинам, разбирает ответы и ведёт локальный учёт.
+    source_project: BitrixAIAgent
+    source_modules:
+      - app.agent.vehicle_usage
+    entrypoint: backend.ai_server.workers.bitrix.vehicle_usage.VehicleUsageWorker
+    schedule_hint: daily request/escalation times from settings
+    status_endpoint: /automations/bitrix_vehicle_usage
+    enabled_by_default: false
+    uses_llm: true
+    dependencies:
+      - bitrix_api
+      - llm_gateway
+    tools:
+      - bitrix_api
+      - llm_gateway
+    data_scopes:
+      - bitrix24_chats
+      - bitrix24_users
+      - vehicle_usage
+    state_paths:
+      - var/vehicle_usage.sqlite
+    emits:
+      - vehicle_usage_request_sent
+      - vehicle_usage_response_parsed
+      - vehicle_usage_escalation
+    notes:
+      - Это отдельный бизнес-процесс поверх Битрикс-чата; позднее его можно вынести из Bitrix-домена в отдельного специалиста.
+  - id: bitrix_event_poller
+    name: Polling входящих сообщений Битрикс24
+    kind: channel_adapter
+    trigger: polling
+    description: Получает события бота через fetch/polling режим, если webhook-режим недоступен.
+    source_project: BitrixAIAgent
+    source_modules:
+      - app.agent.event_poller
+    entrypoint: backend.ai_server.workers.bitrix.event_poller.BitrixEventPollerWorker
+    schedule_hint: event fetcher interval from settings
+    status_endpoint: /automations/bitrix_event_poller
+    enabled_by_default: false
+    dependencies:
+      - bitrix_api
+      - internal_orchestrator
+    tools:
+      - bitrix_api
+      - internal_orchestrator
+    data_scopes:
+      - bitrix24_chats
+      - bitrix24_bot_events
+    emits:
+      - incoming_channel_message
 data_scopes:
   - bitrix24_tasks
   - bitrix24_crm

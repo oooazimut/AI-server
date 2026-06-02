@@ -21,6 +21,12 @@ Bitrix24 Specialist
 Tool Gateway + Policy Layer
   ↓
 Bitrix REST / Portal Search / Documents
+
+Bitrix24 webhooks / schedules
+  ↓
+Bitrix Workers / Automations
+  ↓
+Tool Gateway + State Stores
 ```
 
 ## Структура
@@ -36,10 +42,12 @@ agents/
     instructions.md
     skills/
     knowledge/topics/
+    automations/
 backend/ai_server/
   agents/
   orchestrators/
   tools/
+  workers/
   knowledge.py
   skills.py
   registry.py
@@ -62,6 +70,8 @@ uvicorn backend.ai_server.main:app --reload
 GET  http://127.0.0.1:8000/health
 GET  http://127.0.0.1:8000/agents
 GET  http://127.0.0.1:8000/agents/bitrix24/skills
+GET  http://127.0.0.1:8000/agents/bitrix24/automations
+GET  http://127.0.0.1:8000/automations
 POST http://127.0.0.1:8000/orchestrator/test
 ```
 
@@ -96,6 +106,7 @@ AI_SERVER_FASTEMBED_CACHE_DIR=var/embedding_models
 - `docs/04-security-and-policies.md` - безопасность, доступы, подтверждения.
 - docs/05-mvp-roadmap.md - первая дорожная карта.
 - docs/06-hybrid-rag.md - hybrid retrieval, RAG и skills.
+- docs/07-bitrix-automations.md - фоновые Bitrix workers и порядок переноса.
 
 
 
