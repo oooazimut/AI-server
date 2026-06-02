@@ -42,12 +42,11 @@ keyword/BM25-like search
 
 - keyword-score по токенам и секциям markdown;
 - vector-score через pluggable `EmbeddingProvider`;
-- default provider: `LocalHashingEmbeddingProvider` для разработки и тестов;
-- production-ready provider: `FastEmbedEmbeddingProvider` для реальных локальных embeddings;
+- production provider по умолчанию: `FastEmbedEmbeddingProvider`;
 - общий итоговый score;
 - endpoint ручной проверки: `GET /agents/{agent_id}/knowledge/search?q=...`.
 
-Hashing provider - fallback, а не semantic model. Он нужен, чтобы проект всегда стартовал локально и чтобы контракт retrieval был покрыт тестами.
+В backend больше нет тихого hashing fallback. Если embeddings не настроены, это ошибка конфигурации, которую нужно исправлять явно. Unit-тесты используют отдельный `FakeEmbeddingProvider` из папки `tests`, чтобы не скачивать модель и не зависеть от внешнего состояния.
 
 ## Как включить реальные локальные embeddings
 

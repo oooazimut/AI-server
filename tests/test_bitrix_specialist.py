@@ -4,14 +4,21 @@ from ai_server.agents.bitrix24 import Bitrix24Specialist
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import AgentTask
 from ai_server.registry import get_agent_manifest
+from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
 from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
+from tests.fakes import FakeEmbeddingProvider
+
+
+def _bitrix_specialist() -> Bitrix24Specialist:
+    manifest = get_agent_manifest("bitrix24")
+    retriever = HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider())
+    return Bitrix24Specialist(manifest, retriever=retriever)
 
 
 def test_bitrix_specialist_selects_task_skill():
-    manifest = get_agent_manifest("bitrix24")
     result = asyncio.run(
-        Bitrix24Specialist(manifest).handle(
+        _bitrix_specialist().handle(
             AgentTask(task_id="t1", request="Найди просроченные задачи в Битриксе")
         )
     )
@@ -22,9 +29,8 @@ def test_bitrix_specialist_selects_task_skill():
 
 
 def test_bitrix_specialist_marks_write_for_approval():
-    manifest = get_agent_manifest("bitrix24")
     result = asyncio.run(
-        Bitrix24Specialist(manifest).handle(
+        _bitrix_specialist().handle(
             AgentTask(task_id="t1", request="Создай задачу в Битриксе")
         )
     )
@@ -50,3 +56,4 @@ def test_bitrix_skills_and_knowledge_loaded():
     assert "safe_bitrix_write" in skill_ids
     assert "tasks_search" in topic_ids
     assert "bitrix_rest" in topic_ids
+

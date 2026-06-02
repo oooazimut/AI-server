@@ -3,17 +3,24 @@ from __future__ import annotations
 from ai_server.agents.bitrix24 import Bitrix24Specialist
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask
 from ai_server.orchestrator import suggest_agents
+from ai_server.retrieval import HybridKnowledgeRetriever
 
 
 class InternalOrchestrator:
-    def __init__(self, manifests: list[AgentManifest]) -> None:
+    def __init__(
+        self,
+        manifests: list[AgentManifest],
+        *,
+        bitrix_retriever: HybridKnowledgeRetriever | None = None,
+    ) -> None:
         self.manifests = manifests
+        self.bitrix_retriever = bitrix_retriever
 
     async def handle(self, task: AgentTask) -> AgentResult:
         matches = [agent for agent in suggest_agents(task.request, self.manifests) if agent.kind == "specialist"]
         bitrix = next((agent for agent in matches if agent.id == "bitrix24"), None)
         if bitrix is not None:
-            specialist_result = await Bitrix24Specialist(bitrix).handle(task)
+            specialist_result = await Bitrix24Specialist(bitrix, retriever=self.bitrix_retriever).handle(task)
             return AgentResult(
                 status=specialist_result.status,
                 agent_id="internal_orchestrator",
