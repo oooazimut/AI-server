@@ -18,8 +18,8 @@ def test_bitrix_automations_are_registered():
         "bitrix_task_supervisor",
         "bitrix_task_quality_control",
         "bitrix_vehicle_usage",
-        "bitrix_event_poller",
     }.issubset(ids)
+    assert "bitrix_event_poller" not in ids
     assert all(automation.owner_agent_id == "bitrix24" for automation in automations)
 
 
@@ -49,4 +49,3 @@ def test_summarize_automations():
     assert summaries
     assert {summary.owner_agent_id for summary in summaries} == {"bitrix24"}
     assert any(summary.kind == "data_pipeline" for summary in summaries)
-

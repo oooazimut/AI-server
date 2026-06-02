@@ -230,29 +230,6 @@ automations:
       - vehicle_usage_escalation
     notes:
       - Это отдельный бизнес-процесс поверх Битрикс-чата; позднее его можно вынести из Bitrix-домена в отдельного специалиста.
-  - id: bitrix_event_poller
-    name: Polling входящих сообщений Битрикс24
-    kind: channel_adapter
-    trigger: polling
-    description: Получает события бота через fetch/polling режим, если webhook-режим недоступен.
-    source_project: BitrixAIAgent
-    source_modules:
-      - app.agent.event_poller
-    entrypoint: backend.ai_server.workers.bitrix.event_poller.BitrixEventPollerWorker
-    schedule_hint: event fetcher interval from settings
-    status_endpoint: /automations/bitrix_event_poller
-    enabled_by_default: false
-    dependencies:
-      - bitrix_api
-      - internal_orchestrator
-    tools:
-      - bitrix_api
-      - internal_orchestrator
-    data_scopes:
-      - bitrix24_chats
-      - bitrix24_bot_events
-    emits:
-      - incoming_channel_message
 data_scopes:
   - bitrix24_tasks
   - bitrix24_crm
