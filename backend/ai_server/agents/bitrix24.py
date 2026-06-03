@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+from ai_server.agents.bitrix_task_create import (
+    BitrixTaskCreateDraft,
+    build_task_create_draft,
+    format_task_create_clarification,
+    looks_like_task_create_request,
+)
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask
 from ai_server.retrieval import HybridKnowledgeRetriever
@@ -54,14 +60,25 @@ class Bitrix24Specialist:
         if portal_search_action is not None:
             actions_taken.append(portal_search_action)
 
-        approval_actions = self._approval_actions(text)
-        status = "needs_human" if approval_actions else "completed"
+        task_create_draft = build_task_create_draft(task) if looks_like_task_create_request(text) else None
+        if task_create_draft is not None:
+            actions_taken.append(
+                ActionRecord(
+                    name="bitrix_task_create_draft",
+                    status="ready" if task_create_draft.is_ready else "needs_clarification",
+                    details=task_create_draft.as_action_details(),
+                )
+            )
+
+        approval_actions = self._approval_actions(text, task_create_draft=task_create_draft)
+        status = _result_status(task_create_draft=task_create_draft, approval_actions=approval_actions)
         answer = self._answer(
             selected_skills,
             selected_topics,
             retrieval_hits,
             bool(approval_actions),
             portal_search_action=portal_search_action,
+            task_create_draft=task_create_draft,
         )
 
         return AgentResult(
@@ -110,8 +127,30 @@ class Bitrix24Specialist:
             topics.append("projects_crm")
         return _unique(topics)
 
-    def _approval_actions(self, text: str) -> list[ActionRecord]:
-        if not any(marker in text for marker in ("создай", "создать", "измени", "изменить", "закрой", "удали", "добавь")):
+    def _approval_actions(
+        self,
+        text: str,
+        *,
+        task_create_draft: BitrixTaskCreateDraft | None = None,
+    ) -> list[ActionRecord]:
+        if task_create_draft is not None:
+            if not task_create_draft.is_ready:
+                return []
+            decision = decide_bitrix_method_policy(task_create_draft.method)
+            return [
+                ActionRecord(
+                    name="bitrix_api",
+                    status="approval_required" if decision.decision == "confirm" else decision.decision,
+                    details={
+                        "method": task_create_draft.method,
+                        "params": task_create_draft.params,
+                        "policy": decision.model_dump(),
+                        "summary": task_create_draft.summary,
+                    },
+                )
+            ]
+
+        if not any(marker in text for marker in ("создай", "создать", "поставь", "измени", "изменить", "закрой", "удали", "добавь")):
             return []
 
         method = "tasks.task.add" if "задач" in text or "заявк" in text else "bitrix.write"
@@ -152,12 +191,16 @@ class Bitrix24Specialist:
         needs_approval: bool,
         *,
         portal_search_action: ActionRecord | None = None,
+        task_create_draft: BitrixTaskCreateDraft | None = None,
     ) -> str:
         if not selected_skills:
             return (
                 "Я Битрикс24-специалист. Вижу запрос, но пока не уверен, какой Bitrix-сценарий нужен. "
                 "Могу работать с задачами, заявками, проектами, CRM, документами и поиском по порталу."
             )
+
+        if task_create_draft is not None and not task_create_draft.is_ready:
+            return format_task_create_clarification(task_create_draft)
 
         parts = ["Битрикс24-специалист принял задачу."]
         parts.append("Подходящие skills: " + ", ".join(selected_skills) + ".")
@@ -174,10 +217,25 @@ class Bitrix24Specialist:
             elif portal_search_action.status == "not_configured":
                 parts.append("Локальный индекс портала пока не подключён; его нужно перенести из `var/search_index.sqlite` или построить заново.")
         if needs_approval:
-            parts.append("Запрос похож на изменение в Bitrix24, поэтому выполнение должно идти через черновик и подтверждение.")
+            if task_create_draft is not None:
+                parts.append("Подготовил черновик задачи в Bitrix24; выполнение пойдёт только после подтверждения.")
+            else:
+                parts.append("Запрос похож на изменение в Bitrix24, поэтому выполнение должно идти через черновик и подтверждение.")
         else:
             parts.append("Запрос похож на read-only сценарий; следующим шагом можно подключать живой Bitrix API или локальный индекс портала.")
         return " ".join(parts)
+
+
+def _result_status(
+    *,
+    task_create_draft: BitrixTaskCreateDraft | None,
+    approval_actions: list[ActionRecord],
+) -> str:
+    if approval_actions:
+        return "needs_human"
+    if task_create_draft is not None and not task_create_draft.is_ready:
+        return "needs_clarification"
+    return "completed"
 
 
 def _unique(values: list[str]) -> list[str]:
