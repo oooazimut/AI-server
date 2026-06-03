@@ -14,8 +14,10 @@ from .integrations.bitrix.oauth import BitrixOAuthService
 from .integrations.bitrix.portal_search import (
     PortalSearchIndex,
     entity_types_for_scope,
+    format_portal_delta_sync_stats,
     format_portal_index_stats,
     format_portal_search_results,
+    format_portal_sync_stats,
 )
 from .knowledge import MarkdownKnowledgeBase
 from .models import AgentTask, AgentTestRequest, UserContext
@@ -27,6 +29,7 @@ from .runtime import ensure_runtime_dirs
 from .settings import get_settings
 from .skills import SkillStore
 from .workers.bitrix.webhook_event_queue import WebhookEventQueue, run_webhook_event_worker
+from .workers.bitrix.search_indexer import PortalSearchIndexerWorker
 from .workers.registry import (
     get_automation_manifest,
     load_automation_manifests,
@@ -42,12 +45,15 @@ async def lifespan(app: FastAPI):
     bitrix_oauth = BitrixOAuthService()
     bitrix_oauth.ensure_schema()
     portal_search = PortalSearchIndex()
+    portal_search.ensure_schema()
+    portal_search_indexer = PortalSearchIndexerWorker(bitrix, portal_search)
     webhook_event_queue = WebhookEventQueue(settings.webhook_event_queue_path)
     webhook_event_queue.ensure_schema()
 
     app.state.bitrix = bitrix
     app.state.bitrix_oauth = bitrix_oauth
     app.state.portal_search = portal_search
+    app.state.portal_search_indexer = portal_search_indexer
     app.state.webhook_event_queue = webhook_event_queue
     app.state.webhook_event_status = {
         "enabled": True,
@@ -74,26 +80,53 @@ async def lifespan(app: FastAPI):
         "errors": 0,
         "last_error": None,
     }
+    app.state.search_webhook_indexer_status = {
+        "enabled": settings.search_webhook_indexer_enabled,
+        "events_seen": 0,
+        "processed": 0,
+        "errors": 0,
+        "last_received_at": None,
+        "last_event": None,
+        "last_file_id": None,
+        "last_action": None,
+        "last_reason": None,
+        "last_error": None,
+        "last_result": None,
+    }
 
-    worker_task: asyncio.Task | None = None
+    webhook_worker_task: asyncio.Task | None = None
+    search_indexer_task: asyncio.Task | None = None
     if settings.webhook_event_queue_enabled and settings.webhook_event_worker_enabled:
-        processor = BitrixWebhookProcessor(bitrix=bitrix)
-        worker_task = asyncio.create_task(
+        processor = BitrixWebhookProcessor(
+            bitrix=bitrix,
+            portal_search=portal_search,
+            search_webhook_status=app.state.search_webhook_indexer_status,
+        )
+        webhook_worker_task = asyncio.create_task(
             run_webhook_event_worker(
                 webhook_event_queue,
                 processor.process,
                 status=app.state.webhook_event_queue_status,
             )
         )
+    if settings.search_background_indexer_enabled:
+        search_indexer_task = asyncio.create_task(portal_search_indexer.run())
 
     try:
         yield
     finally:
-        if worker_task:
+        if webhook_worker_task:
             app.state.webhook_event_queue_status["running"] = False
-            worker_task.cancel()
+            webhook_worker_task.cancel()
             try:
-                await worker_task
+                await webhook_worker_task
+            except asyncio.CancelledError:
+                pass
+        if search_indexer_task:
+            app.state.portal_search_indexer.status["running"] = False
+            search_indexer_task.cancel()
+            try:
+                await search_indexer_task
             except asyncio.CancelledError:
                 pass
 
@@ -113,6 +146,7 @@ def health() -> dict[str, object]:
         "bitrix_configured": settings.bitrix_configured,
         "bitrix_webhook_queue_enabled": settings.webhook_event_queue_enabled,
         "bitrix_webhook_worker_enabled": settings.webhook_event_worker_enabled,
+        "bitrix_search_indexer_enabled": settings.search_background_indexer_enabled,
     }
 
 
@@ -192,6 +226,8 @@ def bitrix_status(request: Request) -> dict[str, Any]:
         "webhook_url_configured": bool(settings.resolved_bot_webhook_url),
         "oauth": request.app.state.bitrix_oauth.public_status(),
         "portal_search": _portal_search_status(request.app.state.portal_search),
+        "portal_search_indexer": request.app.state.portal_search_indexer.public_status(),
+        "search_webhook_indexer": dict(request.app.state.search_webhook_indexer_status),
         "webhook_events": dict(request.app.state.webhook_event_status),
         "webhook_event_queue": {
             **dict(request.app.state.webhook_event_queue_status),
@@ -216,7 +252,47 @@ def bitrix_webhook_events_status(request: Request) -> dict[str, Any]:
 
 @app.get("/bitrix/search/status")
 def bitrix_search_status(request: Request) -> dict[str, Any]:
-    return _portal_search_status(request.app.state.portal_search)
+    return {
+        **_portal_search_status(request.app.state.portal_search),
+        "indexer": request.app.state.portal_search_indexer.public_status(),
+        "webhook_indexer": dict(request.app.state.search_webhook_indexer_status),
+    }
+
+
+@app.get("/bitrix/search/indexer/status")
+def bitrix_search_indexer_status(request: Request) -> dict[str, Any]:
+    return request.app.state.portal_search_indexer.public_status()
+
+
+@app.get("/bitrix/search/webhook-indexer/status")
+def bitrix_search_webhook_indexer_status(request: Request) -> dict[str, Any]:
+    return dict(request.app.state.search_webhook_indexer_status)
+
+
+@app.post("/bitrix/search/reindex")
+async def bitrix_search_reindex(request: Request) -> dict[str, Any]:
+    try:
+        stats = await request.app.state.portal_search_indexer.run_metadata_once()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "summary": format_portal_sync_stats(stats),
+        "stats": stats,
+        "indexer": request.app.state.portal_search_indexer.public_status(),
+    }
+
+
+@app.post("/bitrix/search/reindex-delta")
+async def bitrix_search_reindex_delta(request: Request) -> dict[str, Any]:
+    try:
+        stats = await request.app.state.portal_search_indexer.run_delta_once()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "summary": format_portal_delta_sync_stats(stats),
+        "stats": stats,
+        "indexer": request.app.state.portal_search_indexer.public_status(),
+    }
 
 
 @app.get("/bitrix/search")
@@ -286,7 +362,11 @@ async def bitrix_events(
             "event_id": event_id,
         }
 
-    processor = BitrixWebhookProcessor(bitrix=request.app.state.bitrix)
+    processor = BitrixWebhookProcessor(
+        bitrix=request.app.state.bitrix,
+        portal_search=request.app.state.portal_search,
+        search_webhook_status=request.app.state.search_webhook_indexer_status,
+    )
     result = await processor.process(payload)
     return {"ok": True, **result}
 

@@ -5,10 +5,15 @@ from uuid import uuid4
 
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.events import MESSAGE_EVENTS, parse_incoming_message, payload_event_type
+from ai_server.integrations.bitrix.portal_search import PortalSearchIndex
 from ai_server.models import AgentTask, UserContext
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.registry import load_agent_manifests
 from ai_server.settings import get_settings
+from ai_server.workers.bitrix.search_webhook_indexer import (
+    prepare_search_webhook_job,
+    process_search_webhook_job,
+)
 
 
 class BitrixWebhookProcessor:
@@ -16,15 +21,31 @@ class BitrixWebhookProcessor:
         self,
         *,
         bitrix: BitrixClient | None = None,
+        portal_search: PortalSearchIndex | None = None,
+        search_webhook_status: dict[str, Any] | None = None,
         orchestrator: InternalOrchestrator | None = None,
     ) -> None:
         self.bitrix = bitrix or BitrixClient()
+        self.portal_search = portal_search or PortalSearchIndex()
+        self.search_webhook_status = search_webhook_status if search_webhook_status is not None else {}
         self.orchestrator = orchestrator
 
     async def process(self, payload: dict[str, Any]) -> dict[str, Any]:
         event_type = payload_event_type(payload)
         if event_type not in MESSAGE_EVENTS:
-            return {"handled": False, "event": event_type, "reason": "unsupported_event_for_message_adapter"}
+            search_job, search_result = prepare_search_webhook_job(payload)
+            if search_job:
+                search_result = await process_search_webhook_job(
+                    self.bitrix,
+                    self.portal_search,
+                    search_job,
+                    status=self.search_webhook_status,
+                )
+            return {
+                "handled": bool(search_result.get("handled")),
+                "event": event_type,
+                "search_index": search_result,
+            }
 
         incoming = parse_incoming_message(payload)
         orchestrator = self.orchestrator or InternalOrchestrator(load_agent_manifests())
@@ -72,4 +93,3 @@ class BitrixWebhookProcessor:
             "actions": [action.model_dump() for action in result.actions_taken],
             "approval_actions": [action.model_dump() for action in result.actions_requiring_approval],
         }
-

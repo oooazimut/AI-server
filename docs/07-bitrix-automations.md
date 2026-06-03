@@ -15,7 +15,7 @@
 | Automation | Старый модуль | Тип | Назначение |
 | --- | --- | --- | --- |
 | `bitrix_webhook_event_queue` | `app.agent.webhook_event_queue`, `app.agent.webhook_event_processor` | event worker | Очередь, retry, dedupe и маршрутизация webhook-событий |
-| `bitrix_portal_search_indexer` | `app.agent.search_indexer`, `app.agent.portal_search` | data pipeline | Периодическая индексация задач, проектов, диска и контента |
+| `bitrix_portal_search_indexer` | `app.agent.search_indexer`, `app.agent.portal_search` | data pipeline | Периодическая metadata/delta-индексация задач, проектов и диска |
 | `bitrix_search_webhook_indexer` | `app.agent.search_webhook_indexer` | event worker | Быстрое обновление индекса по disk/file событиям |
 | `bitrix_reconciler` | `app.agent.reconciler` | scheduled worker | Восстановление потерянных task/disk событий |
 | `bitrix_task_supervisor` | `app.agent.supervisor` | business workflow | Контроль просроченных задач и уведомления |
@@ -98,11 +98,17 @@ uv run python scripts/import_bitrix_var.py --profile cutover --execute
   SQLite-очередь `webhook_events`;
 - `backend/ai_server/channels/bitrix.py` - message adapter, который превращает
   Bitrix message event в `AgentTask` для Оркестратора;
-- `backend/ai_server/integrations/bitrix/portal_search.py` - read-only reader
-  старого `var/search_index.sqlite`;
+- `backend/ai_server/integrations/bitrix/portal_search.py` - reader/writer
+  совместимой SQLite-таблицы `portal_search_items`;
+- `backend/ai_server/workers/bitrix/search_indexer.py` - фоновый и ручной
+  metadata/delta-indexer задач, проектов и диска;
+- `backend/ai_server/workers/bitrix/search_webhook_indexer.py` - metadata-only
+  обработчик disk/file webhook-событий;
 - `POST /bitrix/events` - endpoint приёма webhook-событий;
 - `GET /bitrix/status`, `GET /bitrix/webhook-events/status`,
-  `GET /bitrix/search/status` и `GET /bitrix/search` - runtime status/search.
+  `GET /bitrix/search/status` и `GET /bitrix/search` - runtime status/search;
+- `GET /bitrix/search/indexer/status`, `POST /bitrix/search/reindex`,
+  `POST /bitrix/search/reindex-delta` - статус и ручной запуск индексатора.
 
 Worker очереди включается отдельно:
 
@@ -116,6 +122,20 @@ AI_SERVER_WEBHOOK_EVENT_WORKER_ENABLED=true
 AGENT_DRY_RUN=true
 ```
 
-`portal_search` сейчас перенесён как read-only слой. Он читает старую SQLite
-таблицу `portal_search_items` и уже подключён к Bitrix toolset. Индексаторы,
-которые обновляют эту таблицу, остаются следующим отдельным переносом.
+Фоновая индексация портала по умолчанию не стартует сама, чтобы разработочный
+сервер случайно не начал обходить боевой Bitrix:
+
+```env
+SEARCH_BACKGROUND_INDEXER_ENABLED=true
+```
+
+Webhook-обновление файлового индекса тоже включается явно:
+
+```env
+SEARCH_WEBHOOK_INDEXER_ENABLED=true
+```
+
+`portal_search` уже умеет читать и обновлять старую SQLite-таблицу
+`portal_search_items`. Перенесён metadata/delta-контур: задачи, проекты, диск и
+metadata-only disk/file webhook-и. Текстовый слой документов (`var/search_content`,
+извлечение текста из `.doc/.pdf/.xlsx`) остаётся отдельным следующим переносом.

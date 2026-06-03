@@ -59,15 +59,15 @@ automations:
     name: Периодическая индексация портала Битрикс24
     kind: data_pipeline
     trigger: schedule
-    description: По расписанию синхронизирует задачи, проекты, диск и содержимое документов в локальный поисковый индекс.
+    description: По расписанию синхронизирует задачи, проекты и диск в локальный поисковый индекс.
     source_project: BitrixAIAgent
     source_modules:
       - app.agent.search_indexer
       - app.agent.portal_search
     entrypoint: backend.ai_server.workers.bitrix.search_indexer.PortalSearchIndexerWorker
-    schedule_hint: metadata/content/delta intervals from settings
-    status_endpoint: /automations/bitrix_portal_search_indexer
-    enabled_by_default: true
+    schedule_hint: metadata/delta intervals from settings
+    status_endpoint: /bitrix/search/indexer/status
+    enabled_by_default: false
     dependencies:
       - bitrix_api
       - portal_search_index
@@ -81,7 +81,6 @@ automations:
       - portal_search_index
     state_paths:
       - var/search_index.sqlite
-      - var/search_content
       - var/search_indexer_state.json
       - var/search_indexer.lock
     emits:
@@ -95,9 +94,9 @@ automations:
     source_modules:
       - app.agent.search_webhook_indexer
       - app.agent.portal_search
-    entrypoint: backend.ai_server.workers.bitrix.search_webhook_indexer.SearchWebhookIndexerWorker
-    status_endpoint: /automations/bitrix_search_webhook_indexer
-    enabled_by_default: true
+    entrypoint: backend.ai_server.workers.bitrix.search_webhook_indexer.prepare_search_webhook_job
+    status_endpoint: /bitrix/search/webhook-indexer/status
+    enabled_by_default: false
     dependencies:
       - bitrix_webhook_event_queue
       - portal_search_index
@@ -109,7 +108,6 @@ automations:
       - portal_search_index
     state_paths:
       - var/search_index.sqlite
-      - var/search_content
     emits:
       - portal_index_file_updated
   - id: bitrix_reconciler

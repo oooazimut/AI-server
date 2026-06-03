@@ -167,6 +167,105 @@ class BitrixClient:
             start = int(raw_next) if raw_next is not None else None
         return items
 
+    async def list_all_tasks(
+        self,
+        *,
+        filter_: dict[str, Any] | None = None,
+        select: list[str] | None = None,
+        order: dict[str, Any] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        payload: dict[str, Any] = {}
+        if filter_:
+            payload["filter"] = filter_
+        if select:
+            payload["select"] = select
+        if order:
+            payload["order"] = order
+        return await self.collect_paged(
+            "tasks.task.list",
+            payload,
+            list_key="tasks",
+            limit=limit,
+        )
+
+    async def get_attached_object(self, attached_object_id: int) -> Any:
+        return await self.result("disk.attachedObject.get", {"id": attached_object_id})
+
+    async def get_disk_file(self, file_id: int) -> Any:
+        return await self.result("disk.file.get", {"id": file_id})
+
+    async def get_disk_file_download_url(self, file_id: int) -> str:
+        result = await self.get_disk_file(file_id)
+        if isinstance(result, dict):
+            download_url = result.get("DOWNLOAD_URL") or result.get("downloadUrl")
+            if download_url:
+                return str(download_url)
+        raise BitrixApiError("disk.file.get", "EMPTY_DOWNLOAD_URL")
+
+    async def list_workgroups(
+        self,
+        *,
+        filter_: dict[str, Any] | None = None,
+        order: dict[str, Any] | None = None,
+    ) -> Any:
+        payload: dict[str, Any] = {}
+        if filter_:
+            payload["FILTER"] = filter_
+        if order:
+            payload["ORDER"] = order
+        return await self.result("sonet_group.get", payload, base_url=self.projects_base_url)
+
+    async def search_projects(self, query: str = "", *, limit: int = 10) -> list[dict[str, Any]]:
+        filter_: dict[str, Any] = {
+            "ACTIVE": "Y",
+            "PROJECT": "Y",
+        }
+        if query:
+            filter_["%NAME"] = query
+
+        result = await self.list_workgroups(
+            filter_=filter_,
+            order={"NAME": "ASC"},
+        )
+        projects = _extract_workgroups(result)
+
+        if query and not projects:
+            result = await self.list_workgroups(
+                filter_={"ACTIVE": "Y", "PROJECT": "Y"},
+                order={"NAME": "ASC"},
+            )
+            projects = [
+                project
+                for project in _extract_workgroups(result)
+                if query.lower() in str(project.get("NAME") or project.get("name") or "").lower()
+            ]
+
+        return projects[:limit]
+
+    async def list_disk_storages(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        return await self.collect_paged(
+            "disk.storage.getlist",
+            {},
+            limit=limit,
+        )
+
+    async def list_disk_folder_children_all(
+        self,
+        *,
+        folder_id: int,
+        filter_: dict[str, Any] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        payload: dict[str, Any] = {"id": folder_id}
+        if filter_:
+            payload["filter"] = filter_
+        return await self.collect_paged(
+            "disk.folder.getchildren",
+            payload,
+            limit=limit,
+        )
+
     async def download_file_from_url(
         self,
         url: str,
@@ -225,3 +324,13 @@ def _extract_paged_items(result: Any, *, list_key: str | None) -> list[dict[str,
                 return [item for item in value if isinstance(item, dict)]
     return []
 
+
+def _extract_workgroups(result: Any) -> list[dict[str, Any]]:
+    if isinstance(result, list):
+        return [item for item in result if isinstance(item, dict)]
+    if isinstance(result, dict):
+        for key in ("groups", "workgroups", "items"):
+            items = result.get(key)
+            if isinstance(items, list):
+                return [item for item in items if isinstance(item, dict)]
+    return []

@@ -77,7 +77,10 @@ GET  http://127.0.0.1:8000/agents/bitrix24/automations
 GET  http://127.0.0.1:8000/automations
 GET  http://127.0.0.1:8000/bitrix/status
 GET  http://127.0.0.1:8000/bitrix/search/status
+GET  http://127.0.0.1:8000/bitrix/search/indexer/status
 GET  http://127.0.0.1:8000/bitrix/search?q=...
+POST http://127.0.0.1:8000/bitrix/search/reindex
+POST http://127.0.0.1:8000/bitrix/search/reindex-delta
 POST http://127.0.0.1:8000/bitrix/events
 POST http://127.0.0.1:8000/orchestrator/test
 ```
@@ -154,15 +157,26 @@ GET http://127.0.0.1:8000/bitrix/webhook-events/status
 
 ## Bitrix portal search
 
-Новый сервер умеет читать локальный индекс портала из `var/search_index.sqlite`.
-После cutover-миграции старого `BitrixAIAgent/var` доступны:
+Новый сервер умеет читать и обновлять локальный индекс портала
+`var/search_index.sqlite`. После cutover-миграции старого `BitrixAIAgent/var`
+доступны:
 
 ```text
 GET http://127.0.0.1:8000/bitrix/search/status
+GET http://127.0.0.1:8000/bitrix/search/indexer/status
 GET http://127.0.0.1:8000/bitrix/search?q=договор&scope=documents
+POST http://127.0.0.1:8000/bitrix/search/reindex
+POST http://127.0.0.1:8000/bitrix/search/reindex-delta
 ```
 
 Поддерживаемые scope: `all`, `documents`, `files`, `tasks`, `projects`.
+
+Фоновый индексатор metadata/delta включается явно:
+
+```env
+SEARCH_BACKGROUND_INDEXER_ENABLED=true
+SEARCH_WEBHOOK_INDEXER_ENABLED=true
+```
 
 `portal_search` также подключён как Bitrix tool и используется Bitrix24-специалистом
 для запросов про документы, файлы, договоры и портал.

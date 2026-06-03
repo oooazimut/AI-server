@@ -12,6 +12,7 @@ class Settings:
     bitrix_bot_token: str
     bitrix_bot_auth_mode: str
     bitrix_bot_webhook_url: str
+    bitrix_domain: str
     bitrix_oauth_client_id: str
     bitrix_oauth_client_secret: str
     bitrix_oauth_enabled: bool
@@ -30,6 +31,23 @@ class Settings:
     webhook_event_queue_retry_base_seconds: int
     webhook_event_queue_retry_max_seconds: int
     webhook_event_queue_stale_processing_seconds: int
+    search_index_max_tasks: int
+    search_index_max_projects: int
+    search_index_max_storages: int
+    search_index_max_disk_items: int
+    search_index_max_task_attachments: int
+    search_index_disk_max_depth: int
+    search_index_include_disk: bool
+    search_index_include_task_attachments: bool
+    search_background_indexer_enabled: bool
+    search_background_initial_delay_seconds: int
+    search_background_metadata_interval_seconds: int
+    search_delta_indexer_enabled: bool
+    search_delta_interval_seconds: int
+    search_delta_folders_per_run: int
+    search_delta_max_children_per_folder: int
+    search_background_lock_stale_seconds: int
+    search_webhook_indexer_enabled: bool
     agent_dry_run: bool
     var_dir: Path
 
@@ -61,6 +79,22 @@ class Settings:
     def webhook_event_queue_path(self) -> Path:
         return runtime_paths(self.var_dir).webhook_event_queue_db
 
+    @property
+    def search_index_path(self) -> Path:
+        return runtime_paths(self.var_dir).search_index_db
+
+    @property
+    def search_background_state_path(self) -> Path:
+        return runtime_paths(self.var_dir).search_indexer_state
+
+    @property
+    def search_background_lock_path(self) -> Path:
+        return runtime_paths(self.var_dir).search_indexer_lock
+
+    @property
+    def search_content_storage_dir(self) -> Path:
+        return runtime_paths(self.var_dir).search_content_dir
+
     def _with_webhook_secret(self, url: str) -> str:
         if not self.webhook_secret:
             return url
@@ -77,6 +111,7 @@ def get_settings() -> Settings:
         bitrix_bot_token=_env("BITRIX_BOT_TOKEN"),
         bitrix_bot_auth_mode=_env("BITRIX_BOT_AUTH_MODE", "webhook"),
         bitrix_bot_webhook_url=_env("BITRIX_BOT_WEBHOOK_URL"),
+        bitrix_domain=_env("BITRIX_DOMAIN"),
         bitrix_oauth_client_id=_env("BITRIX_OAUTH_CLIENT_ID"),
         bitrix_oauth_client_secret=_env("BITRIX_OAUTH_CLIENT_SECRET"),
         bitrix_oauth_enabled=_env_bool("BITRIX_OAUTH_ENABLED", True),
@@ -95,6 +130,23 @@ def get_settings() -> Settings:
         webhook_event_queue_retry_base_seconds=_env_int("WEBHOOK_EVENT_QUEUE_RETRY_BASE_SECONDS", 10) or 10,
         webhook_event_queue_retry_max_seconds=_env_int("WEBHOOK_EVENT_QUEUE_RETRY_MAX_SECONDS", 300) or 300,
         webhook_event_queue_stale_processing_seconds=_env_int("WEBHOOK_EVENT_QUEUE_STALE_PROCESSING_SECONDS", 300) or 300,
+        search_index_max_tasks=_env_int("SEARCH_INDEX_MAX_TASKS", 5000) or 5000,
+        search_index_max_projects=_env_int("SEARCH_INDEX_MAX_PROJECTS", 200) or 200,
+        search_index_max_storages=_env_int("SEARCH_INDEX_MAX_STORAGES", 500) or 500,
+        search_index_max_disk_items=_env_int("SEARCH_INDEX_MAX_DISK_ITEMS", 50000) or 50000,
+        search_index_max_task_attachments=_env_int("SEARCH_INDEX_MAX_TASK_ATTACHMENTS", 5000) or 5000,
+        search_index_disk_max_depth=_env_int("SEARCH_INDEX_DISK_MAX_DEPTH", 6) or 6,
+        search_index_include_disk=_env_bool("SEARCH_INDEX_INCLUDE_DISK", True),
+        search_index_include_task_attachments=_env_bool("SEARCH_INDEX_INCLUDE_TASK_ATTACHMENTS", True),
+        search_background_indexer_enabled=_env_bool("SEARCH_BACKGROUND_INDEXER_ENABLED", False),
+        search_background_initial_delay_seconds=_env_int("SEARCH_BACKGROUND_INITIAL_DELAY_SECONDS", 60) or 60,
+        search_background_metadata_interval_seconds=_env_int("SEARCH_BACKGROUND_METADATA_INTERVAL_SECONDS", 6 * 60 * 60) or (6 * 60 * 60),
+        search_delta_indexer_enabled=_env_bool("SEARCH_DELTA_INDEXER_ENABLED", True),
+        search_delta_interval_seconds=_env_int("SEARCH_DELTA_INTERVAL_SECONDS", 5 * 60) or (5 * 60),
+        search_delta_folders_per_run=_env_int("SEARCH_DELTA_FOLDERS_PER_RUN", 15) or 15,
+        search_delta_max_children_per_folder=_env_int("SEARCH_DELTA_MAX_CHILDREN_PER_FOLDER", 1000) or 1000,
+        search_background_lock_stale_seconds=_env_int("SEARCH_BACKGROUND_LOCK_STALE_SECONDS", 2 * 60 * 60) or (2 * 60 * 60),
+        search_webhook_indexer_enabled=_env_bool("SEARCH_WEBHOOK_INDEXER_ENABLED", False),
         agent_dry_run=_env_bool("AGENT_DRY_RUN", False),
         var_dir=paths.root,
     )
@@ -119,4 +171,3 @@ def _env_int(name: str, default: int | None = None) -> int | None:
         return int(raw)
     except ValueError:
         return default
-

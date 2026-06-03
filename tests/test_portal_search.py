@@ -4,12 +4,20 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist
-from ai_server.integrations.bitrix.portal_search import PortalSearchIndex
+from ai_server.integrations.bitrix.portal_search import (
+    PortalSearchIndex,
+    sync_disk_delta_index,
+    sync_portal_index,
+)
 from ai_server.main import app
 from ai_server.models import AgentTask
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.tools.bitrix import BitrixToolset
+from ai_server.workers.bitrix.search_webhook_indexer import (
+    prepare_search_webhook_job,
+    process_search_webhook_job,
+)
 from tests.fakes import FakeEmbeddingProvider
 
 
@@ -127,6 +135,182 @@ def test_bitrix_specialist_uses_portal_search_for_document_requests(tmp_path):
     assert action.details["data"]["results"][0]["entity_id"] == "101"
 
 
+def test_portal_metadata_sync_indexes_tasks_projects_and_disk(monkeypatch, tmp_path):
+    monkeypatch.setenv("SEARCH_INDEX_MAX_TASK_ATTACHMENTS", "10")
+    index = PortalSearchIndex(tmp_path / "search_index.sqlite")
+    bitrix = FakePortalBitrix()
+
+    stats = anyio_run(sync_portal_index(bitrix, index))
+
+    assert stats.tasks == 1
+    assert stats.projects == 1
+    assert stats.task_attachments == 1
+    assert stats.disk_items == 3
+    assert index.get_item(entity_type="task", entity_id=202) is not None
+    assert index.get_item(entity_type="project", entity_id=17) is not None
+    assert index.get_item(entity_type="disk_file", entity_id=501) is not None
+    assert index.search("план склад", entity_types={"disk_file"})
+
+
+def test_portal_delta_sync_updates_folder_and_deletes_missing_children(tmp_path):
+    index = PortalSearchIndex(tmp_path / "search_index.sqlite")
+    index.upsert_item(
+        entity_type="disk_storage",
+        entity_id=10,
+        title="Общий диск",
+        metadata={"root_object_id": 500},
+    )
+    index.upsert_item(
+        entity_type="disk_file",
+        entity_id=999,
+        title="Старый файл.txt",
+        metadata={"parent_id": 500},
+    )
+
+    stats = anyio_run(
+        sync_disk_delta_index(
+            FakePortalBitrix(),
+            index,
+            cursor_type=None,
+            cursor_id=None,
+            folder_limit=10,
+            child_limit=10,
+        )
+    )
+
+    assert stats.folders_scanned == 1
+    assert stats.items_seen == 2
+    assert stats.deleted == 1
+    assert index.get_item(entity_type="disk_file", entity_id=501) is not None
+    assert index.get_item(entity_type="disk_file", entity_id=999) is None
+
+
+def test_search_webhook_indexer_upserts_and_deletes_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("SEARCH_WEBHOOK_INDEXER_ENABLED", "true")
+    index = PortalSearchIndex(tmp_path / "search_index.sqlite")
+    status: dict[str, object] = {}
+
+    job, prepared = prepare_search_webhook_job(
+        {"event": "ONDISKFILEUPDATE", "data": {"FIELDS_AFTER": {"ID": "777"}}}
+    )
+
+    assert job is not None
+    assert prepared["handled"] is True
+
+    result = anyio_run(
+        process_search_webhook_job(
+            FakePortalBitrix(),
+            index,
+            job,
+            status=status,
+        )
+    )
+
+    assert result["reason"] == "metadata_indexed"
+    assert index.get_item(entity_type="disk_file", entity_id=777) is not None
+
+    delete_job, _ = prepare_search_webhook_job({"event": "ONDISKFILEDELETE", "FILE_ID": "777"})
+    assert delete_job is not None
+    delete_result = anyio_run(
+        process_search_webhook_job(
+            FakePortalBitrix(),
+            index,
+            delete_job,
+            status=status,
+        )
+    )
+
+    assert delete_result["reason"] == "deleted"
+    assert index.get_item(entity_type="disk_file", entity_id=777) is None
+
+
+class FakePortalBitrix:
+    async def list_all_tasks(self, **kwargs):
+        return [
+            {
+                "ID": 202,
+                "TITLE": "Проверить камеру на складе",
+                "DESCRIPTION": "IP-камера, регистратор и склад",
+                "STATUS": 2,
+                "RESPONSIBLE_ID": 9,
+                "CREATED_BY": 1,
+                "GROUP_ID": 17,
+                "DEADLINE": "2026-06-10T09:00:00+03:00",
+                "CHANGED_DATE": "2026-06-02T09:00:00+03:00",
+                "UF_TASK_WEBDAV_FILES": ["n701"],
+            }
+        ]
+
+    async def get_attached_object(self, attached_object_id: int):
+        return {
+            "ID": attached_object_id,
+            "OBJECT_ID": 501,
+            "NAME": "Фото камеры.jpg",
+            "SIZE": 1024,
+            "CREATE_TIME": "2026-06-02T09:05:00+03:00",
+            "DOWNLOAD_URL": "https://example.test/download/701",
+        }
+
+    async def search_projects(self, query: str = "", *, limit: int = 10):
+        return [
+            {
+                "ID": 17,
+                "NAME": "Склад",
+                "DESCRIPTION": "Проект склада",
+                "OWNER_ID": 1,
+                "ACTIVE": "Y",
+                "PROJECT": "Y",
+                "DATE_UPDATE": "2026-06-02T08:00:00+03:00",
+            }
+        ][:limit]
+
+    async def list_disk_storages(self, *, limit: int | None = None):
+        storages = [{"ID": 10, "ROOT_OBJECT_ID": 500, "NAME": "Общий диск"}]
+        return storages[:limit] if limit else storages
+
+    async def list_disk_folder_children_all(
+        self,
+        *,
+        folder_id: int,
+        filter_: dict | None = None,
+        limit: int | None = None,
+    ):
+        if folder_id == 500:
+            children = [
+                {
+                    "ID": 501,
+                    "NAME": "План склада.pdf",
+                    "TYPE": "file",
+                    "DETAIL_URL": "/docs/file/501/",
+                    "UPDATE_TIME": "2026-06-02T10:00:00+03:00",
+                    "SIZE": 2048,
+                },
+                {
+                    "ID": 502,
+                    "NAME": "Чертежи",
+                    "TYPE": "folder",
+                    "DETAIL_URL": "/docs/folder/502/",
+                    "UPDATE_TIME": "2026-06-02T10:01:00+03:00",
+                },
+            ]
+            return children[:limit] if limit else children
+        return []
+
+    async def get_disk_file(self, file_id: int):
+        return {
+            "ID": file_id,
+            "NAME": "Схема подключения.dwg",
+            "TYPE": "file",
+            "DETAIL_URL": "/docs/file/777/",
+            "STORAGE_NAME": "Общий диск",
+            "PATH": "Общий диск/Схемы",
+            "STORAGE_ID": 10,
+            "PARENT_ID": 500,
+            "UPDATE_TIME": "2026-06-02T11:00:00+03:00",
+            "SIZE": 4096,
+        }
+
+
 def anyio_run(awaitable):
     import anyio
 
@@ -134,4 +318,3 @@ def anyio_run(awaitable):
         return await awaitable
 
     return anyio.run(runner)
-
