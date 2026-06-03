@@ -7,6 +7,7 @@ from ai_server.agents.bitrix24 import Bitrix24Specialist
 from ai_server.integrations.bitrix.portal_search import (
     PortalSearchIndex,
     sync_disk_delta_index,
+    sync_portal_content_index,
     sync_portal_index,
 )
 from ai_server.main import app
@@ -185,8 +186,32 @@ def test_portal_delta_sync_updates_folder_and_deletes_missing_children(tmp_path)
     assert index.get_item(entity_type="disk_file", entity_id=999) is None
 
 
+def test_portal_content_sync_indexes_downloaded_text(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
+    monkeypatch.setenv("SEARCH_CONTENT_MAX_FILES", "10")
+    index = PortalSearchIndex(tmp_path / "search_index.sqlite")
+    index.upsert_item(
+        entity_type="disk_file",
+        entity_id=501,
+        title="План склада.txt",
+        body="Диск: Общий диск\nПуть: Общий диск/План склада.txt",
+        metadata={"disk_object_id": 501, "size": 128},
+        source_updated_at="2026-06-02T10:00:00+03:00",
+    )
+
+    stats = anyio_run(sync_portal_content_index(FakePortalBitrix(), index))
+
+    item = index.get_item(entity_type="disk_file", entity_id=501)
+    assert item is not None
+    assert stats.indexed == 1
+    assert item.metadata["content_index_status"] == "indexed"
+    assert "секретное слово альфа" in item.body.lower()
+    assert index.search("альфа", entity_types={"disk_file"})
+
+
 def test_search_webhook_indexer_upserts_and_deletes_file(monkeypatch, tmp_path):
     monkeypatch.setenv("SEARCH_WEBHOOK_INDEXER_ENABLED", "true")
+    monkeypatch.setenv("SEARCH_WEBHOOK_CONTENT_ENABLED", "false")
     index = PortalSearchIndex(tmp_path / "search_index.sqlite")
     status: dict[str, object] = {}
 
@@ -299,7 +324,7 @@ class FakePortalBitrix:
     async def get_disk_file(self, file_id: int):
         return {
             "ID": file_id,
-            "NAME": "Схема подключения.dwg",
+            "NAME": "Схема подключения.txt",
             "TYPE": "file",
             "DETAIL_URL": "/docs/file/777/",
             "STORAGE_NAME": "Общий диск",
@@ -309,6 +334,15 @@ class FakePortalBitrix:
             "UPDATE_TIME": "2026-06-02T11:00:00+03:00",
             "SIZE": 4096,
         }
+
+    async def get_disk_file_download_url(self, file_id: int):
+        return f"fake://disk/{file_id}"
+
+    async def download_file_from_url(self, url: str, destination: Path, *, max_bytes: int):
+        data = "Содержимое файла: секретное слово Альфа и данные склада.".encode("utf-8")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+        return len(data)
 
 
 def anyio_run(awaitable):

@@ -39,15 +39,23 @@ class Settings:
     search_index_disk_max_depth: int
     search_index_include_disk: bool
     search_index_include_task_attachments: bool
+    search_content_enabled: bool
+    search_content_keep_local_files: bool
+    search_content_max_files: int
+    search_content_max_bytes: int
+    search_content_max_chars: int
+    search_content_allowed_extensions: str
     search_background_indexer_enabled: bool
     search_background_initial_delay_seconds: int
     search_background_metadata_interval_seconds: int
+    search_background_content_interval_seconds: int
     search_delta_indexer_enabled: bool
     search_delta_interval_seconds: int
     search_delta_folders_per_run: int
     search_delta_max_children_per_folder: int
     search_background_lock_stale_seconds: int
     search_webhook_indexer_enabled: bool
+    search_webhook_content_enabled: bool
     agent_dry_run: bool
     var_dir: Path
 
@@ -95,6 +103,17 @@ class Settings:
     def search_content_storage_dir(self) -> Path:
         return runtime_paths(self.var_dir).search_content_dir
 
+    @property
+    def resolved_search_content_allowed_extensions(self) -> set[str]:
+        return {
+            extension if extension.startswith(".") else f".{extension}"
+            for extension in (
+                part.strip().lower()
+                for part in self.search_content_allowed_extensions.replace(";", ",").split(",")
+            )
+            if extension
+        }
+
     def _with_webhook_secret(self, url: str) -> str:
         if not self.webhook_secret:
             return url
@@ -138,15 +157,23 @@ def get_settings() -> Settings:
         search_index_disk_max_depth=_env_int("SEARCH_INDEX_DISK_MAX_DEPTH", 6) or 6,
         search_index_include_disk=_env_bool("SEARCH_INDEX_INCLUDE_DISK", True),
         search_index_include_task_attachments=_env_bool("SEARCH_INDEX_INCLUDE_TASK_ATTACHMENTS", True),
+        search_content_enabled=_env_bool("SEARCH_CONTENT_ENABLED", True),
+        search_content_keep_local_files=_env_bool("SEARCH_CONTENT_KEEP_LOCAL_FILES", False),
+        search_content_max_files=_env_int("SEARCH_CONTENT_MAX_FILES", 80) or 80,
+        search_content_max_bytes=_env_int("SEARCH_CONTENT_MAX_BYTES", 20 * 1024 * 1024) or (20 * 1024 * 1024),
+        search_content_max_chars=_env_int("SEARCH_CONTENT_MAX_CHARS", 40_000) or 40_000,
+        search_content_allowed_extensions=_env("SEARCH_CONTENT_ALLOWED_EXTENSIONS", ".txt,.csv,.doc,.docx,.xlsx,.xls,.pdf"),
         search_background_indexer_enabled=_env_bool("SEARCH_BACKGROUND_INDEXER_ENABLED", False),
         search_background_initial_delay_seconds=_env_int("SEARCH_BACKGROUND_INITIAL_DELAY_SECONDS", 60) or 60,
         search_background_metadata_interval_seconds=_env_int("SEARCH_BACKGROUND_METADATA_INTERVAL_SECONDS", 6 * 60 * 60) or (6 * 60 * 60),
+        search_background_content_interval_seconds=_env_int("SEARCH_BACKGROUND_CONTENT_INTERVAL_SECONDS", 10 * 60) or (10 * 60),
         search_delta_indexer_enabled=_env_bool("SEARCH_DELTA_INDEXER_ENABLED", True),
         search_delta_interval_seconds=_env_int("SEARCH_DELTA_INTERVAL_SECONDS", 5 * 60) or (5 * 60),
         search_delta_folders_per_run=_env_int("SEARCH_DELTA_FOLDERS_PER_RUN", 15) or 15,
         search_delta_max_children_per_folder=_env_int("SEARCH_DELTA_MAX_CHILDREN_PER_FOLDER", 1000) or 1000,
         search_background_lock_stale_seconds=_env_int("SEARCH_BACKGROUND_LOCK_STALE_SECONDS", 2 * 60 * 60) or (2 * 60 * 60),
         search_webhook_indexer_enabled=_env_bool("SEARCH_WEBHOOK_INDEXER_ENABLED", False),
+        search_webhook_content_enabled=_env_bool("SEARCH_WEBHOOK_CONTENT_ENABLED", True),
         agent_dry_run=_env_bool("AGENT_DRY_RUN", False),
         var_dir=paths.root,
     )

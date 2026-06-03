@@ -14,6 +14,7 @@ from .integrations.bitrix.oauth import BitrixOAuthService
 from .integrations.bitrix.portal_search import (
     PortalSearchIndex,
     entity_types_for_scope,
+    format_portal_content_sync_stats,
     format_portal_delta_sync_stats,
     format_portal_index_stats,
     format_portal_search_results,
@@ -295,6 +296,24 @@ async def bitrix_search_reindex_delta(request: Request) -> dict[str, Any]:
     }
 
 
+@app.post("/bitrix/search/reindex-content")
+async def bitrix_search_reindex_content(
+    request: Request,
+    extensions: str | None = None,
+) -> dict[str, Any]:
+    try:
+        stats = await request.app.state.portal_search_indexer.run_content_once(
+            extensions=_extension_set(extensions),
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "summary": format_portal_content_sync_stats(stats),
+        "stats": stats,
+        "indexer": request.app.state.portal_search_indexer.public_status(),
+    }
+
+
 @app.get("/bitrix/search")
 def bitrix_search(
     request: Request,
@@ -458,7 +477,27 @@ def _now_ts() -> str:
 
 
 def _portal_search_status(index: PortalSearchIndex) -> dict[str, Any]:
+    settings = get_settings()
     stats = index.stats()
+    content = (
+        index.content_readiness(
+            allowed_extensions=settings.resolved_search_content_allowed_extensions,
+        ).as_dict()
+        if stats.exists
+        else {
+            "total_documents": 0,
+            "supported_documents": 0,
+            "indexed": 0,
+            "pending": 0,
+            "terminal": 0,
+            "unsupported": 0,
+            "indexed_by_extension": {},
+            "pending_by_extension": {},
+            "pending_by_status": {},
+            "terminal_by_status": {},
+            "unsupported_by_extension": {},
+        }
+    )
     return {
         "exists": stats.exists,
         "path": str(stats.path),
@@ -466,6 +505,18 @@ def _portal_search_status(index: PortalSearchIndex) -> dict[str, Any]:
         "total_items": stats.total_items,
         "by_type": stats.by_type,
         "content_by_status": stats.content_by_status,
+        "content": content,
         "last_indexed_at": stats.last_indexed_at,
     }
+
+
+def _extension_set(value: str | None) -> set[str] | None:
+    if not value:
+        return None
+    result = {
+        item.strip().lower() if item.strip().startswith(".") else f".{item.strip().lower()}"
+        for item in value.replace(";", ",").split(",")
+        if item.strip()
+    }
+    return result or None
 

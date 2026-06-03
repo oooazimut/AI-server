@@ -10,12 +10,15 @@ from typing import Any
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.portal_search import (
     MOSCOW_TZ,
+    PortalContentSyncStats,
     PortalDeltaSyncStats,
     PortalSearchIndex,
     PortalSyncStats,
+    format_portal_content_sync_stats,
     format_portal_delta_sync_stats,
     format_portal_sync_stats,
     sync_disk_delta_index,
+    sync_portal_content_index,
     sync_portal_index,
 )
 from ai_server.settings import get_settings
@@ -28,16 +31,22 @@ PERSISTED_STATUS_KEYS = {
     "last_error_at",
     "consecutive_errors",
     "last_success_at",
+    "content_runs",
     "metadata_runs",
     "delta_runs",
+    "last_content_sync_at",
     "last_metadata_sync_at",
     "last_delta_sync_at",
+    "last_content_started_at",
     "last_metadata_started_at",
     "last_delta_started_at",
+    "last_content_duration_seconds",
     "last_metadata_duration_seconds",
     "last_delta_duration_seconds",
+    "last_content_summary",
     "last_metadata_summary",
     "last_delta_summary",
+    "last_content_pending_after",
     "last_metadata_prune_skipped",
     "last_metadata_stale_deleted",
     "last_metadata_total",
@@ -67,22 +76,30 @@ class PortalSearchIndexerWorker:
             "consecutive_errors": 0,
             "last_success_at": None,
             "metadata_running": False,
+            "content_running": False,
             "delta_running": False,
             "metadata_runs": 0,
+            "content_runs": 0,
             "delta_runs": 0,
             "last_metadata_sync_at": None,
+            "last_content_sync_at": None,
             "last_delta_sync_at": None,
             "last_metadata_started_at": None,
+            "last_content_started_at": None,
             "last_delta_started_at": None,
             "last_metadata_duration_seconds": None,
+            "last_content_duration_seconds": None,
             "last_delta_duration_seconds": None,
             "next_metadata_sync_at": None,
+            "next_content_sync_at": None,
             "next_delta_sync_at": None,
             "last_metadata_summary": None,
+            "last_content_summary": None,
             "last_delta_summary": None,
             "last_metadata_prune_skipped": [],
             "last_metadata_stale_deleted": 0,
             "last_metadata_total": 0,
+            "last_content_pending_after": None,
             "last_delta_folders_scanned": 0,
             "last_delta_items_seen": 0,
             "last_delta_items_changed": 0,
@@ -120,8 +137,14 @@ class PortalSearchIndexerWorker:
             initial_delay=initial_delay,
             now=now,
         )
+        next_content_at = self._next_run_at(
+            "last_content_sync_at",
+            settings.search_background_content_interval_seconds,
+            initial_delay=initial_delay,
+            now=now,
+        )
         next_delta_at = now + initial_delay
-        self._set_next_times(next_metadata_at, next_delta_at)
+        self._set_next_times(next_metadata_at, next_content_at, next_delta_at)
 
         try:
             while self.status["running"]:
@@ -149,6 +172,15 @@ class PortalSearchIndexerWorker:
                     self.status["next_metadata_sync_at"] = _format_time(next_metadata_at)
 
                 now = _now()
+                if settings.search_content_enabled and now >= next_content_at:
+                    await self.run_content_once()
+                    self._heartbeat_lock()
+                    next_content_at = _now() + timedelta(
+                        seconds=settings.search_background_content_interval_seconds
+                    )
+                    self.status["next_content_sync_at"] = _format_time(next_content_at)
+
+                now = _now()
                 if settings.search_delta_indexer_enabled and now >= next_delta_at:
                     await self.run_delta_once()
                     self._heartbeat_lock()
@@ -157,6 +189,7 @@ class PortalSearchIndexerWorker:
 
                 sleep_candidates = [
                     max((next_metadata_at - _now()).total_seconds(), 1),
+                    max((next_content_at - _now()).total_seconds(), 1),
                     30,
                 ]
                 if settings.search_delta_indexer_enabled:
@@ -171,6 +204,7 @@ class PortalSearchIndexerWorker:
             self._release_lock()
             self.status["running"] = False
             self.status["metadata_running"] = False
+            self.status["content_running"] = False
             self.status["delta_running"] = False
 
     async def run_full_once(self, *, include_content: bool = False) -> PortalSyncStats:
@@ -197,6 +231,8 @@ class PortalSearchIndexerWorker:
                 self.status["last_metadata_prune_skipped"] = stats.prune_skipped or []
                 self.status["last_metadata_stale_deleted"] = stats.stale_deleted
                 self.status["last_metadata_total"] = stats.total
+                if stats.content:
+                    self._save_content_status(stats.content)
                 self._record_success()
                 self._save_state()
                 return stats
@@ -211,6 +247,37 @@ class PortalSearchIndexerWorker:
 
     async def run_metadata_once(self) -> PortalSyncStats:
         return await self.run_full_once(include_content=False)
+
+    async def run_content_once(self, *, extensions: set[str] | None = None) -> PortalContentSyncStats:
+        async with self._lock:
+            acquired_for_call = self._ensure_lock_for_operation()
+            self.status["content_running"] = True
+            started_at = _now()
+            self.status["last_content_started_at"] = _format_time(started_at)
+            self.status["last_error"] = None
+            self._save_state()
+            try:
+                stats = await sync_portal_content_index(
+                    self.bitrix,
+                    self.index,
+                    extensions=extensions,
+                )
+                self._save_content_status(stats)
+                self.status["last_content_duration_seconds"] = round(
+                    (_now() - started_at).total_seconds(),
+                    3,
+                )
+                self._record_success()
+                self._save_state()
+                return stats
+            except Exception as exc:
+                self._record_error(exc)
+                raise
+            finally:
+                self.status["content_running"] = False
+                if acquired_for_call:
+                    self._release_lock()
+                self._save_state()
 
     async def run_delta_once(self) -> PortalDeltaSyncStats:
         async with self._lock:
@@ -247,6 +314,15 @@ class PortalSearchIndexerWorker:
                     self._release_lock()
                 self._save_state()
 
+    def _save_content_status(self, stats: PortalContentSyncStats) -> None:
+        self.status["content_runs"] += 1
+        self.status["last_content_sync_at"] = _format_time(_now())
+        self.status["last_content_summary"] = format_portal_content_sync_stats(stats)
+        self.status["last_content_pending_after"] = self.index.content_readiness(
+            allowed_extensions=get_settings().resolved_search_content_allowed_extensions,
+        ).pending
+        self._save_state()
+
     def _save_delta_status(self, stats: PortalDeltaSyncStats) -> None:
         self.status["delta_runs"] += 1
         self.status["last_delta_sync_at"] = _format_time(_now())
@@ -264,9 +340,11 @@ class PortalSearchIndexerWorker:
     def _set_next_times(
         self,
         metadata_at: datetime,
+        content_at: datetime,
         delta_at: datetime,
     ) -> None:
         self.status["next_metadata_sync_at"] = _format_time(metadata_at)
+        self.status["next_content_sync_at"] = _format_time(content_at)
         self.status["next_delta_sync_at"] = _format_time(delta_at)
 
     def _next_run_at(

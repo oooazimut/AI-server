@@ -81,6 +81,7 @@ GET  http://127.0.0.1:8000/bitrix/search/indexer/status
 GET  http://127.0.0.1:8000/bitrix/search?q=...
 POST http://127.0.0.1:8000/bitrix/search/reindex
 POST http://127.0.0.1:8000/bitrix/search/reindex-delta
+POST http://127.0.0.1:8000/bitrix/search/reindex-content
 POST http://127.0.0.1:8000/bitrix/events
 POST http://127.0.0.1:8000/orchestrator/test
 ```
@@ -167,15 +168,20 @@ GET http://127.0.0.1:8000/bitrix/search/indexer/status
 GET http://127.0.0.1:8000/bitrix/search?q=договор&scope=documents
 POST http://127.0.0.1:8000/bitrix/search/reindex
 POST http://127.0.0.1:8000/bitrix/search/reindex-delta
+POST http://127.0.0.1:8000/bitrix/search/reindex-content
 ```
 
 Поддерживаемые scope: `all`, `documents`, `files`, `tasks`, `projects`.
 
-Фоновый индексатор metadata/delta включается явно:
+Фоновый индексатор metadata/delta/content включается явно:
 
 ```env
 SEARCH_BACKGROUND_INDEXER_ENABLED=true
 SEARCH_WEBHOOK_INDEXER_ENABLED=true
+SEARCH_WEBHOOK_CONTENT_ENABLED=true
+SEARCH_CONTENT_MAX_FILES=80
+SEARCH_CONTENT_MAX_BYTES=20971520
+SEARCH_CONTENT_ALLOWED_EXTENSIONS=.txt,.csv,.doc,.docx,.xlsx,.xls,.pdf
 ```
 
 `portal_search` также подключён как Bitrix tool и используется Bitrix24-специалистом

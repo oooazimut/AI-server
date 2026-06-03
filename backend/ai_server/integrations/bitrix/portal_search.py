@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
@@ -9,12 +10,15 @@ import sqlite3
 from typing import Any
 from urllib.parse import quote, urlsplit
 
+from ai_server.document_text import extract_text_from_file
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.runtime import runtime_paths
 from ai_server.settings import get_settings
 
 
 MOSCOW_TZ = timezone(timedelta(hours=3))
+CONTENT_INDEX_VERSION = "2026-05-07-doc-v3"
+CONTENT_TERMINAL_STATUSES = {"empty", "too_large", "failed", "no_download_url"}
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,7 @@ class PortalSyncStats:
     task_attachments: int = 0
     stale_deleted: int = 0
     prune_skipped: list[str] | None = None
+    content: "PortalContentSyncStats | None" = None
     errors: list[str] | None = None
 
     @property
@@ -55,6 +60,47 @@ class PortalDeltaSyncStats:
     cursor_id: str | None = None
     wrapped: bool = False
     errors: list[str] | None = None
+
+
+@dataclass
+class PortalContentSyncStats:
+    candidates: int = 0
+    downloaded: int = 0
+    indexed: int = 0
+    skipped: int = 0
+    unsupported: int = 0
+    failed: int = 0
+    errors: list[str] | None = None
+
+
+@dataclass(frozen=True)
+class PortalContentReadiness:
+    total_documents: int
+    supported_documents: int
+    indexed: int
+    pending: int
+    terminal: int
+    unsupported: int
+    indexed_by_extension: dict[str, int]
+    pending_by_extension: dict[str, int]
+    pending_by_status: dict[str, int]
+    terminal_by_status: dict[str, int]
+    unsupported_by_extension: dict[str, int]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "total_documents": self.total_documents,
+            "supported_documents": self.supported_documents,
+            "indexed": self.indexed,
+            "pending": self.pending,
+            "terminal": self.terminal,
+            "unsupported": self.unsupported,
+            "indexed_by_extension": self.indexed_by_extension,
+            "pending_by_extension": self.pending_by_extension,
+            "pending_by_status": self.pending_by_status,
+            "terminal_by_status": self.terminal_by_status,
+            "unsupported_by_extension": self.unsupported_by_extension,
+        }
 
 
 @dataclass(frozen=True)
@@ -325,6 +371,127 @@ class PortalSearchIndex:
             ).fetchall()
         return [_row_to_search_result(row) for row in rows]
 
+    def content_candidates(self, *, limit: int) -> list[PortalSearchResult]:
+        self.ensure_schema()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT entity_type, entity_id, title, body, url, metadata_json
+                FROM portal_search_items
+                WHERE entity_type IN ('disk_file', 'task_attachment')
+                ORDER BY indexed_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [_row_to_search_result(row) for row in rows]
+
+    def content_readiness(self, *, allowed_extensions: set[str]) -> PortalContentReadiness:
+        self.ensure_schema()
+        normalized_allowed_extensions = _normalize_extensions(allowed_extensions)
+        indexed_by_extension: dict[str, int] = {}
+        pending_by_extension: dict[str, int] = {}
+        pending_by_status: dict[str, int] = {}
+        terminal_by_status: dict[str, int] = {}
+        unsupported_by_extension: dict[str, int] = {}
+        total_documents = 0
+        supported_documents = 0
+        indexed = 0
+        pending = 0
+        terminal = 0
+        unsupported = 0
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT title, metadata_json
+                FROM portal_search_items
+                WHERE entity_type IN ('disk_file', 'task_attachment')
+                """
+            ).fetchall()
+
+        for row in rows:
+            total_documents += 1
+            extension = _file_extension(str(row["title"] or "")) or "<none>"
+            metadata = _safe_json(row["metadata_json"])
+            status = str(metadata.get("content_index_status") or "none")
+            content_version = str(metadata.get("content_index_version") or "")
+
+            if extension not in normalized_allowed_extensions:
+                unsupported += 1
+                _increment(unsupported_by_extension, extension)
+                continue
+
+            supported_documents += 1
+            if status == "indexed":
+                indexed += 1
+                _increment(indexed_by_extension, extension)
+            elif content_version == CONTENT_INDEX_VERSION and status in CONTENT_TERMINAL_STATUSES:
+                terminal += 1
+                _increment(terminal_by_status, status)
+            else:
+                pending += 1
+                _increment(pending_by_extension, extension)
+                _increment(pending_by_status, status)
+
+        return PortalContentReadiness(
+            total_documents=total_documents,
+            supported_documents=supported_documents,
+            indexed=indexed,
+            pending=pending,
+            terminal=terminal,
+            unsupported=unsupported,
+            indexed_by_extension=indexed_by_extension,
+            pending_by_extension=pending_by_extension,
+            pending_by_status=pending_by_status,
+            terminal_by_status=terminal_by_status,
+            unsupported_by_extension=unsupported_by_extension,
+        )
+
+    def update_item_body_metadata(
+        self,
+        *,
+        entity_type: str,
+        entity_id: object,
+        body: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        self.ensure_schema()
+        now = datetime.now(MOSCOW_TZ).isoformat()
+        normalized_body = _clean_text(body)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT title
+                FROM portal_search_items
+                WHERE entity_type = ? AND entity_id = ?
+                """,
+                (entity_type, str(entity_id)),
+            ).fetchone()
+            if not row:
+                return
+            search_text = _normalize_search_text(
+                " ".join([entity_type, str(entity_id), row["title"], normalized_body])
+            )
+            connection.execute(
+                """
+                UPDATE portal_search_items
+                SET body = ?,
+                    search_text = ?,
+                    metadata_json = ?,
+                    indexed_at = ?
+                WHERE entity_type = ? AND entity_id = ?
+                """,
+                (
+                    normalized_body,
+                    search_text,
+                    json.dumps(metadata, ensure_ascii=False),
+                    now,
+                    entity_type,
+                    str(entity_id),
+                ),
+            )
+
     def stats(self) -> PortalIndexStats:
         if not self.path.exists():
             return PortalIndexStats(
@@ -504,12 +671,226 @@ async def sync_portal_index(
         except Exception as exc:
             stats.errors.append(f"disk: {type(exc).__name__}: {exc}")
 
-    if include_content:
-        stats.errors.append("content indexing is not migrated in this step")
+    if include_content and settings.search_content_enabled:
+        try:
+            stats.content = await sync_portal_content_index(bitrix, index)
+        except Exception as exc:
+            stats.errors.append(f"content: {type(exc).__name__}: {exc}")
     if not stats.prune_skipped:
         stats.prune_skipped = None
     if not stats.errors:
         stats.errors = None
+    return stats
+
+
+async def sync_portal_content_index(
+    bitrix: BitrixClient,
+    index: PortalSearchIndex,
+    *,
+    extensions: set[str] | None = None,
+) -> PortalContentSyncStats:
+    settings = get_settings()
+    stats = PortalContentSyncStats(errors=[])
+    allowed_extensions = _normalize_extensions(settings.resolved_search_content_allowed_extensions)
+    if extensions:
+        allowed_extensions &= _normalize_extensions(extensions)
+    candidate_limit = max(settings.search_content_max_files * 50, settings.search_content_max_files)
+    processed_downloads = 0
+
+    for item in index.content_candidates(limit=candidate_limit):
+        metadata = dict(item.metadata)
+        status = str(metadata.get("content_index_status") or "")
+        content_version = str(metadata.get("content_index_version") or "")
+        extension = _file_extension(item.title)
+        if extensions and extension not in allowed_extensions:
+            continue
+        if status == "indexed" and (content_version == CONTENT_INDEX_VERSION or not extensions):
+            continue
+        if (
+            content_version == CONTENT_INDEX_VERSION
+            and status in {"unsupported", "too_large", "empty", "failed", "no_download_url"}
+        ):
+            continue
+
+        stats.candidates += 1
+        if extension not in allowed_extensions:
+            _mark_content_status(
+                index,
+                item,
+                metadata,
+                status="unsupported",
+                reason=f"extension {extension or '<none>'} is not enabled",
+            )
+            stats.unsupported += 1
+            continue
+
+        size = _safe_int(metadata.get("size"))
+        if size and size > settings.search_content_max_bytes:
+            _mark_content_status(
+                index,
+                item,
+                metadata,
+                status="too_large",
+                reason=f"file exceeds {settings.search_content_max_bytes} bytes",
+            )
+            stats.skipped += 1
+            continue
+
+        if processed_downloads >= settings.search_content_max_files:
+            break
+        processed_downloads += 1
+
+        item_stats = await sync_portal_content_item(
+            bitrix,
+            index,
+            item,
+            extensions={extension},
+        )
+        stats.downloaded += item_stats.downloaded
+        stats.indexed += item_stats.indexed
+        stats.skipped += item_stats.skipped
+        stats.unsupported += item_stats.unsupported
+        stats.failed += item_stats.failed
+        if item_stats.errors:
+            stats.errors.extend(item_stats.errors)
+
+    if not stats.errors:
+        stats.errors = None
+    return stats
+
+
+async def sync_portal_content_item(
+    bitrix: BitrixClient,
+    index: PortalSearchIndex,
+    item: PortalSearchResult,
+    *,
+    extensions: set[str] | None = None,
+) -> PortalContentSyncStats:
+    settings = get_settings()
+    stats = PortalContentSyncStats(errors=[])
+    allowed_extensions = _normalize_extensions(settings.resolved_search_content_allowed_extensions)
+    if extensions:
+        allowed_extensions &= _normalize_extensions(extensions)
+
+    metadata = dict(item.metadata)
+    extension = _file_extension(item.title)
+    if extensions and extension not in allowed_extensions:
+        return stats
+
+    stats.candidates = 1
+    if extension not in allowed_extensions:
+        _mark_content_status(
+            index,
+            item,
+            metadata,
+            status="unsupported",
+            reason=f"extension {extension or '<none>'} is not enabled",
+        )
+        stats.unsupported += 1
+        return stats
+
+    size = _safe_int(metadata.get("size"))
+    if size and size > settings.search_content_max_bytes:
+        _mark_content_status(
+            index,
+            item,
+            metadata,
+            status="too_large",
+            reason=f"file exceeds {settings.search_content_max_bytes} bytes",
+        )
+        stats.skipped += 1
+        return stats
+
+    target_path: Path | None = None
+    downloaded_for_indexing = False
+    try:
+        download_url = await _resolve_download_url(bitrix, item)
+        if not download_url:
+            _mark_content_status(
+                index,
+                item,
+                metadata,
+                status="no_download_url",
+                reason="Bitrix did not return a download URL",
+            )
+            stats.failed += 1
+            return stats
+
+        target_path = portal_file_cache_path(item)
+        downloaded_bytes = await bitrix.download_file_from_url(
+            download_url,
+            target_path,
+            max_bytes=settings.search_content_max_bytes,
+        )
+        downloaded_for_indexing = True
+        stats.downloaded += 1
+
+        extracted = await asyncio.to_thread(
+            extract_text_from_file,
+            target_path,
+            original_name=item.title,
+            max_chars=settings.search_content_max_chars,
+        )
+        metadata.update(
+            {
+                "content_index_status": extracted.status,
+                "content_index_version": CONTENT_INDEX_VERSION,
+                "content_index_reason": extracted.reason,
+                "content_indexed_at": datetime.now(MOSCOW_TZ).isoformat(),
+                "content_bytes": downloaded_bytes,
+                "content_extension": extension,
+                "content_text_length": len(extracted.text),
+            }
+        )
+        if extracted.status == "indexed":
+            index.update_item_body_metadata(
+                entity_type=item.entity_type,
+                entity_id=item.entity_id,
+                body=_body_with_content(item.body, extracted.text),
+                metadata=metadata,
+            )
+            stats.indexed += 1
+        else:
+            index.update_item_body_metadata(
+                entity_type=item.entity_type,
+                entity_id=item.entity_id,
+                body=item.body,
+                metadata=metadata,
+            )
+            if extracted.status == "unsupported":
+                stats.unsupported += 1
+            elif extracted.status == "failed":
+                stats.failed += 1
+            else:
+                stats.skipped += 1
+    except Exception as exc:
+        metadata.update(
+            {
+                "content_index_status": "failed",
+                "content_index_version": CONTENT_INDEX_VERSION,
+                "content_index_reason": type(exc).__name__,
+                "content_indexed_at": datetime.now(MOSCOW_TZ).isoformat(),
+                "content_extension": extension,
+            }
+        )
+        index.update_item_body_metadata(
+            entity_type=item.entity_type,
+            entity_id=item.entity_id,
+            body=item.body,
+            metadata=metadata,
+        )
+        stats.failed += 1
+        stats.errors = [
+            f"{item.entity_type} #{item.entity_id} {item.title}: {type(exc).__name__}"
+        ]
+    finally:
+        if (
+            downloaded_for_indexing
+            and target_path is not None
+            and not settings.search_content_keep_local_files
+        ):
+            delete_portal_file_cache_path(target_path)
+
     return stats
 
 
@@ -611,6 +992,50 @@ async def sync_disk_file_item(
     return index.get_item(entity_type="disk_file", entity_id=item_id)
 
 
+async def _resolve_download_url(bitrix: BitrixClient, item: PortalSearchResult) -> str | None:
+    if item.entity_type == "task_attachment":
+        attached_object_id = _safe_int(item.metadata.get("attached_object_id")) or _safe_int(item.entity_id)
+        if not attached_object_id:
+            return None
+        attached = await bitrix.get_attached_object(attached_object_id)
+        if isinstance(attached, dict):
+            return _to_str(_first(attached, "DOWNLOAD_URL", "downloadUrl"))
+        return None
+
+    if item.entity_type == "disk_file":
+        disk_file_id = _safe_int(item.metadata.get("disk_object_id")) or _safe_int(item.entity_id)
+        if not disk_file_id:
+            return None
+        return await bitrix.get_disk_file_download_url(disk_file_id)
+
+    return None
+
+
+def _mark_content_status(
+    index: PortalSearchIndex,
+    item: PortalSearchResult,
+    metadata: dict[str, Any],
+    *,
+    status: str,
+    reason: str,
+) -> None:
+    metadata.update(
+        {
+            "content_index_status": status,
+            "content_index_version": CONTENT_INDEX_VERSION,
+            "content_index_reason": reason,
+            "content_indexed_at": datetime.now(MOSCOW_TZ).isoformat(),
+            "content_extension": _file_extension(item.title),
+        }
+    )
+    index.update_item_body_metadata(
+        entity_type=item.entity_type,
+        entity_id=item.entity_id,
+        body=item.body,
+        metadata=metadata,
+    )
+
+
 def portal_file_cache_path(item: PortalSearchResult) -> Path:
     extension = _file_extension(item.title) or ".bin"
     safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{item.entity_type}_{item.entity_id}")
@@ -650,10 +1075,30 @@ def format_portal_sync_stats(stats: PortalSyncStats) -> str:
         lines.append("")
         lines.append("Удаление пропущено для неполных обходов:")
         lines.extend(f"- {item}" for item in stats.prune_skipped)
+    if stats.content:
+        lines.append("")
+        lines.extend(format_portal_content_sync_stats(stats.content).splitlines())
     if stats.errors:
         lines.append("")
         lines.append("Есть предупреждения:")
         lines.extend(f"- {error}" for error in stats.errors)
+    return "\n".join(lines)
+
+
+def format_portal_content_sync_stats(stats: PortalContentSyncStats) -> str:
+    lines = [
+        "Содержимое документов обработано.",
+        f"Кандидатов: {stats.candidates}",
+        f"Скачано: {stats.downloaded}",
+        f"Текст добавлен: {stats.indexed}",
+        f"Пропущено: {stats.skipped}",
+        f"Неподдерживаемый формат: {stats.unsupported}",
+        f"Ошибок: {stats.failed}",
+    ]
+    if stats.errors:
+        lines.append("")
+        lines.append("Ошибки по файлам:")
+        lines.extend(f"- {error}" for error in stats.errors[:10])
     return "\n".join(lines)
 
 
@@ -1298,6 +1743,14 @@ def _file_extension(name: str) -> str:
     return Path(name).suffix.lower()
 
 
+def _normalize_extensions(extensions: set[str]) -> set[str]:
+    return {
+        extension.lower() if extension.startswith(".") else f".{extension.lower()}"
+        for extension in extensions
+        if extension
+    }
+
+
 def _safe_int(value: object) -> int | None:
     if value is None or value == "":
         return None
@@ -1305,6 +1758,10 @@ def _safe_int(value: object) -> int | None:
         return int(str(value).strip())
     except (TypeError, ValueError):
         return None
+
+
+def _increment(counter: dict[str, int], key: str) -> None:
+    counter[key] = counter.get(key, 0) + 1
 
 
 def _normalize_url(value: str | None) -> str:

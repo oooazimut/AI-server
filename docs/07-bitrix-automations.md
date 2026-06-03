@@ -100,15 +100,18 @@ uv run python scripts/import_bitrix_var.py --profile cutover --execute
   Bitrix message event в `AgentTask` для Оркестратора;
 - `backend/ai_server/integrations/bitrix/portal_search.py` - reader/writer
   совместимой SQLite-таблицы `portal_search_items`;
+- `backend/ai_server/document_text.py` - извлечение текста из `.txt`, `.csv`,
+  `.doc`, `.docx`, `.xls`, `.xlsx`, `.pdf`;
 - `backend/ai_server/workers/bitrix/search_indexer.py` - фоновый и ручной
-  metadata/delta-indexer задач, проектов и диска;
-- `backend/ai_server/workers/bitrix/search_webhook_indexer.py` - metadata-only
-  обработчик disk/file webhook-событий;
+  metadata/delta/content-indexer задач, проектов, диска и содержимого файлов;
+- `backend/ai_server/workers/bitrix/search_webhook_indexer.py` - обработчик
+  disk/file webhook-событий с обновлением metadata и, если включено, текста файла;
 - `POST /bitrix/events` - endpoint приёма webhook-событий;
 - `GET /bitrix/status`, `GET /bitrix/webhook-events/status`,
   `GET /bitrix/search/status` и `GET /bitrix/search` - runtime status/search;
 - `GET /bitrix/search/indexer/status`, `POST /bitrix/search/reindex`,
-  `POST /bitrix/search/reindex-delta` - статус и ручной запуск индексатора.
+  `POST /bitrix/search/reindex-delta`, `POST /bitrix/search/reindex-content` -
+  статус и ручной запуск индексатора.
 
 Worker очереди включается отдельно:
 
@@ -133,9 +136,9 @@ Webhook-обновление файлового индекса тоже вклю
 
 ```env
 SEARCH_WEBHOOK_INDEXER_ENABLED=true
+SEARCH_WEBHOOK_CONTENT_ENABLED=true
 ```
 
 `portal_search` уже умеет читать и обновлять старую SQLite-таблицу
-`portal_search_items`. Перенесён metadata/delta-контур: задачи, проекты, диск и
-metadata-only disk/file webhook-и. Текстовый слой документов (`var/search_content`,
-извлечение текста из `.doc/.pdf/.xlsx`) остаётся отдельным следующим переносом.
+`portal_search_items`. Перенесён metadata/delta/content-контур: задачи, проекты,
+диск, содержимое документов и disk/file webhook-и.

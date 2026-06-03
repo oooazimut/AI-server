@@ -9,8 +9,10 @@ from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.portal_search import (
     PortalSearchIndex,
     delete_portal_file_cache_path,
+    format_portal_content_sync_stats,
     portal_file_cache_path,
     sync_disk_file_item,
+    sync_portal_content_item,
 )
 from ai_server.settings import get_settings
 
@@ -121,15 +123,40 @@ async def _upsert_indexed_file(
             "file_id": job.file_id,
         }
 
-    return {
+    result: dict[str, Any] = {
         "handled": True,
         "reason": "metadata_indexed",
         "event": job.event,
         "action": job.action,
         "file_id": job.file_id,
         "title": item.title,
-        "content": {"handled": False, "reason": "content_indexing_not_migrated"},
     }
+    settings = get_settings()
+    if not settings.search_webhook_content_enabled:
+        result["content"] = {"handled": False, "reason": "disabled"}
+        return result
+
+    extension = _file_extension(item.title)
+    if extension not in settings.resolved_search_content_allowed_extensions:
+        result["content"] = {
+            "handled": False,
+            "reason": "unsupported_extension",
+            "extension": extension or "<none>",
+        }
+        return result
+
+    stats = await sync_portal_content_item(bitrix, index, item, extensions={extension})
+    result["content"] = {
+        "handled": True,
+        "summary": format_portal_content_sync_stats(stats),
+        "downloaded": stats.downloaded,
+        "indexed": stats.indexed,
+        "failed": stats.failed,
+        "unsupported": stats.unsupported,
+        "skipped": stats.skipped,
+    }
+    result["reason"] = "metadata_and_content_indexed"
+    return result
 
 
 def _record_seen(status: dict[str, Any], job: SearchWebhookJob) -> None:
@@ -210,3 +237,9 @@ def _first_int(candidates: list[Any]) -> int | None:
         if cleaned.isdigit():
             return int(cleaned)
     return None
+
+
+def _file_extension(name: str) -> str:
+    from pathlib import Path
+
+    return Path(name).suffix.lower()
