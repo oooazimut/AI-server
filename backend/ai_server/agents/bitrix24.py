@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from ai_server.agents.bitrix_task_create import (
     BitrixTaskCreateDraft,
+    BitrixTaskCreateResolution,
     build_task_create_draft,
     format_task_create_clarification,
     looks_like_task_create_request,
@@ -60,7 +61,7 @@ class Bitrix24Specialist:
         if portal_search_action is not None:
             actions_taken.append(portal_search_action)
 
-        task_create_draft = build_task_create_draft(task) if looks_like_task_create_request(text) else None
+        task_create_draft = await self._task_create_draft(task, text)
         if task_create_draft is not None:
             actions_taken.append(
                 ActionRecord(
@@ -96,6 +97,63 @@ class Bitrix24Specialist:
 
     def tool_definitions(self) -> list[dict]:
         return [definition.model_dump() for definition in self.tools.definitions()]
+
+    async def _task_create_draft(self, task: AgentTask, text: str) -> BitrixTaskCreateDraft | None:
+        if not looks_like_task_create_request(text):
+            return None
+        draft = build_task_create_draft(task)
+        resolution = await self._resolve_task_create_draft(draft)
+        if resolution is None:
+            return draft
+        return build_task_create_draft(task, resolution=resolution)
+
+    async def _resolve_task_create_draft(
+        self,
+        draft: BitrixTaskCreateDraft,
+    ) -> BitrixTaskCreateResolution | None:
+        responsible_id = None
+        responsible_note = ""
+        group_id = None
+        group_note = ""
+        notes: list[str] = []
+
+        if "responsible_id" in draft.missing_fields and draft.responsible_query:
+            result = await self.tools.resolve_user(draft.responsible_query)
+            if result.status == "ok":
+                candidate = result.data.get("candidate") if isinstance(result.data, dict) else None
+                if isinstance(candidate, dict):
+                    responsible_id = _optional_int(candidate.get("id"))
+                    responsible_note = f"Ответственный найден в Bitrix: {candidate.get('label') or draft.responsible_query}."
+            elif result.status == "ambiguous":
+                notes.append(_format_ambiguous_note("Найдено несколько сотрудников", result.data.get("candidates")))
+            elif result.status == "not_found":
+                notes.append(f"Не нашёл сотрудника в Bitrix по запросу `{draft.responsible_query}`.")
+            else:
+                notes.append(f"Не смог проверить сотрудника через Bitrix: {result.status}.")
+
+        if "group_id" in draft.missing_fields and draft.project_query:
+            result = await self.tools.resolve_project(draft.project_query)
+            if result.status == "ok":
+                candidate = result.data.get("candidate") if isinstance(result.data, dict) else None
+                if isinstance(candidate, dict):
+                    group_id = _optional_int(candidate.get("id"))
+                    group_note = f"Проект найден в Bitrix: {candidate.get('label') or draft.project_query}."
+            elif result.status == "ambiguous":
+                notes.append(_format_ambiguous_note("Найдено несколько проектов", result.data.get("candidates")))
+            elif result.status == "not_found":
+                notes.append(f"Не нашёл проект в Bitrix по запросу `{draft.project_query}`.")
+            else:
+                notes.append(f"Не смог проверить проект через Bitrix: {result.status}.")
+
+        if responsible_id is None and group_id is None and not notes:
+            return None
+        return BitrixTaskCreateResolution(
+            responsible_id=responsible_id,
+            responsible_note=responsible_note,
+            group_id=group_id,
+            group_note=group_note,
+            notes=notes,
+        )
 
     def _select_skills(self, text: str) -> list[str]:
         selected: list[str] = []
@@ -236,6 +294,29 @@ def _result_status(
     if task_create_draft is not None and not task_create_draft.is_ready:
         return "needs_clarification"
     return "completed"
+
+
+def _format_ambiguous_note(prefix: str, candidates: object) -> str:
+    if not isinstance(candidates, list):
+        return prefix + "; нужно уточнение."
+    labels = []
+    for candidate in candidates[:5]:
+        if isinstance(candidate, dict):
+            label = candidate.get("label") or candidate.get("id")
+            if label:
+                labels.append(str(label))
+    if not labels:
+        return prefix + "; нужно уточнение."
+    return prefix + ": " + "; ".join(labels) + ". Уточни нужный вариант."
+
+
+def _optional_int(value: object) -> int | None:
+    try:
+        if value in (None, ""):
+            return None
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
 
 
 def _unique(values: list[str]) -> list[str]:

@@ -189,6 +189,25 @@ class BitrixClient:
             limit=limit,
         )
 
+    async def search_users(self, query: str, *, limit: int = 10) -> list[dict[str, Any]]:
+        payload: dict[str, Any] = {
+            "FILTER": {"ACTIVE": True},
+            "SORT": "LAST_NAME",
+            "ORDER": "ASC",
+            "LIMIT": limit,
+        }
+        if query:
+            payload["FILTER"]["FIND"] = query
+        result = await self.result("user.search", payload)
+        if isinstance(result, list):
+            return [item for item in result if isinstance(item, dict)][:limit]
+        if isinstance(result, dict):
+            for key in ("users", "items", "result"):
+                items = result.get(key)
+                if isinstance(items, list):
+                    return [item for item in items if isinstance(item, dict)][:limit]
+        return []
+
     async def get_attached_object(self, attached_object_id: int) -> Any:
         return await self.result("disk.attachedObject.get", {"id": attached_object_id})
 
