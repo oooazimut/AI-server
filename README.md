@@ -75,6 +75,8 @@ GET  http://127.0.0.1:8000/agents
 GET  http://127.0.0.1:8000/agents/bitrix24/skills
 GET  http://127.0.0.1:8000/agents/bitrix24/automations
 GET  http://127.0.0.1:8000/automations
+GET  http://127.0.0.1:8000/bitrix/status
+POST http://127.0.0.1:8000/bitrix/events
 POST http://127.0.0.1:8000/orchestrator/test
 ```
 
@@ -117,6 +119,35 @@ uv run python scripts/import_bitrix_var.py --profile cutover
 
 ```powershell
 uv run python scripts/import_bitrix_var.py --profile cutover --execute
+```
+
+## Bitrix webhook contour
+
+Новый сервер уже умеет принимать webhook-события Битрикс24 в совместимую SQLite
+очередь:
+
+```env
+PUBLIC_BASE_URL=https://your-public-host.example
+WEBHOOK_SECRET=change-me
+BITRIX_REST_WEBHOOK_URL=https://example.bitrix24.ru/rest/...
+BITRIX_BOT_ID=...
+BITRIX_BOT_TOKEN=...
+AGENT_DRY_RUN=true
+```
+
+По умолчанию worker очереди не запускается автоматически. Для обработки очереди
+и отправки ответов в Bitrix-чат:
+
+```env
+AI_SERVER_WEBHOOK_EVENT_WORKER_ENABLED=true
+AGENT_DRY_RUN=false
+```
+
+Проверка состояния:
+
+```text
+GET http://127.0.0.1:8000/bitrix/status
+GET http://127.0.0.1:8000/bitrix/webhook-events/status
 ```
 ## Документы
 

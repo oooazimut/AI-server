@@ -1,14 +1,26 @@
+import asyncio
+import json
+from contextlib import asynccontextmanager
+from typing import Annotated, Any
+from urllib.parse import parse_qsl
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request, status
 
+from .channels.bitrix import BitrixWebhookProcessor
+from .integrations.bitrix.client import BitrixClient
+from .integrations.bitrix.events import payload_event_type
+from .integrations.bitrix.oauth import BitrixOAuthService
 from .knowledge import MarkdownKnowledgeBase
 from .models import AgentTask, AgentTestRequest, UserContext
 from .retrieval import HybridKnowledgeRetriever
 from .orchestrator import suggest_agents
 from .orchestrators.internal import InternalOrchestrator
 from .registry import get_agent_manifest, load_agent_manifests, summarize_agents
+from .runtime import ensure_runtime_dirs
+from .settings import get_settings
 from .skills import SkillStore
+from .workers.bitrix.webhook_event_queue import WebhookEventQueue, run_webhook_event_worker
 from .workers.registry import (
     get_automation_manifest,
     load_automation_manifests,
@@ -16,17 +28,83 @@ from .workers.registry import (
 )
 
 
-app = FastAPI(title="AI Server", version="0.1.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = get_settings()
+    ensure_runtime_dirs()
+    bitrix = BitrixClient()
+    bitrix_oauth = BitrixOAuthService()
+    bitrix_oauth.ensure_schema()
+    webhook_event_queue = WebhookEventQueue(settings.webhook_event_queue_path)
+    webhook_event_queue.ensure_schema()
+
+    app.state.bitrix = bitrix
+    app.state.bitrix_oauth = bitrix_oauth
+    app.state.webhook_event_queue = webhook_event_queue
+    app.state.webhook_event_status = {
+        "enabled": True,
+        "mode": "webhook",
+        "webhook_url_configured": bool(settings.resolved_bot_webhook_url),
+        "secret_required": bool(settings.webhook_secret),
+        "last_received_at": None,
+        "last_event": None,
+        "events_seen": 0,
+        "duplicates_seen": 0,
+    }
+    app.state.webhook_event_queue_status = {
+        "enabled": settings.webhook_event_queue_enabled,
+        "running": False,
+        "path": str(settings.webhook_event_queue_path),
+        "worker_enabled": settings.webhook_event_worker_enabled,
+        "worker_count": settings.webhook_event_queue_worker_count,
+        "last_enqueued_at": None,
+        "last_enqueued_event_id": None,
+        "last_enqueued_event": None,
+        "enqueued": 0,
+        "duplicates_seen": 0,
+        "processed": 0,
+        "errors": 0,
+        "last_error": None,
+    }
+
+    worker_task: asyncio.Task | None = None
+    if settings.webhook_event_queue_enabled and settings.webhook_event_worker_enabled:
+        processor = BitrixWebhookProcessor(bitrix=bitrix)
+        worker_task = asyncio.create_task(
+            run_webhook_event_worker(
+                webhook_event_queue,
+                processor.process,
+                status=app.state.webhook_event_queue_status,
+            )
+        )
+
+    try:
+        yield
+    finally:
+        if worker_task:
+            app.state.webhook_event_queue_status["running"] = False
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+
+
+app = FastAPI(title="AI Server", version="0.1.0", lifespan=lifespan)
 
 
 @app.get("/health")
 def health() -> dict[str, object]:
     manifests = load_agent_manifests()
+    settings = get_settings()
     return {
         "status": "ok",
         "architecture": "orchestrator_plus_modular_specialists",
         "agent_count": len(manifests),
         "agents": [agent.id for agent in manifests],
+        "bitrix_configured": settings.bitrix_configured,
+        "bitrix_webhook_queue_enabled": settings.webhook_event_queue_enabled,
+        "bitrix_webhook_worker_enabled": settings.webhook_event_worker_enabled,
     }
 
 
@@ -96,6 +174,85 @@ def automation_detail(automation_id: str):
     return automation
 
 
+@app.get("/bitrix/status")
+def bitrix_status(request: Request) -> dict[str, Any]:
+    settings = get_settings()
+    return {
+        "configured": settings.bitrix_configured,
+        "bot_id": settings.bitrix_bot_id,
+        "bot_auth_mode": settings.bitrix_bot_auth_mode,
+        "webhook_url_configured": bool(settings.resolved_bot_webhook_url),
+        "oauth": request.app.state.bitrix_oauth.public_status(),
+        "webhook_events": dict(request.app.state.webhook_event_status),
+        "webhook_event_queue": {
+            **dict(request.app.state.webhook_event_queue_status),
+            **request.app.state.webhook_event_queue.stats(),
+        },
+    }
+
+
+@app.get("/bitrix/oauth/status")
+def bitrix_oauth_status(request: Request) -> dict[str, Any]:
+    return request.app.state.bitrix_oauth.public_status()
+
+
+@app.get("/bitrix/webhook-events/status")
+def bitrix_webhook_events_status(request: Request) -> dict[str, Any]:
+    return {
+        "worker": dict(request.app.state.webhook_event_queue_status),
+        "queue": request.app.state.webhook_event_queue.stats(),
+        "latest_events": request.app.state.webhook_event_queue.latest(limit=20),
+    }
+
+
+@app.post("/bitrix/events")
+async def bitrix_events(
+    request: Request,
+    x_agent_secret: Annotated[str | None, Header(alias="X-Agent-Secret")] = None,
+) -> dict[str, Any]:
+    settings = get_settings()
+    payload = await _read_bitrix_event_payload(request)
+    _validate_webhook_secret(
+        settings,
+        x_agent_secret
+        or request.query_params.get("secret")
+        or request.query_params.get("agent_secret")
+        or request.query_params.get("token")
+        or _payload_secret(payload),
+    )
+
+    event_type = payload_event_type(payload)
+    webhook_status = request.app.state.webhook_event_status
+    webhook_status["last_received_at"] = _now_ts()
+    webhook_status["events_seen"] = int(webhook_status.get("events_seen") or 0) + 1
+    webhook_status["last_event"] = event_type
+
+    if settings.webhook_event_queue_enabled:
+        event_id, inserted = request.app.state.webhook_event_queue.enqueue(
+            payload,
+            event_type=event_type,
+        )
+        queue_status = request.app.state.webhook_event_queue_status
+        queue_status["last_enqueued_at"] = _now_ts()
+        queue_status["last_enqueued_event_id"] = event_id
+        queue_status["last_enqueued_event"] = event_type
+        queue_status["enqueued"] = int(queue_status.get("enqueued") or 0) + int(inserted)
+        if not inserted:
+            queue_status["duplicates_seen"] = int(queue_status.get("duplicates_seen") or 0) + 1
+            webhook_status["duplicates_seen"] = int(webhook_status.get("duplicates_seen") or 0) + 1
+        return {
+            "ok": True,
+            "queued": inserted,
+            "duplicate": not inserted,
+            "event": event_type,
+            "event_id": event_id,
+        }
+
+    processor = BitrixWebhookProcessor(bitrix=request.app.state.bitrix)
+    result = await processor.process(payload)
+    return {"ok": True, **result}
+
+
 @app.get("/route-preview")
 def route_preview(q: str = Query(..., min_length=1)):
     manifests = load_agent_manifests()
@@ -113,4 +270,71 @@ async def orchestrator_test(body: AgentTestRequest):
         request=body.text,
     )
     return await InternalOrchestrator(manifests).handle(task)
+
+
+async def _read_bitrix_event_payload(request: Request) -> dict[str, Any]:
+    content_type = request.headers.get("content-type", "").lower()
+    if "application/json" in content_type:
+        payload = await request.json()
+        return payload if isinstance(payload, dict) else {}
+
+    body = await request.body()
+    if not body:
+        return {}
+
+    if "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+        pairs = parse_qsl(body.decode("utf-8"), keep_blank_values=True)
+        return _expand_form_pairs(pairs)
+
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError:
+        pairs = parse_qsl(body.decode("utf-8"), keep_blank_values=True)
+        return _expand_form_pairs(pairs)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _expand_form_pairs(pairs: list[tuple[str, str]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if "[" not in key:
+            result[key] = value
+            continue
+        _assign_bracketed(result, key, value)
+    return result
+
+
+def _assign_bracketed(target: dict[str, Any], key: str, value: str) -> None:
+    head, *raw_parts = key.replace("]", "").split("[")
+    current = target.setdefault(head, {})
+    for part in raw_parts[:-1]:
+        if not isinstance(current, dict):
+            return
+        current = current.setdefault(part, {})
+    if isinstance(current, dict) and raw_parts:
+        current[raw_parts[-1]] = value
+
+
+def _payload_secret(payload: dict[str, Any]) -> str | None:
+    for key in ("secret", "agent_secret", "token", "WEBHOOK_SECRET"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    auth = payload.get("auth")
+    if isinstance(auth, dict):
+        value = auth.get("application_token") or auth.get("APPLICATION_TOKEN")
+        if value:
+            return str(value)
+    return None
+
+
+def _validate_webhook_secret(settings, value: str | None) -> None:
+    if settings.webhook_secret and value != settings.webhook_secret:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="invalid webhook secret")
+
+
+def _now_ts() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
 

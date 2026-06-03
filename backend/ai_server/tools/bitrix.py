@@ -1,46 +1,10 @@
 from __future__ import annotations
 
-import os
 from typing import Any
 
-import httpx
-
+from ai_server.integrations.bitrix.client import BitrixApiError, BitrixClient, BitrixConfigError
 from ai_server.models import ToolDefinition, ToolResult
 from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
-
-
-class BitrixApiError(RuntimeError):
-    def __init__(self, method: str, error: str, description: str = "") -> None:
-        self.method = method
-        self.error = error
-        self.description = description
-        super().__init__(f"Bitrix REST error in {method}: {error} {description}".strip())
-
-
-class BitrixClient:
-    def __init__(self, base_url: str | None = None) -> None:
-        self.base_url = (base_url or os.getenv("BITRIX_REST_WEBHOOK_URL", "")).rstrip("/") + "/"
-        self.timeout = httpx.Timeout(30.0)
-
-    @property
-    def configured(self) -> bool:
-        return bool(self.base_url.strip("/"))
-
-    async def call(self, method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        if not self.configured:
-            raise BitrixApiError(method, "NOT_CONFIGURED", "BITRIX_REST_WEBHOOK_URL is empty")
-        url = f"{self.base_url}{method}.json"
-        async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
-            response = await client.post(url, json=dict(payload or {}))
-            response.raise_for_status()
-        data = response.json()
-        if "error" in data:
-            raise BitrixApiError(method, str(data.get("error", "")), str(data.get("error_description", "")))
-        return data
-
-    async def result(self, method: str, payload: dict[str, Any] | None = None) -> Any:
-        data = await self.call(method, payload)
-        return data.get("result")
 
 
 class BitrixToolset:
@@ -109,9 +73,9 @@ class BitrixToolset:
 
         try:
             result = await self.client.result(method, params)
-        except BitrixApiError as exc:
+        except (BitrixApiError, BitrixConfigError) as exc:
             return ToolResult(
-                status="not_configured" if exc.error == "NOT_CONFIGURED" else "error",
+                status="not_configured" if isinstance(exc, BitrixConfigError) else "error",
                 tool="bitrix_api",
                 error=str(exc),
                 data={"method": method, "params": params},

@@ -79,7 +79,7 @@ uv run python scripts/import_bitrix_var.py --profile cutover --execute
 1. Зарегистрировать automation manifests и API чтения каталога.
 2. Встроить `var/` как runtime-контур и подготовить cutover-миграцию.
 3. Вынести общий Bitrix client/OAuth/event parser в `integrations/bitrix`.
-4. Перенести очередь webhook-событий и processor как первый реальный worker.
+4. Перенести очередь webhook-событий и message processor как первый реальный worker.
 5. Подключить portal search indexer, потому что он кормит RAG и поиск.
 6. Перенести `quality_control` и `supervisor` через policy layer и dry-run.
 7. Отдельно решить судьбу `vehicle_usage`: оставить в Bitrix-домене или выделить
@@ -87,3 +87,28 @@ uv run python scripts/import_bitrix_var.py --profile cutover --execute
 
 Устаревший `event_poller` из старого проекта не переносится. Для Bitrix24
 целевой входной канал - webhook-режим через очередь событий.
+
+## Текущий webhook contour
+
+В `AI-server` уже есть:
+
+- `backend/ai_server/integrations/bitrix` - REST client, OAuth state reader и
+  parser входящих Bitrix-событий;
+- `backend/ai_server/workers/bitrix/webhook_event_queue.py` - совместимая
+  SQLite-очередь `webhook_events`;
+- `backend/ai_server/channels/bitrix.py` - message adapter, который превращает
+  Bitrix message event в `AgentTask` для Оркестратора;
+- `POST /bitrix/events` - endpoint приёма webhook-событий;
+- `GET /bitrix/status` и `GET /bitrix/webhook-events/status` - runtime status.
+
+Worker очереди включается отдельно:
+
+```env
+AI_SERVER_WEBHOOK_EVENT_WORKER_ENABLED=true
+```
+
+Для безопасной разработки можно держать:
+
+```env
+AGENT_DRY_RUN=true
+```
