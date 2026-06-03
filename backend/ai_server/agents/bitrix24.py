@@ -50,10 +50,19 @@ class Bitrix24Specialist:
                 },
             )
         ]
+        portal_search_action = self._portal_search_action(task.request, selected_skills)
+        if portal_search_action is not None:
+            actions_taken.append(portal_search_action)
 
         approval_actions = self._approval_actions(text)
         status = "needs_human" if approval_actions else "completed"
-        answer = self._answer(selected_skills, selected_topics, retrieval_hits, bool(approval_actions))
+        answer = self._answer(
+            selected_skills,
+            selected_topics,
+            retrieval_hits,
+            bool(approval_actions),
+            portal_search_action=portal_search_action,
+        )
 
         return AgentResult(
             status=status,
@@ -77,7 +86,7 @@ class Bitrix24Specialist:
             selected.append("tasks_search")
         if any(marker in text for marker in ("создай", "создать", "измени", "изменить", "поставь задачу")):
             selected.append("tasks_create_edit")
-        if any(marker in text for marker in ("документ", "файл", "смет", "диск", "вложен")):
+        if any(marker in text for marker in ("документ", "файл", "смет", "диск", "вложен", "договор", "портал")):
             selected.append("portal_document_search")
         if any(marker in text for marker in ("crm", "сделк", "лид", "проект", "групп")):
             selected.append("projects_crm")
@@ -93,7 +102,7 @@ class Bitrix24Specialist:
             topics.append("tasks_create_edit")
         if any(marker in text for marker in ("контроль", "результат", "закрой", "заверши")):
             topics.append("tasks_quality")
-        if any(marker in text for marker in ("документ", "файл", "смет", "диск")):
+        if any(marker in text for marker in ("документ", "файл", "смет", "диск", "договор", "портал")):
             topics.append("documents")
         if "bitrix" in text or "битрикс" in text or "rest" in text:
             topics.append("bitrix_rest")
@@ -119,7 +128,31 @@ class Bitrix24Specialist:
             )
         ]
 
-    def _answer(self, selected_skills: list[str], selected_topics: list[str], retrieval_hits: list, needs_approval: bool) -> str:
+    def _portal_search_action(self, request: str, selected_skills: list[str]) -> ActionRecord | None:
+        if "portal_document_search" not in selected_skills:
+            return None
+        result = self.tools.portal_search_contract(
+            {
+                "query": request,
+                "scope": "documents",
+                "limit": 5,
+            }
+        )
+        return ActionRecord(
+            name="portal_search",
+            status=result.status,
+            details=result.model_dump(),
+        )
+
+    def _answer(
+        self,
+        selected_skills: list[str],
+        selected_topics: list[str],
+        retrieval_hits: list,
+        needs_approval: bool,
+        *,
+        portal_search_action: ActionRecord | None = None,
+    ) -> str:
         if not selected_skills:
             return (
                 "Я Битрикс24-специалист. Вижу запрос, но пока не уверен, какой Bitrix-сценарий нужен. "
@@ -133,6 +166,13 @@ class Bitrix24Specialist:
         if retrieval_hits:
             labels = [f"{hit.chunk.topic}/{hit.chunk.section}" for hit in retrieval_hits[:2]]
             parts.append("Hybrid RAG подобрал фрагменты: " + "; ".join(labels) + ".")
+        if portal_search_action is not None:
+            tool_data = portal_search_action.details.get("data") if isinstance(portal_search_action.details, dict) else {}
+            results = tool_data.get("results") if isinstance(tool_data, dict) else None
+            if portal_search_action.status == "ok" and isinstance(results, list):
+                parts.append(f"Локальный индекс портала вернул результатов: {len(results)}.")
+            elif portal_search_action.status == "not_configured":
+                parts.append("Локальный индекс портала пока не подключён; его нужно перенести из `var/search_index.sqlite` или построить заново.")
         if needs_approval:
             parts.append("Запрос похож на изменение в Bitrix24, поэтому выполнение должно идти через черновик и подтверждение.")
         else:

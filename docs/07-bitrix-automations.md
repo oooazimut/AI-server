@@ -98,8 +98,11 @@ uv run python scripts/import_bitrix_var.py --profile cutover --execute
   SQLite-очередь `webhook_events`;
 - `backend/ai_server/channels/bitrix.py` - message adapter, который превращает
   Bitrix message event в `AgentTask` для Оркестратора;
+- `backend/ai_server/integrations/bitrix/portal_search.py` - read-only reader
+  старого `var/search_index.sqlite`;
 - `POST /bitrix/events` - endpoint приёма webhook-событий;
-- `GET /bitrix/status` и `GET /bitrix/webhook-events/status` - runtime status.
+- `GET /bitrix/status`, `GET /bitrix/webhook-events/status`,
+  `GET /bitrix/search/status` и `GET /bitrix/search` - runtime status/search.
 
 Worker очереди включается отдельно:
 
@@ -112,3 +115,7 @@ AI_SERVER_WEBHOOK_EVENT_WORKER_ENABLED=true
 ```env
 AGENT_DRY_RUN=true
 ```
+
+`portal_search` сейчас перенесён как read-only слой. Он читает старую SQLite
+таблицу `portal_search_items` и уже подключён к Bitrix toolset. Индексаторы,
+которые обновляют эту таблицу, остаются следующим отдельным переносом.

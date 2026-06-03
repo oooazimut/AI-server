@@ -3,13 +3,24 @@ from __future__ import annotations
 from typing import Any
 
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixClient, BitrixConfigError
+from ai_server.integrations.bitrix.portal_search import (
+    PortalSearchIndex,
+    entity_types_for_scope,
+    format_portal_search_results,
+)
 from ai_server.models import ToolDefinition, ToolResult
 from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
 
 
 class BitrixToolset:
-    def __init__(self, client: BitrixClient | None = None) -> None:
+    def __init__(
+        self,
+        client: BitrixClient | None = None,
+        *,
+        portal_search: PortalSearchIndex | None = None,
+    ) -> None:
         self.client = client or BitrixClient()
+        self.portal_search = portal_search or PortalSearchIndex()
 
     def definitions(self) -> list[ToolDefinition]:
         return [
@@ -29,7 +40,7 @@ class BitrixToolset:
             ),
             ToolDefinition(
                 name="portal_search",
-                description="Search local Bitrix portal index. The current MVP exposes the contract; index backend comes next.",
+                description="Search the local Bitrix portal index from var/search_index.sqlite.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -86,13 +97,37 @@ class BitrixToolset:
         query = str(args.get("query") or "").strip()
         scope = str(args.get("scope") or "all").strip().lower()
         limit = max(1, min(int(args.get("limit") or 10), 30))
+        if not query:
+            return ToolResult(status="invalid_tool_call", tool="portal_search", error="query is required")
+
+        entity_types = entity_types_for_scope(scope)
+        if entity_types is None and scope not in {"", "all"}:
+            return ToolResult(status="invalid_tool_call", tool="portal_search", error=f"unknown scope: {scope}")
+
+        stats = self.portal_search.stats()
+        if not stats.exists:
+            return ToolResult(
+                status="not_configured",
+                tool="portal_search",
+                data={
+                    "query": query,
+                    "scope": scope,
+                    "limit": limit,
+                    "index_path": str(stats.path),
+                    "message": "Local portal search index is missing. Run cutover var import or indexing first.",
+                },
+            )
+
+        results = self.portal_search.search(query, entity_types=entity_types, limit=limit)
         return ToolResult(
-            status="not_connected",
+            status="ok",
             tool="portal_search",
             data={
                 "query": query,
                 "scope": scope,
                 "limit": limit,
-                "message": "Local portal search index will be connected in the Bitrix specialist integration step.",
+                "index_path": str(stats.path),
+                "summary": format_portal_search_results(results, query=query),
+                "results": [result.as_dict() for result in results],
             },
         )

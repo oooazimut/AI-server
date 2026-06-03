@@ -11,6 +11,12 @@ from .channels.bitrix import BitrixWebhookProcessor
 from .integrations.bitrix.client import BitrixClient
 from .integrations.bitrix.events import payload_event_type
 from .integrations.bitrix.oauth import BitrixOAuthService
+from .integrations.bitrix.portal_search import (
+    PortalSearchIndex,
+    entity_types_for_scope,
+    format_portal_index_stats,
+    format_portal_search_results,
+)
 from .knowledge import MarkdownKnowledgeBase
 from .models import AgentTask, AgentTestRequest, UserContext
 from .retrieval import HybridKnowledgeRetriever
@@ -35,11 +41,13 @@ async def lifespan(app: FastAPI):
     bitrix = BitrixClient()
     bitrix_oauth = BitrixOAuthService()
     bitrix_oauth.ensure_schema()
+    portal_search = PortalSearchIndex()
     webhook_event_queue = WebhookEventQueue(settings.webhook_event_queue_path)
     webhook_event_queue.ensure_schema()
 
     app.state.bitrix = bitrix
     app.state.bitrix_oauth = bitrix_oauth
+    app.state.portal_search = portal_search
     app.state.webhook_event_queue = webhook_event_queue
     app.state.webhook_event_status = {
         "enabled": True,
@@ -183,6 +191,7 @@ def bitrix_status(request: Request) -> dict[str, Any]:
         "bot_auth_mode": settings.bitrix_bot_auth_mode,
         "webhook_url_configured": bool(settings.resolved_bot_webhook_url),
         "oauth": request.app.state.bitrix_oauth.public_status(),
+        "portal_search": _portal_search_status(request.app.state.portal_search),
         "webhook_events": dict(request.app.state.webhook_event_status),
         "webhook_event_queue": {
             **dict(request.app.state.webhook_event_queue_status),
@@ -202,6 +211,35 @@ def bitrix_webhook_events_status(request: Request) -> dict[str, Any]:
         "worker": dict(request.app.state.webhook_event_queue_status),
         "queue": request.app.state.webhook_event_queue.stats(),
         "latest_events": request.app.state.webhook_event_queue.latest(limit=20),
+    }
+
+
+@app.get("/bitrix/search/status")
+def bitrix_search_status(request: Request) -> dict[str, Any]:
+    return _portal_search_status(request.app.state.portal_search)
+
+
+@app.get("/bitrix/search")
+def bitrix_search(
+    request: Request,
+    q: str = Query(..., min_length=1),
+    scope: str = Query(default="all"),
+    limit: int = Query(default=10, ge=1, le=30),
+) -> dict[str, Any]:
+    index: PortalSearchIndex = request.app.state.portal_search
+    entity_types = entity_types_for_scope(scope)
+    if entity_types is None and scope.strip().lower() not in {"", "all"}:
+        raise HTTPException(status_code=400, detail=f"unknown portal search scope: {scope}")
+    stats = index.stats()
+    if not stats.exists:
+        raise HTTPException(status_code=409, detail=f"portal search index is missing: {stats.path}")
+    results = index.search(q, entity_types=entity_types, limit=limit)
+    return {
+        "summary": format_portal_search_results(results, query=q),
+        "query": q,
+        "scope": scope,
+        "limit": limit,
+        "results": [result.as_dict() for result in results],
     }
 
 
@@ -337,4 +375,17 @@ def _now_ts() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).isoformat()
+
+
+def _portal_search_status(index: PortalSearchIndex) -> dict[str, Any]:
+    stats = index.stats()
+    return {
+        "exists": stats.exists,
+        "path": str(stats.path),
+        "summary": format_portal_index_stats(stats),
+        "total_items": stats.total_items,
+        "by_type": stats.by_type,
+        "content_by_status": stats.content_by_status,
+        "last_indexed_at": stats.last_indexed_at,
+    }
 

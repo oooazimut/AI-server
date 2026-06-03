@@ -76,6 +76,8 @@ GET  http://127.0.0.1:8000/agents/bitrix24/skills
 GET  http://127.0.0.1:8000/agents/bitrix24/automations
 GET  http://127.0.0.1:8000/automations
 GET  http://127.0.0.1:8000/bitrix/status
+GET  http://127.0.0.1:8000/bitrix/search/status
+GET  http://127.0.0.1:8000/bitrix/search?q=...
 POST http://127.0.0.1:8000/bitrix/events
 POST http://127.0.0.1:8000/orchestrator/test
 ```
@@ -149,6 +151,21 @@ AGENT_DRY_RUN=false
 GET http://127.0.0.1:8000/bitrix/status
 GET http://127.0.0.1:8000/bitrix/webhook-events/status
 ```
+
+## Bitrix portal search
+
+Новый сервер умеет читать локальный индекс портала из `var/search_index.sqlite`.
+После cutover-миграции старого `BitrixAIAgent/var` доступны:
+
+```text
+GET http://127.0.0.1:8000/bitrix/search/status
+GET http://127.0.0.1:8000/bitrix/search?q=договор&scope=documents
+```
+
+Поддерживаемые scope: `all`, `documents`, `files`, `tasks`, `projects`.
+
+`portal_search` также подключён как Bitrix tool и используется Bitrix24-специалистом
+для запросов про документы, файлы, договоры и портал.
 ## Документы
 
 - `docs/00-vision.md` - цель и границы проекта.
