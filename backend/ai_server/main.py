@@ -101,6 +101,7 @@ async def lifespan(app: FastAPI):
         processor = BitrixWebhookProcessor(
             bitrix=bitrix,
             portal_search=portal_search,
+            bitrix_oauth=bitrix_oauth,
             search_webhook_status=app.state.search_webhook_indexer_status,
         )
         webhook_worker_task = asyncio.create_task(
@@ -384,6 +385,7 @@ async def bitrix_events(
     processor = BitrixWebhookProcessor(
         bitrix=request.app.state.bitrix,
         portal_search=request.app.state.portal_search,
+        bitrix_oauth=request.app.state.bitrix_oauth,
         search_webhook_status=request.app.state.search_webhook_indexer_status,
     )
     result = await processor.process(payload)

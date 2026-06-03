@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixClient, BitrixConfigError
+from ai_server.integrations.bitrix.dialog_state import BitrixPendingActionService, PendingBitrixAction
 from ai_server.integrations.bitrix.portal_search import (
     PortalSearchIndex,
     entity_types_for_scope,
@@ -18,9 +19,15 @@ class BitrixToolset:
         client: BitrixClient | None = None,
         *,
         portal_search: PortalSearchIndex | None = None,
+        pending_actions: BitrixPendingActionService | None = None,
+        dialog_key: str | None = None,
+        user_id: int | None = None,
     ) -> None:
         self.client = client or BitrixClient()
         self.portal_search = portal_search or PortalSearchIndex()
+        self.pending_actions = pending_actions
+        self.dialog_key = dialog_key
+        self.user_id = user_id
 
     def definitions(self) -> list[ToolDefinition]:
         return [
@@ -60,10 +67,20 @@ class BitrixToolset:
         summary = str(args.get("summary") or method).strip()
 
         if action in {"confirm_pending", "cancel_pending"}:
+            if not self.pending_actions or not self.dialog_key:
+                return ToolResult(
+                    status="not_configured",
+                    tool="bitrix_api",
+                    data={"action": action, "message": "Pending-action store is not bound to this tool call."},
+                )
+            if action == "cancel_pending":
+                result = self.pending_actions.cancel(self.dialog_key)
+            else:
+                result = await self.pending_actions.confirm(self.dialog_key, user_id=self.user_id)
             return ToolResult(
-                status="not_implemented",
+                status=result.status,
                 tool="bitrix_api",
-                data={"action": action, "message": "Pending-action store will be added with dialog state."},
+                data={"action": action, "message": result.message, **result.data},
             )
         if action != "call":
             return ToolResult(status="invalid_tool_call", tool="bitrix_api", error=f"unknown action: {action}")
@@ -76,6 +93,23 @@ class BitrixToolset:
                 data={"method": method, "policy_reason": decision.reason},
             )
         if decision.decision == "confirm":
+            if not params:
+                return ToolResult(
+                    status="invalid_tool_call",
+                    tool="bitrix_api",
+                    error="Bitrix write methods require real params before confirmation.",
+                    data={"method": method},
+                )
+            if self.pending_actions and self.dialog_key:
+                self.pending_actions.save_pending(
+                    self.dialog_key,
+                    PendingBitrixAction(
+                        method=method,
+                        params=params,
+                        summary=summary,
+                        created_by=self.user_id,
+                    ),
+                )
             return ToolResult(
                 status="confirmation_required",
                 tool="bitrix_api",

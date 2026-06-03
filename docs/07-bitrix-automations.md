@@ -14,6 +14,7 @@
 
 | Automation | Старый модуль | Тип | Назначение |
 | --- | --- | --- | --- |
+| `bitrix_chat_adapter` | `app.agent.runtime_v2`, `app.agent.dialog_state_store` | channel adapter | Входящие сообщения Bitrix-чата, pending write confirmations, аудит действий |
 | `bitrix_webhook_event_queue` | `app.agent.webhook_event_queue`, `app.agent.webhook_event_processor` | event worker | Очередь, retry, dedupe и маршрутизация webhook-событий |
 | `bitrix_portal_search_indexer` | `app.agent.search_indexer`, `app.agent.portal_search` | data pipeline | Периодическая metadata/delta-индексация задач, проектов и диска |
 | `bitrix_search_webhook_indexer` | `app.agent.search_webhook_indexer` | event worker | Быстрое обновление индекса по disk/file событиям |
@@ -29,6 +30,14 @@
   их состояние или использовать результат индекса.
 - Tool Gateway выполняет Bitrix REST вызовы и применяет policy layer.
 - Worker runtime запускает процессы, хранит state и отдаёт status endpoints.
+- Bitrix message adapter хранит ожидающие подтверждения write-действий в
+  `var/dialog_state.sqlite` и выполняет их только после прямого ответа
+  пользователя `да`; отмена делается ответом `отмена`.
+- Подтверждённые write-действия дополнительно проверяют
+  `AGENT_WRITE_ALLOWED_USER_IDS` или ограниченное правило
+  `AGENT_LIMITED_TASK_CREATE_USER_IDS` + `AGENT_LIMITED_TASK_CREATE_PROJECT_ID`.
+  Если `BITRIX_OAUTH_REQUIRED_FOR_WRITES=true`, выполнение идёт только через
+  OAuth-токен пользователя.
 
 ## Runtime `var`
 
@@ -97,7 +106,11 @@ uv run python scripts/import_bitrix_var.py --profile cutover --execute
 - `backend/ai_server/workers/bitrix/webhook_event_queue.py` - совместимая
   SQLite-очередь `webhook_events`;
 - `backend/ai_server/channels/bitrix.py` - message adapter, который превращает
-  Bitrix message event в `AgentTask` для Оркестратора;
+  Bitrix message event в `AgentTask` для Оркестратора, а также перехватывает
+  подтверждение/отмену ожидающих Bitrix-действий;
+- `backend/ai_server/integrations/bitrix/dialog_state.py` - совместимое
+  хранилище `dialog_states`, pending Bitrix write actions и JSONL-аудит
+  подтверждённых/отменённых действий;
 - `backend/ai_server/integrations/bitrix/portal_search.py` - reader/writer
   совместимой SQLite-таблицы `portal_search_items`;
 - `backend/ai_server/document_text.py` - извлечение текста из `.txt`, `.csv`,
@@ -142,3 +155,9 @@ SEARCH_WEBHOOK_CONTENT_ENABLED=true
 `portal_search` уже умеет читать и обновлять старую SQLite-таблицу
 `portal_search_items`. Перенесён metadata/delta/content-контур: задачи, проекты,
 диск, содержимое документов и disk/file webhook-и.
+
+`dialog_state` читает старую форму `pending_action` из `dialog_state.sqlite`.
+Формат ключа сохранён: `chat:{chat_id}:user:{user_id}`,
+`dialog:{dialog_id}:user:{user_id}` или `user:{user_id}`. Это позволяет при
+cutover перенести незавершённые подтверждения из старого агента без ручной
+конвертации.

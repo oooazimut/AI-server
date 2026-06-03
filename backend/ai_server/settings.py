@@ -56,6 +56,9 @@ class Settings:
     search_background_lock_stale_seconds: int
     search_webhook_indexer_enabled: bool
     search_webhook_content_enabled: bool
+    agent_write_allowed_user_ids: str
+    agent_limited_task_create_project_id: int | None
+    agent_limited_task_create_user_ids: str
     agent_dry_run: bool
     var_dir: Path
 
@@ -86,6 +89,22 @@ class Settings:
     @property
     def webhook_event_queue_path(self) -> Path:
         return runtime_paths(self.var_dir).webhook_event_queue_db
+
+    @property
+    def dialog_state_path(self) -> Path:
+        return runtime_paths(self.var_dir).dialog_state_db
+
+    @property
+    def bitrix_write_audit_log_path(self) -> Path:
+        return runtime_paths(self.var_dir).bitrix_write_audit_log
+
+    @property
+    def resolved_agent_write_allowed_user_ids(self) -> list[int]:
+        return _id_list(self.agent_write_allowed_user_ids)
+
+    @property
+    def resolved_agent_limited_task_create_user_ids(self) -> list[int]:
+        return _id_list(self.agent_limited_task_create_user_ids)
 
     @property
     def search_index_path(self) -> Path:
@@ -174,6 +193,9 @@ def get_settings() -> Settings:
         search_background_lock_stale_seconds=_env_int("SEARCH_BACKGROUND_LOCK_STALE_SECONDS", 2 * 60 * 60) or (2 * 60 * 60),
         search_webhook_indexer_enabled=_env_bool("SEARCH_WEBHOOK_INDEXER_ENABLED", False),
         search_webhook_content_enabled=_env_bool("SEARCH_WEBHOOK_CONTENT_ENABLED", True),
+        agent_write_allowed_user_ids=_env("AGENT_WRITE_ALLOWED_USER_IDS"),
+        agent_limited_task_create_project_id=_env_int("AGENT_LIMITED_TASK_CREATE_PROJECT_ID"),
+        agent_limited_task_create_user_ids=_env("AGENT_LIMITED_TASK_CREATE_USER_IDS"),
         agent_dry_run=_env_bool("AGENT_DRY_RUN", False),
         var_dir=paths.root,
     )
@@ -198,3 +220,16 @@ def _env_int(name: str, default: int | None = None) -> int | None:
         return int(raw)
     except ValueError:
         return default
+
+
+def _id_list(raw: str) -> list[int]:
+    ids: list[int] = []
+    for item in raw.replace(";", ",").split(","):
+        value = item.strip()
+        if not value:
+            continue
+        try:
+            ids.append(int(value))
+        except ValueError:
+            continue
+    return ids

@@ -24,6 +24,37 @@ tools:
   - document_access
   - task_closure
 automations:
+  - id: bitrix_chat_adapter
+    name: Чатовый адаптер Битрикс24
+    kind: channel_adapter
+    trigger: webhook
+    description: Принимает сообщения из чата Битрикс24, передаёт обычные запросы Оркестратору и обслуживает подтверждение/отмену ожидающих Bitrix write actions.
+    source_project: BitrixAIAgent
+    source_modules:
+      - app.agent.runtime_v2
+      - app.agent.dialog_state_store
+    entrypoint: backend.ai_server.channels.bitrix.BitrixWebhookProcessor
+    status_endpoint: /bitrix/status
+    enabled_by_default: true
+    human_approval_required: true
+    dependencies:
+      - bitrix_api
+      - internal_orchestrator
+    tools:
+      - bitrix_api
+    data_scopes:
+      - bitrix24_chats
+      - bitrix24_tasks
+      - bitrix24_crm
+      - bitrix24_disk
+    state_paths:
+      - var/dialog_state.sqlite
+      - var/bitrix_write_audit.jsonl
+    emits:
+      - bitrix_chat_message_received
+      - bitrix_pending_action_saved
+      - bitrix_pending_action_confirmed
+      - bitrix_pending_action_cancelled
   - id: bitrix_webhook_event_queue
     name: Очередь вебхуков Битрикс24
     kind: event_worker
