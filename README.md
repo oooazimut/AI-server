@@ -117,6 +117,7 @@ AI_SERVER_FASTEMBED_CACHE_DIR=var/embedding_models
 и будущий gateway брали одну модель:
 
 ```env
+AI_SERVER_ENV_FILE=.env,.env.local
 AI_SERVER_LLM_PROVIDER=deepseek
 AI_SERVER_LLM_MODEL=deepseek-v4-flash
 AI_SERVER_LLM_BASE_URL=
@@ -126,6 +127,13 @@ AI_SERVER_LLM_MAX_TOKENS=3000
 
 `GET /health` показывает `llm_provider`, `llm_model` и `llm_configured`, но не
 показывает ключи.
+
+Если нужно наложить env-файлы старого `BitrixAIAgent` и локальные секреты нового
+сервера, укажите их через запятую или точку с запятой:
+
+```env
+AI_SERVER_ENV_FILE=C:\Users\office3pc\PyProjects\BitrixAIAgent\.env,C:\Users\office3pc\PyProjects\BitrixAIAgent\.env.webhook.local,.env.local
+```
 
 ## Runtime var и cutover
 

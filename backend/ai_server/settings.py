@@ -3,7 +3,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from ai_server.registry import PROJECT_ROOT
 from ai_server.runtime import runtime_paths
+
+
+_LOADED_ENV_FILE_SPEC: str | None = None
+_LOADED_ENV_KEYS: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -157,6 +162,7 @@ class Settings:
 
 
 def get_settings() -> Settings:
+    _load_env_files()
     paths = runtime_paths()
     return Settings(
         bitrix_bot_id=_env_int("BITRIX_BOT_ID"),
@@ -225,6 +231,53 @@ def get_settings() -> Settings:
 
 def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
+
+
+def _load_env_files() -> None:
+    global _LOADED_ENV_FILE_SPEC
+
+    raw_spec = os.getenv("AI_SERVER_ENV_FILE", ".env,.env.local")
+    if raw_spec == _LOADED_ENV_FILE_SPEC:
+        return
+
+    for raw_path in _split_env_file_spec(raw_spec):
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        _load_env_file(path)
+    _LOADED_ENV_FILE_SPEC = raw_spec
+
+
+def _split_env_file_spec(raw_spec: str) -> list[str]:
+    return [item.strip() for item in raw_spec.replace(";", ",").split(",") if item.strip()]
+
+
+def _load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+        parsed = _parse_env_line(raw_line)
+        if parsed is None:
+            continue
+        key, value = parsed
+        if key in os.environ and key not in _LOADED_ENV_KEYS:
+            continue
+        os.environ[key] = value
+        _LOADED_ENV_KEYS.add(key)
+
+
+def _parse_env_line(raw_line: str) -> tuple[str, str] | None:
+    line = raw_line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        return None
+    key, value = line.split("=", 1)
+    key = key.strip()
+    if not key:
+        return None
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    return key, value
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
