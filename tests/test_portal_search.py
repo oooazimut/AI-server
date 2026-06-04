@@ -4,6 +4,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist
+from ai_server.agents.bitrix_llm import BitrixLLMToolCall
 from ai_server.integrations.bitrix.portal_search import (
     PortalSearchIndex,
     sync_disk_delta_index,
@@ -19,7 +20,7 @@ from ai_server.workers.bitrix.search_webhook_indexer import (
     prepare_search_webhook_job,
     process_search_webhook_job,
 )
-from tests.fakes import FakeEmbeddingProvider
+from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider
 
 
 def _create_index(path: Path) -> PortalSearchIndex:
@@ -127,6 +128,14 @@ def test_bitrix_specialist_uses_portal_search_for_document_requests(tmp_path):
         manifest,
         retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
         tools=BitrixToolset(portal_search=index),
+        llm=FakeBitrixLLM(
+            tool_calls=[
+                BitrixLLMToolCall(
+                    name="portal_search",
+                    args={"query": "договор Транзит", "scope": "documents", "limit": 5},
+                )
+            ]
+        ),
     )
 
     result = anyio_run(specialist.handle(AgentTask(task_id="t1", request="Найди договор Транзит на портале")))

@@ -3,6 +3,7 @@ import sqlite3
 
 from fastapi.testclient import TestClient
 
+from ai_server.agents.bitrix_llm import BitrixLLMToolCall
 from ai_server.channels.bitrix import BitrixWebhookProcessor
 from ai_server.integrations.bitrix.dialog_state import (
     BitrixPendingActionService,
@@ -20,7 +21,7 @@ from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.technical_footer import ProviderBalanceSnapshot, TechnicalFooterService
 from ai_server.workers.bitrix.webhook_event_queue import WebhookEventQueue
 from scripts.create_bitrix_dev_chat import chat_reference, sanitize_result
-from tests.fakes import FakeEmbeddingProvider
+from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider
 
 
 def _bitrix_v2_message_payload() -> dict:
@@ -383,6 +384,20 @@ def test_bitrix_task_create_chat_flow_saves_and_confirms_pending_action(monkeypa
     processor = BitrixWebhookProcessor(
         bitrix=fake_bitrix,
         bitrix_tools=FakeBitrixTools(),
+        bitrix_llm=FakeBitrixLLM(
+            tool_calls=[
+                BitrixLLMToolCall(
+                    name="task_create_draft",
+                    args={
+                        "title": "проверить IP-камеру",
+                        "responsible_query": "Иванова",
+                        "deadline_iso": "2026-06-05T19:00:00+03:00",
+                    },
+                )
+            ],
+            final_status="needs_human",
+            final_answer="Подготовил черновик задачи, нужно подтверждение.",
+        ),
         bitrix_retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
         pending_actions=BitrixPendingActionService(
             store=store,
@@ -504,6 +519,9 @@ class RecordingCreateChatClient(BitrixClient):
 
 
 class FakeBitrixTools:
+    def definitions(self):
+        return []
+
     async def resolve_user(self, query: str, *, limit: int = 5):
         assert query == "Иванова"
         return ToolResult(

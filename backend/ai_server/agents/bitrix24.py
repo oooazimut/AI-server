@@ -3,17 +3,16 @@ from __future__ import annotations
 from ai_server.agents.bitrix_task_create import (
     BitrixTaskCreateDraft,
     BitrixTaskCreateResolution,
-    build_task_create_draft,
-    format_task_create_clarification,
-    looks_like_task_create_request,
+    build_task_create_draft_from_args,
 )
-from ai_server.agents.bitrix_task_search import (
-    build_task_search_draft,
-    format_task_search_answer,
-    looks_like_task_search_request,
+from ai_server.agents.bitrix_llm import (
+    BitrixAgentLLM,
+    BitrixLLMService,
+    BitrixLLMToolCall,
+    llm_failure_result,
 )
 from ai_server.knowledge import MarkdownKnowledgeBase
-from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask
+from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
 from ai_server.tools.bitrix import BitrixToolset
@@ -29,12 +28,14 @@ class Bitrix24Specialist:
         skill_store: SkillStore | None = None,
         retriever: HybridKnowledgeRetriever | None = None,
         tools: BitrixToolset | None = None,
+        llm: BitrixAgentLLM | None = None,
     ) -> None:
         self.manifest = manifest
         self.knowledge_base = knowledge_base or MarkdownKnowledgeBase()
         self.skill_store = skill_store or SkillStore()
         self.retriever = retriever or HybridKnowledgeRetriever(knowledge_base=self.knowledge_base)
         self.tools = tools or BitrixToolset()
+        self.llm = llm or BitrixLLMService()
 
     async def handle(self, task: AgentTask) -> AgentResult:
         text = task.request.casefold()
@@ -62,66 +63,175 @@ class Bitrix24Specialist:
                 },
             )
         ]
-        portal_search_action = self._portal_search_action(task.request, selected_skills)
-        if portal_search_action is not None:
-            actions_taken.append(portal_search_action)
 
-        task_create_draft = await self._task_create_draft(task, text)
-        if task_create_draft is not None:
-            actions_taken.append(
-                ActionRecord(
-                    name="bitrix_task_create_draft",
-                    status="ready" if task_create_draft.is_ready else "needs_clarification",
-                    details=task_create_draft.as_action_details(),
-                )
+        try:
+            decision_result = await self.llm.decide(
+                manifest=self.manifest,
+                task=task,
+                retrieval_hits=retrieval_hits,
+                tool_definitions=self.tool_definitions(),
+            )
+        except Exception as exc:
+            failure = llm_failure_result(f"{type(exc).__name__}: {exc}")
+            return AgentResult(
+                status="failed",
+                agent_id=self.manifest.id,
+                answer=failure.answer,
+                actions_taken=[
+                    *actions_taken,
+                    ActionRecord(
+                        name="bitrix_llm_decision",
+                        status="error",
+                        details={"error": f"{type(exc).__name__}: {exc}"},
+                    ),
+                ],
+                model_usage=[failure.model_usage],
+                confidence=0.0,
+                logs=_logs(),
             )
 
-        task_search_result = await self._task_search_result(task, text, task_create_draft=task_create_draft)
-        if task_search_result is not None:
-            actions_taken.append(
-                ActionRecord(
-                    name="bitrix_task_search",
-                    status=task_search_result.status,
-                    details=task_search_result.model_dump(),
-                )
+        decision = decision_result.decision
+        actions_taken.append(
+            ActionRecord(
+                name="bitrix_llm_decision",
+                status=decision.status,
+                details={
+                    "tool_calls": [
+                        {"name": call.name, "args": call.args, "summary": call.summary}
+                        for call in decision.tool_calls
+                    ],
+                    "confidence": decision.confidence,
+                },
             )
-
-        approval_actions = self._approval_actions(text, task_create_draft=task_create_draft)
-        status = _result_status(task_create_draft=task_create_draft, approval_actions=approval_actions)
-        answer = self._answer(
-            selected_skills,
-            selected_topics,
-            retrieval_hits,
-            bool(approval_actions),
-            portal_search_action=portal_search_action,
-            task_create_draft=task_create_draft,
-            task_search_result=task_search_result,
         )
+
+        tool_results: list[ToolResult] = []
+        approval_actions: list[ActionRecord] = []
+        for tool_call in decision.tool_calls:
+            result, action, approvals = await self._execute_tool_call(tool_call, task)
+            if result is not None:
+                tool_results.append(result)
+            if action is not None:
+                actions_taken.append(action)
+            approval_actions.extend(approvals)
+
+        try:
+            final_result = await self.llm.compose(
+                task=task,
+                decision=decision,
+                tool_results=tool_results,
+                approval_actions=[action.model_dump() for action in approval_actions],
+            )
+        except Exception as exc:
+            failure = llm_failure_result(f"{type(exc).__name__}: {exc}")
+            return AgentResult(
+                status="failed",
+                agent_id=self.manifest.id,
+                answer=failure.answer,
+                actions_taken=[
+                    *actions_taken,
+                    ActionRecord(
+                        name="bitrix_llm_final_answer",
+                        status="error",
+                        details={"error": f"{type(exc).__name__}: {exc}"},
+                    ),
+                ],
+                actions_requiring_approval=approval_actions,
+                model_usage=[decision_result.model_usage, failure.model_usage],
+                confidence=0.0,
+                logs=_logs(),
+            )
+
+        actions_taken.append(
+            ActionRecord(
+                name="bitrix_llm_final_answer",
+                status=final_result.status,
+                details={},
+            )
+        )
+        status = "needs_human" if approval_actions else final_result.status
 
         return AgentResult(
             status=status,
             agent_id=self.manifest.id,
-            answer=answer,
+            answer=final_result.answer,
             actions_taken=actions_taken,
             actions_requiring_approval=approval_actions,
-            confidence=0.74 if selected_skills else 0.48,
-            logs=[
-                "Bitrix24 specialist was separated from the old autonomous BitrixAIAgent runtime.",
-                "Knowledge context is selected through hybrid retrieval over the agent package.",
-            ],
+            model_usage=[decision_result.model_usage, final_result.model_usage],
+            confidence=decision.confidence,
+            logs=_logs(),
         )
 
     def tool_definitions(self) -> list[dict]:
-        return [definition.model_dump() for definition in self.tools.definitions()]
+        return [
+            *[definition.model_dump() for definition in self.tools.definitions()],
+            {
+                "name": "task_create_draft",
+                "description": (
+                    "Prepare a Bitrix task creation draft from fields already understood by the LLM. "
+                    "The backend validates fields, resolves Bitrix IDs, applies policies, and requires confirmation."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "description": {"type": "string"},
+                        "responsible_id": {"type": "integer"},
+                        "responsible_query": {"type": "string"},
+                        "responsible_self": {"type": "boolean"},
+                        "group_id": {"type": "integer"},
+                        "project_query": {"type": "string"},
+                        "deadline_iso": {"type": "string"},
+                        "no_deadline": {"type": "boolean"},
+                    },
+                    "required": ["title"],
+                },
+            },
+        ]
 
-    async def _task_create_draft(self, task: AgentTask, text: str) -> BitrixTaskCreateDraft | None:
-        if not looks_like_task_create_request(text):
-            return None
-        draft = build_task_create_draft(task)
+    async def _task_create_draft(self, task: AgentTask, args: dict) -> BitrixTaskCreateDraft:
+        draft = build_task_create_draft_from_args(task, args)
         resolution = await self._resolve_task_create_draft(draft)
         if resolution is None:
             return draft
-        return build_task_create_draft(task, resolution=resolution)
+        return build_task_create_draft_from_args(task, args, resolution=resolution)
+
+    async def _execute_tool_call(
+        self,
+        tool_call: BitrixLLMToolCall,
+        task: AgentTask,
+    ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
+        if tool_call.name == "none":
+            return None, None, []
+        if tool_call.name == "task_search":
+            result = await self.tools.task_search(tool_call.args)
+            return (
+                result,
+                ActionRecord(name="bitrix_task_search", status=result.status, details=result.model_dump()),
+                [],
+            )
+        if tool_call.name == "portal_search":
+            result = self.tools.portal_search_contract(tool_call.args)
+            return (
+                result,
+                ActionRecord(name="portal_search", status=result.status, details=result.model_dump()),
+                [],
+            )
+        if tool_call.name == "task_create_draft":
+            draft = await self._task_create_draft(task, tool_call.args)
+            result = _tool_result_from_task_create_draft(draft)
+            action = ActionRecord(
+                name="bitrix_task_create_draft",
+                status=result.status,
+                details=draft.as_action_details(),
+            )
+            return result, action, _approval_actions_from_task_create_draft(draft)
+        result = ToolResult(
+            status="invalid_tool_call",
+            tool=tool_call.name,
+            error=f"unknown Bitrix LLM tool call: {tool_call.name}",
+        )
+        return result, ActionRecord(name=tool_call.name, status=result.status, details=result.model_dump()), []
 
     async def _resolve_task_create_draft(
         self,
@@ -171,18 +281,6 @@ class Bitrix24Specialist:
             notes=notes,
         )
 
-    async def _task_search_result(
-        self,
-        task: AgentTask,
-        text: str,
-        *,
-        task_create_draft: BitrixTaskCreateDraft | None,
-    ):
-        if task_create_draft is not None or not looks_like_task_search_request(text):
-            return None
-        draft = build_task_search_draft(task)
-        return await self.tools.task_search(draft.args)
-
     def _select_skills(self, text: str) -> list[str]:
         selected: list[str] = []
         if any(marker in text for marker in ("задач", "заявк", "исполнитель", "срок", "дедлайн")):
@@ -213,119 +311,6 @@ class Bitrix24Specialist:
             topics.append("projects_crm")
         return _unique(topics)
 
-    def _approval_actions(
-        self,
-        text: str,
-        *,
-        task_create_draft: BitrixTaskCreateDraft | None = None,
-    ) -> list[ActionRecord]:
-        if task_create_draft is not None:
-            if not task_create_draft.is_ready:
-                return []
-            decision = decide_bitrix_method_policy(task_create_draft.method)
-            return [
-                ActionRecord(
-                    name="bitrix_api",
-                    status="approval_required" if decision.decision == "confirm" else decision.decision,
-                    details={
-                        "method": task_create_draft.method,
-                        "params": task_create_draft.params,
-                        "policy": decision.model_dump(),
-                        "summary": task_create_draft.summary,
-                    },
-                )
-            ]
-
-        if not any(marker in text for marker in ("создай", "создать", "поставь", "измени", "изменить", "закрой", "удали", "добавь")):
-            return []
-
-        method = "tasks.task.add" if "задач" in text or "заявк" in text else "bitrix.write"
-        decision = decide_bitrix_method_policy(method)
-        return [
-            ActionRecord(
-                name="bitrix_api",
-                status="approval_required" if decision.decision == "confirm" else decision.decision,
-                details={
-                    "method": method,
-                    "policy": decision.model_dump(),
-                    "summary": "Подготовить черновик изменения в Битрикс24; выполнение только после подтверждения.",
-                },
-            )
-        ]
-
-    def _portal_search_action(self, request: str, selected_skills: list[str]) -> ActionRecord | None:
-        if "portal_document_search" not in selected_skills:
-            return None
-        result = self.tools.portal_search_contract(
-            {
-                "query": request,
-                "scope": "documents",
-                "limit": 5,
-            }
-        )
-        return ActionRecord(
-            name="portal_search",
-            status=result.status,
-            details=result.model_dump(),
-        )
-
-    def _answer(
-        self,
-        selected_skills: list[str],
-        selected_topics: list[str],
-        retrieval_hits: list,
-        needs_approval: bool,
-        *,
-        portal_search_action: ActionRecord | None = None,
-        task_create_draft: BitrixTaskCreateDraft | None = None,
-        task_search_result=None,
-    ) -> str:
-        if not selected_skills:
-            return (
-                "Я Битрикс24-специалист. Вижу запрос, но пока не уверен, какой Bitrix-сценарий нужен. "
-                "Могу работать с задачами, заявками, проектами, CRM, документами и поиском по порталу."
-            )
-
-        if task_create_draft is not None and not task_create_draft.is_ready:
-            return format_task_create_clarification(task_create_draft)
-        if task_search_result is not None:
-            return format_task_search_answer(task_search_result)
-
-        parts = ["Битрикс24-специалист принял задачу."]
-        parts.append("Подходящие skills: " + ", ".join(selected_skills) + ".")
-        if selected_topics:
-            parts.append("Подключаемые знания: " + ", ".join(selected_topics) + ".")
-        if retrieval_hits:
-            labels = [f"{hit.chunk.topic}/{hit.chunk.section}" for hit in retrieval_hits[:2]]
-            parts.append("Hybrid RAG подобрал фрагменты: " + "; ".join(labels) + ".")
-        if portal_search_action is not None:
-            tool_data = portal_search_action.details.get("data") if isinstance(portal_search_action.details, dict) else {}
-            results = tool_data.get("results") if isinstance(tool_data, dict) else None
-            if portal_search_action.status == "ok" and isinstance(results, list):
-                parts.append(f"Локальный индекс портала вернул результатов: {len(results)}.")
-            elif portal_search_action.status == "not_configured":
-                parts.append("Локальный индекс портала пока не подключён; его нужно перенести из `var/search_index.sqlite` или построить заново.")
-        if needs_approval:
-            if task_create_draft is not None:
-                parts.append("Подготовил черновик задачи в Bitrix24; выполнение пойдёт только после подтверждения.")
-            else:
-                parts.append("Запрос похож на изменение в Bitrix24, поэтому выполнение должно идти через черновик и подтверждение.")
-        else:
-            parts.append("Запрос похож на read-only сценарий; следующим шагом можно подключать живой Bitrix API или локальный индекс портала.")
-        return " ".join(parts)
-
-
-def _result_status(
-    *,
-    task_create_draft: BitrixTaskCreateDraft | None,
-    approval_actions: list[ActionRecord],
-) -> str:
-    if approval_actions:
-        return "needs_human"
-    if task_create_draft is not None and not task_create_draft.is_ready:
-        return "needs_clarification"
-    return "completed"
-
 
 def _format_ambiguous_note(prefix: str, candidates: object) -> str:
     if not isinstance(candidates, list):
@@ -339,6 +324,40 @@ def _format_ambiguous_note(prefix: str, candidates: object) -> str:
     if not labels:
         return prefix + "; нужно уточнение."
     return prefix + ": " + "; ".join(labels) + ". Уточни нужный вариант."
+
+
+def _tool_result_from_task_create_draft(draft: BitrixTaskCreateDraft) -> ToolResult:
+    return ToolResult(
+        status="ready" if draft.is_ready else "contract_violation",
+        tool="task_create_draft",
+        data=draft.as_action_details(),
+        error=None if draft.is_ready else "LLM called task_create_draft without enough validated fields.",
+    )
+
+
+def _approval_actions_from_task_create_draft(draft: BitrixTaskCreateDraft) -> list[ActionRecord]:
+    if not draft.is_ready:
+        return []
+    decision = decide_bitrix_method_policy(draft.method)
+    return [
+        ActionRecord(
+            name="bitrix_api",
+            status="approval_required" if decision.decision == "confirm" else decision.decision,
+            details={
+                "method": draft.method,
+                "params": draft.params,
+                "policy": decision.model_dump(),
+                "summary": draft.summary,
+            },
+        )
+    ]
+
+
+def _logs() -> list[str]:
+    return [
+        "Bitrix24 specialist is an LLM subagent; backend tools only execute and validate selected tool calls.",
+        "Knowledge context is selected through hybrid retrieval over the agent package.",
+    ]
 
 
 def _optional_int(value: object) -> int | None:

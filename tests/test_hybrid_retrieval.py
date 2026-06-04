@@ -4,7 +4,7 @@ from ai_server.agents.bitrix24 import Bitrix24Specialist
 from ai_server.models import AgentTask
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
-from tests.fakes import FakeEmbeddingProvider
+from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider
 
 
 def _retriever() -> HybridKnowledgeRetriever:
@@ -29,7 +29,7 @@ def test_hybrid_retrieval_finds_bitrix_knowledge():
 def test_bitrix_specialist_includes_retrieval_hits():
     manifest = get_agent_manifest("bitrix24")
     result = asyncio.run(
-        Bitrix24Specialist(manifest, retriever=_retriever()).handle(
+        Bitrix24Specialist(manifest, retriever=_retriever(), llm=FakeBitrixLLM()).handle(
             AgentTask(task_id="t1", request="Как создать задачу в Битриксе с ответственным?")
         )
     )

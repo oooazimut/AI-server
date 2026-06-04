@@ -1,0 +1,166 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+import httpx
+
+from ai_server.models import ModelUsageRecord
+from ai_server.settings import get_settings
+
+
+class LLMError(RuntimeError):
+    pass
+
+
+class LLMClient(Protocol):
+    async def complete(
+        self,
+        *,
+        agent_id: str,
+        messages: list[dict[str, str]],
+        json_mode: bool = False,
+    ) -> "LLMCompletion":
+        pass
+
+
+@dataclass(frozen=True)
+class LLMCompletion:
+    content: str
+    model_usage: ModelUsageRecord
+    raw: dict[str, Any]
+
+    def json_content(self) -> dict[str, Any]:
+        text = _strip_json_fence(self.content)
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise LLMError(f"LLM returned invalid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise LLMError("LLM returned JSON, but root value is not an object")
+        return parsed
+
+
+class OpenAICompatibleLLMClient:
+    def __init__(self) -> None:
+        self.settings = get_settings()
+        self.timeout = httpx.Timeout(60.0)
+
+    async def complete(
+        self,
+        *,
+        agent_id: str,
+        messages: list[dict[str, str]],
+        json_mode: bool = False,
+    ) -> LLMCompletion:
+        settings = get_settings()
+        if not settings.llm_configured:
+            raise LLMError("LLM is not configured")
+        url = _chat_completions_url(settings.llm_provider, settings.llm_base_url)
+        payload: dict[str, Any] = {
+            "model": settings.llm_model,
+            "messages": messages,
+            "max_tokens": settings.llm_max_tokens,
+        }
+        if settings.llm_temperature is not None:
+            payload["temperature"] = settings.llm_temperature
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+
+        async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
+            response = await client.post(
+                url,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {settings.llm_api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+
+        data = _response_json(response)
+        if "error" in data:
+            raise LLMError(_format_provider_error(data["error"]))
+        if response.is_error:
+            raise LLMError(f"LLM HTTP error {response.status_code}: {_response_text(response)}")
+
+        content = _extract_content(data)
+        usage = _model_usage(agent_id=agent_id, data=data)
+        return LLMCompletion(content=content, model_usage=usage, raw=data)
+
+
+def _chat_completions_url(provider: str, base_url: str) -> str:
+    normalized_provider = provider.strip().casefold()
+    if base_url.strip():
+        return base_url.rstrip("/") + "/chat/completions"
+    if normalized_provider == "deepseek":
+        return "https://api.deepseek.com/v1/chat/completions"
+    raise LLMError("AI_SERVER_LLM_BASE_URL is required for this LLM provider")
+
+
+def _extract_content(data: dict[str, Any]) -> str:
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise LLMError("LLM response does not contain choices")
+    first = choices[0]
+    if not isinstance(first, dict):
+        raise LLMError("LLM response choice is not an object")
+    message = first.get("message")
+    if not isinstance(message, dict):
+        raise LLMError("LLM response choice does not contain message")
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise LLMError("LLM response content is empty")
+    return content
+
+
+def _model_usage(*, agent_id: str, data: dict[str, Any]) -> ModelUsageRecord:
+    settings = get_settings()
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    return ModelUsageRecord(
+        agent_id=agent_id,
+        provider=settings.llm_provider,
+        model=str(data.get("model") or settings.llm_model),
+        status="used",
+        input_tokens=_optional_int(usage.get("prompt_tokens")),
+        output_tokens=_optional_int(usage.get("completion_tokens")),
+    )
+
+
+def _strip_json_fence(text: str) -> str:
+    value = text.strip()
+    if not value.startswith("```"):
+        return value
+    lines = value.splitlines()
+    if len(lines) >= 2 and lines[0].startswith("```") and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1]).strip()
+    return value
+
+
+def _response_json(response: httpx.Response) -> dict[str, Any]:
+    try:
+        data = response.json()
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _response_text(response: httpx.Response) -> str:
+    text = response.text.strip()
+    return text[:500] + "..." if len(text) > 500 else text
+
+
+def _format_provider_error(error: object) -> str:
+    if isinstance(error, dict):
+        message = error.get("message") or error.get("error") or error
+        return f"LLM provider error: {message}"
+    return f"LLM provider error: {error}"
+
+
+def _optional_int(value: object) -> int | None:
+    try:
+        if value in (None, ""):
+            return None
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None

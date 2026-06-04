@@ -4,7 +4,7 @@ from ai_server.models import AgentTask
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.registry import load_agent_manifests
 from ai_server.retrieval import HybridKnowledgeRetriever
-from tests.fakes import FakeEmbeddingProvider
+from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider
 
 
 def test_internal_orchestrator_delegates_bitrix_request():
@@ -12,6 +12,7 @@ def test_internal_orchestrator_delegates_bitrix_request():
         InternalOrchestrator(
             load_agent_manifests(),
             bitrix_retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
+            bitrix_llm=FakeBitrixLLM(),
         ).handle(AgentTask(task_id="t1", request="Покажи задачи в Битриксе"))
     )
 

@@ -113,9 +113,10 @@ AI_SERVER_FASTEMBED_CACHE_DIR=var/embedding_models
 ## LLM model
 
 Модель верхнего уровня зафиксирована в конфиге как `deepseek-v4-flash`.
-Живой LLM gateway ещё подключается отдельным шагом; текущие Bitrix task-create
-сценарии пока работают детерминированно. Переменные уже заведены, чтобы worker-ы
-и будущий gateway брали одну модель:
+Bitrix24-специалист работает как LLM-субагент: сначала модель выбирает tool calls
+и передаёт структурированные аргументы, затем backend-tools выполняют только
+валидацию, policy/OAuth и конкретные Bitrix REST действия. Backend не должен
+выбирать бизнес-сценарий вместо LLM-субагента.
 
 ```env
 AI_SERVER_ENV_FILE=.env,.env.local

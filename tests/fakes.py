@@ -5,6 +5,14 @@ import hashlib
 import math
 import re
 
+from ai_server.agents.bitrix_llm import (
+    BitrixLLMDecision,
+    BitrixLLMDecisionResult,
+    BitrixLLMFinalResult,
+    BitrixLLMToolCall,
+)
+from ai_server.models import ModelUsageRecord
+
 
 class FakeEmbeddingProvider:
     name = "test_embeddings"
@@ -24,4 +32,54 @@ class FakeEmbeddingProvider:
         if norm == 0:
             return {}
         return {index: value / norm for index, value in vector.items()}
+
+
+class FakeBitrixLLM:
+    def __init__(
+        self,
+        *,
+        tool_calls: list[BitrixLLMToolCall] | None = None,
+        decision_status: str = "completed",
+        decision_answer: str = "",
+        final_status: str = "completed",
+        final_answer: str = "Готово.",
+        confidence: float = 0.82,
+    ) -> None:
+        self.tool_calls = tool_calls or [BitrixLLMToolCall(name="none")]
+        self.decision_status = decision_status
+        self.decision_answer = decision_answer
+        self.final_status = final_status
+        self.final_answer = final_answer
+        self.confidence = confidence
+        self.decide_calls = []
+        self.compose_calls = []
+
+    async def decide(self, **kwargs):
+        self.decide_calls.append(kwargs)
+        return BitrixLLMDecisionResult(
+            decision=BitrixLLMDecision(
+                status=self.decision_status,
+                answer=self.decision_answer,
+                confidence=self.confidence,
+                tool_calls=self.tool_calls,
+            ),
+            model_usage=_fake_usage(),
+        )
+
+    async def compose(self, **kwargs):
+        self.compose_calls.append(kwargs)
+        return BitrixLLMFinalResult(
+            status=self.final_status,
+            answer=self.final_answer,
+            model_usage=_fake_usage(),
+        )
+
+
+def _fake_usage() -> ModelUsageRecord:
+    return ModelUsageRecord(
+        agent_id="bitrix24",
+        provider="fake",
+        model="fake-bitrix-llm",
+        status="used",
+    )
 

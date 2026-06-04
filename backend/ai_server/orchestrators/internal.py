@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist
+from ai_server.agents.bitrix_llm import BitrixAgentLLM
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ModelUsageRecord
 from ai_server.orchestrator import suggest_agents
 from ai_server.retrieval import HybridKnowledgeRetriever
@@ -15,10 +16,12 @@ class InternalOrchestrator:
         *,
         bitrix_retriever: HybridKnowledgeRetriever | None = None,
         bitrix_tools: BitrixToolset | None = None,
+        bitrix_llm: BitrixAgentLLM | None = None,
     ) -> None:
         self.manifests = manifests
         self.bitrix_retriever = bitrix_retriever
         self.bitrix_tools = bitrix_tools
+        self.bitrix_llm = bitrix_llm
 
     async def handle(self, task: AgentTask) -> AgentResult:
         if _looks_like_model_question(task.request):
@@ -62,6 +65,7 @@ class InternalOrchestrator:
                 bitrix,
                 retriever=self.bitrix_retriever,
                 tools=self.bitrix_tools,
+                llm=self.bitrix_llm,
             ).handle(task)
             return AgentResult(
                 status=specialist_result.status,

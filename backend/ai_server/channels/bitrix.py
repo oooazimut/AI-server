@@ -12,6 +12,7 @@ from ai_server.integrations.bitrix.dialog_state import (
     is_confirm_text,
     make_dialog_key,
 )
+from ai_server.agents.bitrix_llm import BitrixAgentLLM
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.events import MESSAGE_EVENTS, parse_incoming_message, payload_event_type
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService
@@ -41,6 +42,7 @@ class BitrixWebhookProcessor:
         pending_actions: BitrixPendingActionService | None = None,
         bitrix_tools: BitrixToolset | None = None,
         bitrix_retriever: HybridKnowledgeRetriever | None = None,
+        bitrix_llm: BitrixAgentLLM | None = None,
         technical_footer: TechnicalFooterService | None = None,
     ) -> None:
         settings = get_settings()
@@ -50,6 +52,7 @@ class BitrixWebhookProcessor:
         self.orchestrator = orchestrator
         self.bitrix_tools = bitrix_tools
         self.bitrix_retriever = bitrix_retriever
+        self.bitrix_llm = bitrix_llm
         self.technical_footer = technical_footer or TechnicalFooterService()
         self.pending_actions = pending_actions or BitrixPendingActionService(
             store=DialogStateStore(settings.dialog_state_path),
@@ -109,6 +112,7 @@ class BitrixWebhookProcessor:
         orchestrator = self.orchestrator or InternalOrchestrator(
             load_agent_manifests(),
             bitrix_retriever=self.bitrix_retriever,
+            bitrix_llm=self.bitrix_llm,
             bitrix_tools=self.bitrix_tools
             or BitrixToolset(
                 client=self.bitrix,

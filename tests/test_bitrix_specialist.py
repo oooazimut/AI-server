@@ -1,19 +1,25 @@
 import asyncio
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist
+from ai_server.agents.bitrix_llm import BitrixLLMToolCall
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import AgentTask, ToolResult
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
 from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
-from tests.fakes import FakeEmbeddingProvider
+from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider
 
 
-def _bitrix_specialist(*, tools=None) -> Bitrix24Specialist:
+def _bitrix_specialist(*, tools=None, llm=None) -> Bitrix24Specialist:
     manifest = get_agent_manifest("bitrix24")
     retriever = HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider())
-    return Bitrix24Specialist(manifest, retriever=retriever, tools=tools)
+    return Bitrix24Specialist(
+        manifest,
+        retriever=retriever,
+        tools=tools,
+        llm=llm or FakeBitrixLLM(),
+    )
 
 
 def test_bitrix_specialist_selects_task_skill():
@@ -26,6 +32,7 @@ def test_bitrix_specialist_selects_task_skill():
     assert result.status == "completed"
     assert result.handoff_to == []
     assert result.actions_taken[0].details["skills"] == ["tasks_search"]
+    assert result.actions_taken[1].name == "bitrix_llm_decision"
 
 
 def test_bitrix_specialist_searches_task_by_id():
@@ -47,13 +54,19 @@ def test_bitrix_specialist_searches_task_by_id():
                         },
                     },
                 )
-            )
+            ),
+            llm=FakeBitrixLLM(
+                tool_calls=[
+                    BitrixLLMToolCall(name="task_search", args={"mode": "get", "task_id": 8413})
+                ],
+                final_answer="Нашёл задачу #8413 без срока.",
+            ),
         ).handle(AgentTask(task_id="t1", request="Найди задачу #8413"))
     )
 
     assert result.status == "completed"
-    assert result.actions_taken[1].name == "bitrix_task_search"
-    assert result.actions_taken[1].status == "ok"
+    assert result.actions_taken[2].name == "bitrix_task_search"
+    assert result.actions_taken[2].status == "ok"
     assert "#8413" in result.answer
     assert "без срока" in result.answer
 
@@ -79,7 +92,18 @@ def test_bitrix_specialist_searches_my_open_tasks():
     )
 
     result = asyncio.run(
-        _bitrix_specialist(tools=tools).handle(
+        _bitrix_specialist(
+            tools=tools,
+            llm=FakeBitrixLLM(
+                tool_calls=[
+                    BitrixLLMToolCall(
+                        name="task_search",
+                        args={"mode": "list", "filter": {"!STATUS": 5, "RESPONSIBLE_ID": 9}},
+                    )
+                ],
+                final_answer="Нашёл задачу: Проверить камеру.",
+            ),
+        ).handle(
             AgentTask(task_id="t1", request="Покажи мои открытые задачи", user={"id": "9"})
         )
     )
@@ -92,7 +116,22 @@ def test_bitrix_specialist_searches_my_open_tasks():
 
 def test_bitrix_specialist_marks_write_for_approval():
     result = asyncio.run(
-        _bitrix_specialist().handle(
+        _bitrix_specialist(
+            llm=FakeBitrixLLM(
+                tool_calls=[
+                    BitrixLLMToolCall(
+                        name="task_create_draft",
+                        args={
+                            "title": "проверить IP-камеру",
+                            "responsible_self": True,
+                            "deadline_iso": "2026-06-05T19:00:00+03:00",
+                        },
+                    )
+                ],
+                final_status="needs_human",
+                final_answer="Подготовил черновик задачи, нужно подтверждение.",
+            )
+        ).handle(
             AgentTask(task_id="t1", request="Создай задачу на меня проверить IP-камеру завтра", user={"id": "9"})
         )
     )
@@ -109,19 +148,42 @@ def test_bitrix_specialist_marks_write_for_approval():
 
 def test_bitrix_specialist_asks_for_responsible_before_task_create():
     result = asyncio.run(
-        _bitrix_specialist().handle(
+        _bitrix_specialist(
+            llm=FakeBitrixLLM(
+                tool_calls=[BitrixLLMToolCall(name="none")],
+                decision_status="needs_clarification",
+                final_status="needs_clarification",
+                final_answer="Кого поставить ответственным?",
+            )
+        ).handle(
             AgentTask(task_id="t1", request="Создай задачу проверить IP-камеру")
         )
     )
 
     assert result.status == "needs_clarification"
     assert result.actions_requiring_approval == []
-    assert "ответственный" in result.answer
+    assert "ответственн" in result.answer
 
 
 def test_bitrix_specialist_task_create_uses_explicit_ids():
     result = asyncio.run(
-        _bitrix_specialist().handle(
+        _bitrix_specialist(
+            llm=FakeBitrixLLM(
+                tool_calls=[
+                    BitrixLLMToolCall(
+                        name="task_create_draft",
+                        args={
+                            "title": "проверить регистратор",
+                            "responsible_id": 15,
+                            "group_id": 44,
+                            "deadline_iso": "2026-06-05T19:00:00+03:00",
+                        },
+                    )
+                ],
+                final_status="needs_human",
+                final_answer="Подготовил черновик задачи, нужно подтверждение.",
+            )
+        ).handle(
             AgentTask(
                 task_id="t1",
                 request="Поставь задачу ответственному #15 проверить регистратор в проекте #44 до 05.06.2026",
@@ -147,7 +209,21 @@ def test_bitrix_specialist_resolves_responsible_name():
                         {"id": 15, "label": "Иванов Иван"},
                     ]
                 }
-            )
+            ),
+            llm=FakeBitrixLLM(
+                tool_calls=[
+                    BitrixLLMToolCall(
+                        name="task_create_draft",
+                        args={
+                            "title": "проверить IP-камеру",
+                            "responsible_query": "Иванову",
+                            "deadline_iso": "2026-06-05T19:00:00+03:00",
+                        },
+                    )
+                ],
+                final_status="needs_human",
+                final_answer="Подготовил черновик задачи, нужно подтверждение.",
+            ),
         ).handle(
             AgentTask(
                 task_id="t1",
@@ -172,7 +248,22 @@ def test_bitrix_specialist_resolves_project_name():
                         {"id": 44, "label": "Монтаж"},
                     ]
                 }
-            )
+            ),
+            llm=FakeBitrixLLM(
+                tool_calls=[
+                    BitrixLLMToolCall(
+                        name="task_create_draft",
+                        args={
+                            "title": "проверить камеру",
+                            "responsible_self": True,
+                            "project_query": "Монтаж",
+                            "deadline_iso": "2026-06-05T19:00:00+03:00",
+                        },
+                    )
+                ],
+                final_status="needs_human",
+                final_answer="Подготовил черновик задачи, нужно подтверждение.",
+            ),
         ).handle(
             AgentTask(
                 task_id="t1",
@@ -199,7 +290,21 @@ def test_bitrix_specialist_asks_when_responsible_name_is_ambiguous():
                         {"id": 16, "label": "Иванов Пётр"},
                     ]
                 }
-            )
+            ),
+            llm=FakeBitrixLLM(
+                tool_calls=[
+                    BitrixLLMToolCall(
+                        name="task_create_draft",
+                        args={
+                            "title": "проверить камеру",
+                            "responsible_query": "Иванову",
+                            "deadline_iso": "2026-06-05T19:00:00+03:00",
+                        },
+                    )
+                ],
+                final_status="needs_clarification",
+                final_answer="Нашёл несколько сотрудников Ивановых. Уточните ответственного.",
+            ),
         ).handle(
             AgentTask(
                 task_id="t1",
