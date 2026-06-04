@@ -189,6 +189,17 @@ uv run python scripts/create_bitrix_dev_chat.py `
   --title "AI dev" --users 1,9 --execute
 ```
 
+Контролируемая smoke-проверка сценария `tasks.task.add` через тот же Bitrix
+channel processor:
+
+```powershell
+uv run python scripts/smoke_bitrix_task_create_flow.py `
+  --env-file C:\Users\office3pc\PyProjects\BitrixAIAgent\.env `
+  --env-file C:\Users\office3pc\PyProjects\BitrixAIAgent\.env.webhook.local `
+  --oauth-db-path C:\Users\office3pc\PyProjects\BitrixAIAgent\var\bitrix_oauth.sqlite `
+  --chat-id 3955 --dialog-id chat3955 --user-id 9 --confirm
+```
+
 Проверка состояния:
 
 ```text

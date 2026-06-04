@@ -29,6 +29,12 @@ CONFIRM_WORDS = {
     "согласен",
 }
 CANCEL_WORDS = {"отмена", "отмени", "не надо", "сбрось", "не создавай", "не выполняй", "cancel"}
+NO_DEADLINE_FIELD_NAMES = {
+    "NO_DEADLINE",
+    "WITHOUT_DEADLINE",
+    "noDeadline",
+    "withoutDeadline",
+}
 
 
 @dataclass
@@ -367,11 +373,13 @@ def apply_write_policy(method: str, params: dict[str, Any], user_id: int | None)
     normalized = method.strip().lower()
     if normalized != "tasks.task.add":
         return params
-    allowed_project_id = settings.agent_limited_task_create_project_id
-    if allowed_project_id is None or user_id not in settings.resolved_agent_limited_task_create_user_ids:
-        return params
     fields = params.get("fields")
     if not isinstance(fields, dict):
+        return params
+    if no_deadline_requested(fields):
+        strip_no_deadline_markers(fields)
+    allowed_project_id = settings.agent_limited_task_create_project_id
+    if allowed_project_id is None or user_id not in settings.resolved_agent_limited_task_create_user_ids:
         return params
     if task_add_group_id(params) is None:
         fields["GROUP_ID"] = allowed_project_id
@@ -389,3 +397,41 @@ def task_add_group_id(params: dict[str, Any]) -> int | None:
         except (TypeError, ValueError):
             return None
     return None
+
+
+def no_deadline_requested(fields: dict[str, Any]) -> bool:
+    for key in NO_DEADLINE_FIELD_NAMES:
+        if _truthy(fields.get(key)):
+            return True
+    for key, value in fields.items():
+        if key.lower() != "deadline":
+            continue
+        if value is None:
+            return True
+        if isinstance(value, str) and value.strip().lower() in {
+            "",
+            "none",
+            "null",
+            "no",
+            "n",
+            "без срока",
+            "бессрочно",
+        }:
+            return True
+    return False
+
+
+def strip_no_deadline_markers(fields: dict[str, Any]) -> None:
+    for key in list(fields):
+        if key in NO_DEADLINE_FIELD_NAMES or key.lower() == "deadline":
+            fields.pop(key, None)
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "да", "без срока", "бессрочно"}
+    return bool(value)

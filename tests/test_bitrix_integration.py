@@ -8,6 +8,7 @@ from ai_server.integrations.bitrix.dialog_state import (
     BitrixPendingActionService,
     DialogStateStore,
     PendingBitrixAction,
+    apply_write_policy,
     make_dialog_key,
 )
 from ai_server.integrations.bitrix.client import BitrixClient
@@ -274,6 +275,22 @@ def test_bitrix_pending_action_cancel_clears_state_without_call(monkeypatch, tmp
     assert fake_bitrix.calls == []
     assert store.load(key).pending_action is None
     assert '"status": "cancelled"' in (tmp_path / "bitrix_write_audit.jsonl").read_text(encoding="utf-8")
+
+
+def test_task_add_write_policy_strips_internal_no_deadline_markers(monkeypatch):
+    monkeypatch.delenv("AGENT_LIMITED_TASK_CREATE_PROJECT_ID", raising=False)
+    params = {
+        "fields": {
+            "TITLE": "Тестовая задача",
+            "RESPONSIBLE_ID": 9,
+            "NO_DEADLINE": True,
+            "DEADLINE": "",
+        }
+    }
+
+    result = apply_write_policy("tasks.task.add", params, user_id=9)
+
+    assert result["fields"] == {"TITLE": "Тестовая задача", "RESPONSIBLE_ID": 9}
 
 
 def test_bitrix_client_create_bot_chat_builds_v2_payload(monkeypatch):
