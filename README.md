@@ -109,6 +109,24 @@ AI_SERVER_EMBEDDINGS_PROVIDER=fastembed
 AI_SERVER_FASTEMBED_CACHE_DIR=var/embedding_models
 ```
 
+## LLM model
+
+Модель верхнего уровня зафиксирована в конфиге как `deepseek-v4-flash`.
+Живой LLM gateway ещё подключается отдельным шагом; текущие Bitrix task-create
+сценарии пока работают детерминированно. Переменные уже заведены, чтобы worker-ы
+и будущий gateway брали одну модель:
+
+```env
+AI_SERVER_LLM_PROVIDER=deepseek
+AI_SERVER_LLM_MODEL=deepseek-v4-flash
+AI_SERVER_LLM_BASE_URL=
+AI_SERVER_LLM_API_KEY=
+AI_SERVER_LLM_MAX_TOKENS=3000
+```
+
+`GET /health` показывает `llm_provider`, `llm_model` и `llm_configured`, но не
+показывает ключи.
+
 ## Runtime var и cutover
 
 `var/` - локальный runtime-контур сервера. В Git хранится только каркас каталога,

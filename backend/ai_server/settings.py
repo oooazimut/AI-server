@@ -22,6 +22,12 @@ class Settings:
     bitrix_projects_webhook_url: str
     public_base_url: str
     webhook_secret: str
+    llm_provider: str
+    llm_model: str
+    llm_base_url: str
+    llm_api_key: str
+    llm_temperature: float | None
+    llm_max_tokens: int
     webhook_event_queue_enabled: bool
     webhook_event_worker_enabled: bool
     webhook_event_queue_interval_seconds: int
@@ -73,6 +79,10 @@ class Settings:
     @property
     def bitrix_oauth_configured(self) -> bool:
         return bool(self.bitrix_oauth_client_id and self.bitrix_oauth_client_secret)
+
+    @property
+    def llm_configured(self) -> bool:
+        return bool(self.llm_provider and self.llm_model and self.llm_api_key)
 
     @property
     def bitrix_oauth_db_path(self) -> Path:
@@ -159,6 +169,12 @@ def get_settings() -> Settings:
         bitrix_projects_webhook_url=_env("BITRIX_PROJECTS_WEBHOOK_URL"),
         public_base_url=_env("PUBLIC_BASE_URL"),
         webhook_secret=_env("WEBHOOK_SECRET"),
+        llm_provider=_env("AI_SERVER_LLM_PROVIDER", _env("LLM_PROVIDER", "deepseek")),
+        llm_model=_env("AI_SERVER_LLM_MODEL", _env("LLM_MODEL", "deepseek-v4-flash")),
+        llm_base_url=_env("AI_SERVER_LLM_BASE_URL", _env("LLM_BASE_URL")),
+        llm_api_key=_env("AI_SERVER_LLM_API_KEY", _env("LLM_API_KEY")),
+        llm_temperature=_env_float("AI_SERVER_LLM_TEMPERATURE", _env_float("LLM_TEMPERATURE")),
+        llm_max_tokens=_env_int("AI_SERVER_LLM_MAX_TOKENS", _env_int("LLM_MAX_TOKENS", 3000)) or 3000,
         webhook_event_queue_enabled=_env_bool("WEBHOOK_EVENT_QUEUE_ENABLED", True),
         webhook_event_worker_enabled=_env_bool("AI_SERVER_WEBHOOK_EVENT_WORKER_ENABLED", False),
         webhook_event_queue_interval_seconds=_env_int("WEBHOOK_EVENT_QUEUE_INTERVAL_SECONDS", 2) or 2,
@@ -218,6 +234,16 @@ def _env_int(name: str, default: int | None = None) -> int | None:
         return default
     try:
         return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float | None = None) -> float | None:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
     except ValueError:
         return default
 
