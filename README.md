@@ -167,6 +167,28 @@ AI_SERVER_WEBHOOK_EVENT_WORKER_ENABLED=true
 AGENT_DRY_RUN=false
 ```
 
+Тестовый чат для dev-контура создаётся отдельно, чтобы не смешивать старый
+моноагентный сервис и новую связку `internal_orchestrator -> bitrix24`:
+
+```powershell
+uv run python scripts/create_bitrix_dev_chat.py --title "AI dev" --users 1,9
+uv run python scripts/create_bitrix_dev_chat.py --title "AI dev" --users 1,9 --execute
+```
+
+Первая команда печатает dry-run план и замаскированный payload, вторая реально
+создаёт групповой чат Bitrix24 через `imbot.v2.Chat.add`.
+
+Если используем старый OAuth-бот из `BitrixAIAgent`, env-файлы нужно накладывать
+так же, как в старом сервисе:
+
+```powershell
+uv run python scripts/create_bitrix_dev_chat.py `
+  --env-file C:\Users\office3pc\PyProjects\BitrixAIAgent\.env `
+  --env-file C:\Users\office3pc\PyProjects\BitrixAIAgent\.env.webhook.local `
+  --oauth-db-path C:\Users\office3pc\PyProjects\BitrixAIAgent\var\bitrix_oauth.sqlite `
+  --title "AI dev" --users 1,9 --execute
+```
+
 Проверка состояния:
 
 ```text

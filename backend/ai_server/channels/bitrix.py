@@ -19,7 +19,9 @@ from ai_server.integrations.bitrix.portal_search import PortalSearchIndex
 from ai_server.models import ActionRecord, AgentTask, UserContext
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.registry import load_agent_manifests
+from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import get_settings
+from ai_server.tools.bitrix import BitrixToolset
 from ai_server.workers.bitrix.search_webhook_indexer import (
     prepare_search_webhook_job,
     process_search_webhook_job,
@@ -36,12 +38,16 @@ class BitrixWebhookProcessor:
         search_webhook_status: dict[str, Any] | None = None,
         orchestrator: InternalOrchestrator | None = None,
         pending_actions: BitrixPendingActionService | None = None,
+        bitrix_tools: BitrixToolset | None = None,
+        bitrix_retriever: HybridKnowledgeRetriever | None = None,
     ) -> None:
         settings = get_settings()
         self.bitrix = bitrix or BitrixClient()
         self.portal_search = portal_search or PortalSearchIndex()
         self.search_webhook_status = search_webhook_status if search_webhook_status is not None else {}
         self.orchestrator = orchestrator
+        self.bitrix_tools = bitrix_tools
+        self.bitrix_retriever = bitrix_retriever
         self.pending_actions = pending_actions or BitrixPendingActionService(
             store=DialogStateStore(settings.dialog_state_path),
             bitrix=self.bitrix,
@@ -92,7 +98,18 @@ class BitrixWebhookProcessor:
                 "dialog_key": dialog_key,
             }
 
-        orchestrator = self.orchestrator or InternalOrchestrator(load_agent_manifests())
+        orchestrator = self.orchestrator or InternalOrchestrator(
+            load_agent_manifests(),
+            bitrix_retriever=self.bitrix_retriever,
+            bitrix_tools=self.bitrix_tools
+            or BitrixToolset(
+                client=self.bitrix,
+                portal_search=self.portal_search,
+                pending_actions=self.pending_actions,
+                dialog_key=dialog_key,
+                user_id=incoming.user_id,
+            ),
+        )
         result = await orchestrator.handle(
             AgentTask(
                 task_id=str(uuid4()),

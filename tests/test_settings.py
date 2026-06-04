@@ -30,3 +30,16 @@ def test_llm_settings_can_be_overridden(monkeypatch):
     assert settings.llm_base_url == "https://example.local/v1"
     assert settings.llm_max_tokens == 1234
     assert settings.llm_configured is True
+
+
+def test_bitrix_oauth_bot_settings_can_be_loaded(monkeypatch, tmp_path):
+    oauth_db = tmp_path / "bitrix_oauth.sqlite"
+    monkeypatch.setenv("BITRIX_BOT_AUTH_MODE", "oauth")
+    monkeypatch.setenv("BITRIX_BOT_OAUTH_USER_ID", "9")
+    monkeypatch.setenv("BITRIX_OAUTH_DB_PATH", str(oauth_db))
+
+    settings = get_settings()
+
+    assert settings.bitrix_bot_uses_oauth is True
+    assert settings.bitrix_bot_oauth_user_id == 9
+    assert settings.bitrix_oauth_db_path == oauth_db

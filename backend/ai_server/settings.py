@@ -11,12 +11,14 @@ class Settings:
     bitrix_bot_id: int | None
     bitrix_bot_token: str
     bitrix_bot_auth_mode: str
+    bitrix_bot_oauth_user_id: int | None
     bitrix_bot_webhook_url: str
     bitrix_domain: str
     bitrix_oauth_client_id: str
     bitrix_oauth_client_secret: str
     bitrix_oauth_enabled: bool
     bitrix_oauth_required_for_writes: bool
+    bitrix_oauth_db_path_override: str
     bitrix_oauth_token_endpoint: str
     bitrix_rest_webhook_url: str
     bitrix_projects_webhook_url: str
@@ -86,6 +88,8 @@ class Settings:
 
     @property
     def bitrix_oauth_db_path(self) -> Path:
+        if self.bitrix_oauth_db_path_override:
+            return Path(self.bitrix_oauth_db_path_override)
         return runtime_paths(self.var_dir).bitrix_oauth_db
 
     @property
@@ -158,12 +162,14 @@ def get_settings() -> Settings:
         bitrix_bot_id=_env_int("BITRIX_BOT_ID"),
         bitrix_bot_token=_env("BITRIX_BOT_TOKEN"),
         bitrix_bot_auth_mode=_env("BITRIX_BOT_AUTH_MODE", "webhook"),
+        bitrix_bot_oauth_user_id=_env_int("BITRIX_BOT_OAUTH_USER_ID"),
         bitrix_bot_webhook_url=_env("BITRIX_BOT_WEBHOOK_URL"),
         bitrix_domain=_env("BITRIX_DOMAIN"),
         bitrix_oauth_client_id=_env("BITRIX_OAUTH_CLIENT_ID"),
         bitrix_oauth_client_secret=_env("BITRIX_OAUTH_CLIENT_SECRET"),
         bitrix_oauth_enabled=_env_bool("BITRIX_OAUTH_ENABLED", True),
         bitrix_oauth_required_for_writes=_env_bool("BITRIX_OAUTH_REQUIRED_FOR_WRITES", True),
+        bitrix_oauth_db_path_override=_env("BITRIX_OAUTH_DB_PATH"),
         bitrix_oauth_token_endpoint=_env("BITRIX_OAUTH_TOKEN_ENDPOINT", "https://oauth.bitrix.info/oauth/token/"),
         bitrix_rest_webhook_url=_env("BITRIX_REST_WEBHOOK_URL"),
         bitrix_projects_webhook_url=_env("BITRIX_PROJECTS_WEBHOOK_URL"),

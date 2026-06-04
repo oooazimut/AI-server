@@ -201,14 +201,19 @@ class BitrixOAuthService:
         url = endpoint or settings.bitrix_oauth_token_endpoint
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), trust_env=False) as client:
             response = await client.post(url, data=data)
-            response.raise_for_status()
-        payload = response.json()
+        payload = _response_json(response)
         if "error" in payload:
             raise BitrixApiError(
                 "oauth.token",
                 str(payload.get("error", "")),
                 str(payload.get("error_description", "")),
             )
+        if response.is_error:
+            raise BitrixApiError(
+                "oauth.token",
+                f"HTTP_{response.status_code}",
+                _response_text(response),
+            ) from None
         return payload
 
     def _connect(self) -> sqlite3.Connection:
@@ -259,3 +264,17 @@ def _token_endpoint_from_server(server_endpoint: str) -> str:
         return endpoint
     return endpoint.rstrip("/") + "/oauth/token/"
 
+
+def _response_json(response: httpx.Response) -> dict[str, Any]:
+    try:
+        payload = response.json()
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _response_text(response: httpx.Response) -> str:
+    text = response.text.strip()
+    if len(text) > 500:
+        return text[:500] + "..."
+    return text

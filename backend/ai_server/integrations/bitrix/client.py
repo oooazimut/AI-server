@@ -61,15 +61,20 @@ class BitrixClient:
             request_payload.setdefault("auth", self.access_token)
         async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
             response = await client.post(url, json=request_payload)
-            response.raise_for_status()
 
-        data = response.json()
+        data = _response_json(response)
         if "error" in data:
             raise BitrixApiError(
                 method=method,
                 error=str(data.get("error", "")),
                 description=str(data.get("error_description", "")),
             )
+        if response.is_error:
+            raise BitrixApiError(
+                method=method,
+                error=f"HTTP_{response.status_code}",
+                description=_response_text(response),
+            ) from None
         return data
 
     async def result(
@@ -99,15 +104,20 @@ class BitrixClient:
             request_payload.setdefault("auth", self.access_token)
         async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
             response = await client.post(url, json=request_payload)
-            response.raise_for_status()
 
-        data = response.json()
+        data = _response_json(response)
         if "error" in data:
             raise BitrixApiError(
                 method=method,
                 error=str(data.get("error", "")),
                 description=str(data.get("error_description", "")),
             )
+        if response.is_error:
+            raise BitrixApiError(
+                method=method,
+                error=f"HTTP_{response.status_code}",
+                description=_response_text(response),
+            ) from None
         return data
 
     async def result_v3(
@@ -129,6 +139,15 @@ class BitrixClient:
         keyboard: object | None = None,
     ) -> Any:
         settings = get_settings()
+        if settings.bitrix_bot_uses_oauth and not self.access_token:
+            client = await _oauth_bot_client()
+            return await client.send_bot_message(
+                dialog_id,
+                message,
+                bot_id=bot_id,
+                keyboard=keyboard,
+            )
+
         resolved_bot_id = bot_id or settings.bitrix_bot_id
         if not resolved_bot_id:
             raise BitrixConfigError("Bot id is required: pass bot_id or set BITRIX_BOT_ID")
@@ -143,6 +162,61 @@ class BitrixClient:
         if keyboard:
             payload["fields"]["keyboard"] = keyboard
         return await self.result("imbot.v2.Chat.Message.send", payload)
+
+    async def create_bot_chat(
+        self,
+        *,
+        title: str,
+        user_ids: list[int],
+        description: str = "",
+        color: str = "mint",
+        message: str = "",
+        bot_id: int | None = None,
+        owner_id: int | None = None,
+    ) -> Any:
+        settings = get_settings()
+        if settings.bitrix_bot_uses_oauth and not self.access_token:
+            client = await _oauth_bot_client()
+            return await client.create_bot_chat(
+                title=title,
+                user_ids=user_ids,
+                description=description,
+                color=color,
+                message=message,
+                bot_id=bot_id,
+                owner_id=owner_id,
+            )
+
+        resolved_bot_id = bot_id or settings.bitrix_bot_id
+        normalized_user_ids = _unique_positive_ints(user_ids)
+        if not resolved_bot_id:
+            raise BitrixConfigError("Bot id is required: pass bot_id or set BITRIX_BOT_ID")
+        if not title.strip():
+            raise BitrixConfigError("Chat title is required")
+        if not normalized_user_ids:
+            raise BitrixConfigError("At least one user id is required")
+
+        fields: dict[str, Any] = {
+            "title": title.strip(),
+            "color": color,
+            "userIds": normalized_user_ids,
+        }
+        if description:
+            fields["description"] = description
+        if message:
+            fields["message"] = message
+        if owner_id is not None:
+            fields["ownerId"] = owner_id
+
+        payload: dict[str, Any] = {
+            "botId": resolved_bot_id,
+            "fields": fields,
+        }
+        if not self.access_token:
+            if not settings.bitrix_bot_token:
+                raise BitrixConfigError("Bot token is required in webhook auth mode: set BITRIX_BOT_TOKEN")
+            payload["botToken"] = settings.bitrix_bot_token
+        return await self.result("imbot.v2.Chat.add", payload)
 
     async def collect_paged(
         self,
@@ -330,6 +404,45 @@ def _to_rest_api_base_url(base_url: str) -> str:
     if len(parts) >= 2 and parts[0].isdigit():
         return f"{prefix}/rest/"
     return base_url
+
+
+def _unique_positive_ints(values: list[int]) -> list[int]:
+    result: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            continue
+        if normalized <= 0 or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+def _response_json(response: httpx.Response) -> dict[str, Any]:
+    try:
+        data = response.json()
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _response_text(response: httpx.Response) -> str:
+    text = response.text.strip()
+    if len(text) > 500:
+        return text[:500] + "..."
+    return text
+
+
+async def _oauth_bot_client() -> BitrixClient:
+    settings = get_settings()
+    if not settings.bitrix_bot_oauth_user_id:
+        raise BitrixConfigError("BITRIX_BOT_OAUTH_USER_ID is required for OAuth bot mode")
+    from ai_server.integrations.bitrix.oauth import BitrixOAuthService
+
+    return await BitrixOAuthService().client_for_user(settings.bitrix_bot_oauth_user_id)
 
 
 def _extract_paged_items(result: Any, *, list_key: str | None) -> list[dict[str, Any]]:

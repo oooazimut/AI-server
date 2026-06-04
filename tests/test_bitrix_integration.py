@@ -10,11 +10,15 @@ from ai_server.integrations.bitrix.dialog_state import (
     PendingBitrixAction,
     make_dialog_key,
 )
+from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.events import parse_incoming_message
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService
 from ai_server.main import app
-from ai_server.models import ActionRecord, AgentResult
+from ai_server.models import ActionRecord, AgentResult, ToolResult
+from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.workers.bitrix.webhook_event_queue import WebhookEventQueue
+from scripts.create_bitrix_dev_chat import chat_reference, sanitize_result
+from tests.fakes import FakeEmbeddingProvider
 
 
 def _bitrix_v2_message_payload() -> dict:
@@ -272,6 +276,99 @@ def test_bitrix_pending_action_cancel_clears_state_without_call(monkeypatch, tmp
     assert '"status": "cancelled"' in (tmp_path / "bitrix_write_audit.jsonl").read_text(encoding="utf-8")
 
 
+def test_bitrix_client_create_bot_chat_builds_v2_payload(monkeypatch):
+    monkeypatch.setenv("BITRIX_BOT_ID", "42")
+    monkeypatch.setenv("BITRIX_BOT_TOKEN", "bot-token")
+
+    client = RecordingCreateChatClient()
+
+    result = anyio_run(
+        client.create_bot_chat(
+            title=" AI dev ",
+            user_ids=[1, 9, 9],
+            description="Dev contour",
+            message="Ready",
+        )
+    )
+
+    assert result == {"chatId": 555, "dialogId": "chat555"}
+    assert client.calls == [
+        (
+            "imbot.v2.Chat.add",
+            {
+                "botId": 42,
+                "botToken": "bot-token",
+                "fields": {
+                    "title": "AI dev",
+                    "color": "mint",
+                    "userIds": [1, 9],
+                    "description": "Dev contour",
+                    "message": "Ready",
+                },
+            },
+        )
+    ]
+
+
+def test_create_bitrix_dev_chat_helpers_extract_reference_and_redact_tokens():
+    raw = {
+        "chat": {"id": 3955, "dialogId": "chat3955"},
+        "callInfo": {"token": "secret-call-token", "chatId": 3955},
+        "access_token": "secret-access",
+    }
+
+    assert chat_reference(raw) == {"chat_id": 3955, "dialog_id": "chat3955"}
+    assert sanitize_result(raw)["callInfo"]["token"] == "<redacted>"
+    assert sanitize_result(raw)["access_token"] == "<redacted>"
+
+
+def test_bitrix_task_create_chat_flow_saves_and_confirms_pending_action(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
+    monkeypatch.setenv("AGENT_DRY_RUN", "true")
+    store = DialogStateStore(tmp_path / "dialog_state.sqlite")
+    fake_bitrix = FakeBitrixClient()
+    processor = BitrixWebhookProcessor(
+        bitrix=fake_bitrix,
+        bitrix_tools=FakeBitrixTools(),
+        bitrix_retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
+        pending_actions=BitrixPendingActionService(
+            store=store,
+            bitrix=fake_bitrix,
+            audit_log_path=tmp_path / "bitrix_write_audit.jsonl",
+        ),
+    )
+    payload = _bitrix_v2_message_payload()
+    payload["data"]["message"]["text"] = "Создай задачу на Иванова проверить IP-камеру завтра"
+
+    draft_result = anyio_run(processor.process(payload))
+    key = make_dialog_key(chat_id=77, dialog_id="chat99", user_id=9)
+    pending = store.load(key).pending_action
+
+    assert draft_result["handled"] is True
+    assert draft_result["agent_result_status"] == "needs_human"
+    assert draft_result["pending_action_saved"] is True
+    assert pending is not None
+    assert pending.method == "tasks.task.add"
+    fields = pending.params["fields"]
+    assert fields["TITLE"] == "проверить IP-камеру"
+    assert fields["RESPONSIBLE_ID"] == 15
+    assert fields["CREATED_BY"] == 9
+    assert "DEADLINE" in fields
+
+    monkeypatch.setenv("AGENT_DRY_RUN", "false")
+    monkeypatch.setenv("AGENT_WRITE_ALLOWED_USER_IDS", "9")
+    monkeypatch.setenv("BITRIX_OAUTH_REQUIRED_FOR_WRITES", "false")
+    payload["data"]["message"]["text"] = "да"
+
+    confirm_result = anyio_run(processor.process(payload))
+
+    assert confirm_result["agent_result_status"] == "executed"
+    assert fake_bitrix.calls == [("tasks.task.add", {"fields": fields})]
+    assert fake_bitrix.messages[0][0] == "chat99"
+    assert fake_bitrix.messages[0][1].startswith("Готово")
+    assert store.load(key).pending_action is None
+
+
 def test_bitrix_oauth_service_reads_migrated_sqlite(tmp_path):
     db_path = tmp_path / "bitrix_oauth.sqlite"
     service = BitrixOAuthService(db_path)
@@ -331,3 +428,33 @@ class FakeBitrixClient:
     async def send_bot_message(self, dialog_id, message, *, bot_id=None, keyboard=None):
         self.messages.append((dialog_id, message, bot_id, keyboard))
         return 1
+
+
+class RecordingCreateChatClient(BitrixClient):
+    def __init__(self) -> None:
+        super().__init__(base_url="https://example.bitrix24.ru/rest/1/webhook/")
+        self.calls = []
+
+    async def result(self, method, payload=None, *, base_url=None):
+        self.calls.append((method, payload or {}))
+        return {"chatId": 555, "dialogId": "chat555"}
+
+
+class FakeBitrixTools:
+    async def resolve_user(self, query: str, *, limit: int = 5):
+        assert query == "Иванова"
+        return ToolResult(
+            status="ok",
+            tool="resolve_user",
+            data={
+                "query": query,
+                "candidate": {"id": 15, "label": "Иванов Иван"},
+                "candidates": [{"id": 15, "label": "Иванов Иван"}],
+            },
+        )
+
+    async def resolve_project(self, query: str, *, limit: int = 5):
+        raise AssertionError("project resolver should not be called")
+
+    def portal_search_contract(self, args):
+        raise AssertionError("portal search should not be called")
