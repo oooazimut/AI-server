@@ -21,6 +21,7 @@ from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.registry import load_agent_manifests
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import get_settings
+from ai_server.technical_footer import TechnicalFooterService, append_footer
 from ai_server.tools.bitrix import BitrixToolset
 from ai_server.workers.bitrix.search_webhook_indexer import (
     prepare_search_webhook_job,
@@ -40,6 +41,7 @@ class BitrixWebhookProcessor:
         pending_actions: BitrixPendingActionService | None = None,
         bitrix_tools: BitrixToolset | None = None,
         bitrix_retriever: HybridKnowledgeRetriever | None = None,
+        technical_footer: TechnicalFooterService | None = None,
     ) -> None:
         settings = get_settings()
         self.bitrix = bitrix or BitrixClient()
@@ -48,6 +50,7 @@ class BitrixWebhookProcessor:
         self.orchestrator = orchestrator
         self.bitrix_tools = bitrix_tools
         self.bitrix_retriever = bitrix_retriever
+        self.technical_footer = technical_footer or TechnicalFooterService()
         self.pending_actions = pending_actions or BitrixPendingActionService(
             store=DialogStateStore(settings.dialog_state_path),
             bitrix=self.bitrix,
@@ -81,9 +84,14 @@ class BitrixWebhookProcessor:
         )
         direct_result = await self._maybe_handle_pending_control(dialog_key, incoming.text, user_id=incoming.user_id)
         if direct_result:
+            footer = await self.technical_footer.build_for_pending_action(
+                user_id=incoming.user_id,
+                channel="bitrix24_chat",
+                status=direct_result.status,
+            )
             reply_sent, send_error = await self._send_reply(
                 incoming.dialog_id,
-                direct_result.message,
+                append_footer(direct_result.message, footer),
                 bot_id=incoming.bot_id or settings.bitrix_bot_id,
             )
             return {
@@ -136,6 +144,12 @@ class BitrixWebhookProcessor:
             user_id=incoming.user_id,
         )
         reply_text = _with_pending_confirmation_hint(result.answer, pending_action)
+        footer = await self.technical_footer.build_for_agent_result(
+            result,
+            user_id=incoming.user_id,
+            channel="bitrix24_chat",
+        )
+        reply_text = append_footer(reply_text, footer)
         reply_sent, send_error = await self._send_reply(
             incoming.dialog_id,
             reply_text,

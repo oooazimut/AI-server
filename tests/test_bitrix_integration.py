@@ -15,8 +15,9 @@ from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.events import parse_incoming_message
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService
 from ai_server.main import app
-from ai_server.models import ActionRecord, AgentResult, ToolResult
+from ai_server.models import ActionRecord, AgentResult, ModelUsageRecord, ToolResult
 from ai_server.retrieval import HybridKnowledgeRetriever
+from ai_server.technical_footer import ProviderBalanceSnapshot, TechnicalFooterService
 from ai_server.workers.bitrix.webhook_event_queue import WebhookEventQueue
 from scripts.create_bitrix_dev_chat import chat_reference, sanitize_result
 from tests.fakes import FakeEmbeddingProvider
@@ -124,6 +125,41 @@ def test_bitrix_webhook_processor_delegates_message_to_orchestrator(monkeypatch)
     assert result["handled"] is True
     assert result["reply_sent"] is False
     assert result["handoff_to"] == ["bitrix24"]
+
+
+def test_bitrix_webhook_processor_appends_admin_technical_footer(monkeypatch):
+    monkeypatch.setenv("AGENT_DRY_RUN", "false")
+    monkeypatch.setenv("AI_SERVER_TECH_FOOTER_ENABLED", "true")
+    monkeypatch.setenv("AI_SERVER_TECH_FOOTER_ALLOWED_USER_IDS", "9")
+    fake_bitrix = FakeBitrixClient()
+
+    class FakeOrchestrator:
+        async def handle(self, task):
+            return AgentResult(
+                status="completed",
+                agent_id="internal_orchestrator",
+                answer="Готово",
+                model_usage=[
+                    ModelUsageRecord(
+                        agent_id="internal_orchestrator",
+                        provider="deepseek",
+                        model="deepseek-v4-flash",
+                    )
+                ],
+                confidence=0.9,
+            )
+
+    processor = BitrixWebhookProcessor(
+        bitrix=fake_bitrix,
+        orchestrator=FakeOrchestrator(),
+        technical_footer=TechnicalFooterService(deepseek_balance=FakeDeepSeekBalance()),
+    )
+
+    result = anyio_run(processor.process(_bitrix_v2_message_payload()))
+
+    assert result["reply_sent"] is True
+    assert "Тех: LLM: internal_orchestrator deepseek deepseek-v4-flash" in fake_bitrix.messages[0][1]
+    assert "DeepSeek: доступен; баланс $12.34." in fake_bitrix.messages[0][1]
 
 
 def test_dialog_state_store_keeps_legacy_pending_action_shape(tmp_path):
@@ -475,3 +511,13 @@ class FakeBitrixTools:
 
     def portal_search_contract(self, args):
         raise AssertionError("portal search should not be called")
+
+
+class FakeDeepSeekBalance:
+    async def snapshot(self):
+        return ProviderBalanceSnapshot(
+            provider="deepseek",
+            status="ok",
+            lines=["DeepSeek: доступен; баланс $12.34."],
+            available=True,
+        )

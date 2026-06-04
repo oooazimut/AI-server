@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist
-from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask
+from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ModelUsageRecord
 from ai_server.orchestrator import suggest_agents
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import get_settings
@@ -44,6 +44,14 @@ class InternalOrchestrator:
                         },
                     )
                 ],
+                model_usage=[
+                    ModelUsageRecord(
+                        agent_id="internal_orchestrator",
+                        provider=settings.llm_provider,
+                        model=settings.llm_model,
+                        status="configured",
+                    )
+                ],
                 confidence=0.95,
             )
 
@@ -69,6 +77,7 @@ class InternalOrchestrator:
                     *specialist_result.actions_taken,
                 ],
                 actions_requiring_approval=specialist_result.actions_requiring_approval,
+                model_usage=specialist_result.model_usage,
                 handoff_to=["bitrix24"],
                 confidence=specialist_result.confidence,
                 logs=specialist_result.logs,

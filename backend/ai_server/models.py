@@ -127,6 +127,18 @@ class Artifact(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ModelUsageRecord(BaseModel):
+    agent_id: str
+    provider: str
+    model: str
+    status: str = "used"
+    role: str = ""
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cost_usd: float | None = None
+    notes: list[str] = Field(default_factory=list)
+
+
 class AgentResult(BaseModel):
     status: AgentResultStatus
     agent_id: str
@@ -134,6 +146,7 @@ class AgentResult(BaseModel):
     artifacts: list[Artifact] = Field(default_factory=list)
     actions_taken: list[ActionRecord] = Field(default_factory=list)
     actions_requiring_approval: list[ActionRecord] = Field(default_factory=list)
+    model_usage: list[ModelUsageRecord] = Field(default_factory=list)
     handoff_to: list[str] = Field(default_factory=list)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     logs: list[str] = Field(default_factory=list)

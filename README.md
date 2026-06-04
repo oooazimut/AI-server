@@ -135,6 +135,22 @@ AI_SERVER_LLM_MAX_TOKENS=3000
 AI_SERVER_ENV_FILE=C:\Users\office3pc\PyProjects\BitrixAIAgent\.env,C:\Users\office3pc\PyProjects\BitrixAIAgent\.env.webhook.local,.env.local
 ```
 
+## Technical footer
+
+Для внутренних каналов можно включить короткий технический footer только для
+админов и директора. Footer строится не от "агента вообще", а от фактических
+`model_usage` текущего ответа: какие агенты, провайдеры и модели участвовали.
+Если в ответе работали только deterministic skills/API, footer так и пишет, что
+LLM не использовалась. Клиентские каналы не должны подключать этот footer.
+
+```env
+AI_SERVER_TECH_FOOTER_ENABLED=true
+AI_SERVER_TECH_FOOTER_ALLOWED_USER_IDS=1,9
+AI_SERVER_TECH_FOOTER_BALANCE_ENABLED=true
+AI_SERVER_TECH_FOOTER_BALANCE_CACHE_SECONDS=300
+AI_SERVER_DEEPSEEK_BALANCE_BASE_URL=https://api.deepseek.com
+```
+
 ## Runtime var и cutover
 
 `var/` - локальный runtime-контур сервера. В Git хранится только каркас каталога,

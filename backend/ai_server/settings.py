@@ -35,6 +35,13 @@ class Settings:
     llm_api_key: str
     llm_temperature: float | None
     llm_max_tokens: int
+    deepseek_api_key: str
+    deepseek_balance_base_url: str
+    deepseek_balance_timeout_seconds: float
+    tech_footer_enabled: bool
+    tech_footer_allowed_user_ids: str
+    tech_footer_balance_enabled: bool
+    tech_footer_balance_cache_seconds: int
     webhook_event_queue_enabled: bool
     webhook_event_worker_enabled: bool
     webhook_event_queue_interval_seconds: int
@@ -126,6 +133,10 @@ class Settings:
         return _id_list(self.agent_limited_task_create_user_ids)
 
     @property
+    def resolved_tech_footer_allowed_user_ids(self) -> list[int]:
+        return _id_list(self.tech_footer_allowed_user_ids)
+
+    @property
     def search_index_path(self) -> Path:
         return runtime_paths(self.var_dir).search_index_db
 
@@ -187,6 +198,13 @@ def get_settings() -> Settings:
         llm_api_key=_env("AI_SERVER_LLM_API_KEY", _env("LLM_API_KEY")),
         llm_temperature=_env_float("AI_SERVER_LLM_TEMPERATURE", _env_float("LLM_TEMPERATURE")),
         llm_max_tokens=_env_int("AI_SERVER_LLM_MAX_TOKENS", _env_int("LLM_MAX_TOKENS", 3000)) or 3000,
+        deepseek_api_key=_deepseek_api_key(),
+        deepseek_balance_base_url=_env("AI_SERVER_DEEPSEEK_BALANCE_BASE_URL", "https://api.deepseek.com"),
+        deepseek_balance_timeout_seconds=_env_float("AI_SERVER_DEEPSEEK_BALANCE_TIMEOUT_SECONDS", 10.0) or 10.0,
+        tech_footer_enabled=_env_bool("AI_SERVER_TECH_FOOTER_ENABLED", True),
+        tech_footer_allowed_user_ids=_env("AI_SERVER_TECH_FOOTER_ALLOWED_USER_IDS"),
+        tech_footer_balance_enabled=_env_bool("AI_SERVER_TECH_FOOTER_BALANCE_ENABLED", True),
+        tech_footer_balance_cache_seconds=_env_int("AI_SERVER_TECH_FOOTER_BALANCE_CACHE_SECONDS", 300) or 300,
         webhook_event_queue_enabled=_env_bool("WEBHOOK_EVENT_QUEUE_ENABLED", True),
         webhook_event_worker_enabled=_env_bool("AI_SERVER_WEBHOOK_EVENT_WORKER_ENABLED", False),
         webhook_event_queue_interval_seconds=_env_int("WEBHOOK_EVENT_QUEUE_INTERVAL_SECONDS", 2) or 2,
@@ -231,6 +249,16 @@ def get_settings() -> Settings:
 
 def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
+
+
+def _deepseek_api_key() -> str:
+    explicit = _env("AI_SERVER_DEEPSEEK_API_KEY", _env("DEEPSEEK_API_KEY"))
+    if explicit:
+        return explicit
+    provider = _env("AI_SERVER_LLM_PROVIDER", _env("LLM_PROVIDER", "deepseek")).casefold()
+    if provider == "deepseek":
+        return _env("AI_SERVER_LLM_API_KEY", _env("LLM_API_KEY"))
+    return ""
 
 
 def _load_env_files() -> None:

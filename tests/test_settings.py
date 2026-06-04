@@ -68,3 +68,12 @@ def test_bitrix_oauth_bot_settings_can_be_loaded(monkeypatch, tmp_path):
     assert settings.bitrix_bot_uses_oauth is True
     assert settings.bitrix_bot_oauth_user_id == 9
     assert settings.bitrix_oauth_db_path == oauth_db
+
+
+def test_technical_footer_allowed_user_ids(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("AI_SERVER_TECH_FOOTER_ALLOWED_USER_IDS", "1,9")
+
+    settings = get_settings()
+
+    assert settings.resolved_tech_footer_allowed_user_ids == [1, 9]
