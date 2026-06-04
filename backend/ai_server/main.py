@@ -23,9 +23,8 @@ from .integrations.bitrix.portal_search import (
 from .knowledge import MarkdownKnowledgeBase
 from .models import AgentTask, AgentTestRequest, UserContext
 from .retrieval import HybridKnowledgeRetriever
-from .orchestrator import suggest_agents
 from .orchestrators.internal import InternalOrchestrator
-from .registry import get_agent_manifest, load_agent_manifests, summarize_agents
+from .registry import get_agent_manifest, load_agent_manifests
 from .runtime import ensure_runtime_dirs
 from .settings import get_settings
 from .skills import SkillStore
@@ -396,13 +395,6 @@ async def bitrix_events(
     )
     result = await processor.process(payload)
     return {"ok": True, **result}
-
-
-@app.get("/route-preview")
-def route_preview(q: str = Query(..., min_length=1)):
-    manifests = load_agent_manifests()
-    matches = suggest_agents(q, manifests)
-    return summarize_agents(matches)
 
 
 @app.post("/orchestrator/test")

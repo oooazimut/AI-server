@@ -165,6 +165,33 @@ def test_bitrix_specialist_asks_for_responsible_before_task_create():
     assert "ответственн" in result.answer
 
 
+def test_bitrix_specialist_rejects_incomplete_task_create_tool_call():
+    result = asyncio.run(
+        _bitrix_specialist(
+            llm=FakeBitrixLLM(
+                tool_calls=[
+                    BitrixLLMToolCall(
+                        name="task_create_draft",
+                        args={"title": "проверить камеру"},
+                    )
+                ],
+                final_status="failed",
+                final_answer="LLM-субагент вызвал task_create_draft с неполным контрактом.",
+            )
+        ).handle(AgentTask(task_id="t1", request="Создай задачу проверить камеру"))
+    )
+
+    assert result.status == "failed"
+    assert result.actions_requiring_approval == []
+    action = result.actions_taken[2]
+    assert action.name == "bitrix_task_create_draft"
+    assert action.status == "contract_violation"
+    assert action.details["contract_errors"] == [
+        "task_create_draft requires one of responsible_id, responsible_query, or responsible_self",
+        "task_create_draft requires deadline_iso or no_deadline=true",
+    ]
+
+
 def test_bitrix_specialist_task_create_uses_explicit_ids():
     result = asyncio.run(
         _bitrix_specialist(

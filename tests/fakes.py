@@ -12,6 +12,7 @@ from ai_server.agents.bitrix_llm import (
     BitrixLLMToolCall,
 )
 from ai_server.models import ModelUsageRecord
+from ai_server.orchestrators.internal_llm import InternalRouteDecision, InternalRouteResult
 
 
 class FakeEmbeddingProvider:
@@ -82,4 +83,37 @@ def _fake_usage() -> ModelUsageRecord:
         model="fake-bitrix-llm",
         status="used",
     )
+
+
+class FakeInternalOrchestratorLLM:
+    def __init__(
+        self,
+        *,
+        handoff_to: list[str] | None = None,
+        status: str = "completed",
+        answer: str = "",
+        confidence: float = 0.9,
+    ) -> None:
+        self.handoff_to = handoff_to or []
+        self.status = status
+        self.answer = answer
+        self.confidence = confidence
+        self.route_calls = []
+
+    async def route(self, **kwargs):
+        self.route_calls.append(kwargs)
+        return InternalRouteResult(
+            decision=InternalRouteDecision(
+                status=self.status,
+                answer=self.answer,
+                handoff_to=self.handoff_to,
+                confidence=self.confidence,
+            ),
+            model_usage=ModelUsageRecord(
+                agent_id="internal_orchestrator",
+                provider="fake",
+                model="fake-orchestrator-llm",
+                status="used",
+            ),
+        )
 

@@ -126,7 +126,7 @@ def _is_footer_allowed(*, user_id: int | None, channel: str) -> bool:
 
 def _format_model_usage(usages: list[ModelUsageRecord]) -> str:
     if not usages:
-        return "LLM: не использовалась; сработали deterministic skills/API."
+        return "LLM: не использовалась; выполнено системное действие/API."
 
     parts: list[str] = []
     for usage in usages:

@@ -13,21 +13,21 @@ class BitrixTaskCreateDraft:
     method: str = "tasks.task.add"
     params: dict[str, Any] = field(default_factory=dict)
     summary: str = ""
-    missing_fields: list[str] = field(default_factory=list)
+    contract_errors: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     responsible_query: str = ""
     project_query: str = ""
 
     @property
     def is_ready(self) -> bool:
-        return not self.missing_fields and bool(self.params.get("fields"))
+        return not self.contract_errors and bool(self.params.get("fields"))
 
     def as_action_details(self) -> dict[str, Any]:
         return {
             "method": self.method,
             "params": self.params,
             "summary": self.summary,
-            "missing_fields": self.missing_fields,
+            "contract_errors": self.contract_errors,
             "notes": self.notes,
             "responsible_query": self.responsible_query,
             "project_query": self.project_query,
@@ -52,7 +52,7 @@ def build_task_create_draft_from_args(
     resolution = resolution or BitrixTaskCreateResolution()
     args = args or {}
     title = _compact(str(args.get("title") or "")).strip(" .,:;-")
-    description = _compact(str(args.get("description") or task.request.strip()))
+    description = _compact(str(args.get("description") or ""))
     responsible_id = _optional_int(args.get("responsible_id"))
     responsible_query = _compact(str(args.get("responsible_query") or ""))
     responsible_note = ""
@@ -74,30 +74,35 @@ def build_task_create_draft_from_args(
         group_id = resolution.group_id
         group_note = resolution.group_note or f"Проект найден по запросу `{project_query}`."
 
-    deadline, deadline_note, no_deadline, invalid_deadline = _deadline_from_args(args)
+    deadline, deadline_note, no_deadline, deadline_error = _deadline_from_args(args)
 
-    missing_fields: list[str] = []
+    contract_errors: list[str] = []
     notes = [note for note in (responsible_note, group_note, deadline_note, *resolution.notes) if note]
     fields: dict[str, Any] = {}
     current_user_id = _optional_int(task.user.id)
     if title:
         fields["TITLE"] = title
-        fields["DESCRIPTION"] = description
+        if description:
+            fields["DESCRIPTION"] = description
     else:
-        missing_fields.append("title")
+        contract_errors.append("task_create_draft.title is required")
 
     if responsible_id is not None:
         fields["RESPONSIBLE_ID"] = responsible_id
     else:
-        missing_fields.append("responsible_id")
         if responsible_query:
-            notes.append(f"Ответственного нужно найти в Bitrix по запросу `{responsible_query}`.")
+            contract_errors.append("task_create_draft.responsible_query was not resolved to a unique Bitrix user")
+        elif _truthy(args.get("responsible_self")):
+            contract_errors.append("task_create_draft.responsible_self requires channel user id")
+        else:
+            contract_errors.append(
+                "task_create_draft requires one of responsible_id, responsible_query, or responsible_self"
+            )
 
     if project_query and group_id is None:
-        missing_fields.append("group_id")
-        notes.append(f"Проект нужно найти в Bitrix по запросу `{project_query}`.")
-    if invalid_deadline:
-        missing_fields.append("deadline")
+        contract_errors.append("task_create_draft.project_query was not resolved to a unique Bitrix project")
+    if deadline_error:
+        contract_errors.append(deadline_error)
 
     if current_user_id is not None:
         fields["CREATED_BY"] = current_user_id
@@ -111,24 +116,24 @@ def build_task_create_draft_from_args(
     return BitrixTaskCreateDraft(
         params={"fields": fields} if fields else {},
         summary=_summary(title=title, responsible_id=responsible_id, deadline=deadline, group_id=group_id),
-        missing_fields=_unique(missing_fields),
+        contract_errors=_unique(contract_errors),
         notes=notes,
         responsible_query=responsible_query,
         project_query=project_query,
     )
 
 
-def _deadline_from_args(args: dict[str, Any]) -> tuple[str | None, str, bool, bool]:
+def _deadline_from_args(args: dict[str, Any]) -> tuple[str | None, str, bool, str]:
     if _truthy(args.get("no_deadline")):
-        return None, "LLM распознала, что задача должна быть без срока.", True, False
+        return None, "LLM explicitly selected no_deadline.", True, ""
     raw_deadline = str(args.get("deadline") or args.get("deadline_iso") or "").strip()
     if not raw_deadline:
-        return None, "", False, False
+        return None, "", False, "task_create_draft requires deadline_iso or no_deadline=true"
     try:
         datetime.fromisoformat(raw_deadline.replace("Z", "+00:00"))
     except ValueError:
-        return None, "LLM вернула некорректный ISO-срок.", False, True
-    return raw_deadline, "Срок взят из LLM-структуры.", False, False
+        return None, "", False, "task_create_draft.deadline_iso must be ISO 8601"
+    return raw_deadline, "LLM provided deadline_iso.", False, ""
 
 
 def _summary(*, title: str, responsible_id: int | None, deadline: str | None, group_id: int | None) -> str:

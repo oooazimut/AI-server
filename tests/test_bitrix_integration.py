@@ -21,7 +21,7 @@ from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.technical_footer import ProviderBalanceSnapshot, TechnicalFooterService
 from ai_server.workers.bitrix.webhook_event_queue import WebhookEventQueue
 from scripts.create_bitrix_dev_chat import chat_reference, sanitize_result
-from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider
+from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, FakeInternalOrchestratorLLM
 
 
 def _bitrix_v2_message_payload() -> dict:
@@ -384,6 +384,7 @@ def test_bitrix_task_create_chat_flow_saves_and_confirms_pending_action(monkeypa
     processor = BitrixWebhookProcessor(
         bitrix=fake_bitrix,
         bitrix_tools=FakeBitrixTools(),
+        orchestrator_llm=FakeInternalOrchestratorLLM(handoff_to=["bitrix24"]),
         bitrix_llm=FakeBitrixLLM(
             tool_calls=[
                 BitrixLLMToolCall(

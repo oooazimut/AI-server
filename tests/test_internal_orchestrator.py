@@ -4,7 +4,7 @@ from ai_server.models import AgentTask
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.registry import load_agent_manifests
 from ai_server.retrieval import HybridKnowledgeRetriever
-from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider
+from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, FakeInternalOrchestratorLLM
 
 
 def test_internal_orchestrator_delegates_bitrix_request():
@@ -13,26 +13,29 @@ def test_internal_orchestrator_delegates_bitrix_request():
             load_agent_manifests(),
             bitrix_retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
             bitrix_llm=FakeBitrixLLM(),
+            orchestrator_llm=FakeInternalOrchestratorLLM(handoff_to=["bitrix24"]),
         ).handle(AgentTask(task_id="t1", request="Покажи задачи в Битриксе"))
     )
 
     assert result.agent_id == "internal_orchestrator"
     assert result.handoff_to == ["bitrix24"]
-    assert result.actions_taken[0].name == "delegate_to_specialist"
+    assert result.actions_taken[0].name == "orchestrator_llm_route"
+    assert result.actions_taken[1].name == "delegate_to_specialist"
 
 
 def test_internal_orchestrator_reports_configured_model(monkeypatch):
-    monkeypatch.setenv("AI_SERVER_LLM_PROVIDER", "deepseek")
-    monkeypatch.setenv("AI_SERVER_LLM_MODEL", "deepseek-v4-flash")
-    monkeypatch.setenv("AI_SERVER_LLM_API_KEY", "secret")
-
     result = asyncio.run(
-        InternalOrchestrator(load_agent_manifests()).handle(
+        InternalOrchestrator(
+            load_agent_manifests(),
+            orchestrator_llm=FakeInternalOrchestratorLLM(
+                answer="LLM-контур: provider deepseek, model deepseek-v4-flash."
+            ),
+        ).handle(
             AgentTask(task_id="t1", request="Какая ты модель?")
         )
     )
 
     assert result.agent_id == "internal_orchestrator"
     assert "deepseek-v4-flash" in result.answer
-    assert result.actions_taken[0].details["llm_configured"] is True
+    assert result.actions_taken[0].name == "orchestrator_llm_route"
 

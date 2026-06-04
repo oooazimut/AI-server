@@ -169,7 +169,9 @@ class Bitrix24Specialist:
                 "name": "task_create_draft",
                 "description": (
                     "Prepare a Bitrix task creation draft from fields already understood by the LLM. "
-                    "The backend validates fields, resolves Bitrix IDs, applies policies, and requires confirmation."
+                    "The LLM must call this only after it has checked that the contract is complete. "
+                    "The backend only rejects malformed calls, resolves explicit Bitrix lookup args, applies policy, "
+                    "and requires confirmation."
                 ),
                 "parameters": {
                     "type": "object",
@@ -185,6 +187,21 @@ class Bitrix24Specialist:
                         "no_deadline": {"type": "boolean"},
                     },
                     "required": ["title"],
+                    "allOf": [
+                        {
+                            "anyOf": [
+                                {"required": ["responsible_id"]},
+                                {"required": ["responsible_query"]},
+                                {"required": ["responsible_self"]},
+                            ]
+                        },
+                        {
+                            "anyOf": [
+                                {"required": ["deadline_iso"]},
+                                {"required": ["no_deadline"]},
+                            ]
+                        },
+                    ],
                 },
             },
         ]
@@ -243,7 +260,8 @@ class Bitrix24Specialist:
         group_note = ""
         notes: list[str] = []
 
-        if "responsible_id" in draft.missing_fields and draft.responsible_query:
+        fields = _draft_fields(draft)
+        if draft.responsible_query and "RESPONSIBLE_ID" not in fields:
             result = await self.tools.resolve_user(draft.responsible_query)
             if result.status == "ok":
                 candidate = result.data.get("candidate") if isinstance(result.data, dict) else None
@@ -257,7 +275,7 @@ class Bitrix24Specialist:
             else:
                 notes.append(f"Не смог проверить сотрудника через Bitrix: {result.status}.")
 
-        if "group_id" in draft.missing_fields and draft.project_query:
+        if draft.project_query and "GROUP_ID" not in fields:
             result = await self.tools.resolve_project(draft.project_query)
             if result.status == "ok":
                 candidate = result.data.get("candidate") if isinstance(result.data, dict) else None
@@ -331,7 +349,7 @@ def _tool_result_from_task_create_draft(draft: BitrixTaskCreateDraft) -> ToolRes
         status="ready" if draft.is_ready else "contract_violation",
         tool="task_create_draft",
         data=draft.as_action_details(),
-        error=None if draft.is_ready else "LLM called task_create_draft without enough validated fields.",
+        error=None if draft.is_ready else "LLM called task_create_draft with arguments outside the tool contract.",
     )
 
 
@@ -367,6 +385,11 @@ def _optional_int(value: object) -> int | None:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def _draft_fields(draft: BitrixTaskCreateDraft) -> dict:
+    fields = draft.params.get("fields")
+    return fields if isinstance(fields, dict) else {}
 
 
 def _unique(values: list[str]) -> list[str]:

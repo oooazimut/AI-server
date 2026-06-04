@@ -174,6 +174,7 @@ def _decision_system_prompt() -> str:
         '"confidence":0.0,'
         '"tool_calls":[{"name":"task_search|task_create_draft|portal_search|none","args":{},"summary":""}]}. '
         "Перед каждым tool_call сам проверь, хватает ли данных для его корректного вызова. "
+        "Нельзя вызывать tool с надеждой, что backend или tool сам разберётся с недостающими данными. "
         "Если данных не хватает, не вызывай tool: верни status=needs_clarification, tool_calls=[{\"name\":\"none\"}], "
         "а в answer задай короткий уточняющий вопрос. "
         "Для поиска задач используй task_search. Для создания задачи используй task_create_draft. "
@@ -181,7 +182,8 @@ def _decision_system_prompt() -> str:
         "group_id/project_query, deadline_iso или no_deadline. "
         "Если пользователь сказал относительный срок, вычисли deadline_iso сам по current_datetime. "
         "Если срок не указан, применяй правила из retrieval_context; если правило неясно, спроси уточнение. "
-        "Не вызывай task_create_draft без title и одного из responsible_id/responsible_query/responsible_self. "
+        "Не вызывай task_create_draft без title, одного из responsible_id/responsible_query/responsible_self, "
+        "и одного из deadline_iso/no_deadline=true. "
         "Для поиска документов/файлов используй portal_search. Если данных не хватает, status=needs_clarification."
     )
 
