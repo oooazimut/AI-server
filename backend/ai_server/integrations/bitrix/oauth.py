@@ -113,16 +113,17 @@ class BitrixOAuthService:
             },
             endpoint=_token_endpoint_from_server(token.server_endpoint),
         )
+        normalized = _normalize_auth(payload, fallback=token)
         refreshed = BitrixOAuthToken(
             user_id=token.user_id,
-            access_token=str(payload.get("access_token") or token.access_token),
-            refresh_token=str(payload.get("refresh_token") or token.refresh_token),
-            client_endpoint=str(payload.get("client_endpoint") or token.client_endpoint),
-            server_endpoint=str(payload.get("server_endpoint") or token.server_endpoint),
-            domain=str(payload.get("domain") or token.domain),
-            member_id=str(payload.get("member_id") or token.member_id),
-            scope=str(payload.get("scope") or token.scope),
-            expires_at=_expires_at(payload.get("expires"), payload.get("expires_in")),
+            access_token=normalized.access_token,
+            refresh_token=normalized.refresh_token,
+            client_endpoint=normalized.client_endpoint,
+            server_endpoint=normalized.server_endpoint,
+            domain=normalized.domain,
+            member_id=normalized.member_id,
+            scope=normalized.scope,
+            expires_at=normalized.expires_at,
             updated_at=datetime.now(timezone.utc),
         )
         self.save_token(refreshed, source="refresh")
@@ -237,6 +238,54 @@ def _row_to_token(row: sqlite3.Row) -> BitrixOAuthToken:
     )
 
 
+@dataclass(frozen=True)
+class _NormalizedAuth:
+    access_token: str
+    refresh_token: str
+    client_endpoint: str
+    server_endpoint: str
+    domain: str
+    member_id: str
+    scope: str
+    expires_at: datetime
+    user_id: int | None = None
+
+
+def _normalize_auth(value: dict[str, Any], *, fallback: BitrixOAuthToken | None = None) -> _NormalizedAuth:
+    access_token = str(value.get("access_token") or (fallback.access_token if fallback else "") or "")
+    refresh_token = str(value.get("refresh_token") or (fallback.refresh_token if fallback else "") or "")
+    domain = _domain(str(value.get("domain") or (fallback.domain if fallback else "") or get_settings().bitrix_domain))
+    client_endpoint = str(value.get("client_endpoint") or (fallback.client_endpoint if fallback else "") or "")
+    if not client_endpoint and domain:
+        client_endpoint = f"https://{domain}/rest/"
+    server_endpoint = str(
+        value.get("server_endpoint")
+        or (fallback.server_endpoint if fallback else "")
+        or "https://oauth.bitrix.info/rest/"
+    )
+    member_id = str(value.get("member_id") or (fallback.member_id if fallback else "") or "")
+    scope = str(value.get("scope") or (fallback.scope if fallback else "") or "")
+    user_id = _optional_int(value.get("user_id") or value.get("USER_ID") or value.get("member_user_id"))
+
+    expires_in = _optional_int(value.get("expires_in") or value.get("expires") or value.get("AUTH_EXPIRES"))
+    if expires_in is None and fallback is not None:
+        expires_at = fallback.expires_at
+    else:
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(60, expires_in or 3600))
+
+    return _NormalizedAuth(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        client_endpoint=client_endpoint.rstrip("/") + "/" if client_endpoint else "",
+        server_endpoint=server_endpoint,
+        domain=domain,
+        member_id=member_id,
+        scope=scope,
+        expires_at=expires_at,
+        user_id=user_id,
+    )
+
+
 def _parse_datetime(value: str) -> datetime:
     normalized = value.replace("Z", "+00:00")
     parsed = datetime.fromisoformat(normalized)
@@ -259,10 +308,29 @@ def _expires_at(expires: Any, expires_in: Any) -> datetime:
 
 
 def _token_endpoint_from_server(server_endpoint: str) -> str:
+    settings = get_settings()
+    if settings.bitrix_oauth_token_endpoint:
+        return settings.bitrix_oauth_token_endpoint
     endpoint = server_endpoint.strip()
     if endpoint.endswith("/oauth/token/") or endpoint.endswith("/oauth/token"):
         return endpoint
+    endpoint = endpoint.rstrip("/")
+    if endpoint.endswith("/rest"):
+        endpoint = endpoint[:-5]
     return endpoint.rstrip("/") + "/oauth/token/"
+
+
+def _domain(value: str) -> str:
+    return value.strip().removeprefix("https://").removeprefix("http://").rstrip("/")
+
+
+def _optional_int(value: object) -> int | None:
+    try:
+        if value in (None, ""):
+            return None
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def _response_json(response: httpx.Response) -> dict[str, Any]:

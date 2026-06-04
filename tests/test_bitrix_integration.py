@@ -13,7 +13,7 @@ from ai_server.integrations.bitrix.dialog_state import (
 )
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.events import parse_incoming_message
-from ai_server.integrations.bitrix.oauth import BitrixOAuthService
+from ai_server.integrations.bitrix.oauth import BitrixOAuthService, _token_endpoint_from_server
 from ai_server.main import app
 from ai_server.models import ActionRecord, AgentResult, ModelUsageRecord, ToolResult
 from ai_server.retrieval import HybridKnowledgeRetriever
@@ -458,6 +458,16 @@ def test_bitrix_oauth_service_reads_migrated_sqlite(tmp_path):
     assert token is not None
     assert token.user_id == 9
     assert token.access_token == "access"
+
+
+def test_bitrix_oauth_token_endpoint_handles_rest_server_endpoint(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_OAUTH_TOKEN_ENDPOINT", "")
+
+    assert (
+        _token_endpoint_from_server("https://oauth.bitrix.info/rest/")
+        == "https://oauth.bitrix.info/oauth/token/"
+    )
 
 
 def anyio_run(awaitable):
