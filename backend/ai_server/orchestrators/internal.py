@@ -4,6 +4,7 @@ from ai_server.agents.bitrix24 import Bitrix24Specialist
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask
 from ai_server.orchestrator import suggest_agents
 from ai_server.retrieval import HybridKnowledgeRetriever
+from ai_server.settings import get_settings
 from ai_server.tools.bitrix import BitrixToolset
 
 
@@ -20,6 +21,32 @@ class InternalOrchestrator:
         self.bitrix_tools = bitrix_tools
 
     async def handle(self, task: AgentTask) -> AgentResult:
+        if _looks_like_model_question(task.request):
+            settings = get_settings()
+            configured = "подключён" if settings.llm_configured else "пока не подключён ключом"
+            return AgentResult(
+                status="completed",
+                agent_id="internal_orchestrator",
+                answer=(
+                    "Я новый внутренний оркестратор AI-server. "
+                    f"LLM-контур в конфиге: provider `{settings.llm_provider}`, "
+                    f"model `{settings.llm_model}`; gateway {configured}. "
+                    "Bitrix24-сценарии MVP сейчас частично выполняются детерминированными skills."
+                ),
+                actions_taken=[
+                    ActionRecord(
+                        name="report_runtime_model",
+                        status="completed",
+                        details={
+                            "llm_provider": settings.llm_provider,
+                            "llm_model": settings.llm_model,
+                            "llm_configured": settings.llm_configured,
+                        },
+                    )
+                ],
+                confidence=0.95,
+            )
+
         matches = [agent for agent in suggest_agents(task.request, self.manifests) if agent.kind == "specialist"]
         bitrix = next((agent for agent in matches if agent.id == "bitrix24"), None)
         if bitrix is not None:
@@ -63,3 +90,19 @@ class InternalOrchestrator:
             ],
             confidence=0.35,
         )
+
+
+def _looks_like_model_question(text: str) -> bool:
+    normalized = text.casefold()
+    model_markers = (
+        "какая модель",
+        "какая ты модель",
+        "что за модель",
+        "на какой модели",
+        "какой llm",
+        "какая llm",
+        "модель под капотом",
+        "deepseek",
+        "дипсик",
+    )
+    return any(marker in normalized for marker in model_markers)

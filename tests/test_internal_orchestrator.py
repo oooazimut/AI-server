@@ -19,3 +19,19 @@ def test_internal_orchestrator_delegates_bitrix_request():
     assert result.handoff_to == ["bitrix24"]
     assert result.actions_taken[0].name == "delegate_to_specialist"
 
+
+def test_internal_orchestrator_reports_configured_model(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_LLM_PROVIDER", "deepseek")
+    monkeypatch.setenv("AI_SERVER_LLM_MODEL", "deepseek-v4-flash")
+    monkeypatch.setenv("AI_SERVER_LLM_API_KEY", "secret")
+
+    result = asyncio.run(
+        InternalOrchestrator(load_agent_manifests()).handle(
+            AgentTask(task_id="t1", request="Какая ты модель?")
+        )
+    )
+
+    assert result.agent_id == "internal_orchestrator"
+    assert "deepseek-v4-flash" in result.answer
+    assert result.actions_taken[0].details["llm_configured"] is True
+
