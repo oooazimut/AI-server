@@ -7,6 +7,11 @@ from ai_server.agents.bitrix_task_create import (
     format_task_create_clarification,
     looks_like_task_create_request,
 )
+from ai_server.agents.bitrix_task_search import (
+    build_task_search_draft,
+    format_task_search_answer,
+    looks_like_task_search_request,
+)
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask
 from ai_server.retrieval import HybridKnowledgeRetriever
@@ -71,6 +76,16 @@ class Bitrix24Specialist:
                 )
             )
 
+        task_search_result = await self._task_search_result(task, text, task_create_draft=task_create_draft)
+        if task_search_result is not None:
+            actions_taken.append(
+                ActionRecord(
+                    name="bitrix_task_search",
+                    status=task_search_result.status,
+                    details=task_search_result.model_dump(),
+                )
+            )
+
         approval_actions = self._approval_actions(text, task_create_draft=task_create_draft)
         status = _result_status(task_create_draft=task_create_draft, approval_actions=approval_actions)
         answer = self._answer(
@@ -80,6 +95,7 @@ class Bitrix24Specialist:
             bool(approval_actions),
             portal_search_action=portal_search_action,
             task_create_draft=task_create_draft,
+            task_search_result=task_search_result,
         )
 
         return AgentResult(
@@ -154,6 +170,18 @@ class Bitrix24Specialist:
             group_note=group_note,
             notes=notes,
         )
+
+    async def _task_search_result(
+        self,
+        task: AgentTask,
+        text: str,
+        *,
+        task_create_draft: BitrixTaskCreateDraft | None,
+    ):
+        if task_create_draft is not None or not looks_like_task_search_request(text):
+            return None
+        draft = build_task_search_draft(task)
+        return await self.tools.task_search(draft.args)
 
     def _select_skills(self, text: str) -> list[str]:
         selected: list[str] = []
@@ -250,6 +278,7 @@ class Bitrix24Specialist:
         *,
         portal_search_action: ActionRecord | None = None,
         task_create_draft: BitrixTaskCreateDraft | None = None,
+        task_search_result=None,
     ) -> str:
         if not selected_skills:
             return (
@@ -259,6 +288,8 @@ class Bitrix24Specialist:
 
         if task_create_draft is not None and not task_create_draft.is_ready:
             return format_task_create_clarification(task_create_draft)
+        if task_search_result is not None:
+            return format_task_search_answer(task_search_result)
 
         parts = ["Битрикс24-специалист принял задачу."]
         parts.append("Подходящие skills: " + ", ".join(selected_skills) + ".")
