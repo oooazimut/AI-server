@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -216,7 +217,7 @@ class BitrixPendingActionService:
                 action=action,
             )
 
-        params = apply_write_policy(action.method, dict(action.params), user_id)
+        params = apply_write_policy(action.method, deepcopy(action.params), user_id)
         write_client = await self._write_client(user_id, action=action, key=key)
         if isinstance(write_client, PendingActionResult):
             return write_client
@@ -377,7 +378,7 @@ def apply_write_policy(method: str, params: dict[str, Any], user_id: int | None)
     if not isinstance(fields, dict):
         return params
     if no_deadline_requested(fields):
-        strip_no_deadline_markers(fields)
+        prepare_no_deadline_fields(fields)
     allowed_project_id = settings.agent_limited_task_create_project_id
     if allowed_project_id is None or user_id not in settings.resolved_agent_limited_task_create_user_ids:
         return params
@@ -421,10 +422,11 @@ def no_deadline_requested(fields: dict[str, Any]) -> bool:
     return False
 
 
-def strip_no_deadline_markers(fields: dict[str, Any]) -> None:
+def prepare_no_deadline_fields(fields: dict[str, Any]) -> None:
     for key in list(fields):
         if key in NO_DEADLINE_FIELD_NAMES or key.lower() == "deadline":
             fields.pop(key, None)
+    fields["DEADLINE"] = ""
 
 
 def _truthy(value: object) -> bool:

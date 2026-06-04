@@ -313,7 +313,7 @@ def test_bitrix_pending_action_cancel_clears_state_without_call(monkeypatch, tmp
     assert '"status": "cancelled"' in (tmp_path / "bitrix_write_audit.jsonl").read_text(encoding="utf-8")
 
 
-def test_task_add_write_policy_strips_internal_no_deadline_markers(monkeypatch):
+def test_task_add_write_policy_translates_internal_no_deadline_marker(monkeypatch):
     monkeypatch.delenv("AGENT_LIMITED_TASK_CREATE_PROJECT_ID", raising=False)
     params = {
         "fields": {
@@ -326,7 +326,7 @@ def test_task_add_write_policy_strips_internal_no_deadline_markers(monkeypatch):
 
     result = apply_write_policy("tasks.task.add", params, user_id=9)
 
-    assert result["fields"] == {"TITLE": "Тестовая задача", "RESPONSIBLE_ID": 9}
+    assert result["fields"] == {"TITLE": "Тестовая задача", "RESPONSIBLE_ID": 9, "DEADLINE": ""}
 
 
 def test_bitrix_client_create_bot_chat_builds_v2_payload(monkeypatch):

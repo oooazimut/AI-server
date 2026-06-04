@@ -64,7 +64,8 @@ cd C:\Users\office3pc\PyProjects\AI-server
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
-uvicorn backend.ai_server.main:app --reload
+$env:AI_SERVER_ENV_FILE="C:\Users\office3pc\PyProjects\BitrixAIAgent\.env,C:\Users\office3pc\PyProjects\BitrixAIAgent\.env.webhook.local,.env.local"
+uvicorn --app-dir backend ai_server.main:app --reload
 ```
 
 Проверка:
