@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 from uuid import uuid4
 
+from ai_server.attachments import AttachmentService, StoredAttachment
 from ai_server.integrations.bitrix.dialog_state import (
     BitrixPendingActionService,
     DialogStateStore,
@@ -25,6 +26,7 @@ from ai_server.settings import get_settings
 from ai_server.technical_footer import TechnicalFooterService, append_footer
 from ai_server.tools.bitrix import BitrixToolset
 from ai_server.tools.document_access import DocumentToolset
+from ai_server.transcription import TranscriptionResult, build_transcriber
 from ai_server.workers.bitrix.search_webhook_indexer import (
     prepare_search_webhook_job,
     process_search_webhook_job,
@@ -49,6 +51,8 @@ class BitrixWebhookProcessor:
         pending_control_llm: PendingControlLLM | None = None,
         orchestrator_llm: InternalOrchestratorLLM | None = None,
         technical_footer: TechnicalFooterService | None = None,
+        attachment_service: AttachmentService | None = None,
+        transcriber: Any | None = None,
     ) -> None:
         settings = get_settings()
         self.bitrix = bitrix or BitrixClient()
@@ -63,6 +67,8 @@ class BitrixWebhookProcessor:
         self.pending_control_llm = pending_control_llm or PendingControlLLMService()
         self.orchestrator_llm = orchestrator_llm
         self.technical_footer = technical_footer or TechnicalFooterService()
+        self.attachment_service = attachment_service or AttachmentService(self.bitrix)
+        self.transcriber = transcriber or build_transcriber()
         self.pending_actions = pending_actions or BitrixPendingActionService(
             store=DialogStateStore(settings.dialog_state_path),
             bitrix=self.bitrix,
@@ -98,6 +104,9 @@ class BitrixWebhookProcessor:
             }
 
         incoming = parse_incoming_message(payload)
+        attachment_context = await self._prepare_attachments(incoming)
+        if attachment_context["transcription_text"]:
+            incoming = incoming.model_copy(update={"text": _merge_text_and_transcription(incoming.text, attachment_context["transcription_text"])})
         settings = get_settings()
         dialog_key = make_dialog_key(
             chat_id=incoming.chat_id,
@@ -163,8 +172,15 @@ class BitrixWebhookProcessor:
                     },
                 ),
                 request=incoming.text,
-                files=[file.model_dump() for file in incoming.files],
-                context={"bitrix_event_type": incoming.event_type},
+                files=[
+                    *[file.model_dump() for file in incoming.files],
+                    *attachment_context["stored_files"],
+                ],
+                context={
+                    "bitrix_event_type": incoming.event_type,
+                    "transcriptions": attachment_context["transcriptions"],
+                    "attachment_errors": attachment_context["errors"],
+                },
             )
         )
 
@@ -197,6 +213,37 @@ class BitrixWebhookProcessor:
             "approval_actions": [action.model_dump() for action in result.actions_requiring_approval],
             "pending_action_saved": pending_action is not None,
             "dialog_key": dialog_key,
+            "transcriptions": attachment_context["transcriptions"],
+            "attachment_errors": attachment_context["errors"],
+        }
+
+    async def _prepare_attachments(self, incoming) -> dict[str, Any]:
+        if not incoming.files:
+            return {"stored_files": [], "transcriptions": [], "transcription_text": "", "errors": []}
+
+        errors: list[str] = []
+        stored_files: list[StoredAttachment] = []
+        transcriptions: list[TranscriptionResult] = []
+        try:
+            stored_files = await self.attachment_service.download_message_files(incoming)
+        except Exception as exc:
+            errors.append(f"download:{type(exc).__name__}: {exc}")
+            return {"stored_files": [], "transcriptions": [], "transcription_text": "", "errors": errors}
+
+        for attachment in stored_files:
+            if not attachment.is_audio:
+                continue
+            try:
+                transcriptions.append(await self.transcriber.transcribe(attachment))
+            except Exception as exc:
+                errors.append(f"transcribe:{attachment.file_id}:{type(exc).__name__}: {exc}")
+
+        transcription_text = "\n\n".join(item.text for item in transcriptions if item.text)
+        return {
+            "stored_files": [item.model_dump() for item in stored_files],
+            "transcriptions": [item.model_dump() for item in transcriptions],
+            "transcription_text": transcription_text,
+            "errors": errors,
         }
 
     async def _maybe_handle_pending_control(
@@ -375,3 +422,11 @@ def _record_quality_actor_error(status: dict[str, Any], error: dict[str, Any]) -
     status["last_error"] = error.get("message") or error.get("reason")
     status["last_reason"] = error.get("reason")
     status["errors"] = int(status.get("errors") or 0) + 1
+
+
+def _merge_text_and_transcription(text: str, transcription: str) -> str:
+    cleaned_text = text.strip()
+    cleaned_transcription = transcription.strip()
+    if cleaned_text and cleaned_transcription:
+        return f"{cleaned_text}\n\nРасшифровка голосового сообщения:\n{cleaned_transcription}"
+    return cleaned_transcription or cleaned_text

@@ -108,6 +108,17 @@ class Settings:
     vehicle_usage_dialog_id: str
     vehicle_usage_staff_roster: str
     vehicle_usage_dry_run: bool
+    attachment_max_bytes: int
+    stt_provider: str
+    transcription_max_bytes: int
+    yandex_api_key: str
+    yandex_iam_token: str
+    yandex_folder_id: str
+    yandex_speechkit_base_url: str
+    yandex_speechkit_lang: str
+    yandex_speechkit_max_bytes: int
+    yandex_speechkit_convert_to_ogg: bool
+    ffmpeg_path: str
     agent_write_allowed_user_ids: str
     agent_limited_task_create_project_id: int | None
     agent_limited_task_create_user_ids: str
@@ -169,6 +180,16 @@ class Settings:
     @property
     def vehicle_usage_db_path(self) -> Path:
         return runtime_paths(self.var_dir).vehicle_usage_db
+
+    @property
+    def attachment_storage_dir(self) -> Path:
+        return runtime_paths(self.var_dir).attachments_dir
+
+    @property
+    def transcription_configured(self) -> bool:
+        return self.stt_provider == "yandex_speechkit" and bool(
+            self.yandex_api_key or (self.yandex_iam_token and self.yandex_folder_id)
+        )
 
     @property
     def resolved_supervisor_admin_user_ids(self) -> list[int]:
@@ -345,6 +366,17 @@ def get_settings() -> Settings:
         vehicle_usage_dialog_id=_env("VEHICLE_USAGE_DIALOG_ID"),
         vehicle_usage_staff_roster=_env("VEHICLE_USAGE_STAFF_ROSTER"),
         vehicle_usage_dry_run=_env_bool("VEHICLE_USAGE_DRY_RUN", True),
+        attachment_max_bytes=_env_int("ATTACHMENT_MAX_BYTES", 30 * 1024 * 1024) or (30 * 1024 * 1024),
+        stt_provider=_env("STT_PROVIDER", "yandex_speechkit"),
+        transcription_max_bytes=_env_int("TRANSCRIPTION_MAX_BYTES", 25 * 1024 * 1024) or (25 * 1024 * 1024),
+        yandex_api_key=_env("YANDEX_API_KEY"),
+        yandex_iam_token=_env("YANDEX_IAM_TOKEN"),
+        yandex_folder_id=_env("YANDEX_FOLDER_ID"),
+        yandex_speechkit_base_url=_env("YANDEX_SPEECHKIT_BASE_URL", "https://stt.api.cloud.yandex.net"),
+        yandex_speechkit_lang=_env("YANDEX_SPEECHKIT_LANG", "ru-RU"),
+        yandex_speechkit_max_bytes=_env_int("YANDEX_SPEECHKIT_MAX_BYTES", 1024 * 1024) or (1024 * 1024),
+        yandex_speechkit_convert_to_ogg=_env_bool("YANDEX_SPEECHKIT_CONVERT_TO_OGG", True),
+        ffmpeg_path=_env("FFMPEG_PATH", "ffmpeg"),
         agent_write_allowed_user_ids=_env("AGENT_WRITE_ALLOWED_USER_IDS"),
         agent_limited_task_create_project_id=_env_int("AGENT_LIMITED_TASK_CREATE_PROJECT_ID"),
         agent_limited_task_create_user_ids=_env("AGENT_LIMITED_TASK_CREATE_USER_IDS"),

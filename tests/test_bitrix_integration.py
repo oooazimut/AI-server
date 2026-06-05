@@ -4,6 +4,7 @@ import sqlite3
 from fastapi.testclient import TestClient
 
 from ai_server.agents.bitrix_llm import BitrixLLMToolCall
+from ai_server.attachments import StoredAttachment
 from ai_server.channels.bitrix import BitrixWebhookProcessor
 from ai_server.integrations.bitrix.dialog_state import (
     BitrixPendingActionService,
@@ -19,6 +20,7 @@ from ai_server.main import app
 from ai_server.models import ActionRecord, AgentResult, ModelUsageRecord, ToolResult
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.technical_footer import ProviderBalanceSnapshot, TechnicalFooterService
+from ai_server.transcription import TranscriptionResult
 from ai_server.workers.bitrix.webhook_event_queue import WebhookEventQueue
 from scripts.create_bitrix_dev_chat import chat_reference, sanitize_result
 from tests.fakes import (
@@ -132,6 +134,65 @@ def test_bitrix_webhook_processor_delegates_message_to_orchestrator(monkeypatch)
     assert result["handled"] is True
     assert result["reply_sent"] is False
     assert result["handoff_to"] == ["bitrix24"]
+
+
+def test_bitrix_webhook_processor_transcribes_voice_before_orchestrator(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_DRY_RUN", "true")
+    audio = StoredAttachment(
+        file_id=501,
+        name="voice.ogg",
+        content_type="audio/ogg",
+        size=4,
+        path=str(tmp_path / "voice.ogg"),
+        is_audio=True,
+    )
+
+    class FakeAttachmentService:
+        async def download_message_files(self, message):
+            assert message.files[0].id == 501
+            return [audio]
+
+    class FakeTranscriber:
+        async def transcribe(self, attachment):
+            assert attachment.file_id == 501
+            return TranscriptionResult(
+                text="Создай задачу по камере",
+                model="fake_stt",
+                attachment=attachment,
+                raw={"ok": True},
+            )
+
+    class FakeOrchestrator:
+        async def handle(self, task):
+            assert task.request == "Создай задачу по камере"
+            assert task.files[0]["id"] == 501
+            assert task.files[1]["file_id"] == 501
+            assert task.context["transcriptions"][0]["text"] == "Создай задачу по камере"
+            return AgentResult(
+                status="completed",
+                agent_id="internal_orchestrator",
+                answer="Готово",
+                confidence=0.9,
+                handoff_to=["bitrix24"],
+            )
+
+    payload = _bitrix_v2_message_payload()
+    payload["data"]["message"] = {
+        "id": 123,
+        "authorId": 9,
+        "text": "",
+        "files": [{"id": 501, "name": "voice.ogg", "type": "voice"}],
+    }
+    processor = BitrixWebhookProcessor(
+        orchestrator=FakeOrchestrator(),
+        attachment_service=FakeAttachmentService(),
+        transcriber=FakeTranscriber(),
+    )
+
+    result = anyio_run(processor.process(payload))
+
+    assert result["handled"] is True
+    assert result["transcriptions"][0]["text"] == "Создай задачу по камере"
 
 
 def test_bitrix_webhook_processor_appends_admin_technical_footer(monkeypatch):

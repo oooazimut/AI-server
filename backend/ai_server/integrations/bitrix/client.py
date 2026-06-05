@@ -163,6 +163,47 @@ class BitrixClient:
             payload["fields"]["keyboard"] = keyboard
         return await self.result("imbot.v2.Chat.Message.send", payload)
 
+    async def get_bot_file_download_url(
+        self,
+        file_id: int,
+        *,
+        bot_id: int | None = None,
+    ) -> str:
+        settings = get_settings()
+        if settings.bitrix_bot_uses_oauth and not self.access_token:
+            client = await _oauth_bot_client()
+            return await client.get_bot_file_download_url(file_id, bot_id=bot_id)
+
+        resolved_bot_id = bot_id or settings.bitrix_bot_id
+        if not resolved_bot_id:
+            raise BitrixConfigError("Bot id is required: pass bot_id or set BITRIX_BOT_ID")
+
+        payload: dict[str, Any] = {
+            "botId": resolved_bot_id,
+            "fileId": file_id,
+        }
+        if not self.access_token:
+            if not settings.bitrix_bot_token:
+                raise BitrixConfigError("Bot token is required in webhook auth mode: set BITRIX_BOT_TOKEN")
+            payload["botToken"] = settings.bitrix_bot_token
+        result = await self.result("imbot.v2.File.download", payload)
+        if not isinstance(result, dict) or not result.get("downloadUrl"):
+            raise BitrixApiError("imbot.v2.File.download", "EMPTY_DOWNLOAD_URL")
+        return str(result["downloadUrl"])
+
+    async def get_chat_file_download_url(
+        self,
+        file_id: int,
+        *,
+        dialog_id: str,
+    ) -> str:
+        if not dialog_id:
+            raise BitrixConfigError("dialog_id is required to download a chat file")
+        result = await self.result("im.v2.File.download", {"dialogId": dialog_id, "fileId": file_id})
+        if not isinstance(result, dict) or not result.get("downloadUrl"):
+            raise BitrixApiError("im.v2.File.download", "EMPTY_DOWNLOAD_URL")
+        return str(result["downloadUrl"])
+
     async def create_bot_chat(
         self,
         *,
