@@ -109,6 +109,7 @@ class BitrixWebhookProcessor:
                 user_id=incoming.user_id,
                 channel="bitrix24_chat",
                 status=direct_result.status,
+                model_usage=direct_result.data.get("model_usage"),
             )
             reply_sent, send_error = await self._send_reply(
                 incoming.dialog_id,

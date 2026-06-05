@@ -103,10 +103,21 @@ class TechnicalFooterService:
         user_id: int | None,
         channel: str,
         status: str,
+        model_usage: Any | None = None,
     ) -> str:
         if not _is_footer_allowed(user_id=user_id, channel=channel):
             return ""
-        return f"LLM: не использовалась; Bitrix action: {status}."
+        usages = _coerce_model_usage_list(model_usage)
+        if not usages:
+            return f"LLM: не использовалась; Bitrix action: {status}."
+
+        lines = [_format_model_usage(usages), f"Bitrix action: {status}."]
+        providers = {usage.provider.casefold() for usage in usages if usage.provider}
+        settings = get_settings()
+        if settings.tech_footer_balance_enabled and "deepseek" in providers:
+            balance = await self.deepseek_balance.snapshot()
+            lines.extend(balance.lines)
+        return "\n".join(line for line in lines if line)
 
 
 def append_footer(message: str, footer: str) -> str:
@@ -139,6 +150,23 @@ def _format_model_usage(usages: list[ModelUsageRecord]) -> str:
             label += f" cost ${usage.cost_usd:.4f}"
         parts.append(label)
     return "LLM: " + "; ".join(parts) + "."
+
+
+def _coerce_model_usage_list(value: Any) -> list[ModelUsageRecord]:
+    if value is None:
+        return []
+    raw_items = value if isinstance(value, list) else [value]
+    usages: list[ModelUsageRecord] = []
+    for item in raw_items:
+        if isinstance(item, ModelUsageRecord):
+            usages.append(item)
+            continue
+        if isinstance(item, dict):
+            try:
+                usages.append(ModelUsageRecord.model_validate(item))
+            except Exception:
+                continue
+    return usages
 
 
 def _format_deepseek_balance(payload: Any) -> list[str]:

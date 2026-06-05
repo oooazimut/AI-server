@@ -147,11 +147,13 @@ class BitrixPendingActionService:
         store: DialogStateStore | None = None,
         bitrix: BitrixClient | None = None,
         bitrix_oauth: BitrixOAuthService | None = None,
+        task_closure_llm: object | None = None,
         audit_log_path: Path | str | None = None,
     ) -> None:
         self.store = store or DialogStateStore()
         self.bitrix = bitrix or BitrixClient()
         self.bitrix_oauth = bitrix_oauth
+        self.task_closure_llm = task_closure_llm
         self.audit_log_path = (
             Path(audit_log_path)
             if audit_log_path is not None
@@ -303,6 +305,7 @@ class BitrixPendingActionService:
             write_client,
             PortalSearchIndex(),
             actor_bitrix=actor_client,
+            llm=self.task_closure_llm,
         )
         try:
             data = await service.execute(action.params, current_user_id=user_id)

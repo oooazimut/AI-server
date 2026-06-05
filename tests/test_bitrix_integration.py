@@ -21,7 +21,13 @@ from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.technical_footer import ProviderBalanceSnapshot, TechnicalFooterService
 from ai_server.workers.bitrix.webhook_event_queue import WebhookEventQueue
 from scripts.create_bitrix_dev_chat import chat_reference, sanitize_result
-from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, FakeInternalOrchestratorLLM, FakePendingControlLLM
+from tests.fakes import (
+    FakeBitrixLLM,
+    FakeEmbeddingProvider,
+    FakeInternalOrchestratorLLM,
+    FakePendingControlLLM,
+    FakeTaskClosureLLM,
+)
 
 
 def _bitrix_v2_message_payload() -> dict:
@@ -512,7 +518,7 @@ def test_bitrix_task_create_chat_flow_saves_and_confirms_pending_action(monkeypa
     assert store.load(key).pending_action is None
 
 
-def test_bitrix_task_closure_pending_confirm_executes_compound_action(monkeypatch, tmp_path):
+def test_bitrix_task_closure_pending_confirm_executes_llm_tool_steps(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     monkeypatch.setenv("AGENT_DRY_RUN", "false")
     monkeypatch.setenv("BITRIX_OAUTH_REQUIRED_FOR_WRITES", "false")
@@ -538,6 +544,29 @@ def test_bitrix_task_closure_pending_confirm_executes_compound_action(monkeypatc
         pending_actions=BitrixPendingActionService(
             store=store,
             bitrix=fake_bitrix,
+            task_closure_llm=FakeTaskClosureLLM(
+                decisions=[
+                    {
+                        "status": "continue",
+                        "answer": "Читаю задачу перед записью.",
+                        "tool_calls": [
+                            {"name": "bitrix_task_get", "args": {"task_id": 8413}},
+                        ],
+                    },
+                    {
+                        "status": "completed",
+                        "outcome": "closed",
+                        "answer": "Готово, закрыл задачу #8413.",
+                        "tool_calls": [
+                            {
+                                "name": "bitrix_task_result_add",
+                                "args": {"task_id": 8413, "use_pending_result_text": True},
+                            },
+                            {"name": "bitrix_task_complete", "args": {"task_id": 8413}},
+                        ],
+                    },
+                ]
+            ),
             audit_log_path=tmp_path / "bitrix_write_audit.jsonl",
         ),
     )

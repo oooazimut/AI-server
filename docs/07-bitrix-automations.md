@@ -131,7 +131,8 @@ uv run python scripts/import_bitrix_var.py --profile cutover --execute
   dry-run/policy/OAuth-actor перед approve/disapprove/renew/comment/notify;
 - `backend/ai_server/agents/bitrix_task_closure.py` - чатовый tool закрытия
   задачи: LLM Битрикс-субагент готовит `task_id`/`task_query` и `result_text`,
-  пользователь подтверждает, затем tool применяет quality review и Bitrix REST;
+  пользователь подтверждает, затем Битрикс-специалист в режиме `task_closure`
+  сам выбирает read/write tools; backend исполняет tools и применяет guardrails;
 - `POST /bitrix/events` - endpoint приёма webhook-событий;
 - `GET /bitrix/status`, `GET /bitrix/webhook-events/status`,
   `GET /bitrix/search/status` и `GET /bitrix/search` - runtime status/search;

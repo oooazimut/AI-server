@@ -11,6 +11,7 @@ from ai_server.agents.bitrix_llm import (
     BitrixLLMFinalResult,
     BitrixLLMToolCall,
 )
+from ai_server.agents.bitrix_task_closure import TaskClosureDecision, TaskClosureToolCall
 from ai_server.agents.pending_control_llm import PendingControlDecision, PendingControlResult
 from ai_server.models import ModelUsageRecord
 from ai_server.orchestrators.internal_llm import InternalRouteDecision, InternalRouteResult
@@ -102,6 +103,49 @@ class FakePendingControlLLM:
                 reasoning=self.reasoning,
             ),
             model_usage=_fake_usage(agent_id="bitrix24_pending_control"),
+        )
+
+
+class FakeTaskClosureLLM:
+    def __init__(self, decisions: list[TaskClosureDecision | dict] | None = None) -> None:
+        self.decisions = decisions or [
+            TaskClosureDecision(
+                status="completed",
+                answer="Готово.",
+                tool_calls=[TaskClosureToolCall(name="none")],
+                model_usage=_fake_usage(agent_id="bitrix24"),
+            )
+        ]
+        self.decide_calls = []
+        self._index = 0
+
+    async def decide(self, **kwargs):
+        self.decide_calls.append(kwargs)
+        index = min(self._index, len(self.decisions) - 1)
+        self._index += 1
+        decision = self.decisions[index]
+        if isinstance(decision, TaskClosureDecision):
+            if decision.model_usage is not None:
+                return decision
+            return TaskClosureDecision(
+                status=decision.status,
+                answer=decision.answer,
+                tool_calls=decision.tool_calls,
+                confidence=decision.confidence,
+                raw=decision.raw,
+                model_usage=_fake_usage(agent_id="bitrix24"),
+            )
+        tool_calls = [
+            call if isinstance(call, TaskClosureToolCall) else TaskClosureToolCall(**call)
+            for call in decision.get("tool_calls", [{"name": "none"}])
+        ]
+        return TaskClosureDecision(
+            status=str(decision.get("status") or "completed"),
+            answer=str(decision.get("answer") or ""),
+            tool_calls=tool_calls,
+            confidence=float(decision.get("confidence") or 0.9),
+            raw=decision,
+            model_usage=_fake_usage(agent_id="bitrix24"),
         )
 
 

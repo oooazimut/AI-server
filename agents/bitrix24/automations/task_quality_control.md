@@ -38,4 +38,4 @@ state. Автоматические write-действия требуют слу
 
 Закрытие задачи по просьбе человека из чата проходит не через этот worker, а
 через цепочку `оркестратор -> LLM Bitrix24 -> task_closure -> pending
-confirmation -> Bitrix REST`.
+confirmation -> LLM Bitrix24 task_closure skill -> Bitrix tools`.
