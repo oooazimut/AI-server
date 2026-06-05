@@ -273,10 +273,13 @@ SEARCH_CONTENT_ALLOWED_EXTENSIONS=.txt,.csv,.doc,.docx,.xlsx,.xls,.pdf
 
 ## Bitrix quality control
 
-Webhook-контроль качества закрытия задач перенесён в новый worker-контур. Он
-слушает `onTaskUpdate` через общую очередь `/bitrix/events`, читает задачу и
-последний результат, отдаёт смысловую проверку LLM-проверяющему и только после
-этого применяет dry-run/policy/OAuth-actor и Bitrix REST действия.
+Webhook-контроль качества закрытия задач перенесён в новый LLM-driven
+worker-контур. Transport-часть слушает `onTaskUpdate` через общую очередь
+`/bitrix/events` и передаёт LLM quality-control агенту только событие и ID
+задачи. Дальше уже модель выбирает tools: читает карточку задачи через
+`bitrix_task_get`, читает результаты через `bitrix_task_results_list`, принимает
+решение и вызывает `quality_control_action`. Backend-tools выполняют REST,
+dedupe, dry-run, policy/OAuth-actor и state.
 
 ```env
 QUALITY_CONTROL_WEBHOOK_ENABLED=true
@@ -304,7 +307,7 @@ tool.
 После подтверждения `да` pending `ai_server.task_closure`:
 
 - проверяет права пользователя и ограничение проекта;
-- отдаёт результат LLM-проверяющему качества;
+- проверяет результат через LLM quality reviewer;
 - если результат достаточен, добавляет результат и закрывает задачу;
 - если результат недостаточен, не закрывает задачу, добавляет замечания и
   уведомляет настроенных получателей.

@@ -12,8 +12,10 @@
 ## Входы
 
 - `ONTASKUPDATE` из очереди webhook-событий.
-- Детали задачи и результаты задачи из Bitrix REST.
-- LLM-проверка, если включён smart quality-control.
+- `task_id` из события.
+- Read-tools `bitrix_task_get` и `bitrix_task_results_list`, которые вызывает
+  сам LLM quality-control агент.
+- Action-tool `quality_control_action`, который модель вызывает после анализа.
 
 ## Выходы
 
@@ -28,9 +30,11 @@
 
 ## Правило переноса
 
-Это автономная Bitrix-автоматизация. Она может использовать LLM и знания
-Bitrix24-специалиста, но не должна быть чатовым субагентом. Автоматические
-write-действия требуют служебного OAuth actor и явной политики.
+Это автономная Bitrix-автоматизация. Она запускает LLM quality-control агента:
+модель сама выбирает read-tools, сама оценивает результат и сама вызывает
+action-tool. Backend остаётся исполнителем tools, policy, OAuth actor, dedupe и
+state. Автоматические write-действия требуют служебного OAuth actor и явной
+политики.
 
 Закрытие задачи по просьбе человека из чата проходит не через этот worker, а
 через цепочку `оркестратор -> LLM Bitrix24 -> task_closure -> pending

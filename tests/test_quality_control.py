@@ -1,7 +1,8 @@
 import asyncio
 
 from ai_server.workers.bitrix.quality_control import (
-    TemplateValidation,
+    QualityControlDecision,
+    QualityControlToolCall,
     handle_quality_control_webhook_event,
 )
 
@@ -30,7 +31,7 @@ def test_quality_control_dry_run_does_not_write(monkeypatch, tmp_path):
         handle_quality_control_webhook_event(
             bitrix,
             payload=_task_update_payload(),
-            reviewer=FakeQualityReviewer(valid=False),
+            quality_llm=FakeQualityControlLLM(valid=False),
             status={},
         )
     )
@@ -57,7 +58,7 @@ def test_quality_control_disapproves_invalid_result(monkeypatch, tmp_path):
         handle_quality_control_webhook_event(
             bitrix,
             payload=_task_update_payload(),
-            reviewer=FakeQualityReviewer(valid=False),
+            quality_llm=FakeQualityControlLLM(valid=False),
             status={},
         )
     )
@@ -71,7 +72,7 @@ def test_quality_control_disapproves_invalid_result(monkeypatch, tmp_path):
         handle_quality_control_webhook_event(
             bitrix,
             payload=_task_update_payload(),
-            reviewer=FakeQualityReviewer(valid=False),
+            quality_llm=FakeQualityControlLLM(valid=False),
             status={},
         )
     )
@@ -93,7 +94,7 @@ def test_quality_control_approves_valid_waiting_control_result(monkeypatch, tmp_
         handle_quality_control_webhook_event(
             bitrix,
             payload=_task_update_payload(),
-            reviewer=FakeQualityReviewer(valid=True),
+            quality_llm=FakeQualityControlLLM(valid=True),
             status={},
         )
     )
@@ -105,17 +106,40 @@ def test_quality_control_approves_valid_waiting_control_result(monkeypatch, tmp_
     assert ("add_task_comment", 101) in [call[:2] for call in bitrix.calls]
 
 
-class FakeQualityReviewer:
+class FakeQualityControlLLM:
     def __init__(self, *, valid: bool) -> None:
         self.valid = valid
+        self.calls = []
 
-    async def review(self, **kwargs):
-        return TemplateValidation(
-            template_id="fake_llm_quality_review",
-            valid=self.valid,
-            outcome="all_done" if self.valid else "not_all_done",
-            issues=[] if self.valid else ["LLM считает результат недостаточным."],
-            fixes=[] if self.valid else ["Уточнить выполненные пункты."],
+    async def decide(self, **kwargs):
+        self.calls.append(kwargs)
+        tool_results = kwargs["tool_results"]
+        if not any(result["tool"] == "bitrix_task_get" for result in tool_results):
+            return QualityControlDecision(
+                status="continue",
+                answer="Нужно прочитать задачу и результат.",
+                tool_calls=[
+                    QualityControlToolCall(name="bitrix_task_get", args={"task_id": kwargs["task_id"]}),
+                    QualityControlToolCall(name="bitrix_task_results_list", args={"task_id": kwargs["task_id"]}),
+                ],
+            )
+        return QualityControlDecision(
+            status="completed",
+            answer="Решение принято моделью.",
+            tool_calls=[
+                QualityControlToolCall(
+                    name="quality_control_action",
+                    args={
+                        "action": "approve" if self.valid else "return_to_work",
+                        "validation": {
+                            "valid": self.valid,
+                            "outcome": "all_done" if self.valid else "not_all_done",
+                            "issues": [] if self.valid else ["LLM считает результат недостаточным."],
+                            "fixes": [] if self.valid else ["Уточнить выполненные пункты."],
+                        },
+                    },
+                )
+            ],
         )
 
 

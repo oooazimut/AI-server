@@ -124,8 +124,10 @@ uv run python scripts/import_bitrix_var.py --profile cutover --execute
   metadata/delta/content-indexer задач, проектов, диска и содержимого файлов;
 - `backend/ai_server/workers/bitrix/search_webhook_indexer.py` - обработчик
   disk/file webhook-событий с обновлением metadata и, если включено, текста файла;
-- `backend/ai_server/workers/bitrix/quality_control.py` - обработчик
-  `onTaskUpdate` для LLM-проверки результата закрытия задач и применения
+- `backend/ai_server/workers/bitrix/quality_control.py` - LLM-driven обработчик
+  `onTaskUpdate`: worker передаёт модели событие и ID задачи, модель сама
+  вызывает read-tools `bitrix_task_get`/`bitrix_task_results_list`, затем
+  вызывает `quality_control_action`; backend применяет dedupe,
   dry-run/policy/OAuth-actor перед approve/disapprove/renew/comment/notify;
 - `backend/ai_server/agents/bitrix_task_closure.py` - чатовый tool закрытия
   задачи: LLM Битрикс-субагент готовит `task_id`/`task_query` и `result_text`,
