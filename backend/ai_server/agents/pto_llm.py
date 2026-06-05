@@ -10,7 +10,7 @@ from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolRes
 from ai_server.retrieval import RetrievalHit
 
 
-ALLOWED_TOOL_NAMES = {"portal_document_search", "document_read", "spreadsheet_compare", "none"}
+ALLOWED_TOOL_NAMES = {"portal_document_search", "document_read", "spreadsheet_preview", "spreadsheet_compare", "none"}
 RESULT_STATUSES = {"completed", "needs_clarification", "needs_human", "failed"}
 
 
@@ -22,6 +22,7 @@ class PtoAgentLLM(Protocol):
         task: AgentTask,
         retrieval_hits: list[RetrievalHit],
         tool_definitions: list[dict[str, Any]],
+        tool_results: list[ToolResult] | None = None,
     ) -> "PtoLLMDecisionResult":
         pass
 
@@ -76,6 +77,7 @@ class PtoLLMService:
         task: AgentTask,
         retrieval_hits: list[RetrievalHit],
         tool_definitions: list[dict[str, Any]],
+        tool_results: list[ToolResult] | None = None,
     ) -> PtoLLMDecisionResult:
         completion = await self.client.complete(
             agent_id=manifest.id,
@@ -96,6 +98,7 @@ class PtoLLMService:
                             "current_datetime": datetime.now(timezone.utc).astimezone().isoformat(),
                             "retrieval_context": _retrieval_context(retrieval_hits),
                             "tools": _allowed_tool_definitions(tool_definitions),
+                            "tool_results": [_compact_tool_result(result) for result in (tool_results or [])],
                         },
                         ensure_ascii=False,
                     ),
@@ -164,14 +167,20 @@ def _decision_system_prompt() -> str:
         "сметы/ведомости как технические документы, проверка комплектности и сравнение версий. "
         "Ты не работаешь напрямую с Bitrix API: выбирай document tools. Backend только скачивает/читает/сравнивает файлы "
         "и применяет guardrails доступа. "
+        "В tool_results могут прийти результаты твоих предыдущих tool_calls; используй их как наблюдения "
+        "для следующего шага. "
         "Если документ по смыслу бухгалтерский, складской, сетевой или программный, не притворяйся профильным специалистом: "
         "верни needs_human/needs_clarification и объясни, кому лучше передать. "
         "Перед каждым tool_call сам проверь, хватает ли данных. Если не хватает, не вызывай tool, задай уточняющий вопрос. "
+        "Для сравнения таблиц сначала вызови spreadsheet_preview по каждому документу или по найденным entity_id. "
+        "По preview сам выбери sheet, header_row_number, key_column и value_columns; только после этого вызывай "
+        "spreadsheet_compare с явной схемой. spreadsheet_compare делает точный механический diff и не должен "
+        "использоваться без выбранной тобой схемы. "
         "Верни только JSON-объект без markdown: "
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
-        '"tool_calls":[{"name":"portal_document_search|document_read|spreadsheet_compare|none","args":{},"summary":""}]}.'
+        '"tool_calls":[{"name":"portal_document_search|document_read|spreadsheet_preview|spreadsheet_compare|none","args":{},"summary":""}]}.'
     )
 
 

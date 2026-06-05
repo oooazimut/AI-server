@@ -54,54 +54,83 @@ class PtoSpecialist:
             )
         ]
 
-        try:
-            decision_result = await self.llm.decide(
-                manifest=self.manifest,
-                task=task,
-                retrieval_hits=retrieval_hits,
-                tool_definitions=self.tool_definitions(),
+        tool_results: list[ToolResult] = []
+        decision_results = []
+        decision = None
+        max_steps = 5
+        for step in range(1, max_steps + 1):
+            try:
+                decision_result = await self.llm.decide(
+                    manifest=self.manifest,
+                    task=task,
+                    retrieval_hits=retrieval_hits,
+                    tool_definitions=self.tool_definitions(),
+                    tool_results=list(tool_results),
+                )
+            except Exception as exc:
+                failure = pto_llm_failure_result(f"{type(exc).__name__}: {exc}")
+                return AgentResult(
+                    status="failed",
+                    agent_id=self.manifest.id,
+                    answer=failure.answer,
+                    actions_taken=[
+                        *actions_taken,
+                        ActionRecord(
+                            name="pto_llm_decision",
+                            status="error",
+                            details={"step": step, "error": f"{type(exc).__name__}: {exc}"},
+                        ),
+                    ],
+                    model_usage=[*[item.model_usage for item in decision_results], failure.model_usage],
+                    confidence=0.0,
+                    logs=_logs(),
+                )
+
+            decision_results.append(decision_result)
+            decision = decision_result.decision
+            actions_taken.append(
+                ActionRecord(
+                    name="pto_llm_decision",
+                    status=decision.status,
+                    details={
+                        "step": step,
+                        "tool_calls": [
+                            {"name": call.name, "args": call.args, "summary": call.summary}
+                            for call in decision.tool_calls
+                        ],
+                        "confidence": decision.confidence,
+                    },
+                )
             )
-        except Exception as exc:
-            failure = pto_llm_failure_result(f"{type(exc).__name__}: {exc}")
+
+            executable_calls = [call for call in decision.tool_calls if call.name != "none"]
+            if not executable_calls:
+                break
+            for tool_call in executable_calls:
+                result, action = await self._execute_tool_call(tool_call)
+                if result is not None:
+                    tool_results.append(result)
+                if action is not None:
+                    actions_taken.append(action)
+            if step == max_steps:
+                actions_taken.append(
+                    ActionRecord(
+                        name="pto_tool_loop_guardrail",
+                        status="stopped",
+                        details={"max_steps": max_steps},
+                    )
+                )
+        if decision is None:
+            failure = pto_llm_failure_result("empty PTO LLM decision loop")
             return AgentResult(
                 status="failed",
                 agent_id=self.manifest.id,
                 answer=failure.answer,
-                actions_taken=[
-                    *actions_taken,
-                    ActionRecord(
-                        name="pto_llm_decision",
-                        status="error",
-                        details={"error": f"{type(exc).__name__}: {exc}"},
-                    ),
-                ],
+                actions_taken=actions_taken,
                 model_usage=[failure.model_usage],
                 confidence=0.0,
                 logs=_logs(),
             )
-
-        decision = decision_result.decision
-        actions_taken.append(
-            ActionRecord(
-                name="pto_llm_decision",
-                status=decision.status,
-                details={
-                    "tool_calls": [
-                        {"name": call.name, "args": call.args, "summary": call.summary}
-                        for call in decision.tool_calls
-                    ],
-                    "confidence": decision.confidence,
-                },
-            )
-        )
-
-        tool_results: list[ToolResult] = []
-        for tool_call in decision.tool_calls:
-            result, action = await self._execute_tool_call(tool_call)
-            if result is not None:
-                tool_results.append(result)
-            if action is not None:
-                actions_taken.append(action)
 
         try:
             final_result = await self.llm.compose(
@@ -123,7 +152,7 @@ class PtoSpecialist:
                         details={"error": f"{type(exc).__name__}: {exc}"},
                     ),
                 ],
-                model_usage=[decision_result.model_usage, failure.model_usage],
+                model_usage=[*[item.model_usage for item in decision_results], failure.model_usage],
                 confidence=0.0,
                 logs=_logs(),
             )
@@ -134,7 +163,7 @@ class PtoSpecialist:
             agent_id=self.manifest.id,
             answer=final_result.answer,
             actions_taken=actions_taken,
-            model_usage=[decision_result.model_usage, final_result.model_usage],
+            model_usage=[*[item.model_usage for item in decision_results], final_result.model_usage],
             confidence=decision.confidence,
             logs=_logs(),
         )
@@ -154,6 +183,9 @@ class PtoSpecialist:
         if tool_call.name == "document_read":
             result = await self.tools.document_read(tool_call.args)
             return result, ActionRecord(name="pto_document_read", status=result.status, details=result.model_dump())
+        if tool_call.name == "spreadsheet_preview":
+            result = await self.tools.spreadsheet_preview(tool_call.args)
+            return result, ActionRecord(name="pto_spreadsheet_preview", status=result.status, details=result.model_dump())
         if tool_call.name == "spreadsheet_compare":
             result = await self.tools.spreadsheet_compare(tool_call.args)
             return result, ActionRecord(name="pto_spreadsheet_compare", status=result.status, details=result.model_dump())

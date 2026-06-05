@@ -25,20 +25,6 @@ from ai_server.settings import get_settings
 
 SPREADSHEET_EXTENSIONS = {".csv", ".xls", ".xlsx"}
 VALUE_FIELD_PRIORITY = {"цена": 10, "стоимость": 20, "количество": 30}
-KEY_HEADER_MARKERS = (
-    "наимен",
-    "товар",
-    "материал",
-    "оборуд",
-    "работ",
-    "услуг",
-    "позици",
-    "номенклат",
-    "описан",
-    "издел",
-    "ресурс",
-)
-SKIP_HEADER_MARKERS = ("номер", "п/п", "n", "№", "ед", "изм", "код", "артикул")
 
 
 @dataclass(frozen=True)
@@ -175,18 +161,38 @@ class SheetRows:
 
 
 @dataclass(frozen=True)
-class HeaderMatch:
-    sheet: SheetRows
-    row_position: int
-    key_column: int
-    value_columns: dict[int, str]
-
-
-@dataclass(frozen=True)
 class SpreadsheetDataset:
     document: ComparedDocument
     entries: dict[str, SpreadsheetEntry]
     duplicates: int
+
+
+@dataclass(frozen=True)
+class SpreadsheetCompareSchema:
+    header_row_number: int
+    key_column: object
+    value_columns: list[object]
+    first_sheet: str = ""
+    second_sheet: str = ""
+    first_header_row_number: int | None = None
+    second_header_row_number: int | None = None
+
+    def first_header(self) -> int:
+        return self.first_header_row_number or self.header_row_number
+
+    def second_header(self) -> int:
+        return self.second_header_row_number or self.header_row_number
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "header_row_number": self.header_row_number,
+            "first_header_row_number": self.first_header_row_number,
+            "second_header_row_number": self.second_header_row_number,
+            "key_column": self.key_column,
+            "value_columns": self.value_columns,
+            "first_sheet": self.first_sheet,
+            "second_sheet": self.second_sheet,
+        }
 
 
 class DocumentToolset:
@@ -230,16 +236,50 @@ class DocumentToolset:
                 },
             ),
             ToolDefinition(
+                name="spreadsheet_preview",
+                description=(
+                    "Read a small preview of a spreadsheet so the PTO LLM can choose sheet, header row, "
+                    "key column and value columns before exact comparison."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "entity_type": {"type": "string"},
+                        "entity_id": {"type": "string"},
+                        "max_rows": {"type": "integer", "minimum": 1, "maximum": 30},
+                        "max_sheets": {"type": "integer", "minimum": 1, "maximum": 10},
+                    },
+                },
+            ),
+            ToolDefinition(
                 name="spreadsheet_compare",
-                description="Compare two spreadsheet documents from Bitrix by recognized row keys and values.",
+                description=(
+                    "Compare two spreadsheet documents exactly by an explicit schema chosen by the PTO LLM "
+                    "after spreadsheet_preview."
+                ),
                 parameters={
                     "type": "object",
                     "properties": {
                         "first_query": {"type": "string"},
                         "second_query": {"type": "string"},
+                        "header_row_number": {"type": "integer", "minimum": 1},
+                        "first_header_row_number": {"type": "integer", "minimum": 1},
+                        "second_header_row_number": {"type": "integer", "minimum": 1},
+                        "key_column": {
+                            "description": "0-based preview index, Excel letter, or exact header text.",
+                            "anyOf": [{"type": "integer"}, {"type": "string"}],
+                        },
+                        "value_columns": {
+                            "type": "array",
+                            "items": {"anyOf": [{"type": "integer"}, {"type": "string"}]},
+                            "minItems": 1,
+                        },
+                        "first_sheet": {"type": "string"},
+                        "second_sheet": {"type": "string"},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 50},
                     },
-                    "required": ["first_query", "second_query"],
+                    "required": ["first_query", "second_query", "key_column", "value_columns"],
                 },
             ),
         ]
@@ -323,6 +363,59 @@ class DocumentToolset:
             },
         )
 
+    async def spreadsheet_preview(self, args: dict[str, Any]) -> ToolResult:
+        resolved = self._resolve_document(args)
+        if resolved is None:
+            return ToolResult(
+                status="not_found",
+                tool="spreadsheet_preview",
+                data={"query": str(args.get("query") or ""), "candidates": []},
+                error="spreadsheet document not found in portal index",
+            )
+        if not _is_spreadsheet(resolved.item):
+            return ToolResult(
+                status="invalid_tool_call",
+                tool="spreadsheet_preview",
+                data={"document": _document_dict(resolved.item)},
+                error=f"document is not a supported spreadsheet: {resolved.item.title}",
+            )
+
+        path: Path | None = None
+        max_rows = max(1, min(_optional_int(args.get("max_rows")) or 12, 30))
+        max_sheets = max(1, min(_optional_int(args.get("max_sheets")) or 5, 10))
+        try:
+            path = await self._ensure_local_document(resolved.item)
+            preview = await asyncio.to_thread(
+                _spreadsheet_preview,
+                resolved.item,
+                path,
+                max_rows=max_rows,
+                max_sheets=max_sheets,
+            )
+        except Exception as exc:
+            return ToolResult(
+                status="error",
+                tool="spreadsheet_preview",
+                error=f"{type(exc).__name__}: {exc}",
+                data={"document": _document_dict(resolved.item)},
+            )
+        finally:
+            self._delete_temp(path)
+
+        return ToolResult(
+            status="ok",
+            tool="spreadsheet_preview",
+            data={
+                "document": _document_dict(resolved.item),
+                "sheets": preview,
+                "candidates": [_document_dict(item) for item in resolved.candidates],
+                "note": (
+                    "Choose header_row_number, key_column and value_columns from this preview before "
+                    "calling spreadsheet_compare. Column references may be preview index, Excel letter, or header text."
+                ),
+            },
+        )
+
     async def spreadsheet_compare(self, args: dict[str, Any]) -> ToolResult:
         first_query = str(args.get("first_query") or "").strip()
         second_query = str(args.get("second_query") or "").strip()
@@ -333,12 +426,16 @@ class DocumentToolset:
                 tool="spreadsheet_compare",
                 error="first_query and second_query are required",
             )
+        schema, schema_error = _spreadsheet_compare_schema_from_args(args)
+        if schema_error is not None:
+            return schema_error
 
         report = await compare_spreadsheets_by_query(
             self.client,
             self.portal_search,
             first_query=first_query,
             second_query=second_query,
+            schema=schema,
             limit=limit,
             item_filter=lambda item: can_user_see_portal_item(item, user_id=self.user_id),
         )
@@ -348,6 +445,7 @@ class DocumentToolset:
             data={
                 "summary": format_document_comparison_report(report, limit=limit),
                 "report": report.as_dict(),
+                "schema": schema.as_dict(),
             },
             error="; ".join(report.errors) if report.errors else None,
         )
@@ -407,6 +505,7 @@ async def compare_spreadsheets_by_query(
     *,
     first_query: str,
     second_query: str,
+    schema: SpreadsheetCompareSchema,
     limit: int = 20,
     item_filter: Callable[[PortalSearchResult], bool] | None = None,
 ) -> DocumentCompareReport:
@@ -438,8 +537,24 @@ async def compare_spreadsheets_by_query(
         first_path = await _ensure_local_document(bitrix, first_item)
         second_path = await _ensure_local_document(bitrix, second_item)
         first_dataset, second_dataset = await asyncio.gather(
-            asyncio.to_thread(_extract_spreadsheet_dataset, first_item, first_path),
-            asyncio.to_thread(_extract_spreadsheet_dataset, second_item, second_path),
+            asyncio.to_thread(
+                _extract_spreadsheet_dataset_with_schema,
+                first_item,
+                first_path,
+                sheet_name=schema.first_sheet,
+                header_row_number=schema.first_header(),
+                key_column=schema.key_column,
+                value_columns=schema.value_columns,
+            ),
+            asyncio.to_thread(
+                _extract_spreadsheet_dataset_with_schema,
+                second_item,
+                second_path,
+                sheet_name=schema.second_sheet,
+                header_row_number=schema.second_header(),
+                key_column=schema.key_column,
+                value_columns=schema.value_columns,
+            ),
         )
     except Exception as exc:
         report.errors.append(f"Не смог разобрать документы: {type(exc).__name__}: {exc}")
@@ -592,6 +707,74 @@ def _spreadsheet_candidates(
     return candidates
 
 
+def _spreadsheet_compare_schema_from_args(args: dict[str, Any]) -> tuple[SpreadsheetCompareSchema, ToolResult | None]:
+    header_row_number = _optional_int(args.get("header_row_number"))
+    first_header_row_number = _optional_int(args.get("first_header_row_number"))
+    second_header_row_number = _optional_int(args.get("second_header_row_number"))
+    if header_row_number is None:
+        if first_header_row_number is None or second_header_row_number is None:
+            return _empty_schema(), ToolResult(
+                status="contract_violation",
+                tool="spreadsheet_compare",
+                error=(
+                    "spreadsheet_compare requires header_row_number, or both first_header_row_number "
+                    "and second_header_row_number. Call spreadsheet_preview first and let the PTO LLM choose it."
+                ),
+            )
+        header_row_number = first_header_row_number
+    if header_row_number <= 0 or (first_header_row_number is not None and first_header_row_number <= 0) or (
+        second_header_row_number is not None and second_header_row_number <= 0
+    ):
+        return _empty_schema(), ToolResult(
+            status="invalid_tool_call",
+            tool="spreadsheet_compare",
+            error="header row numbers must be positive",
+        )
+
+    key_column = args.get("key_column")
+    if not _has_column_reference(key_column):
+        return _empty_schema(), ToolResult(
+            status="contract_violation",
+            tool="spreadsheet_compare",
+            error="spreadsheet_compare requires key_column selected by the PTO LLM from spreadsheet_preview.",
+        )
+
+    raw_value_columns = args.get("value_columns")
+    if isinstance(raw_value_columns, list):
+        value_columns = [value for value in raw_value_columns if _has_column_reference(value)]
+    elif _has_column_reference(raw_value_columns):
+        value_columns = [raw_value_columns]
+    else:
+        value_columns = []
+    if not value_columns:
+        return _empty_schema(), ToolResult(
+            status="contract_violation",
+            tool="spreadsheet_compare",
+            error="spreadsheet_compare requires at least one value_columns entry selected by the PTO LLM from spreadsheet_preview.",
+        )
+
+    return (
+        SpreadsheetCompareSchema(
+            header_row_number=header_row_number,
+            first_header_row_number=first_header_row_number,
+            second_header_row_number=second_header_row_number,
+            key_column=key_column,
+            value_columns=value_columns,
+            first_sheet=str(args.get("first_sheet") or "").strip(),
+            second_sheet=str(args.get("second_sheet") or "").strip(),
+        ),
+        None,
+    )
+
+
+def _empty_schema() -> SpreadsheetCompareSchema:
+    return SpreadsheetCompareSchema(header_row_number=1, key_column="", value_columns=[])
+
+
+def _has_column_reference(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) or bool(str(value or "").strip())
+
+
 def _compare_datasets(
     first: SpreadsheetDataset,
     second: SpreadsheetDataset,
@@ -607,7 +790,10 @@ def _compare_datasets(
         first_entry = first.entries[key]
         second_entry = second.entries[key]
         fields: list[FieldDifference] = []
-        for field in sorted(set(first_entry.values) & set(second_entry.values), key=lambda item: (VALUE_FIELD_PRIORITY.get(item, 100), item)):
+        for field in sorted(
+            set(first_entry.values) & set(second_entry.values),
+            key=lambda item: (VALUE_FIELD_PRIORITY.get(_normalize_header(item), 100), _normalize_header(item)),
+        ):
             difference = _compare_values(field, first_entry.values[field], second_entry.values[field])
             if difference:
                 fields.append(difference)
@@ -627,21 +813,80 @@ def _compare_datasets(
     )
 
 
-def _extract_spreadsheet_dataset(item: PortalSearchResult, path: Path) -> SpreadsheetDataset:
+def _spreadsheet_preview(
+    item: PortalSearchResult,
+    path: Path,
+    *,
+    max_rows: int,
+    max_sheets: int,
+) -> list[dict[str, Any]]:
     sheets = _read_spreadsheet(path, original_name=item.title)
-    header = _find_best_header(sheets)
-    if header is None:
-        raise ValueError("не нашёл строку заголовков с колонкой позиции и значениями")
+    if not sheets:
+        raise ValueError("в табличном документе не нашёл непустых строк")
+    preview: list[dict[str, Any]] = []
+    for sheet in sheets[:max_sheets]:
+        rows: list[dict[str, Any]] = []
+        for row_number, row in sheet.rows[:max_rows]:
+            rows.append(
+                {
+                    "row_number": row_number,
+                    "cells": [
+                        {"index": index, "letter": _column_letter(index), "value": _cell(row, index)}
+                        for index in range(len(row))
+                    ],
+                }
+            )
+        preview.append({"name": sheet.name, "rows": rows, "total_non_empty_rows": len(sheet.rows)})
+    return preview
+
+
+def _extract_spreadsheet_dataset_with_schema(
+    item: PortalSearchResult,
+    path: Path,
+    *,
+    sheet_name: str,
+    header_row_number: int,
+    key_column: object,
+    value_columns: list[object],
+) -> SpreadsheetDataset:
+    sheets = _read_spreadsheet(path, original_name=item.title)
+    sheet = _select_sheet(sheets, sheet_name)
+    if sheet is None:
+        requested = f" '{sheet_name}'" if sheet_name else ""
+        raise ValueError(f"не нашёл лист{requested} в документе {item.title}")
+
+    header_position: int | None = None
+    header_row: list[str] | None = None
+    for position, (row_number, row) in enumerate(sheet.rows):
+        if row_number == header_row_number:
+            header_position = position
+            header_row = row
+            break
+    if header_position is None or header_row is None:
+        raise ValueError(f"не нашёл строку заголовков #{header_row_number} на листе {sheet.name}")
+
+    key_index = _column_index_from_reference(key_column, header_row)
+    value_indexes = _value_column_indexes_from_references(value_columns, header_row)
+    if key_index in value_indexes:
+        raise ValueError("key_column не может одновременно быть value_columns")
+
+    used_labels: set[str] = set()
+    value_labels: dict[int, str] = {}
+    for column_index in value_indexes:
+        label = _cell(header_row, column_index) or _column_letter(column_index)
+        label = _dedupe_label(label, used_labels)
+        used_labels.add(label)
+        value_labels[column_index] = label
 
     entries: dict[str, SpreadsheetEntry] = {}
     duplicates = 0
-    for row_number, row in header.sheet.rows[header.row_position + 1 :]:
-        key = _cell(row, header.key_column)
+    for row_number, row in sheet.rows[header_position + 1 :]:
+        key = _cell(row, key_index)
         normalized_key = _normalize_key(key)
         if not normalized_key:
             continue
         values: dict[str, CellValue] = {}
-        for column_index, field_label in header.value_columns.items():
+        for column_index, field_label in value_labels.items():
             raw = _cell(row, column_index)
             if raw:
                 values[field_label] = CellValue(field_label, raw, _parse_number(raw))
@@ -650,7 +895,7 @@ def _extract_spreadsheet_dataset(item: PortalSearchResult, path: Path) -> Spread
         if normalized_key in entries:
             duplicates += 1
             continue
-        entries[normalized_key] = SpreadsheetEntry(key, normalized_key, values, header.sheet.name, row_number)
+        entries[normalized_key] = SpreadsheetEntry(key, normalized_key, values, sheet.name, row_number)
     if not entries:
         raise ValueError("после заголовков не нашёл позиций со значениями")
     return SpreadsheetDataset(
@@ -660,7 +905,7 @@ def _extract_spreadsheet_dataset(item: PortalSearchResult, path: Path) -> Spread
             title=item.title,
             url=item.url,
             rows=len(entries),
-            value_fields=sorted({field for entry in entries.values() for field in entry.values}),
+            value_fields=sorted({field for entry in entries.values() for field in entry.values}, key=_normalize_header),
         ),
         entries=entries,
         duplicates=duplicates,
@@ -735,45 +980,84 @@ def _read_xlsx(path: Path) -> list[SheetRows]:
         return sheets
 
 
-def _find_best_header(sheets: list[SheetRows]) -> HeaderMatch | None:
+def _select_sheet(sheets: list[SheetRows], sheet_name: str) -> SheetRows | None:
+    if not sheets:
+        return None
+    requested = sheet_name.strip()
+    if not requested:
+        return sheets[0]
     for sheet in sheets:
-        for position, (_, row) in enumerate(sheet.rows[:80]):
-            key_columns = _key_columns(row)
-            if not key_columns:
-                continue
-            for key_column in key_columns:
-                value_columns = _value_columns(row, key_column=key_column)
-                if value_columns:
-                    return HeaderMatch(sheet, position, key_column, value_columns)
+        if sheet.name.casefold() == requested.casefold():
+            return sheet
+    normalized = _normalize_text(requested)
+    for sheet in sheets:
+        if _normalize_text(sheet.name) == normalized:
+            return sheet
     return None
 
 
-def _key_columns(row: list[str]) -> list[int]:
-    strong = [index for index, value in enumerate(row) if any(marker in _normalize_header(value) for marker in KEY_HEADER_MARKERS)]
-    if strong:
-        return strong
-    return [
-        index
-        for index, value in enumerate(row)
-        if len(_normalize_header(value)) >= 8
-        and _parse_number(value) is None
-        and not any(marker in _normalize_header(value) for marker in SKIP_HEADER_MARKERS)
-    ][:2]
-
-
-def _value_columns(row: list[str], *, key_column: int) -> dict[int, str]:
-    result: dict[int, str] = {}
-    used: set[str] = set()
-    for index, value in enumerate(row):
-        if index == key_column:
-            continue
-        label = _value_label(value)
-        if not label:
-            continue
-        deduped = _dedupe_label(label, used)
-        used.add(deduped)
-        result[index] = deduped
+def _value_column_indexes_from_references(values: list[object], header_row: list[str]) -> list[int]:
+    result: list[int] = []
+    for value in values:
+        index = _column_index_from_reference(value, header_row)
+        if index not in result:
+            result.append(index)
     return result
+
+
+def _column_index_from_reference(value: object, header_row: list[str]) -> int:
+    if isinstance(value, bool):
+        raise ValueError("column reference must be index, Excel letter, or header text")
+    if isinstance(value, int):
+        return _validate_column_index(value, header_row)
+
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("empty column reference")
+
+    letter_index = _column_index_from_letter(text)
+    if letter_index is not None:
+        return _validate_column_index(letter_index, header_row)
+
+    if text.isdigit():
+        numeric_index = int(text)
+        if 0 <= numeric_index < len(header_row):
+            return numeric_index
+        if 1 <= numeric_index <= len(header_row):
+            return numeric_index - 1
+
+    normalized = _normalize_header(text)
+    matches = [index for index, header in enumerate(header_row) if _normalize_header(header) == normalized]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(f"неоднозначная колонка {text!r}: совпало несколько заголовков")
+    raise ValueError(f"не нашёл колонку {text!r}; используй index, letter или header из spreadsheet_preview")
+
+
+def _validate_column_index(index: int, header_row: list[str]) -> int:
+    if 0 <= index < len(header_row):
+        return index
+    raise ValueError(f"индекс колонки {index} вне диапазона preview 0..{max(len(header_row) - 1, 0)}")
+
+
+def _column_index_from_letter(value: str) -> int | None:
+    text = value.strip().upper()
+    if not re.fullmatch(r"[A-Z]+", text):
+        return None
+    result = 0
+    for char in text:
+        result = result * 26 + (ord(char) - ord("A") + 1)
+    return result - 1
+
+
+def _column_letter(index: int) -> str:
+    number = index + 1
+    letters = ""
+    while number > 0:
+        number, remainder = divmod(number - 1, 26)
+        letters = chr(ord("A") + remainder) + letters
+    return letters
 
 
 def _compare_values(field: str, first: CellValue, second: CellValue) -> FieldDifference | None:
@@ -844,21 +1128,6 @@ def _format_field_difference(difference: FieldDifference) -> str:
         percent = f"; {_format_signed_number(difference.percent)}%" if difference.percent is not None else ""
         return f"{_format_number(difference.first.number)} -> {_format_number(difference.second.number)} ({delta}{percent})"
     return f"{difference.first.raw} -> {difference.second.raw}"
-
-
-def _value_label(value: str) -> str | None:
-    normalized = _normalize_header(value)
-    if not normalized:
-        return None
-    if "цен" in normalized:
-        return "цена"
-    if any(marker in normalized for marker in ("кол во", "количество", "к во", "объем", "обьем")):
-        return "количество"
-    if any(marker in normalized for marker in ("сумм", "стоим", "итого", "всего")):
-        return "стоимость"
-    if len(normalized) <= 2 or any(marker in normalized for marker in SKIP_HEADER_MARKERS):
-        return None
-    return normalized[:40]
 
 
 def _dedupe_label(label: str, used: set[str]) -> str:

@@ -16,6 +16,40 @@ def test_document_toolset_compares_spreadsheets(monkeypatch, tmp_path):
     index = _document_index(tmp_path / "search_index.sqlite")
     toolset = DocumentToolset(client=FakeDocumentBitrix(), portal_search=index, user_id=9)
 
+    preview = anyio_run(toolset.spreadsheet_preview({"query": "смета январь"}))
+    assert preview.status == "ok"
+    assert preview.data["sheets"][0]["rows"][0]["cells"][0] == {
+        "index": 0,
+        "letter": "A",
+        "value": "Наименование",
+    }
+
+    result = anyio_run(
+        toolset.spreadsheet_compare(
+            {
+                "first_query": "смета январь",
+                "second_query": "смета февраль",
+                "header_row_number": 1,
+                "key_column": "Наименование",
+                "value_columns": ["Стоимость"],
+                "limit": 10,
+            }
+        )
+    )
+
+    assert result.status == "ok"
+    report = result.data["report"]
+    assert report["common_rows"] == 2
+    assert report["changed"][0]["key"] == "Кабель UTP"
+    assert report["changed"][0]["fields"][0]["field"] == "Стоимость"
+    assert "Отличий по значениям: 1" in result.data["summary"]
+
+
+def test_spreadsheet_compare_requires_llm_selected_schema(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
+    index = _document_index(tmp_path / "search_index.sqlite")
+    toolset = DocumentToolset(client=FakeDocumentBitrix(), portal_search=index, user_id=9)
+
     result = anyio_run(
         toolset.spreadsheet_compare(
             {
@@ -26,12 +60,8 @@ def test_document_toolset_compares_spreadsheets(monkeypatch, tmp_path):
         )
     )
 
-    assert result.status == "ok"
-    report = result.data["report"]
-    assert report["common_rows"] == 2
-    assert report["changed"][0]["key"] == "Кабель UTP"
-    assert report["changed"][0]["fields"][0]["field"] == "стоимость"
-    assert "Отличий по значениям: 1" in result.data["summary"]
+    assert result.status == "contract_violation"
+    assert "spreadsheet_preview" in (result.error or "")
 
 
 def test_pto_specialist_uses_spreadsheet_compare_tool(monkeypatch, tmp_path):
@@ -39,31 +69,45 @@ def test_pto_specialist_uses_spreadsheet_compare_tool(monkeypatch, tmp_path):
     manifest = get_agent_manifest("pto")
     assert manifest is not None
     index = _document_index(tmp_path / "search_index.sqlite")
-    specialist = PtoSpecialist(
-        manifest,
-        retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
-        tools=DocumentToolset(client=FakeDocumentBitrix(), portal_search=index, user_id=9),
-        llm=FakePtoLLM(
-            tool_calls=[
+    fake_llm = FakePtoLLM(
+        tool_call_steps=[
+            [
+                PtoLLMToolCall(name="spreadsheet_preview", args={"query": "смета январь"}),
+                PtoLLMToolCall(name="spreadsheet_preview", args={"query": "смета февраль"}),
+            ],
+            [
                 PtoLLMToolCall(
                     name="spreadsheet_compare",
                     args={
                         "first_query": "смета январь",
                         "second_query": "смета февраль",
+                        "header_row_number": 1,
+                        "key_column": "Наименование",
+                        "value_columns": ["Стоимость"],
                         "limit": 10,
                     },
                 )
             ],
-            final_answer="В сметах изменился кабель.",
-        ),
+            [PtoLLMToolCall(name="none")],
+        ],
+        final_answer="В сметах изменился кабель.",
+    )
+    specialist = PtoSpecialist(
+        manifest,
+        retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
+        tools=DocumentToolset(client=FakeDocumentBitrix(), portal_search=index, user_id=9),
+        llm=fake_llm,
     )
 
     result = anyio_run(
         specialist.handle(AgentTask(task_id="pto-1", request="Сравни сметы за январь и февраль"))
     )
 
+    preview_actions = [item for item in result.actions_taken if item.name == "pto_spreadsheet_preview"]
+    assert len(preview_actions) == 2
     action = next(item for item in result.actions_taken if item.name == "pto_spreadsheet_compare")
     assert action.status == "ok"
+    assert len(fake_llm.decide_calls[1]["tool_results"]) == 2
     assert result.answer == "В сметах изменился кабель."
     assert result.handoff_to == []
 

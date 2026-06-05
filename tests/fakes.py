@@ -160,6 +160,7 @@ class FakePtoLLM:
         self,
         *,
         tool_calls: list[PtoLLMToolCall] | None = None,
+        tool_call_steps: list[list[PtoLLMToolCall]] | None = None,
         decision_status: str = "completed",
         decision_answer: str = "",
         final_status: str = "completed",
@@ -167,6 +168,7 @@ class FakePtoLLM:
         confidence: float = 0.82,
     ) -> None:
         self.tool_calls = tool_calls or [PtoLLMToolCall(name="none")]
+        self.tool_call_steps = tool_call_steps
         self.decision_status = decision_status
         self.decision_answer = decision_answer
         self.final_status = final_status
@@ -177,12 +179,19 @@ class FakePtoLLM:
 
     async def decide(self, **kwargs):
         self.decide_calls.append(kwargs)
+        if self.tool_call_steps is not None:
+            index = min(len(self.decide_calls) - 1, len(self.tool_call_steps) - 1)
+            tool_calls = self.tool_call_steps[index]
+        elif len(self.decide_calls) == 1:
+            tool_calls = self.tool_calls
+        else:
+            tool_calls = [PtoLLMToolCall(name="none")]
         return PtoLLMDecisionResult(
             decision=PtoLLMDecision(
                 status=self.decision_status,
                 answer=self.decision_answer,
                 confidence=self.confidence,
-                tool_calls=self.tool_calls,
+                tool_calls=tool_calls,
             ),
             model_usage=_fake_usage(agent_id="pto"),
         )
