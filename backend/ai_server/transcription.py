@@ -131,8 +131,16 @@ class YandexSpeechKitTranscriber:
         return target, "audio/ogg"
 
 
-def build_transcriber() -> YandexSpeechKitTranscriber:
+class UnconfiguredTranscriber:
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+    async def transcribe(self, attachment: StoredAttachment) -> TranscriptionResult:
+        raise TranscriptionNotConfigured(self.reason)
+
+
+def build_transcriber() -> YandexSpeechKitTranscriber | UnconfiguredTranscriber:
     settings = get_settings()
     if settings.stt_provider == "yandex_speechkit":
         return YandexSpeechKitTranscriber()
-    raise TranscriptionNotConfigured(f"Unknown STT_PROVIDER: {settings.stt_provider}")
+    return UnconfiguredTranscriber(f"Unknown STT_PROVIDER: {settings.stt_provider}")
