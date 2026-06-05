@@ -356,6 +356,14 @@ class BitrixClient:
                     return [item for item in items if isinstance(item, dict)][:limit]
         return []
 
+    async def get_user(self, user_id: int) -> dict[str, Any] | None:
+        for payload in ({"ID": user_id}, {"FILTER": {"ID": user_id}}):
+            result = await self.result("user.get", payload)
+            user = _extract_user(result, user_id=user_id)
+            if user is not None:
+                return user
+        return None
+
     async def get_attached_object(self, attached_object_id: int) -> Any:
         return await self.result("disk.attachedObject.get", {"id": attached_object_id})
 
@@ -540,3 +548,29 @@ def _extract_workgroups(result: Any) -> list[dict[str, Any]]:
             if isinstance(items, list):
                 return [item for item in items if isinstance(item, dict)]
     return []
+
+
+def _extract_user(result: Any, *, user_id: int) -> dict[str, Any] | None:
+    if isinstance(result, dict):
+        if _optional_int(result.get("ID") or result.get("id")) == user_id:
+            return result
+        for key in ("users", "items", "result"):
+            items = result.get(key)
+            if isinstance(items, list):
+                user = _extract_user(items, user_id=user_id)
+                if user is not None:
+                    return user
+    if isinstance(result, list):
+        for item in result:
+            if isinstance(item, dict) and _optional_int(item.get("ID") or item.get("id")) == user_id:
+                return item
+    return None
+
+
+def _optional_int(value: object) -> int | None:
+    try:
+        if value in (None, ""):
+            return None
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None

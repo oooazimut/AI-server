@@ -9,6 +9,7 @@ from ai_server.models import AgentTask, ModelUsageRecord, ToolResult
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
+from ai_server.tools.bitrix import BitrixToolset
 from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
 from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider
 
@@ -119,6 +120,64 @@ def test_bitrix_specialist_searches_my_open_tasks():
     assert tools.task_search_calls[0]["mode"] == "list"
     assert tools.task_search_calls[0]["filter"] == {"!STATUS": 5, "RESPONSIBLE_ID": 9}
     assert "Проверить камеру" in result.answer
+
+
+def test_bitrix_specialist_passes_user_profile_and_permission_rag_to_llm():
+    llm = FakeBitrixLLM()
+    tools = FakeResolverTools(
+        profile_result=ToolResult(
+            status="ok",
+            tool="current_user_profile",
+            data={
+                "user_id": 9,
+                "profile": {
+                    "id": 9,
+                    "label": "Иванов Иван",
+                    "active": True,
+                    "is_admin": False,
+                    "department_ids": [77],
+                    "work_position": "Монтажник",
+                    "user_type": "employee",
+                },
+            },
+        )
+    )
+
+    result = asyncio.run(
+        _bitrix_specialist(tools=tools, llm=llm).handle(
+            AgentTask(task_id="t1", request="Создай задачу на меня проверить камеру", user={"id": "9"})
+        )
+    )
+
+    context = llm.decide_calls[0]["task"].context
+    assert result.actions_taken[0].details["bitrix_current_user_profile_status"] == "ok"
+    assert context["bitrix_current_user_profile"]["status"] == "ok"
+    assert context["bitrix_current_user_profile"]["data"]["profile"]["work_position"] == "Монтажник"
+    assert context["permission_policy_context"]
+    assert {item["topic"] for item in context["permission_policy_context"]} == {"user_permissions"}
+    assert "user_permissions" in result.actions_taken[0].details["permission_policy_topics"]
+
+
+def test_bitrix_specialist_can_call_current_user_profile_tool():
+    result = asyncio.run(
+        _bitrix_specialist(
+            tools=FakeResolverTools(
+                profile_result=ToolResult(
+                    status="ok",
+                    tool="current_user_profile",
+                    data={"user_id": 9, "profile": {"id": 9, "work_position": "Монтажник"}},
+                )
+            ),
+            llm=FakeBitrixLLM(
+                tool_calls=[BitrixLLMToolCall(name="current_user_profile")],
+                final_answer="Профиль пользователя проверен.",
+            ),
+        ).handle(AgentTask(task_id="t1", request="Кто я в Битриксе?", user={"id": "9"}))
+    )
+
+    assert result.status == "completed"
+    assert result.actions_taken[2].name == "bitrix_current_user_profile"
+    assert result.actions_taken[2].status == "ok"
 
 
 def test_bitrix_specialist_marks_write_for_approval():
@@ -409,11 +468,21 @@ def test_bitrix_llm_decision_payload_includes_permission_context(monkeypatch):
         '"tool_calls":[{"name":"none","args":{},"summary":""}]}'
     )
     manifest = get_agent_manifest("bitrix24")
+    context = {
+        "bitrix_current_user_profile": {
+            "status": "ok",
+            "tool": "current_user_profile",
+            "data": {"user_id": 15, "profile": {"work_position": "Монтажник"}},
+        },
+        "permission_policy_context": [
+            {"topic": "user_permissions", "section": "Монтажники", "text": "Монтажник может закрывать свои задачи."}
+        ],
+    }
 
     asyncio.run(
         BitrixLLMService(client).decide(
             manifest=manifest,
-            task=AgentTask(task_id="t1", request="Создай задачу", user={"id": "15"}),
+            task=AgentTask(task_id="t1", request="Создай задачу", user={"id": "15"}, context=context),
             retrieval_hits=[],
             tool_definitions=[],
         )
@@ -426,6 +495,8 @@ def test_bitrix_llm_decision_payload_includes_permission_context(monkeypatch):
     assert permission["full_write_user_ids"] == [1, 9]
     assert permission["limited_task_create_user_ids"] == [15]
     assert permission["limited_task_create_project_id"] == 44
+    assert permission["bitrix_current_user_profile"] == context["bitrix_current_user_profile"]
+    assert permission["permission_policy_context"] == context["permission_policy_context"]
     assert any("read_only users should not prepare write-tools" in rule for rule in permission["rules"])
 
 
@@ -445,6 +516,32 @@ def test_bitrix_skills_and_knowledge_loaded():
     assert "safe_bitrix_write" in skill_ids
     assert "tasks_search" in topic_ids
     assert "bitrix_rest" in topic_ids
+    assert "user_permissions" in topic_ids
+
+
+def test_bitrix_current_user_profile_tool_compacts_user_fields():
+    class ProfileClient:
+        async def get_user(self, user_id: int):
+            assert user_id == 9
+            return {
+                "ID": "9",
+                "ACTIVE": "Y",
+                "NAME": "Иван",
+                "LAST_NAME": "Иванов",
+                "WORK_POSITION": "Монтажник",
+                "UF_DEPARTMENT": ["77", "88"],
+                "IS_ADMIN": "N",
+                "USER_TYPE": "employee",
+            }
+
+    result = asyncio.run(BitrixToolset(client=ProfileClient(), user_id=9).current_user_profile({}))
+
+    assert result.status == "ok"
+    profile = result.data["profile"]
+    assert profile["id"] == 9
+    assert profile["label"] == "Иванов Иван"
+    assert profile["department_ids"] == [77, 88]
+    assert profile["work_position"] == "Монтажник"
 
 
 class FakeResolverTools:
@@ -454,10 +551,12 @@ class FakeResolverTools:
         users: dict[str, list[dict]] | None = None,
         projects: dict[str, list[dict]] | None = None,
         task_result: ToolResult | None = None,
+        profile_result: ToolResult | None = None,
     ) -> None:
         self.users = users or {}
         self.projects = projects or {}
         self.task_result = task_result or ToolResult(status="not_configured", tool="task_search")
+        self.profile_result = profile_result or ToolResult(status="not_available", tool="current_user_profile")
         self.task_search_calls: list[dict] = []
 
     def definitions(self) -> list:
@@ -475,6 +574,9 @@ class FakeResolverTools:
     async def task_search(self, args: dict) -> ToolResult:
         self.task_search_calls.append(args)
         return self.task_result
+
+    async def current_user_profile(self, args: dict | None = None) -> ToolResult:
+        return self.profile_result
 
 
 class RecordingLLMClient:

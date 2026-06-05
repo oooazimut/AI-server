@@ -20,6 +20,7 @@ capabilities:
 tools:
   - knowledge_base
   - bitrix_api
+  - current_user_profile
   - portal_search
   - document_access
   - task_closure

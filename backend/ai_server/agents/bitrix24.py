@@ -44,7 +44,9 @@ class Bitrix24Specialist:
 
     async def handle(self, task: AgentTask) -> AgentResult:
         available_skills = self.skill_store.list_skills(self.manifest)
-        retrieval_hits = self.retriever.search(self.manifest, task.request, limit=3)
+        permission_context = await self._load_permission_context(task)
+        task = task.model_copy(update={"context": {**task.context, **permission_context}})
+        retrieval_hits = self.retriever.search(self.manifest, task.request, limit=5)
         actions_taken = [
             ActionRecord(
                 name="load_bitrix_specialist_context",
@@ -65,6 +67,14 @@ class Bitrix24Specialist:
                             "embedding_provider": hit.embedding_provider,
                         }
                         for hit in retrieval_hits
+                    ],
+                    "bitrix_current_user_profile_status": _tool_context_status(
+                        permission_context.get("bitrix_current_user_profile")
+                    ),
+                    "permission_policy_topics": [
+                        item.get("topic")
+                        for item in permission_context.get("permission_policy_context", [])
+                        if isinstance(item, dict)
                     ],
                 },
             )
@@ -257,6 +267,21 @@ class Bitrix24Specialist:
                 ActionRecord(name="bitrix_task_search", status=result.status, details=result.model_dump()),
                 [],
             )
+        if tool_call.name == "current_user_profile":
+            profile_tool = getattr(self.tools, "current_user_profile", None)
+            if profile_tool is None:
+                result = ToolResult(
+                    status="not_configured",
+                    tool="current_user_profile",
+                    error="current_user_profile tool is not bound",
+                )
+            else:
+                result = await profile_tool(tool_call.args)
+            return (
+                result,
+                ActionRecord(name="bitrix_current_user_profile", status=result.status, details=result.model_dump()),
+                [],
+            )
         if tool_call.name == "portal_search":
             result = self.tools.portal_search_contract(tool_call.args)
             return (
@@ -288,6 +313,46 @@ class Bitrix24Specialist:
             error=f"unknown Bitrix LLM tool call: {tool_call.name}",
         )
         return result, ActionRecord(name=tool_call.name, status=result.status, details=result.model_dump()), []
+
+    async def _load_permission_context(self, task: AgentTask) -> dict:
+        profile_result = await self._current_user_profile_result(task)
+        policy_hits = self.retriever.search(
+            self.manifest,
+            _permission_policy_query(task.request, profile_result),
+            limit=3,
+            topic="user_permissions",
+        )
+        return {
+            "bitrix_current_user_profile": profile_result.model_dump(),
+            "permission_policy_context": [
+                {
+                    "topic": hit.chunk.topic,
+                    "section": hit.chunk.section,
+                    "score": hit.score,
+                    "text": hit.chunk.text[:1200],
+                }
+                for hit in policy_hits
+            ],
+        }
+
+    async def _current_user_profile_result(self, task: AgentTask) -> ToolResult:
+        user_id = _optional_int(task.user.id)
+        tool = getattr(self.tools, "current_user_profile", None)
+        if user_id is None or tool is None:
+            return ToolResult(
+                status="not_available",
+                tool="current_user_profile",
+                error="current Bitrix user id is not available",
+            )
+        try:
+            return await tool({"user_id": user_id})
+        except Exception as exc:
+            return ToolResult(
+                status="error",
+                tool="current_user_profile",
+                error=f"{type(exc).__name__}: {exc}",
+                data={"user_id": user_id},
+            )
 
     async def _resolve_task_create_draft(
         self,
@@ -350,6 +415,28 @@ def _format_ambiguous_note(prefix: str, candidates: object) -> str:
     if not labels:
         return prefix + "; нужно уточнение."
     return prefix + ": " + "; ".join(labels) + ". Уточни нужный вариант."
+
+
+def _permission_policy_query(request: str, profile_result: ToolResult) -> str:
+    parts = [request, "права разрешения роли администратор монтажники отдел создание закрытие задачи"]
+    profile = profile_result.data.get("profile") if isinstance(profile_result.data, dict) else None
+    if isinstance(profile, dict):
+        for key in ("work_position", "user_type", "label"):
+            value = str(profile.get(key) or "").strip()
+            if value:
+                parts.append(value)
+        department_ids = profile.get("department_ids")
+        if isinstance(department_ids, list):
+            parts.extend(f"department_id:{item}" for item in department_ids)
+        if profile.get("is_admin") is True:
+            parts.append("администратор admin")
+    return " ".join(parts)
+
+
+def _tool_context_status(value: object) -> str:
+    if isinstance(value, dict):
+        return str(value.get("status") or "")
+    return ""
 
 
 def _tool_result_from_task_create_draft(draft: BitrixTaskCreateDraft) -> ToolResult:

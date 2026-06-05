@@ -11,7 +11,14 @@ from ai_server.retrieval import RetrievalHit
 from ai_server.settings import get_settings
 
 
-ALLOWED_TOOL_NAMES = {"task_search", "task_create_draft", "task_closure", "portal_search", "none"}
+ALLOWED_TOOL_NAMES = {
+    "current_user_profile",
+    "task_search",
+    "task_create_draft",
+    "task_closure",
+    "portal_search",
+    "none",
+}
 RESULT_STATUSES = {"completed", "needs_clarification", "needs_human", "failed"}
 
 
@@ -172,6 +179,8 @@ def _decision_system_prompt() -> str:
         "Запрещено отвечать так, будто действие уже выполнено, если нужен write-tool. "
         "В payload есть permission_context: именно ты обязан прочитать его до write-tool "
         "и решить, имеет ли текущий пользователь право просить такое действие. "
+        "permission_context содержит Bitrix-факты о текущем пользователе и RAG-выдержки из политики прав. "
+        "Если Bitrix-факты отсутствуют или противоречат политике, не угадывай права. "
         "Если permission_context не разрешает write-действие, не вызывай write-tool; "
         "верни needs_human или needs_clarification с коротким объяснением. "
         "Backend guardrails только страхуют выполнение, но не должны думать вместо тебя. "
@@ -179,11 +188,13 @@ def _decision_system_prompt() -> str:
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
-        '"tool_calls":[{"name":"task_search|task_create_draft|task_closure|portal_search|none","args":{},"summary":""}]}. '
+        '"tool_calls":[{"name":"current_user_profile|task_search|task_create_draft|task_closure|portal_search|none","args":{},"summary":""}]}. '
         "Перед каждым tool_call сам проверь, хватает ли данных для его корректного вызова. "
         "Нельзя вызывать tool с надеждой, что backend или tool сам разберётся с недостающими данными. "
         "Если данных не хватает, не вызывай tool: верни status=needs_clarification, tool_calls=[{\"name\":\"none\"}], "
         "а в answer задай короткий уточняющий вопрос. "
+        "Для проверки фактов о текущем пользователе можно использовать current_user_profile, но перед write-tool "
+        "обычно уже есть permission_context.bitrix_current_user_profile. "
         "Для поиска задач используй task_search. Для создания задачи используй task_create_draft. "
         "Для task_create_draft именно ты распознаёшь title, responsible_id/responsible_query/responsible_self, "
         "group_id/project_query, deadline_iso или no_deadline. "
@@ -294,6 +305,8 @@ def _permission_context(task: AgentTask) -> dict[str, Any]:
         "limited_task_create_user_ids": limited_user_ids,
         "limited_task_create_project_id": limited_project_id,
         "oauth_required_for_writes": settings.bitrix_oauth_required_for_writes,
+        "bitrix_current_user_profile": task.context.get("bitrix_current_user_profile"),
+        "permission_policy_context": task.context.get("permission_policy_context", []),
         "rules": [
             "full_bitrix_write users may prepare Bitrix write-tools, still requiring chat confirmation.",
             "limited_task_create users may prepare task_create_draft only for the configured limited project.",
