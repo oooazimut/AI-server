@@ -121,7 +121,7 @@ def test_vehicle_usage_worker_delegates_due_reminder_to_logistics_llm(monkeypatc
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     monkeypatch.setenv("VEHICLE_USAGE_ENABLED", "true")
-    monkeypatch.setenv("VEHICLE_USAGE_DRY_RUN", "true")
+    monkeypatch.setenv("VEHICLE_USAGE_DRY_RUN", "false")
     monkeypatch.setenv("VEHICLE_USAGE_MANAGER_USER_ID", "9")
     monkeypatch.setenv("VEHICLE_USAGE_DIALOG_ID", "chat9")
     monkeypatch.setenv("VEHICLE_USAGE_REQUEST_TIMES", "08:30,09:00")
@@ -131,27 +131,15 @@ def test_vehicle_usage_worker_delegates_due_reminder_to_logistics_llm(monkeypatc
     fake_llm = FakeLogisticsLLM(
         tool_call_steps=[
             [LogisticsLLMToolCall(name="vehicle_usage_context", args={"request_date": "2026-06-05"})],
-            [
-                LogisticsLLMToolCall(
-                    name="vehicle_usage_send_message",
-                    args={"dialog_id": "chat9", "message": "Нужен утренний отчет."},
-                ),
-                LogisticsLLMToolCall(
-                    name="vehicle_usage_mark_request_sent",
-                    args={
-                        "request_date": "2026-06-05",
-                        "message": "Нужен утренний отчет.",
-                        "reminder_count": 1,
-                    },
-                ),
-            ],
             [LogisticsLLMToolCall(name="none")],
         ],
+        final_answer="Нужен утренний отчет.",
     )
+    bitrix = FakeVehicleBitrix()
 
     result = anyio_run(
         run_vehicle_usage_once(
-            FakeVehicleBitrix(),
+            bitrix,
             status={},
             store=store,
             logistics_llm=fake_llm,
@@ -161,6 +149,10 @@ def test_vehicle_usage_worker_delegates_due_reminder_to_logistics_llm(monkeypatc
 
     assert result["handled"] is True
     assert result["action"] == "reminder"
+    assert bitrix.messages == [
+        {"dialog_id": "chat9", "message": "Нужен утренний отчет.", "bot_id": None, "keyboard": None}
+    ]
+    assert result["delivery"]["speaker"] == "negotiator_channel"
     with sqlite3.connect(store.path) as db:
         row = db.execute("SELECT status, reminder_count, message FROM vehicle_usage_requests").fetchone()
     assert row == ("sent", 1, "Нужен утренний отчет.")
@@ -189,17 +181,9 @@ def test_vehicle_usage_worker_delegates_escalation_to_logistics_llm(monkeypatch,
     fake_llm = FakeLogisticsLLM(
         tool_call_steps=[
             [LogisticsLLMToolCall(name="vehicle_usage_context", args={"request_date": "2026-06-05"})],
-            [
-                LogisticsLLMToolCall(
-                    name="vehicle_usage_notify_admins",
-                    args={
-                        "request_date": "2026-06-05",
-                        "message": "Отчет по машинам не получен.",
-                    },
-                )
-            ],
             [LogisticsLLMToolCall(name="none")],
         ],
+        final_answer="Отчет по машинам не получен.",
     )
     bitrix = FakeVehicleBitrix()
 
@@ -216,6 +200,7 @@ def test_vehicle_usage_worker_delegates_escalation_to_logistics_llm(monkeypatch,
     assert result["handled"] is True
     assert result["action"] == "escalation"
     assert [item["user_id"] for item in bitrix.notifications] == [1, 9]
+    assert result["delivery"]["speaker"] == "negotiator_channel"
     with sqlite3.connect(store.path) as db:
         row = db.execute("SELECT escalated_at FROM vehicle_usage_requests").fetchone()
     assert row[0]

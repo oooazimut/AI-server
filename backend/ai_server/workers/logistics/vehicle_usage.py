@@ -85,8 +85,9 @@ async def run_vehicle_usage_once(
                 request=(
                     "Scheduler event: к времени эскалации не получен утренний отчет по "
                     f"сотрудникам и служебным автомобилям за {request_date}. "
-                    "Сформулируй уведомление администраторам и вызови vehicle_usage_notify_admins. "
-                    "Перед этим прочитай контекст через vehicle_usage_context."
+                    "Сформулируй точный текст уведомления для Переговорщика. "
+                    "Перед этим прочитай контекст через vehicle_usage_context. "
+                    "Сам не отправляй сообщения в Bitrix."
                 ),
                 context={
                     "event": "vehicle_usage_escalation_due",
@@ -95,9 +96,23 @@ async def run_vehicle_usage_once(
                     "existing_request": existing,
                 },
             )
+            delivery = await _deliver_escalation(
+                bitrix,
+                store=selected_store,
+                request_date=request_date,
+                manager_id=manager_id,
+                message=result.answer,
+                now=now,
+            )
             status["last_escalated_at"] = now.isoformat()
             status["last_result"] = result.model_dump()
-            return {"handled": True, "action": "escalation", "result": result.model_dump()}
+            status["last_delivery"] = delivery
+            return {
+                "handled": True,
+                "action": "escalation",
+                "result": result.model_dump(),
+                "delivery": delivery,
+            }
 
     reminder_number = _due_reminder_number(now)
     if reminder_number is None:
@@ -116,9 +131,9 @@ async def run_vehicle_usage_once(
         request=(
             "Scheduler event: пора отправить утренний запрос по сотрудникам и служебным автомобилям "
             f"за {request_date}. Номер напоминания: {reminder_number}. "
-            "Сформулируй сообщение, отправь его в Bitrix через vehicle_usage_send_message, "
-            "затем отметь отправку через vehicle_usage_mark_request_sent. "
-            "Перед отправкой прочитай roster/vehicles/latest_request через vehicle_usage_context."
+            "Сформулируй точный текст сообщения для Переговорщика. "
+            "Перед этим прочитай roster/vehicles/latest_request через vehicle_usage_context. "
+            "Сам не отправляй сообщения в Bitrix."
         ),
         context={
             "event": "vehicle_usage_reminder_due",
@@ -128,11 +143,22 @@ async def run_vehicle_usage_once(
             "existing_request": existing,
         },
     )
+    delivery = await _deliver_reminder(
+        bitrix,
+        store=selected_store,
+        request_date=request_date,
+        manager_id=manager_id,
+        dialog_id=dialog_id,
+        message=result.answer,
+        reminder_number=reminder_number,
+        now=now,
+    )
     status["last_sent_at"] = now.isoformat()
     status["last_request_date"] = request_date
     status["last_reminder_number"] = reminder_number
     status["last_result"] = result.model_dump()
-    return {"handled": True, "action": "reminder", "result": result.model_dump()}
+    status["last_delivery"] = delivery
+    return {"handled": True, "action": "reminder", "result": result.model_dump(), "delivery": delivery}
 
 
 def _initial_status() -> dict[str, Any]:
@@ -186,6 +212,88 @@ async def _run_logistics_event(
             context=context,
         )
     )
+
+
+async def _deliver_reminder(
+    bitrix: BitrixClient,
+    *,
+    store: VehicleUsageStore,
+    request_date: str,
+    manager_id: int,
+    dialog_id: str,
+    message: str,
+    reminder_number: int,
+    now: datetime,
+) -> dict[str, Any]:
+    cleaned_message = message.strip()
+    if not cleaned_message:
+        return {"sent": False, "marked": False, "reason": "empty_logistics_message"}
+
+    settings = get_settings()
+    sent = False
+    if not settings.vehicle_usage_dry_run:
+        await bitrix.send_bot_message(dialog_id, cleaned_message)
+        sent = True
+    request_id = store.create_sent_request(
+        request_date=request_date,
+        user_id=manager_id,
+        dialog_id=dialog_id,
+        message=cleaned_message,
+        sent_at=now.isoformat(),
+        reminder_count=reminder_number,
+    )
+    return {
+        "sent": sent,
+        "dry_run": settings.vehicle_usage_dry_run,
+        "dialog_id": dialog_id,
+        "request_id": request_id,
+        "message": cleaned_message,
+        "speaker": "negotiator_channel",
+    }
+
+
+async def _deliver_escalation(
+    bitrix: BitrixClient,
+    *,
+    store: VehicleUsageStore,
+    request_date: str,
+    manager_id: int,
+    message: str,
+    now: datetime,
+) -> dict[str, Any]:
+    cleaned_message = message.strip()
+    if not cleaned_message:
+        return {"sent": False, "marked": False, "reason": "empty_logistics_message"}
+
+    settings = get_settings()
+    user_ids = settings.resolved_vehicle_usage_admin_notify_user_ids
+    if not user_ids:
+        marked = store.mark_escalated(request_date=request_date, user_id=manager_id, escalated_at=now.isoformat())
+        return {
+            "sent": False,
+            "marked": marked,
+            "reason": "no_admin_user_ids",
+            "speaker": "negotiator_channel",
+        }
+
+    notified: list[int] = []
+    if not settings.vehicle_usage_dry_run:
+        for user_id in user_ids:
+            await bitrix.notify_user(
+                user_id=user_id,
+                message=cleaned_message,
+                tag=f"vehicle_usage_no_response_{request_date}",
+            )
+            notified.append(user_id)
+    marked = store.mark_escalated(request_date=request_date, user_id=manager_id, escalated_at=now.isoformat())
+    return {
+        "sent": bool(notified),
+        "dry_run": settings.vehicle_usage_dry_run,
+        "notified_user_ids": notified if notified else user_ids,
+        "marked": marked,
+        "message": cleaned_message,
+        "speaker": "negotiator_channel",
+    }
 
 
 def _skipped(status: dict[str, Any], reason: str) -> dict[str, Any]:

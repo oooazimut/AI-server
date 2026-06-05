@@ -14,9 +14,6 @@ ALLOWED_TOOL_NAMES = {
     "vehicle_usage_context",
     "vehicle_usage_save_draft",
     "vehicle_usage_save_report",
-    "vehicle_usage_mark_request_sent",
-    "vehicle_usage_notify_admins",
-    "vehicle_usage_send_message",
     "none",
 }
 RESULT_STATUSES = {"completed", "needs_clarification", "needs_human", "failed"}
@@ -173,34 +170,36 @@ def _decision_system_prompt() -> str:
         "Ты LLM-специалист Логист внутри корпоративного AI-server. "
         "Твоя зона: ежедневный учет служебных автомобилей, статусы сотрудников, смены, выезды, "
         "утренние отчеты и уточнения к ним. "
-        "Ты не вызываешь Bitrix напрямую и не пишешь в SQLite сам: выбирай vehicle_usage tools. "
-        "Backend-tools только читают/пишут структурированные данные и отправляют сообщения; "
+        "Ты не вызываешь Bitrix напрямую, не пишешь в чат сам и не пишешь в SQLite сам: выбирай vehicle_usage tools. "
+        "Backend-tools только читают/пишут структурированные данные; "
         "они не решают, что имел в виду человек. "
         "Сначала получи vehicle_usage_context, если в tool_results еще нет roster/vehicles/latest_request. "
         "Сам распознавай естественный язык: кто работает, кто в отпуске/болеет/на объекте, какая машина за кем, "
         "является ли ответ подтверждением, исправлением или просьбой начать заново. "
         "Если данных не хватает, не сохраняй финальный отчет: сохрани черновик при необходимости и задай уточнение. "
         "Если задача пришла от scheduler и пора отправить утренний запрос или повторное напоминание, "
-        "сформулируй сообщение, вызови vehicle_usage_send_message, затем vehicle_usage_mark_request_sent. "
-        "Если scheduler сообщает, что ответа нет к времени эскалации, сформулируй уведомление и вызови "
-        "vehicle_usage_notify_admins. "
+        "сформулируй точный текст сообщения в answer и не вызывай send tools. "
+        "Если scheduler сообщает, что ответа нет к времени эскалации, сформулируй точный текст уведомления "
+        "в answer и не вызывай notify tools. "
         "vehicle_usage_save_report вызывай только когда отчет явно подтвержден человеком или задача от scheduler "
         "содержит уже подтвержденный структурированный отчет. "
         "Верни только JSON-объект без markdown: "
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
-        '"tool_calls":[{"name":"vehicle_usage_context|vehicle_usage_save_draft|vehicle_usage_save_report|vehicle_usage_mark_request_sent|vehicle_usage_notify_admins|vehicle_usage_send_message|none","args":{},"summary":""}]}.'
+        '"tool_calls":[{"name":"vehicle_usage_context|vehicle_usage_save_draft|vehicle_usage_save_report|none","args":{},"summary":""}]}.' 
     )
 
 
 def _compose_system_prompt() -> str:
     return (
-        "Ты тот же Логист. Сформируй итоговый ответ человеку по результатам vehicle_usage tools. "
+        "Ты тот же Логист. Сформируй итоговый текст для Переговорщика по результатам vehicle_usage tools. "
         "Не выдумывай сохраненные записи. Если сохранен черновик, попроси проверить/подтвердить. "
         "Если сохранен финальный отчет, скажи кратко что сохранено. "
+        "Если задача от scheduler про напоминание или эскалацию, answer должен быть точным текстом сообщения, "
+        "которое Переговорщик отправит людям. "
         "Верни только JSON-объект без markdown: "
-        '{"status":"completed|needs_clarification|needs_human|failed","answer":"ответ человеку"}.'
+        '{"status":"completed|needs_clarification|needs_human|failed","answer":"ответ человеку"}.' 
     )
 
 

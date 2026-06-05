@@ -460,44 +460,6 @@ class VehicleUsageToolset:
                     "required": ["parsed"],
                 },
             ),
-            ToolDefinition(
-                name="vehicle_usage_mark_request_sent",
-                description="Mark a scheduled vehicle usage request/reminder as sent after Logistics LLM sends it.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "request_date": {"type": "string"},
-                        "message": {"type": "string"},
-                        "reminder_count": {"type": "integer"},
-                    },
-                    "required": ["request_date", "message", "reminder_count"],
-                },
-            ),
-            ToolDefinition(
-                name="vehicle_usage_notify_admins",
-                description="Notify configured admins about missing vehicle usage report and mark request escalated.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "request_date": {"type": "string"},
-                        "message": {"type": "string"},
-                        "user_ids": {"type": "array", "items": {"type": "integer"}},
-                    },
-                    "required": ["request_date", "message"],
-                },
-            ),
-            ToolDefinition(
-                name="vehicle_usage_send_message",
-                description="Send a logistics reminder or clarification message to a Bitrix dialog.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "dialog_id": {"type": "string"},
-                        "message": {"type": "string"},
-                    },
-                    "required": ["dialog_id", "message"],
-                },
-            ),
         ]
 
     def vehicle_usage_context(self, args: dict[str, Any]) -> ToolResult:
@@ -534,91 +496,6 @@ class VehicleUsageToolset:
             parsed=parsed,
         )
         return ToolResult(status="ok", tool="vehicle_usage_save_report", data=saved)
-
-    def vehicle_usage_mark_request_sent(self, args: dict[str, Any]) -> ToolResult:
-        request_date = _request_date(args.get("request_date"))
-        message = str(args.get("message") or "")
-        reminder_count = _optional_int(args.get("reminder_count")) or 1
-        if not message.strip():
-            return ToolResult(
-                status="invalid_tool_call",
-                tool="vehicle_usage_mark_request_sent",
-                error="message is required",
-            )
-        request_id = self.store.create_sent_request(
-            request_date=request_date,
-            user_id=self.user_id,
-            dialog_id=self.dialog_id or get_settings().vehicle_usage_dialog_id,
-            message=message,
-            sent_at=_now().isoformat(),
-            reminder_count=reminder_count,
-        )
-        return ToolResult(
-            status="ok",
-            tool="vehicle_usage_mark_request_sent",
-            data={"request_id": request_id, "request_date": request_date, "reminder_count": reminder_count},
-        )
-
-    async def vehicle_usage_notify_admins(self, args: dict[str, Any]) -> ToolResult:
-        request_date = _request_date(args.get("request_date"))
-        message = str(args.get("message") or "").strip()
-        if not message:
-            return ToolResult(
-                status="invalid_tool_call",
-                tool="vehicle_usage_notify_admins",
-                error="message is required",
-            )
-        raw_user_ids = args.get("user_ids")
-        user_ids = _int_list(raw_user_ids) if isinstance(raw_user_ids, list) else get_settings().resolved_vehicle_usage_admin_notify_user_ids
-        if not user_ids:
-            return ToolResult(
-                status="skipped",
-                tool="vehicle_usage_notify_admins",
-                data={"reason": "no_admin_user_ids", "request_date": request_date},
-            )
-        if get_settings().vehicle_usage_dry_run:
-            return ToolResult(
-                status="dry_run",
-                tool="vehicle_usage_notify_admins",
-                data={"request_date": request_date, "user_ids": user_ids, "message": message},
-            )
-        notified = []
-        for user_id in user_ids:
-            await self.client.notify_user(
-                user_id=user_id,
-                message=message,
-                tag=f"vehicle_usage_no_response_{request_date}",
-            )
-            notified.append(user_id)
-        marked = self.store.mark_escalated(
-            request_date=request_date,
-            user_id=self.user_id,
-            escalated_at=_now().isoformat(),
-        )
-        return ToolResult(
-            status="ok",
-            tool="vehicle_usage_notify_admins",
-            data={"request_date": request_date, "notified_user_ids": notified, "marked_escalated": marked},
-        )
-
-    async def vehicle_usage_send_message(self, args: dict[str, Any]) -> ToolResult:
-        dialog_id = str(args.get("dialog_id") or self.dialog_id or get_settings().vehicle_usage_dialog_id).strip()
-        message = str(args.get("message") or "").strip()
-        if not dialog_id or not message:
-            return ToolResult(
-                status="invalid_tool_call",
-                tool="vehicle_usage_send_message",
-                error="dialog_id and message are required",
-            )
-        if get_settings().vehicle_usage_dry_run:
-            return ToolResult(
-                status="dry_run",
-                tool="vehicle_usage_send_message",
-                data={"dialog_id": dialog_id, "message": message},
-            )
-        await self.client.send_bot_message(dialog_id, message)
-        return ToolResult(status="ok", tool="vehicle_usage_send_message", data={"dialog_id": dialog_id})
-
 
 def _staff_roster_from_settings() -> list[StaffMember]:
     roster: list[StaffMember] = []
@@ -689,12 +566,3 @@ def _optional_int(value: object) -> int | None:
         return int(str(value).strip())
     except (TypeError, ValueError):
         return None
-
-
-def _int_list(values: list[object]) -> list[int]:
-    result: list[int] = []
-    for value in values:
-        parsed = _optional_int(value)
-        if parsed is not None and parsed not in result:
-            result.append(parsed)
-    return result

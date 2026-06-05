@@ -188,15 +188,6 @@ class LogisticsSpecialist:
         if tool_call.name == "vehicle_usage_save_report":
             result = self.tools.vehicle_usage_save_report(tool_call.args)
             return result, ActionRecord(name="logistics_vehicle_usage_save_report", status=result.status, details=result.model_dump())
-        if tool_call.name == "vehicle_usage_mark_request_sent":
-            result = self.tools.vehicle_usage_mark_request_sent(tool_call.args)
-            return result, ActionRecord(name="logistics_vehicle_usage_mark_request_sent", status=result.status, details=result.model_dump())
-        if tool_call.name == "vehicle_usage_notify_admins":
-            result = await self.tools.vehicle_usage_notify_admins(tool_call.args)
-            return result, ActionRecord(name="logistics_vehicle_usage_notify_admins", status=result.status, details=result.model_dump())
-        if tool_call.name == "vehicle_usage_send_message":
-            result = await self.tools.vehicle_usage_send_message(tool_call.args)
-            return result, ActionRecord(name="logistics_vehicle_usage_send_message", status=result.status, details=result.model_dump())
 
         result = ToolResult(
             status="invalid_tool_call",
@@ -208,7 +199,8 @@ class LogisticsSpecialist:
 
 def _logs() -> list[str]:
     return [
-        "Logistics specialist is an LLM specialist; vehicle tools only read/write structured state and send messages.",
+        "Logistics specialist is an LLM specialist; vehicle tools only read/write structured state.",
+        "User-facing delivery belongs to the Negotiator/channel runtime.",
         "Bitrix remains the channel/source layer; Logistics owns vehicle usage interpretation.",
     ]
 

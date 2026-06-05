@@ -4,7 +4,8 @@
 
 Первый MVP: разделить старый автономный `BitrixAIAgent` на две роли:
 
-- `internal_orchestrator` - входная точка и маршрутизатор для сотрудников;
+- `internal_orchestrator` - Переговорщик: входная точка, маршрутизатор и голос
+  системы для сотрудников;
 - `bitrix24` - узкий специалист по Битрикс24 со своими instructions, skills, knowledge topics и tools.
 
 ## Архитектура
@@ -12,7 +13,7 @@
 ```text
 Bitrix24 chat / local test
   ↓
-Internal Orchestrator
+Internal Orchestrator / Переговорщик
   ↓
 Agent Registry
   ↓
@@ -346,8 +347,9 @@ QUALITY_CONTROL_SMART_ENABLED=true
 
 Утренний учёт служебных автомобилей перенесён в отдельного LLM-субагента
 `logistics`. Worker отвечает за расписание и dedupe, а Логист сам выбирает
-tools, формулирует сообщения, отмечает отправленные напоминания, разбирает
-ответы и эскалирует отсутствие отчёта.
+read/write tools по структурированным данным, формулирует текст для
+Переговорщика, разбирает ответы и готовит текст эскалации. Отправка сообщений
+людям остаётся в канальном runtime.
 
 ```env
 VEHICLE_USAGE_ENABLED=false

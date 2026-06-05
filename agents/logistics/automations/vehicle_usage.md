@@ -25,9 +25,9 @@
 
 Backend-worker отвечает только за техническое расписание, рабочие дни, dedupe и
 хранение state. Содержательные решения остаются у LLM-Логиста: он формулирует
-сообщение, выбирает `vehicle_usage_send_message`,
-`vehicle_usage_mark_request_sent`, `vehicle_usage_notify_admins`,
-`vehicle_usage_save_draft` или `vehicle_usage_save_report`.
+сообщение для Переговорщика и выбирает `vehicle_usage_save_draft` или
+`vehicle_usage_save_report`, когда нужно сохранить структурированные данные.
+Отправка сообщений людям остаётся в канальном runtime.
 
 ## State
 

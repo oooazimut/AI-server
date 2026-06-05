@@ -18,9 +18,6 @@ tools:
   - vehicle_usage_context
   - vehicle_usage_save_draft
   - vehicle_usage_save_report
-  - vehicle_usage_mark_request_sent
-  - vehicle_usage_notify_admins
-  - vehicle_usage_send_message
 automations:
   - id: logistics_vehicle_usage
     name: Утренний учёт служебных машин
@@ -42,9 +39,6 @@ automations:
       - vehicle_usage_context
       - vehicle_usage_save_draft
       - vehicle_usage_save_report
-      - vehicle_usage_mark_request_sent
-      - vehicle_usage_notify_admins
-      - vehicle_usage_send_message
     data_scopes:
       - bitrix24_chats
       - bitrix24_users
