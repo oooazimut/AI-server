@@ -21,7 +21,7 @@ from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.technical_footer import ProviderBalanceSnapshot, TechnicalFooterService
 from ai_server.workers.bitrix.webhook_event_queue import WebhookEventQueue
 from scripts.create_bitrix_dev_chat import chat_reference, sanitize_result
-from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, FakeInternalOrchestratorLLM
+from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, FakeInternalOrchestratorLLM, FakePendingControlLLM
 
 
 def _bitrix_v2_message_payload() -> dict:
@@ -255,15 +255,17 @@ def test_bitrix_pending_action_confirm_executes_and_clears_state(monkeypatch, tm
         ),
     )
     payload = _bitrix_v2_message_payload()
-    payload["data"]["message"]["text"] = "да"
+    payload["data"]["message"]["text"] = "ну давай, запускай это"
 
     class ForbiddenOrchestrator:
         async def handle(self, task):
             raise AssertionError("pending confirmation should not reach orchestrator")
 
+    pending_control = FakePendingControlLLM("confirm")
     processor = BitrixWebhookProcessor(
         bitrix=fake_bitrix,
         orchestrator=ForbiddenOrchestrator(),
+        pending_control_llm=pending_control,
         pending_actions=BitrixPendingActionService(
             store=store,
             bitrix=fake_bitrix,
@@ -274,6 +276,7 @@ def test_bitrix_pending_action_confirm_executes_and_clears_state(monkeypatch, tm
     result = anyio_run(processor.process(payload))
 
     assert result["agent_result_status"] == "executed"
+    assert pending_control.classify_calls[0]["user_text"] == "ну давай, запускай это"
     assert fake_bitrix.calls == [("tasks.task.add", {"fields": {"TITLE": "Тестовая задача"}})]
     assert fake_bitrix.messages[0][1].startswith("Готово")
     assert store.load(key).pending_action is None
@@ -295,10 +298,12 @@ def test_bitrix_pending_action_cancel_clears_state_without_call(monkeypatch, tmp
         ),
     )
     payload = _bitrix_v2_message_payload()
-    payload["data"]["message"]["text"] = "отмена"
+    payload["data"]["message"]["text"] = "не надо выполнять"
 
+    pending_control = FakePendingControlLLM("cancel")
     processor = BitrixWebhookProcessor(
         bitrix=fake_bitrix,
+        pending_control_llm=pending_control,
         pending_actions=BitrixPendingActionService(
             store=store,
             bitrix=fake_bitrix,
@@ -309,9 +314,60 @@ def test_bitrix_pending_action_cancel_clears_state_without_call(monkeypatch, tmp
     result = anyio_run(processor.process(payload))
 
     assert result["agent_result_status"] == "cancelled"
+    assert pending_control.classify_calls[0]["user_text"] == "не надо выполнять"
     assert fake_bitrix.calls == []
     assert store.load(key).pending_action is None
     assert '"status": "cancelled"' in (tmp_path / "bitrix_write_audit.jsonl").read_text(encoding="utf-8")
+
+
+def test_bitrix_pending_action_new_request_goes_to_orchestrator(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_DRY_RUN", "true")
+    store = DialogStateStore(tmp_path / "dialog_state.sqlite")
+    fake_bitrix = FakeBitrixClient()
+    key = make_dialog_key(chat_id=77, dialog_id="chat99", user_id=9)
+    store.set_pending(
+        key,
+        PendingBitrixAction(
+            method="tasks.task.add",
+            params={"fields": {"TITLE": "Тестовая задача"}},
+            summary="создать задачу",
+            created_by=9,
+        ),
+    )
+    payload = _bitrix_v2_message_payload()
+    payload["data"]["message"]["text"] = "Покажи мои открытые задачи"
+
+    class FakeOrchestrator:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def handle(self, task):
+            self.requests.append(task.request)
+            return AgentResult(
+                status="completed",
+                agent_id="internal_orchestrator",
+                answer="Вот список задач.",
+                confidence=0.8,
+            )
+
+    orchestrator = FakeOrchestrator()
+    processor = BitrixWebhookProcessor(
+        bitrix=fake_bitrix,
+        orchestrator=orchestrator,
+        pending_control_llm=FakePendingControlLLM("new_request"),
+        pending_actions=BitrixPendingActionService(
+            store=store,
+            bitrix=fake_bitrix,
+            audit_log_path=tmp_path / "bitrix_write_audit.jsonl",
+        ),
+    )
+
+    result = anyio_run(processor.process(payload))
+
+    assert result["agent_result_status"] == "completed"
+    assert orchestrator.requests == ["Покажи мои открытые задачи"]
+    assert store.load(key).pending_action is not None
+    assert fake_bitrix.calls == []
 
 
 def test_quality_control_live_webhook_requires_actor(monkeypatch):
@@ -417,6 +473,7 @@ def test_bitrix_task_create_chat_flow_saves_and_confirms_pending_action(monkeypa
             final_answer="Подготовил черновик задачи, нужно подтверждение.",
         ),
         bitrix_retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
+        pending_control_llm=FakePendingControlLLM("confirm"),
         pending_actions=BitrixPendingActionService(
             store=store,
             bitrix=fake_bitrix,
@@ -444,7 +501,7 @@ def test_bitrix_task_create_chat_flow_saves_and_confirms_pending_action(monkeypa
     monkeypatch.setenv("AGENT_DRY_RUN", "false")
     monkeypatch.setenv("AGENT_WRITE_ALLOWED_USER_IDS", "9")
     monkeypatch.setenv("BITRIX_OAUTH_REQUIRED_FOR_WRITES", "false")
-    payload["data"]["message"]["text"] = "да"
+    payload["data"]["message"]["text"] = "подтверждаю создание"
 
     confirm_result = anyio_run(processor.process(payload))
 
@@ -473,10 +530,11 @@ def test_bitrix_task_closure_pending_confirm_executes_compound_action(monkeypatc
         ),
     )
     payload = _bitrix_v2_message_payload()
-    payload["data"]["message"]["text"] = "да"
+    payload["data"]["message"]["text"] = "можно закрывать"
 
     processor = BitrixWebhookProcessor(
         bitrix=fake_bitrix,
+        pending_control_llm=FakePendingControlLLM("confirm"),
         pending_actions=BitrixPendingActionService(
             store=store,
             bitrix=fake_bitrix,

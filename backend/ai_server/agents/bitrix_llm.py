@@ -8,6 +8,7 @@ from typing import Any, Protocol
 from ai_server.llm import LLMClient, LLMError, OpenAICompatibleLLMClient
 from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
 from ai_server.retrieval import RetrievalHit
+from ai_server.settings import get_settings
 
 
 ALLOWED_TOOL_NAMES = {"task_search", "task_create_draft", "task_closure", "portal_search", "none"}
@@ -95,6 +96,7 @@ class BitrixLLMService:
                             "user": task.user.model_dump(),
                             "files": task.files,
                             "current_datetime": datetime.now(timezone.utc).astimezone().isoformat(),
+                            "permission_context": _permission_context(task),
                             "retrieval_context": _retrieval_context(retrieval_hits),
                             "tools": _allowed_tool_definitions(tool_definitions),
                         },
@@ -168,6 +170,11 @@ def _decision_system_prompt() -> str:
         "Ты не выполняешь действия сам: выбираешь один или несколько tools. "
         "Backend выполнит tools и применит policy/OAuth/подтверждения. "
         "Запрещено отвечать так, будто действие уже выполнено, если нужен write-tool. "
+        "В payload есть permission_context: именно ты обязан прочитать его до write-tool "
+        "и решить, имеет ли текущий пользователь право просить такое действие. "
+        "Если permission_context не разрешает write-действие, не вызывай write-tool; "
+        "верни needs_human или needs_clarification с коротким объяснением. "
+        "Backend guardrails только страхуют выполнение, но не должны думать вместо тебя. "
         "Верни только JSON-объект без markdown. Формат: "
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
@@ -262,8 +269,51 @@ def _retrieval_context(hits: list[RetrievalHit]) -> list[dict[str, Any]]:
     return context
 
 
+def _permission_context(task: AgentTask) -> dict[str, Any]:
+    settings = get_settings()
+    user_id = _optional_int(task.user.id)
+    full_write_user_ids = settings.resolved_agent_write_allowed_user_ids
+    limited_user_ids = settings.resolved_agent_limited_task_create_user_ids
+    limited_project_id = settings.agent_limited_task_create_project_id
+    full_write = user_id is not None and user_id in full_write_user_ids
+    limited_task_create = (
+        user_id is not None
+        and limited_project_id is not None
+        and user_id in limited_user_ids
+    )
+    if full_write:
+        profile = "full_bitrix_write"
+    elif limited_task_create:
+        profile = "limited_task_create"
+    else:
+        profile = "read_only"
+    return {
+        "current_user_id": user_id,
+        "current_user_write_profile": profile,
+        "full_write_user_ids": full_write_user_ids,
+        "limited_task_create_user_ids": limited_user_ids,
+        "limited_task_create_project_id": limited_project_id,
+        "oauth_required_for_writes": settings.bitrix_oauth_required_for_writes,
+        "rules": [
+            "full_bitrix_write users may prepare Bitrix write-tools, still requiring chat confirmation.",
+            "limited_task_create users may prepare task_create_draft only for the configured limited project.",
+            "read_only users should not prepare write-tools; ask for an authorized user or human handoff.",
+            "task_closure should only be prepared when the user is acting on their own task result or has full write rights.",
+        ],
+    }
+
+
 def _allowed_tool_definitions(definitions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [definition for definition in definitions if definition.get("name") in ALLOWED_TOOL_NAMES]
+
+
+def _optional_int(value: object) -> int | None:
+    try:
+        if value in (None, ""):
+            return None
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
 
 
 def _decision_dict(decision: BitrixLLMDecision) -> dict[str, Any]:

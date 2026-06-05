@@ -1,9 +1,11 @@
 import asyncio
+import json
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist
-from ai_server.agents.bitrix_llm import BitrixLLMToolCall
+from ai_server.agents.bitrix_llm import BitrixLLMService, BitrixLLMToolCall
 from ai_server.knowledge import MarkdownKnowledgeBase
-from ai_server.models import AgentTask, ToolResult
+from ai_server.llm import LLMCompletion
+from ai_server.models import AgentTask, ModelUsageRecord, ToolResult
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
@@ -22,7 +24,7 @@ def _bitrix_specialist(*, tools=None, llm=None) -> Bitrix24Specialist:
     )
 
 
-def test_bitrix_specialist_selects_task_skill():
+def test_bitrix_specialist_loads_available_skills_and_rag_context():
     result = asyncio.run(
         _bitrix_specialist(tools=FakeResolverTools()).handle(
             AgentTask(task_id="t1", request="Найди просроченные задачи в Битриксе")
@@ -31,7 +33,12 @@ def test_bitrix_specialist_selects_task_skill():
 
     assert result.status == "completed"
     assert result.handoff_to == []
-    assert result.actions_taken[0].details["skills"] == ["tasks_search"]
+    details = result.actions_taken[0].details
+    assert "skills" not in details
+    assert "knowledge_topics" not in details
+    assert {skill["id"] for skill in details["available_skills"]} >= {"tasks_search", "safe_bitrix_write"}
+    assert details["retrieval_topics"]
+    assert details["retrieval_hits"]
     assert result.actions_taken[1].name == "bitrix_llm_decision"
 
 
@@ -392,6 +399,36 @@ def test_bitrix_specialist_asks_when_responsible_name_is_ambiguous():
     assert "несколько сотрудников" in result.answer
 
 
+def test_bitrix_llm_decision_payload_includes_permission_context(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("AGENT_WRITE_ALLOWED_USER_IDS", "1,9")
+    monkeypatch.setenv("AGENT_LIMITED_TASK_CREATE_PROJECT_ID", "44")
+    monkeypatch.setenv("AGENT_LIMITED_TASK_CREATE_USER_IDS", "15")
+    client = RecordingLLMClient(
+        '{"status":"completed","answer":"","confidence":0.7,'
+        '"tool_calls":[{"name":"none","args":{},"summary":""}]}'
+    )
+    manifest = get_agent_manifest("bitrix24")
+
+    asyncio.run(
+        BitrixLLMService(client).decide(
+            manifest=manifest,
+            task=AgentTask(task_id="t1", request="Создай задачу", user={"id": "15"}),
+            retrieval_hits=[],
+            tool_definitions=[],
+        )
+    )
+
+    payload = json.loads(client.calls[0]["messages"][1]["content"])
+    permission = payload["permission_context"]
+    assert permission["current_user_id"] == 15
+    assert permission["current_user_write_profile"] == "limited_task_create"
+    assert permission["full_write_user_ids"] == [1, 9]
+    assert permission["limited_task_create_user_ids"] == [15]
+    assert permission["limited_task_create_project_id"] == 44
+    assert any("read_only users should not prepare write-tools" in rule for rule in permission["rules"])
+
+
 def test_bitrix_policy():
     assert decide_bitrix_method_policy("tasks.task.list").decision == "allow"
     assert decide_bitrix_method_policy("tasks.task.add").decision == "confirm"
@@ -438,6 +475,20 @@ class FakeResolverTools:
     async def task_search(self, args: dict) -> ToolResult:
         self.task_search_calls.append(args)
         return self.task_result
+
+
+class RecordingLLMClient:
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.calls: list[dict] = []
+
+    async def complete(self, **kwargs):
+        self.calls.append(kwargs)
+        return LLMCompletion(
+            content=self.content,
+            model_usage=ModelUsageRecord(agent_id=kwargs["agent_id"], provider="fake", model="fake"),
+            raw={},
+        )
 
 
 def _fake_resolution(tool: str, query: str, candidates: list[dict]) -> ToolResult:

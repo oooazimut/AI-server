@@ -8,11 +8,10 @@ from ai_server.integrations.bitrix.dialog_state import (
     DialogStateStore,
     PendingActionResult,
     PendingBitrixAction,
-    is_cancel_text,
-    is_confirm_text,
     make_dialog_key,
 )
 from ai_server.agents.bitrix_llm import BitrixAgentLLM
+from ai_server.agents.pending_control_llm import PendingControlLLM, PendingControlLLMService
 from ai_server.orchestrators.internal_llm import InternalOrchestratorLLM
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.events import MESSAGE_EVENTS, parse_incoming_message, payload_event_type
@@ -46,6 +45,7 @@ class BitrixWebhookProcessor:
         bitrix_tools: BitrixToolset | None = None,
         bitrix_retriever: HybridKnowledgeRetriever | None = None,
         bitrix_llm: BitrixAgentLLM | None = None,
+        pending_control_llm: PendingControlLLM | None = None,
         orchestrator_llm: InternalOrchestratorLLM | None = None,
         technical_footer: TechnicalFooterService | None = None,
     ) -> None:
@@ -59,6 +59,7 @@ class BitrixWebhookProcessor:
         self.bitrix_tools = bitrix_tools
         self.bitrix_retriever = bitrix_retriever
         self.bitrix_llm = bitrix_llm
+        self.pending_control_llm = pending_control_llm or PendingControlLLMService()
         self.orchestrator_llm = orchestrator_llm
         self.technical_footer = technical_footer or TechnicalFooterService()
         self.pending_actions = pending_actions or BitrixPendingActionService(
@@ -165,7 +166,7 @@ class BitrixWebhookProcessor:
             result.actions_requiring_approval,
             user_id=incoming.user_id,
         )
-        reply_text = _with_pending_confirmation_hint(result.answer, pending_action)
+        reply_text = result.answer
         footer = await self.technical_footer.build_for_agent_result(
             result,
             user_id=incoming.user_id,
@@ -201,10 +202,44 @@ class BitrixWebhookProcessor:
         pending = self.pending_actions.pending_for(dialog_key)
         if not pending:
             return None
-        if is_cancel_text(text):
-            return self.pending_actions.cancel(dialog_key)
-        if not is_confirm_text(text):
+
+        try:
+            control_result = await self.pending_control_llm.classify(
+                dialog_key=dialog_key,
+                user_id=user_id,
+                user_text=text,
+                pending_action=pending,
+            )
+        except Exception as exc:
+            return PendingActionResult(
+                status="needs_clarification",
+                message=(
+                    "Не смог уверенно понять, подтверждаете вы ожидающее действие или отменяете его. "
+                    f"Ожидающее действие: {pending.summary}. Подтверждаем или отменяем?"
+                ),
+                action=pending,
+                data={"classification_error": f"{type(exc).__name__}: {exc}"},
+            )
+
+        decision = control_result.decision.decision
+        if decision == "new_request":
             return None
+        if decision == "cancel":
+            return self.pending_actions.cancel(dialog_key)
+        if decision != "confirm":
+            return PendingActionResult(
+                status="needs_clarification",
+                message=(
+                    control_result.decision.answer
+                    or f"У меня есть ожидающее действие: {pending.summary}. Подтверждаем выполнение или отменяем?"
+                ),
+                action=pending,
+                data={
+                    "pending_control_decision": decision,
+                    "pending_control_confidence": control_result.decision.confidence,
+                    "pending_control_reasoning": control_result.decision.reasoning,
+                },
+            )
 
         settings = get_settings()
         if settings.agent_dry_run:
@@ -314,13 +349,6 @@ def _pending_from_approval_action(
         summary=str(details.get("summary") or method),
         created_by=user_id,
     )
-
-
-def _with_pending_confirmation_hint(answer: str, action: PendingBitrixAction | None) -> str:
-    if not action:
-        return answer
-    hint = f"Подготовил действие: {action.summary}. Для выполнения напишите «да», для отмены - «отмена»."
-    return f"{answer}\n\n{hint}" if answer else hint
 
 
 def _pending_result_action(result: PendingActionResult) -> dict[str, Any]:

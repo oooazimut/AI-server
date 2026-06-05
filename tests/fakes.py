@@ -11,6 +11,7 @@ from ai_server.agents.bitrix_llm import (
     BitrixLLMFinalResult,
     BitrixLLMToolCall,
 )
+from ai_server.agents.pending_control_llm import PendingControlDecision, PendingControlResult
 from ai_server.models import ModelUsageRecord
 from ai_server.orchestrators.internal_llm import InternalRouteDecision, InternalRouteResult
 
@@ -76,9 +77,37 @@ class FakeBitrixLLM:
         )
 
 
-def _fake_usage() -> ModelUsageRecord:
+class FakePendingControlLLM:
+    def __init__(
+        self,
+        decision: str,
+        *,
+        answer: str = "",
+        confidence: float = 0.9,
+        reasoning: str = "test decision",
+    ) -> None:
+        self.decision = decision
+        self.answer = answer
+        self.confidence = confidence
+        self.reasoning = reasoning
+        self.classify_calls = []
+
+    async def classify(self, **kwargs):
+        self.classify_calls.append(kwargs)
+        return PendingControlResult(
+            decision=PendingControlDecision(
+                decision=self.decision,
+                answer=self.answer,
+                confidence=self.confidence,
+                reasoning=self.reasoning,
+            ),
+            model_usage=_fake_usage(agent_id="bitrix24_pending_control"),
+        )
+
+
+def _fake_usage(*, agent_id: str = "bitrix24") -> ModelUsageRecord:
     return ModelUsageRecord(
-        agent_id="bitrix24",
+        agent_id=agent_id,
         provider="fake",
         model="fake-bitrix-llm",
         status="used",

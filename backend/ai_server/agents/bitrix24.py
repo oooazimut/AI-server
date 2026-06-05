@@ -43,17 +43,18 @@ class Bitrix24Specialist:
         self.llm = llm or BitrixLLMService()
 
     async def handle(self, task: AgentTask) -> AgentResult:
-        text = task.request.casefold()
-        selected_skills = self._select_skills(text)
-        selected_topics = self._select_knowledge_topics(text)
+        available_skills = self.skill_store.list_skills(self.manifest)
         retrieval_hits = self.retriever.search(self.manifest, task.request, limit=3)
         actions_taken = [
             ActionRecord(
                 name="load_bitrix_specialist_context",
                 status="completed",
                 details={
-                    "skills": selected_skills,
-                    "knowledge_topics": selected_topics,
+                    "available_skills": [
+                        {"id": skill.id, "title": skill.title, "preview": skill.preview}
+                        for skill in available_skills
+                    ],
+                    "retrieval_topics": _unique([hit.chunk.topic for hit in retrieval_hits]),
                     "retrieval_hits": [
                         {
                             "topic": hit.chunk.topic,
@@ -336,37 +337,6 @@ class Bitrix24Specialist:
             group_note=group_note,
             notes=notes,
         )
-
-    def _select_skills(self, text: str) -> list[str]:
-        selected: list[str] = []
-        if any(marker in text for marker in ("задач", "заявк", "исполнитель", "срок", "дедлайн")):
-            selected.append("tasks_search")
-        if any(marker in text for marker in ("создай", "создать", "измени", "изменить", "поставь задачу")):
-            selected.append("tasks_create_edit")
-        if any(marker in text for marker in ("документ", "файл", "смет", "диск", "вложен", "договор", "портал")):
-            selected.append("portal_document_search")
-        if any(marker in text for marker in ("crm", "сделк", "лид", "проект", "групп")):
-            selected.append("projects_crm")
-        if any(marker in text for marker in ("удали", "закрой", "заверши", "обнови", "поменяй", "добавь")):
-            selected.append("safe_bitrix_write")
-        return _unique(selected)
-
-    def _select_knowledge_topics(self, text: str) -> list[str]:
-        topics: list[str] = []
-        if any(marker in text for marker in ("задач", "заявк", "срок", "исполнитель")):
-            topics.append("tasks_search")
-        if any(marker in text for marker in ("создай", "создать", "измени", "изменить")):
-            topics.append("tasks_create_edit")
-        if any(marker in text for marker in ("контроль", "результат", "закрой", "заверши")):
-            topics.append("tasks_quality")
-        if any(marker in text for marker in ("документ", "файл", "смет", "диск", "договор", "портал")):
-            topics.append("documents")
-        if "bitrix" in text or "битрикс" in text or "rest" in text:
-            topics.append("bitrix_rest")
-        if any(marker in text for marker in ("crm", "сделк", "лид", "проект", "групп")):
-            topics.append("projects_crm")
-        return _unique(topics)
-
 
 def _format_ambiguous_note(prefix: str, candidates: object) -> str:
     if not isinstance(candidates, list):
