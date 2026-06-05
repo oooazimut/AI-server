@@ -24,6 +24,7 @@ from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import get_settings
 from ai_server.technical_footer import TechnicalFooterService, append_footer
 from ai_server.tools.bitrix import BitrixToolset
+from ai_server.tools.document_access import DocumentToolset
 from ai_server.workers.bitrix.search_webhook_indexer import (
     prepare_search_webhook_job,
     process_search_webhook_job,
@@ -139,6 +140,11 @@ class BitrixWebhookProcessor:
                 portal_search=self.portal_search,
                 pending_actions=self.pending_actions,
                 dialog_key=dialog_key,
+                user_id=incoming.user_id,
+            ),
+            document_tools=DocumentToolset(
+                client=self.bitrix,
+                portal_search=self.portal_search,
                 user_id=incoming.user_id,
             ),
         )

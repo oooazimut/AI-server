@@ -91,6 +91,8 @@ class Settings:
     agent_write_allowed_user_ids: str
     agent_limited_task_create_project_id: int | None
     agent_limited_task_create_user_ids: str
+    agent_private_disk_path_markers: str
+    agent_private_disk_restricted_user_ids: str
     agent_dry_run: bool
     var_dir: Path
 
@@ -147,6 +149,18 @@ class Settings:
     @property
     def resolved_agent_limited_task_create_user_ids(self) -> list[int]:
         return _id_list(self.agent_limited_task_create_user_ids)
+
+    @property
+    def resolved_agent_private_disk_path_markers(self) -> list[str]:
+        return [
+            item.strip()
+            for item in self.agent_private_disk_path_markers.replace(";", ",").split(",")
+            if item.strip()
+        ]
+
+    @property
+    def resolved_agent_private_disk_restricted_user_ids(self) -> list[int]:
+        return _id_list(self.agent_private_disk_restricted_user_ids)
 
     @property
     def resolved_tech_footer_allowed_user_ids(self) -> list[int]:
@@ -282,6 +296,8 @@ def get_settings() -> Settings:
         agent_write_allowed_user_ids=_env("AGENT_WRITE_ALLOWED_USER_IDS"),
         agent_limited_task_create_project_id=_env_int("AGENT_LIMITED_TASK_CREATE_PROJECT_ID"),
         agent_limited_task_create_user_ids=_env("AGENT_LIMITED_TASK_CREATE_USER_IDS"),
+        agent_private_disk_path_markers=_env("AGENT_PRIVATE_DISK_PATH_MARKERS", "Приватный доступ"),
+        agent_private_disk_restricted_user_ids=_env("AGENT_PRIVATE_DISK_RESTRICTED_USER_IDS"),
         agent_dry_run=_env_bool("AGENT_DRY_RUN", False),
         var_dir=paths.root,
     )

@@ -13,6 +13,12 @@ from ai_server.agents.bitrix_llm import (
 )
 from ai_server.agents.bitrix_task_closure import TaskClosureDecision, TaskClosureToolCall
 from ai_server.agents.pending_control_llm import PendingControlDecision, PendingControlResult
+from ai_server.agents.pto_llm import (
+    PtoLLMDecision,
+    PtoLLMDecisionResult,
+    PtoLLMFinalResult,
+    PtoLLMToolCall,
+)
 from ai_server.models import ModelUsageRecord
 from ai_server.orchestrators.internal_llm import InternalRouteDecision, InternalRouteResult
 
@@ -146,6 +152,47 @@ class FakeTaskClosureLLM:
             confidence=float(decision.get("confidence") or 0.9),
             raw=decision,
             model_usage=_fake_usage(agent_id="bitrix24"),
+        )
+
+
+class FakePtoLLM:
+    def __init__(
+        self,
+        *,
+        tool_calls: list[PtoLLMToolCall] | None = None,
+        decision_status: str = "completed",
+        decision_answer: str = "",
+        final_status: str = "completed",
+        final_answer: str = "Готово.",
+        confidence: float = 0.82,
+    ) -> None:
+        self.tool_calls = tool_calls or [PtoLLMToolCall(name="none")]
+        self.decision_status = decision_status
+        self.decision_answer = decision_answer
+        self.final_status = final_status
+        self.final_answer = final_answer
+        self.confidence = confidence
+        self.decide_calls = []
+        self.compose_calls = []
+
+    async def decide(self, **kwargs):
+        self.decide_calls.append(kwargs)
+        return PtoLLMDecisionResult(
+            decision=PtoLLMDecision(
+                status=self.decision_status,
+                answer=self.decision_answer,
+                confidence=self.confidence,
+                tool_calls=self.tool_calls,
+            ),
+            model_usage=_fake_usage(agent_id="pto"),
+        )
+
+    async def compose(self, **kwargs):
+        self.compose_calls.append(kwargs)
+        return PtoLLMFinalResult(
+            status=self.final_status,
+            answer=self.final_answer,
+            model_usage=_fake_usage(agent_id="pto"),
         )
 
 
