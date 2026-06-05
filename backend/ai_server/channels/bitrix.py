@@ -16,7 +16,7 @@ from ai_server.agents.bitrix_llm import BitrixAgentLLM
 from ai_server.orchestrators.internal_llm import InternalOrchestratorLLM
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.events import MESSAGE_EVENTS, parse_incoming_message, payload_event_type
-from ai_server.integrations.bitrix.oauth import BitrixOAuthService
+from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
 from ai_server.integrations.bitrix.portal_search import PortalSearchIndex
 from ai_server.models import ActionRecord, AgentTask, UserContext
 from ai_server.orchestrators.internal import InternalOrchestrator
@@ -29,6 +29,7 @@ from ai_server.workers.bitrix.search_webhook_indexer import (
     prepare_search_webhook_job,
     process_search_webhook_job,
 )
+from ai_server.workers.bitrix.quality_control import handle_quality_control_webhook_event
 
 
 class BitrixWebhookProcessor:
@@ -39,6 +40,7 @@ class BitrixWebhookProcessor:
         portal_search: PortalSearchIndex | None = None,
         bitrix_oauth: BitrixOAuthService | None = None,
         search_webhook_status: dict[str, Any] | None = None,
+        quality_control_status: dict[str, Any] | None = None,
         orchestrator: InternalOrchestrator | None = None,
         pending_actions: BitrixPendingActionService | None = None,
         bitrix_tools: BitrixToolset | None = None,
@@ -50,7 +52,9 @@ class BitrixWebhookProcessor:
         settings = get_settings()
         self.bitrix = bitrix or BitrixClient()
         self.portal_search = portal_search or PortalSearchIndex()
+        self.bitrix_oauth = bitrix_oauth
         self.search_webhook_status = search_webhook_status if search_webhook_status is not None else {}
+        self.quality_control_status = quality_control_status if quality_control_status is not None else {}
         self.orchestrator = orchestrator
         self.bitrix_tools = bitrix_tools
         self.bitrix_retriever = bitrix_retriever
@@ -75,10 +79,20 @@ class BitrixWebhookProcessor:
                     search_job,
                     status=self.search_webhook_status,
                 )
+            quality_bitrix, quality_actor_error = await self._quality_control_bitrix_client()
+            if quality_actor_error:
+                quality_result = quality_actor_error
+            else:
+                quality_result = await handle_quality_control_webhook_event(
+                    quality_bitrix,
+                    payload=payload,
+                    status=self.quality_control_status,
+                )
             return {
-                "handled": bool(search_result.get("handled")),
+                "handled": bool(search_result.get("handled")) or bool(quality_result.get("handled")),
                 "event": event_type,
                 "search_index": search_result,
+                "quality_control": quality_result,
             }
 
         incoming = parse_incoming_message(payload)
@@ -238,13 +252,56 @@ class BitrixWebhookProcessor:
                 return pending
         return None
 
+    async def _quality_control_bitrix_client(self) -> tuple[BitrixClient, dict[str, Any] | None]:
+        settings = get_settings()
+        if not settings.quality_control_webhook_enabled:
+            return self.bitrix, None
+        actor_user_id = settings.quality_control_actor_user_id
+        if not actor_user_id:
+            if settings.quality_control_dry_run:
+                return self.bitrix, None
+            error = {
+                "handled": False,
+                "reason": "quality_actor_not_configured",
+                "message": (
+                    "Для боевого фонового контроля качества нужно задать "
+                    "QUALITY_CONTROL_ACTOR_USER_ID и авторизовать этого пользователя через Bitrix OAuth."
+                ),
+            }
+            _record_quality_actor_error(self.quality_control_status, error)
+            return self.bitrix, error
+        if settings.quality_control_dry_run:
+            return self.bitrix, None
+        if not settings.bitrix_oauth_enabled or self.bitrix_oauth is None:
+            error = {
+                "handled": False,
+                "reason": "quality_actor_oauth_disabled",
+                "actor_user_id": actor_user_id,
+            }
+            _record_quality_actor_error(self.quality_control_status, error)
+            return self.bitrix, error
+        try:
+            return await self.bitrix_oauth.client_for_user(actor_user_id), None
+        except BitrixOAuthTokenMissing:
+            error = {
+                "handled": False,
+                "reason": "quality_actor_oauth_missing",
+                "actor_user_id": actor_user_id,
+                "message": (
+                    "Для фонового контроля качества нужно один раз авторизовать локальное "
+                    "приложение под служебным пользователем AI-помощника."
+                ),
+            }
+            _record_quality_actor_error(self.quality_control_status, error)
+            return self.bitrix, error
+
 
 def _pending_from_approval_action(
     action: ActionRecord,
     *,
     user_id: int | None,
 ) -> PendingBitrixAction | None:
-    if action.name != "bitrix_api":
+    if action.name not in {"bitrix_api", "bitrix_task_closure"}:
         return None
     details = action.details
     method = str(details.get("method") or "").strip()
@@ -277,3 +334,9 @@ def _pending_result_action(result: PendingActionResult) -> dict[str, Any]:
             }
         )
     return ActionRecord(name="bitrix_pending_action", status=result.status, details=details).model_dump()
+
+
+def _record_quality_actor_error(status: dict[str, Any], error: dict[str, Any]) -> None:
+    status["last_error"] = error.get("message") or error.get("reason")
+    status["last_reason"] = error.get("reason")
+    status["errors"] = int(status.get("errors") or 0) + 1

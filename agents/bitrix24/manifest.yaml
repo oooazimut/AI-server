@@ -206,7 +206,7 @@ automations:
     source_modules:
       - app.agent.quality_control
       - app.agent.task_closure
-    entrypoint: backend.ai_server.workers.bitrix.quality_control.TaskQualityControlWorker
+    entrypoint: backend.ai_server.workers.bitrix.quality_control.handle_quality_control_webhook_event
     status_endpoint: /automations/bitrix_task_quality_control
     enabled_by_default: false
     uses_llm: true
@@ -232,37 +232,6 @@ automations:
     notes:
       - Это автономная Bitrix-автоматизация, а не отдельный чатовый субагент.
       - Автоматические write-действия допустимы только через служебного OAuth actor и явную политику.
-  - id: bitrix_vehicle_usage
-    name: Учёт использования служебных машин
-    kind: business_workflow
-    trigger: schedule
-    description: По расписанию запрашивает у сотрудников данные по машинам, разбирает ответы и ведёт локальный учёт.
-    source_project: BitrixAIAgent
-    source_modules:
-      - app.agent.vehicle_usage
-    entrypoint: backend.ai_server.workers.bitrix.vehicle_usage.VehicleUsageWorker
-    schedule_hint: daily request/escalation times from settings
-    status_endpoint: /automations/bitrix_vehicle_usage
-    enabled_by_default: false
-    uses_llm: true
-    dependencies:
-      - bitrix_api
-      - llm_gateway
-    tools:
-      - bitrix_api
-      - llm_gateway
-    data_scopes:
-      - bitrix24_chats
-      - bitrix24_users
-      - vehicle_usage
-    state_paths:
-      - var/vehicle_usage.sqlite
-    emits:
-      - vehicle_usage_request_sent
-      - vehicle_usage_response_parsed
-      - vehicle_usage_escalation
-    notes:
-      - Это отдельный бизнес-процесс поверх Битрикс-чата; позднее его можно вынести из Bitrix-домена в отдельного специалиста.
 data_scopes:
   - bitrix24_tasks
   - bitrix24_crm

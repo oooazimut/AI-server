@@ -1,0 +1,59 @@
+id: logistics
+name: Логист
+version: 0.1.0
+kind: specialist
+description: Отвечает за ежедневный учёт служебных автомобилей, статусы сотрудников и логистические отчёты.
+handoff_description: Использовать для запросов про служебные автомобили, утренний отчёт по машинам, закрепление авто, выезды, смены и логистику.
+entrypoint: null
+instructions_file: agents/logistics/instructions.md
+skills_path: agents/logistics/skills
+knowledge_path: agents/logistics/knowledge/topics
+automations_path: agents/logistics/automations
+capabilities:
+  - logistics
+  - vehicle_usage
+  - daily_vehicle_report
+  - staff_status_tracking
+tools:
+  - bitrix_api
+  - llm_gateway
+automations:
+  - id: logistics_vehicle_usage
+    name: Утренний учёт служебных машин
+    kind: business_workflow
+    trigger: schedule
+    description: По расписанию напоминает ответственному о ежедневном отчёте по сотрудникам и служебным автомобилям, разбирает ответы через Логиста и сохраняет подтверждённый отчёт.
+    source_project: BitrixAIAgent
+    source_modules:
+      - app.agent.vehicle_usage
+    entrypoint: backend.ai_server.workers.logistics.vehicle_usage.VehicleUsageWorker
+    schedule_hint: daily request/escalation times from settings
+    status_endpoint: /automations/logistics_vehicle_usage
+    enabled_by_default: false
+    uses_llm: true
+    dependencies:
+      - bitrix_api
+      - llm_gateway
+    tools:
+      - bitrix_api
+      - llm_gateway
+    data_scopes:
+      - bitrix24_chats
+      - bitrix24_users
+      - vehicle_usage
+    state_paths:
+      - var/vehicle_usage.sqlite
+    emits:
+      - vehicle_usage_request_sent
+      - vehicle_usage_response_parsed
+      - vehicle_usage_escalation
+data_scopes:
+  - bitrix24_chats
+  - bitrix24_users
+  - vehicle_usage
+allowed_actions:
+  - read_vehicle_usage
+  - draft_vehicle_report
+approval_required:
+  - send_reminder
+  - save_vehicle_report

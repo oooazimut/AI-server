@@ -5,6 +5,11 @@ from ai_server.agents.bitrix_task_create import (
     BitrixTaskCreateResolution,
     build_task_create_draft_from_args,
 )
+from ai_server.agents.bitrix_task_closure import (
+    TASK_CLOSURE_PENDING_METHOD,
+    BitrixTaskClosureDraft,
+    build_task_closure_draft_from_args,
+)
 from ai_server.agents.bitrix_llm import (
     BitrixAgentLLM,
     BitrixLLMService,
@@ -204,6 +209,27 @@ class Bitrix24Specialist:
                     ],
                 },
             },
+            {
+                "name": "task_closure",
+                "description": (
+                    "Prepare a Bitrix task closure action from fields already understood by the LLM. "
+                    "The LLM must call this only after it has checked that result_text and task_id/task_query are present. "
+                    "Execution is delayed until the chat user confirms the pending write action."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": "integer"},
+                        "task_query": {"type": "string"},
+                        "result_text": {"type": "string"},
+                    },
+                    "required": ["result_text"],
+                    "anyOf": [
+                        {"required": ["task_id"]},
+                        {"required": ["task_query"]},
+                    ],
+                },
+            },
         ]
 
     async def _task_create_draft(self, task: AgentTask, args: dict) -> BitrixTaskCreateDraft:
@@ -212,6 +238,9 @@ class Bitrix24Specialist:
         if resolution is None:
             return draft
         return build_task_create_draft_from_args(task, args, resolution=resolution)
+
+    async def _task_closure_draft(self, task: AgentTask, args: dict) -> BitrixTaskClosureDraft:
+        return build_task_closure_draft_from_args(task, args)
 
     async def _execute_tool_call(
         self,
@@ -243,6 +272,15 @@ class Bitrix24Specialist:
                 details=draft.as_action_details(),
             )
             return result, action, _approval_actions_from_task_create_draft(draft)
+        if tool_call.name == "task_closure":
+            draft = await self._task_closure_draft(task, tool_call.args)
+            result = _tool_result_from_task_closure_draft(draft)
+            action = ActionRecord(
+                name="bitrix_task_closure_draft",
+                status=result.status,
+                details=draft.as_action_details(),
+            )
+            return result, action, _approval_actions_from_task_closure_draft(draft)
         result = ToolResult(
             status="invalid_tool_call",
             tool=tool_call.name,
@@ -365,6 +403,32 @@ def _approval_actions_from_task_create_draft(draft: BitrixTaskCreateDraft) -> li
                 "method": draft.method,
                 "params": draft.params,
                 "policy": decision.model_dump(),
+                "summary": draft.summary,
+            },
+        )
+    ]
+
+
+def _tool_result_from_task_closure_draft(draft: BitrixTaskClosureDraft) -> ToolResult:
+    return ToolResult(
+        status="ready" if draft.is_ready else "contract_violation",
+        tool="task_closure",
+        data=draft.as_action_details(),
+        error=None if draft.is_ready else "LLM called task_closure with arguments outside the tool contract.",
+    )
+
+
+def _approval_actions_from_task_closure_draft(draft: BitrixTaskClosureDraft) -> list[ActionRecord]:
+    if not draft.is_ready:
+        return []
+    return [
+        ActionRecord(
+            name="bitrix_task_closure",
+            status="approval_required",
+            details={
+                "method": TASK_CLOSURE_PENDING_METHOD,
+                "params": draft.params,
+                "policy": {"decision": "confirm", "reason": "task closure requires chat confirmation"},
                 "summary": draft.summary,
             },
         )

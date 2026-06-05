@@ -20,8 +20,9 @@
 | `bitrix_search_webhook_indexer` | `app.agent.search_webhook_indexer` | event worker | Быстрое обновление индекса по disk/file событиям |
 | `bitrix_reconciler` | `app.agent.reconciler` | scheduled worker | Восстановление потерянных task/disk событий |
 | `bitrix_task_supervisor` | `app.agent.supervisor` | business workflow | Контроль просроченных задач и уведомления |
-| `bitrix_task_quality_control` | `app.agent.quality_control`, `app.agent.task_closure` | business workflow | Проверка качества закрытия задач |
-| `bitrix_vehicle_usage` | `app.agent.vehicle_usage` | business workflow | Учёт использования служебных машин |
+| `bitrix_task_quality_control` | `app.agent.quality_control` | business workflow | Проверка качества закрытия задач по webhook |
+| `bitrix_task_closure` | `app.agent.task_closure` | chat tool | Закрытие задачи по запросу человека через LLM Битрикс-субагента и pending confirmation |
+| `logistics_vehicle_usage` | `app.agent.vehicle_usage` | business workflow | Утренний учёт использования служебных машин через будущего субагента `Логист` |
 
 ## Граница ответственности
 
@@ -38,6 +39,9 @@
   `AGENT_LIMITED_TASK_CREATE_USER_IDS` + `AGENT_LIMITED_TASK_CREATE_PROJECT_ID`.
   Если `BITRIX_OAUTH_REQUIRED_FOR_WRITES=true`, выполнение идёт только через
   OAuth-токен пользователя.
+- Фоновый quality-control в боевом режиме требует
+  `QUALITY_CONTROL_ACTOR_USER_ID`; без служебного OAuth actor он не выполняет
+  write-действия через общий webhook-токен.
 
 ## Runtime `var`
 
@@ -91,8 +95,9 @@ uv run python scripts/import_bitrix_var.py --profile cutover --execute
 4. Перенести очередь webhook-событий и message processor как первый реальный worker.
 5. Подключить portal search indexer, потому что он кормит RAG и поиск.
 6. Перенести `quality_control` и `supervisor` через policy layer и dry-run.
-7. Отдельно решить судьбу `vehicle_usage`: оставить в Bitrix-домене или выделить
-   самостоятельного специалиста.
+7. `vehicle_usage` переносить не в Bitrix-специалиста, а в отдельного
+   субагента `Логист`: scheduler утром инициирует сбор данных, а Логист
+   разбирает ответы и формирует отчёт.
 
 Устаревший `event_poller` из старого проекта не переносится. Для Bitrix24
 целевой входной канал - webhook-режим через очередь событий.
@@ -119,12 +124,19 @@ uv run python scripts/import_bitrix_var.py --profile cutover --execute
   metadata/delta/content-indexer задач, проектов, диска и содержимого файлов;
 - `backend/ai_server/workers/bitrix/search_webhook_indexer.py` - обработчик
   disk/file webhook-событий с обновлением metadata и, если включено, текста файла;
+- `backend/ai_server/workers/bitrix/quality_control.py` - обработчик
+  `onTaskUpdate` для LLM-проверки результата закрытия задач и применения
+  dry-run/policy/OAuth-actor перед approve/disapprove/renew/comment/notify;
+- `backend/ai_server/agents/bitrix_task_closure.py` - чатовый tool закрытия
+  задачи: LLM Битрикс-субагент готовит `task_id`/`task_query` и `result_text`,
+  пользователь подтверждает, затем tool применяет quality review и Bitrix REST;
 - `POST /bitrix/events` - endpoint приёма webhook-событий;
 - `GET /bitrix/status`, `GET /bitrix/webhook-events/status`,
   `GET /bitrix/search/status` и `GET /bitrix/search` - runtime status/search;
 - `GET /bitrix/search/indexer/status`, `POST /bitrix/search/reindex`,
   `POST /bitrix/search/reindex-delta`, `POST /bitrix/search/reindex-content` -
   статус и ручной запуск индексатора.
+- `GET /bitrix/quality-control/status` - статус webhook-контроля качества.
 
 Worker очереди включается отдельно:
 

@@ -263,6 +263,80 @@ class BitrixClient:
             limit=limit,
         )
 
+    async def get_task(self, task_id: int, *, select: list[str] | None = None) -> Any:
+        payload: dict[str, Any] = {"taskId": task_id}
+        if select:
+            payload["select"] = select
+        return await self.result("tasks.task.get", payload)
+
+    async def list_task_results(self, task_id: int) -> Any:
+        return await self.result("tasks.task.result.list", {"taskId": task_id})
+
+    async def add_task_result(self, task_id: int, text: str) -> Any:
+        return await self.result(
+            "tasks.task.result.add",
+            {
+                "taskId": task_id,
+                "fields": {"text": text},
+            },
+        )
+
+    async def disapprove_task(self, task_id: int) -> Any:
+        return await self.result("tasks.task.disapprove", {"taskId": task_id})
+
+    async def approve_task(self, task_id: int) -> Any:
+        return await self.result("tasks.task.approve", {"taskId": task_id})
+
+    async def complete_task(self, task_id: int) -> Any:
+        return await self.result("tasks.task.complete", {"taskId": task_id})
+
+    async def renew_task(self, task_id: int) -> Any:
+        return await self.result("tasks.task.renew", {"taskId": task_id})
+
+    async def require_task_result(self, task_id: int) -> Any:
+        return await self.result_v3(
+            "tasks.task.update",
+            {
+                "id": task_id,
+                "fields": {"requireResult": True},
+            },
+        )
+
+    async def add_task_comment(
+        self,
+        *,
+        task_id: int,
+        message: str,
+        author_id: int | None = None,
+    ) -> Any:
+        fields: dict[str, Any] = {"POST_MESSAGE": message}
+        if author_id is not None:
+            fields["AUTHOR_ID"] = author_id
+        return await self.result(
+            "task.commentitem.add",
+            {
+                "TASKID": task_id,
+                "FIELDS": fields,
+            },
+        )
+
+    async def notify_user(
+        self,
+        *,
+        user_id: int,
+        message: str,
+        tag: str = "ai_server",
+        sub_tag: str = "",
+    ) -> Any:
+        return await self.result(
+            "im.notify.system.add",
+            {
+                "USER_ID": user_id,
+                "MESSAGE": message,
+                "TAG": f"{tag}:{sub_tag}" if sub_tag else tag,
+            },
+        )
+
     async def search_users(self, query: str, *, limit: int = 10) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {
             "FILTER": {"ACTIVE": True},

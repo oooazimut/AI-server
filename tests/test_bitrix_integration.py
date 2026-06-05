@@ -314,6 +314,23 @@ def test_bitrix_pending_action_cancel_clears_state_without_call(monkeypatch, tmp
     assert '"status": "cancelled"' in (tmp_path / "bitrix_write_audit.jsonl").read_text(encoding="utf-8")
 
 
+def test_quality_control_live_webhook_requires_actor(monkeypatch):
+    monkeypatch.setenv("QUALITY_CONTROL_WEBHOOK_ENABLED", "true")
+    monkeypatch.setenv("QUALITY_CONTROL_DRY_RUN", "false")
+    monkeypatch.delenv("QUALITY_CONTROL_ACTOR_USER_ID", raising=False)
+    fake_bitrix = FakeBitrixClient()
+    payload = {
+        "event": "ONTASKUPDATE",
+        "data": {"FIELDS_AFTER": {"ID": 8413}},
+    }
+
+    result = anyio_run(BitrixWebhookProcessor(bitrix=fake_bitrix).process(payload))
+
+    assert result["handled"] is False
+    assert result["quality_control"]["reason"] == "quality_actor_not_configured"
+    assert fake_bitrix.calls == []
+
+
 def test_task_add_write_policy_translates_internal_no_deadline_marker(monkeypatch):
     monkeypatch.delenv("AGENT_LIMITED_TASK_CREATE_PROJECT_ID", raising=False)
     params = {
@@ -438,6 +455,57 @@ def test_bitrix_task_create_chat_flow_saves_and_confirms_pending_action(monkeypa
     assert store.load(key).pending_action is None
 
 
+def test_bitrix_task_closure_pending_confirm_executes_compound_action(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
+    monkeypatch.setenv("AGENT_DRY_RUN", "false")
+    monkeypatch.setenv("BITRIX_OAUTH_REQUIRED_FOR_WRITES", "false")
+    monkeypatch.setenv("QUALITY_CONTROL_SMART_ENABLED", "false")
+    store = DialogStateStore(tmp_path / "dialog_state.sqlite")
+    fake_bitrix = FakeBitrixClient()
+    key = make_dialog_key(chat_id=77, dialog_id="chat99", user_id=9)
+    store.set_pending(
+        key,
+        PendingBitrixAction(
+            method="ai_server.task_closure",
+            params={"task_id": 8413, "result_text": "Камера перезагружена, изображение восстановлено."},
+            summary="закрыть задачу #8413",
+            created_by=9,
+        ),
+    )
+    payload = _bitrix_v2_message_payload()
+    payload["data"]["message"]["text"] = "да"
+
+    processor = BitrixWebhookProcessor(
+        bitrix=fake_bitrix,
+        pending_actions=BitrixPendingActionService(
+            store=store,
+            bitrix=fake_bitrix,
+            audit_log_path=tmp_path / "bitrix_write_audit.jsonl",
+        ),
+    )
+
+    result = anyio_run(processor.process(payload))
+
+    assert result["agent_result_status"] == "executed"
+    assert fake_bitrix.calls[:2] == [
+        (
+            "tasks.task.result.add",
+            {
+                "taskId": 8413,
+                "fields": {
+                    "text": (
+                        "Камера перезагружена, изображение восстановлено.\n\n"
+                        "[Отправлено через AI-server пользователем Bitrix #9]"
+                    )
+                },
+            },
+        ),
+        ("tasks.task.complete", {"taskId": 8413}),
+    ]
+    assert fake_bitrix.messages[0][1].startswith("Готово, закрыл задачу #8413.")
+    assert store.load(key).pending_action is None
+
+
 def test_bitrix_oauth_service_reads_migrated_sqlite(tmp_path):
     db_path = tmp_path / "bitrix_oauth.sqlite"
     service = BitrixOAuthService(db_path)
@@ -499,6 +567,16 @@ class FakeBitrixClient:
     def __init__(self) -> None:
         self.calls = []
         self.messages = []
+        self.task = {
+            "id": "8413",
+            "title": "Проверить IP-камеру",
+            "description": "Перезагрузить камеру и проверить изображение.",
+            "status": "3",
+            "responsibleId": "9",
+            "createdBy": "1",
+            "groupId": "44",
+            "taskControl": "Y",
+        }
 
     async def call(self, method, payload=None, *, base_url=None):
         self.calls.append((method, payload or {}))
@@ -506,6 +584,52 @@ class FakeBitrixClient:
 
     async def send_bot_message(self, dialog_id, message, *, bot_id=None, keyboard=None):
         self.messages.append((dialog_id, message, bot_id, keyboard))
+        return 1
+
+    async def get_task(self, task_id, *, select=None):
+        task = dict(self.task)
+        task["id"] = str(task_id)
+        return {"task": task}
+
+    async def add_task_result(self, task_id, text):
+        payload = {"taskId": task_id, "fields": {"text": text}}
+        self.calls.append(("tasks.task.result.add", payload))
+        return {"id": 501, "taskId": task_id}
+
+    async def complete_task(self, task_id):
+        payload = {"taskId": task_id}
+        self.calls.append(("tasks.task.complete", payload))
+        self.task["status"] = "5"
+        return True
+
+    async def approve_task(self, task_id):
+        self.calls.append(("tasks.task.approve", {"taskId": task_id}))
+        self.task["status"] = "5"
+        return True
+
+    async def disapprove_task(self, task_id):
+        self.calls.append(("tasks.task.disapprove", {"taskId": task_id}))
+        return True
+
+    async def renew_task(self, task_id):
+        self.calls.append(("tasks.task.renew", {"taskId": task_id}))
+        self.task["status"] = "3"
+        return True
+
+    async def add_task_comment(self, *, task_id, message, author_id=None):
+        payload = {"TASKID": task_id, "FIELDS": {"POST_MESSAGE": message}}
+        if author_id is not None:
+            payload["FIELDS"]["AUTHOR_ID"] = author_id
+        self.calls.append(("task.commentitem.add", payload))
+        return 1
+
+    async def notify_user(self, *, user_id, message, tag="ai_server", sub_tag=""):
+        self.calls.append(
+            (
+                "im.notify.system.add",
+                {"USER_ID": user_id, "MESSAGE": message, "TAG": f"{tag}:{sub_tag}" if sub_tag else tag},
+            )
+        )
         return 1
 
 

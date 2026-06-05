@@ -43,6 +43,10 @@ agents/
     skills/
     knowledge/topics/
     automations/
+  logistics/
+    manifest.yaml
+    instructions.md
+    automations/
 backend/ai_server/
   agents/
   orchestrators/
@@ -79,6 +83,7 @@ GET  http://127.0.0.1:8000/automations
 GET  http://127.0.0.1:8000/bitrix/status
 GET  http://127.0.0.1:8000/bitrix/search/status
 GET  http://127.0.0.1:8000/bitrix/search/indexer/status
+GET  http://127.0.0.1:8000/bitrix/quality-control/status
 GET  http://127.0.0.1:8000/bitrix/search?q=...
 POST http://127.0.0.1:8000/bitrix/search/reindex
 POST http://127.0.0.1:8000/bitrix/search/reindex-delta
@@ -232,6 +237,7 @@ uv run python scripts/smoke_bitrix_task_create_flow.py `
 ```text
 GET http://127.0.0.1:8000/bitrix/status
 GET http://127.0.0.1:8000/bitrix/webhook-events/status
+GET http://127.0.0.1:8000/bitrix/quality-control/status
 ```
 
 ## Bitrix portal search
@@ -264,6 +270,45 @@ SEARCH_CONTENT_ALLOWED_EXTENSIONS=.txt,.csv,.doc,.docx,.xlsx,.xls,.pdf
 
 `portal_search` также подключён как Bitrix tool и используется Bitrix24-специалистом
 для запросов про документы, файлы, договоры и портал.
+
+## Bitrix quality control
+
+Webhook-контроль качества закрытия задач перенесён в новый worker-контур. Он
+слушает `onTaskUpdate` через общую очередь `/bitrix/events`, читает задачу и
+последний результат, отдаёт смысловую проверку LLM-проверяющему и только после
+этого применяет dry-run/policy/OAuth-actor и Bitrix REST действия.
+
+```env
+QUALITY_CONTROL_WEBHOOK_ENABLED=true
+QUALITY_CONTROL_DRY_RUN=true
+QUALITY_CONTROL_AUTO_MANAGE_PROJECT_ID=
+QUALITY_CONTROL_ACTOR_USER_ID=
+QUALITY_CONTROL_NOTIFY_DIRECTOR=true
+QUALITY_CONTROL_NOTIFY_RESPONSIBLE=true
+QUALITY_CONTROL_SMART_ENABLED=true
+```
+
+Для боевого режима (`QUALITY_CONTROL_DRY_RUN=false`) обязателен
+`QUALITY_CONTROL_ACTOR_USER_ID`: этот пользователь должен быть один раз
+авторизован через Bitrix OAuth, иначе фоновые write-действия не будут
+выполняться.
+
+## Bitrix task closure from chat
+
+Закрытие задачи по сообщению человека идёт через общий чатовый контур:
+`internal_orchestrator -> LLM Bitrix24 -> task_closure -> pending confirmation`.
+Битрикс-субагент сам выделяет `task_id` или `task_query` и `result_text`; если
+данных не хватает, он должен спросить уточнение, а не перекладывать догадку на
+tool.
+
+После подтверждения `да` pending `ai_server.task_closure`:
+
+- проверяет права пользователя и ограничение проекта;
+- отдаёт результат LLM-проверяющему качества;
+- если результат достаточен, добавляет результат и закрывает задачу;
+- если результат недостаточен, не закрывает задачу, добавляет замечания и
+  уведомляет настроенных получателей.
+
 ## Документы
 
 - `docs/00-vision.md` - цель и границы проекта.

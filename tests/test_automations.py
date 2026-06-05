@@ -17,10 +17,18 @@ def test_bitrix_automations_are_registered():
         "bitrix_reconciler",
         "bitrix_task_supervisor",
         "bitrix_task_quality_control",
-        "bitrix_vehicle_usage",
     }.issubset(ids)
+    assert "bitrix_vehicle_usage" not in ids
     assert "bitrix_event_poller" not in ids
     assert all(automation.owner_agent_id == "bitrix24" for automation in automations)
+
+
+def test_logistics_automations_are_registered():
+    automations = load_automation_manifests(agent_id="logistics")
+    ids = {automation.id for automation in automations}
+
+    assert "logistics_vehicle_usage" in ids
+    assert all(automation.owner_agent_id == "logistics" for automation in automations)
 
 
 def test_quality_control_automation_policy_flags():

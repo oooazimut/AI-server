@@ -93,6 +93,24 @@ async def lifespan(app: FastAPI):
         "last_error": None,
         "last_result": None,
     }
+    app.state.quality_control_webhook_status = {
+        "enabled": settings.quality_control_webhook_enabled,
+        "auto_managed_only": settings.quality_control_webhook_auto_managed_only,
+        "auto_manage_project_id": settings.quality_control_auto_manage_project_id,
+        "dry_run": settings.quality_control_dry_run,
+        "actor_user_id": settings.quality_control_actor_user_id,
+        "last_received_at": None,
+        "last_event": None,
+        "last_task_id": None,
+        "last_reason": None,
+        "last_error": None,
+        "last_actions": [],
+        "events_seen": 0,
+        "tasks_processed": 0,
+        "duplicates_seen": 0,
+        "ignored": 0,
+        "errors": 0,
+    }
 
     webhook_worker_task: asyncio.Task | None = None
     search_indexer_task: asyncio.Task | None = None
@@ -102,6 +120,7 @@ async def lifespan(app: FastAPI):
             portal_search=portal_search,
             bitrix_oauth=bitrix_oauth,
             search_webhook_status=app.state.search_webhook_indexer_status,
+            quality_control_status=app.state.quality_control_webhook_status,
         )
         webhook_worker_task = asyncio.create_task(
             run_webhook_event_worker(
@@ -154,6 +173,8 @@ def health() -> dict[str, object]:
         "bitrix_webhook_queue_enabled": settings.webhook_event_queue_enabled,
         "bitrix_webhook_worker_enabled": settings.webhook_event_worker_enabled,
         "bitrix_search_indexer_enabled": settings.search_background_indexer_enabled,
+        "bitrix_quality_control_enabled": settings.quality_control_webhook_enabled,
+        "bitrix_quality_control_dry_run": settings.quality_control_dry_run,
     }
 
 
@@ -235,6 +256,7 @@ def bitrix_status(request: Request) -> dict[str, Any]:
         "portal_search": _portal_search_status(request.app.state.portal_search),
         "portal_search_indexer": request.app.state.portal_search_indexer.public_status(),
         "search_webhook_indexer": dict(request.app.state.search_webhook_indexer_status),
+        "quality_control": dict(request.app.state.quality_control_webhook_status),
         "webhook_events": dict(request.app.state.webhook_event_status),
         "webhook_event_queue": {
             **dict(request.app.state.webhook_event_queue_status),
@@ -274,6 +296,11 @@ def bitrix_search_indexer_status(request: Request) -> dict[str, Any]:
 @app.get("/bitrix/search/webhook-indexer/status")
 def bitrix_search_webhook_indexer_status(request: Request) -> dict[str, Any]:
     return dict(request.app.state.search_webhook_indexer_status)
+
+
+@app.get("/bitrix/quality-control/status")
+def bitrix_quality_control_status(request: Request) -> dict[str, Any]:
+    return dict(request.app.state.quality_control_webhook_status)
 
 
 @app.post("/bitrix/search/reindex")
@@ -392,6 +419,7 @@ async def bitrix_events(
         portal_search=request.app.state.portal_search,
         bitrix_oauth=request.app.state.bitrix_oauth,
         search_webhook_status=request.app.state.search_webhook_indexer_status,
+        quality_control_status=request.app.state.quality_control_webhook_status,
     )
     result = await processor.process(payload)
     return {"ok": True, **result}

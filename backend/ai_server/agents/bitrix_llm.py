@@ -10,7 +10,7 @@ from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolRes
 from ai_server.retrieval import RetrievalHit
 
 
-ALLOWED_TOOL_NAMES = {"task_search", "task_create_draft", "portal_search", "none"}
+ALLOWED_TOOL_NAMES = {"task_search", "task_create_draft", "task_closure", "portal_search", "none"}
 RESULT_STATUSES = {"completed", "needs_clarification", "needs_human", "failed"}
 
 
@@ -172,7 +172,7 @@ def _decision_system_prompt() -> str:
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
-        '"tool_calls":[{"name":"task_search|task_create_draft|portal_search|none","args":{},"summary":""}]}. '
+        '"tool_calls":[{"name":"task_search|task_create_draft|task_closure|portal_search|none","args":{},"summary":""}]}. '
         "Перед каждым tool_call сам проверь, хватает ли данных для его корректного вызова. "
         "Нельзя вызывать tool с надеждой, что backend или tool сам разберётся с недостающими данными. "
         "Если данных не хватает, не вызывай tool: верни status=needs_clarification, tool_calls=[{\"name\":\"none\"}], "
@@ -184,6 +184,10 @@ def _decision_system_prompt() -> str:
         "Если срок не указан, применяй правила из retrieval_context; если правило неясно, спроси уточнение. "
         "Не вызывай task_create_draft без title, одного из responsible_id/responsible_query/responsible_self, "
         "и одного из deadline_iso/no_deadline=true. "
+        "Для закрытия/завершения задачи из чата используй task_closure, если пользователь сообщил результат работы. "
+        "Для task_closure именно ты выделяешь task_id или task_query и result_text. "
+        "В result_text передавай только результат выполнения, без команды закрыть задачу. "
+        "Не вызывай task_closure без result_text и одного из task_id/task_query. "
         "Для поиска документов/файлов используй portal_search. Если данных не хватает, status=needs_clarification."
     )
 
