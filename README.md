@@ -163,7 +163,17 @@ AI_SERVER_DEEPSEEK_BALANCE_BASE_URL=https://api.deepseek.com
 
 `var/` - локальный runtime-контур сервера. В Git хранится только каркас каталога,
 а реальные данные остаются локальными: индексы, очереди, OAuth, старые диалоги,
-audit, вложения и drafts.
+audit, learning-события, вложения и drafts.
+
+Журнал накопления примеров пишется в `var/learning_events.jsonl`. Это append-only
+контур для будущих evals, разборов качества и датасетов дообучения: запрос,
+ответ агента, handoff, действия, model usage и ручной feedback.
+
+```env
+LEARNING_EVENTS_ENABLED=true
+LEARNING_EVENTS_CAPTURE_TEXT=true
+LEARNING_EVENTS_MAX_TEXT_CHARS=8000
+```
 
 План переноса из старого `BitrixAIAgent/var`:
 

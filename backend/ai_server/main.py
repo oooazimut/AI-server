@@ -21,7 +21,8 @@ from .integrations.bitrix.portal_search import (
     format_portal_sync_stats,
 )
 from .knowledge import MarkdownKnowledgeBase
-from .models import AgentTask, AgentTestRequest, UserContext
+from .learning import LearningEventRecorder
+from .models import AgentTask, AgentTestRequest, LearningFeedbackRequest, UserContext
 from .retrieval import HybridKnowledgeRetriever
 from .orchestrators.internal import InternalOrchestrator
 from .registry import get_agent_manifest, load_agent_manifests
@@ -49,6 +50,7 @@ async def lifespan(app: FastAPI):
     portal_search = PortalSearchIndex()
     portal_search.ensure_schema()
     portal_search_indexer = PortalSearchIndexerWorker(bitrix, portal_search)
+    learning_recorder = LearningEventRecorder()
     webhook_event_queue = WebhookEventQueue(settings.webhook_event_queue_path)
     webhook_event_queue.ensure_schema()
 
@@ -56,6 +58,7 @@ async def lifespan(app: FastAPI):
     app.state.bitrix_oauth = bitrix_oauth
     app.state.portal_search = portal_search
     app.state.portal_search_indexer = portal_search_indexer
+    app.state.learning_recorder = learning_recorder
     app.state.webhook_event_queue = webhook_event_queue
     app.state.webhook_event_status = {
         "enabled": True,
@@ -149,6 +152,7 @@ async def lifespan(app: FastAPI):
             bitrix_oauth=bitrix_oauth,
             search_webhook_status=app.state.search_webhook_indexer_status,
             quality_control_status=app.state.quality_control_webhook_status,
+            learning_recorder=learning_recorder,
         )
         webhook_worker_task = asyncio.create_task(
             run_webhook_event_worker(
@@ -225,6 +229,8 @@ def health() -> dict[str, object]:
         "tech_footer_enabled": settings.tech_footer_enabled,
         "tech_footer_allowed_user_ids": settings.resolved_tech_footer_allowed_user_ids,
         "deepseek_balance_configured": bool(settings.deepseek_api_key),
+        "learning_events_enabled": settings.learning_events_enabled,
+        "learning_events_path": str(settings.learning_events_path),
         "bitrix_webhook_queue_enabled": settings.webhook_event_queue_enabled,
         "bitrix_webhook_worker_enabled": settings.webhook_event_worker_enabled,
         "bitrix_search_indexer_enabled": settings.search_background_indexer_enabled,
@@ -299,6 +305,41 @@ def automation_detail(automation_id: str):
     if automation is None:
         raise HTTPException(status_code=404, detail="automation not found")
     return automation
+
+
+@app.get("/learning/status")
+def learning_status(request: Request) -> dict[str, Any]:
+    return request.app.state.learning_recorder.stats()
+
+
+@app.get("/learning/events")
+def learning_events(
+    request: Request,
+    x_agent_secret: Annotated[str | None, Header(alias="X-Agent-Secret")] = None,
+    limit: int = Query(default=20, ge=1, le=100),
+) -> dict[str, Any]:
+    _validate_webhook_secret(get_settings(), _request_secret(request, x_agent_secret))
+    recorder: LearningEventRecorder = request.app.state.learning_recorder
+    return {"events": recorder.latest(limit=limit), "status": recorder.stats()}
+
+
+@app.post("/learning/feedback")
+def learning_feedback(
+    request: Request,
+    body: LearningFeedbackRequest,
+    x_agent_secret: Annotated[str | None, Header(alias="X-Agent-Secret")] = None,
+) -> dict[str, Any]:
+    _validate_webhook_secret(get_settings(), _request_secret(request, x_agent_secret))
+    recorder: LearningEventRecorder = request.app.state.learning_recorder
+    return recorder.record_feedback(
+        event_id=body.event_id,
+        rating=body.rating,
+        corrected_answer=body.corrected_answer,
+        comment=body.comment,
+        tags=body.tags,
+        user_id=body.user_id,
+        channel=body.channel,
+    )
 
 
 @app.get("/bitrix/status")
@@ -509,13 +550,14 @@ async def bitrix_events(
         bitrix_oauth=request.app.state.bitrix_oauth,
         search_webhook_status=request.app.state.search_webhook_indexer_status,
         quality_control_status=request.app.state.quality_control_webhook_status,
+        learning_recorder=request.app.state.learning_recorder,
     )
     result = await processor.process(payload)
     return {"ok": True, **result}
 
 
 @app.post("/orchestrator/test")
-async def orchestrator_test(body: AgentTestRequest):
+async def orchestrator_test(request: Request, body: AgentTestRequest):
     manifests = load_agent_manifests()
     task = AgentTask(
         task_id=str(uuid4()),
@@ -523,7 +565,13 @@ async def orchestrator_test(body: AgentTestRequest):
         user=UserContext(id=body.user_id, channel=body.channel, raw={"dialog_id": body.dialog_id}),
         request=body.text,
     )
-    return await InternalOrchestrator(manifests).handle(task)
+    result = await InternalOrchestrator(manifests).handle(task)
+    request.app.state.learning_recorder.record_agent_result(
+        task,
+        result,
+        metadata={"endpoint": "/orchestrator/test", "dialog_id": body.dialog_id},
+    )
+    return result
 
 
 async def _read_bitrix_event_payload(request: Request) -> dict[str, Any]:
@@ -580,6 +628,15 @@ def _payload_secret(payload: dict[str, Any]) -> str | None:
         if value:
             return str(value)
     return None
+
+
+def _request_secret(request: Request, header_value: str | None = None) -> str | None:
+    return (
+        header_value
+        or request.query_params.get("secret")
+        or request.query_params.get("agent_secret")
+        or request.query_params.get("token")
+    )
 
 
 def _validate_webhook_secret(settings, value: str | None) -> None:

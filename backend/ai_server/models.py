@@ -159,6 +159,16 @@ class AgentTestRequest(BaseModel):
     dialog_id: str = "test"
 
 
+class LearningFeedbackRequest(BaseModel):
+    event_id: str
+    rating: int | None = Field(default=None, ge=-1, le=1)
+    corrected_answer: str = ""
+    comment: str = ""
+    tags: list[str] = Field(default_factory=list)
+    user_id: str | None = None
+    channel: str = "manual"
+
+
 class ToolDefinition(BaseModel):
     name: str
     description: str

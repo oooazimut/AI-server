@@ -41,6 +41,10 @@ class RuntimePaths:
         return self.root / "quality_control_state.json"
 
     @property
+    def learning_events_log(self) -> Path:
+        return self.root / "learning_events.jsonl"
+
+    @property
     def search_content_dir(self) -> Path:
         return self.root / "search_content"
 
@@ -94,4 +98,3 @@ def ensure_runtime_dirs(paths: RuntimePaths | None = None) -> None:
         selected.tmp_dir,
     ):
         directory.mkdir(parents=True, exist_ok=True)
-

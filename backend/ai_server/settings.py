@@ -42,6 +42,9 @@ class Settings:
     tech_footer_allowed_user_ids: str
     tech_footer_balance_enabled: bool
     tech_footer_balance_cache_seconds: int
+    learning_events_enabled: bool
+    learning_events_capture_text: bool
+    learning_events_max_text_chars: int
     webhook_event_queue_enabled: bool
     webhook_event_worker_enabled: bool
     webhook_event_queue_interval_seconds: int
@@ -168,6 +171,10 @@ class Settings:
     @property
     def bitrix_write_audit_log_path(self) -> Path:
         return runtime_paths(self.var_dir).bitrix_write_audit_log
+
+    @property
+    def learning_events_path(self) -> Path:
+        return runtime_paths(self.var_dir).learning_events_log
 
     @property
     def quality_control_state_path(self) -> Path:
@@ -304,6 +311,9 @@ def get_settings() -> Settings:
         tech_footer_allowed_user_ids=_env("AI_SERVER_TECH_FOOTER_ALLOWED_USER_IDS"),
         tech_footer_balance_enabled=_env_bool("AI_SERVER_TECH_FOOTER_BALANCE_ENABLED", True),
         tech_footer_balance_cache_seconds=_env_int("AI_SERVER_TECH_FOOTER_BALANCE_CACHE_SECONDS", 300) or 300,
+        learning_events_enabled=_env_bool("LEARNING_EVENTS_ENABLED", True),
+        learning_events_capture_text=_env_bool("LEARNING_EVENTS_CAPTURE_TEXT", True),
+        learning_events_max_text_chars=_env_int("LEARNING_EVENTS_MAX_TEXT_CHARS", 8000) or 8000,
         webhook_event_queue_enabled=_env_bool("WEBHOOK_EVENT_QUEUE_ENABLED", True),
         webhook_event_worker_enabled=_env_bool("AI_SERVER_WEBHOOK_EVENT_WORKER_ENABLED", False),
         webhook_event_queue_interval_seconds=_env_int("WEBHOOK_EVENT_QUEUE_INTERVAL_SECONDS", 2) or 2,

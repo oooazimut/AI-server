@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 from uuid import uuid4
 
 from ai_server.attachments import AttachmentService, StoredAttachment
+from ai_server.learning import LearningEventRecorder
 from ai_server.integrations.bitrix.dialog_state import (
     BitrixPendingActionService,
     DialogStateStore,
@@ -34,6 +36,9 @@ from ai_server.workers.bitrix.search_webhook_indexer import (
 from ai_server.workers.bitrix.quality_control import handle_quality_control_webhook_event
 
 
+logger = logging.getLogger(__name__)
+
+
 class BitrixWebhookProcessor:
     def __init__(
         self,
@@ -53,6 +58,7 @@ class BitrixWebhookProcessor:
         technical_footer: TechnicalFooterService | None = None,
         attachment_service: AttachmentService | None = None,
         transcriber: Any | None = None,
+        learning_recorder: LearningEventRecorder | None = None,
     ) -> None:
         settings = get_settings()
         self.bitrix = bitrix or BitrixClient()
@@ -69,6 +75,7 @@ class BitrixWebhookProcessor:
         self.technical_footer = technical_footer or TechnicalFooterService()
         self.attachment_service = attachment_service or AttachmentService(self.bitrix)
         self.transcriber = transcriber or build_transcriber()
+        self.learning_recorder = learning_recorder
         self.pending_actions = pending_actions or BitrixPendingActionService(
             store=DialogStateStore(settings.dialog_state_path),
             bitrix=self.bitrix,
@@ -126,6 +133,19 @@ class BitrixWebhookProcessor:
                 append_footer(direct_result.message, footer),
                 bot_id=incoming.bot_id or settings.bitrix_bot_id,
             )
+            learning_event = self._record_pending_result(
+                dialog_key,
+                incoming.text,
+                direct_result,
+                metadata={
+                    "bitrix_event_type": incoming.event_type,
+                    "message_id": incoming.message_id,
+                    "bot_id": incoming.bot_id,
+                    "reply_sent": reply_sent,
+                    "send_error": send_error,
+                },
+                user_id=incoming.user_id,
+            )
             return {
                 "handled": True,
                 "event": event_type,
@@ -136,6 +156,7 @@ class BitrixWebhookProcessor:
                 "actions": [_pending_result_action(direct_result)],
                 "approval_actions": [],
                 "dialog_key": dialog_key,
+                "learning_event": learning_event,
             }
 
         orchestrator = self.orchestrator or InternalOrchestrator(
@@ -157,32 +178,31 @@ class BitrixWebhookProcessor:
                 user_id=incoming.user_id,
             ),
         )
-        result = await orchestrator.handle(
-            AgentTask(
-                task_id=str(uuid4()),
-                source="bitrix24_chat",
-                user=UserContext(
-                    id=str(incoming.user_id) if incoming.user_id is not None else None,
-                    channel="bitrix24_chat",
-                    raw={
-                        "dialog_id": incoming.dialog_id,
-                        "chat_id": incoming.chat_id,
-                        "message_id": incoming.message_id,
-                        "bot_id": incoming.bot_id,
-                    },
-                ),
-                request=incoming.text,
-                files=[
-                    *[file.model_dump() for file in incoming.files],
-                    *attachment_context["stored_files"],
-                ],
-                context={
-                    "bitrix_event_type": incoming.event_type,
-                    "transcriptions": attachment_context["transcriptions"],
-                    "attachment_errors": attachment_context["errors"],
+        task = AgentTask(
+            task_id=str(uuid4()),
+            source="bitrix24_chat",
+            user=UserContext(
+                id=str(incoming.user_id) if incoming.user_id is not None else None,
+                channel="bitrix24_chat",
+                raw={
+                    "dialog_id": incoming.dialog_id,
+                    "chat_id": incoming.chat_id,
+                    "message_id": incoming.message_id,
+                    "bot_id": incoming.bot_id,
                 },
-            )
+            ),
+            request=incoming.text,
+            files=[
+                *[file.model_dump() for file in incoming.files],
+                *attachment_context["stored_files"],
+            ],
+            context={
+                "bitrix_event_type": incoming.event_type,
+                "transcriptions": attachment_context["transcriptions"],
+                "attachment_errors": attachment_context["errors"],
+            },
         )
+        result = await orchestrator.handle(task)
 
         pending_action = self._save_first_pending_action(
             dialog_key,
@@ -201,6 +221,16 @@ class BitrixWebhookProcessor:
             reply_text,
             bot_id=incoming.bot_id or settings.bitrix_bot_id,
         )
+        learning_event = self._record_agent_result(
+            task,
+            result,
+            metadata={
+                "dialog_key": dialog_key,
+                "pending_action_saved": pending_action is not None,
+                "reply_sent": reply_sent,
+                "send_error": send_error,
+            },
+        )
 
         return {
             "handled": True,
@@ -215,6 +245,7 @@ class BitrixWebhookProcessor:
             "dialog_key": dialog_key,
             "transcriptions": attachment_context["transcriptions"],
             "attachment_errors": attachment_context["errors"],
+            "learning_event": learning_event,
         }
 
     async def _prepare_attachments(self, incoming) -> dict[str, Any]:
@@ -340,6 +371,44 @@ class BitrixWebhookProcessor:
                 self.pending_actions.save_pending(dialog_key, pending)
                 return pending
         return None
+
+    def _record_agent_result(
+        self,
+        task: AgentTask,
+        result: Any,
+        *,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if self.learning_recorder is None:
+            return None
+        try:
+            return self.learning_recorder.record_agent_result(task, result, metadata=metadata)
+        except Exception:
+            logger.exception("Failed to record Bitrix learning event")
+            return {"recorded": False, "reason": "unexpected_error"}
+
+    def _record_pending_result(
+        self,
+        dialog_key: str,
+        request_text: str,
+        result: PendingActionResult,
+        *,
+        metadata: dict[str, Any],
+        user_id: int | None,
+    ) -> dict[str, Any] | None:
+        if self.learning_recorder is None:
+            return None
+        try:
+            return self.learning_recorder.record_pending_result(
+                dialog_key=dialog_key,
+                user_id=user_id,
+                request_text=request_text,
+                result=result,
+                metadata=metadata,
+            )
+        except Exception:
+            logger.exception("Failed to record pending Bitrix learning event")
+            return {"recorded": False, "reason": "unexpected_error"}
 
     async def _quality_control_bitrix_client(self) -> tuple[BitrixClient, dict[str, Any] | None]:
         settings = get_settings()

@@ -4,7 +4,7 @@
 
 Only this README and empty directory markers are committed. Runtime data is not
 stored in Git because it can contain company data, OAuth tokens, dialog history,
-search indexes, attachments and generated documents.
+search indexes, learning events, attachments and generated documents.
 
 Expected Bitrix runtime paths:
 
@@ -18,6 +18,7 @@ Expected Bitrix runtime paths:
 - `quality_control_state.json`
 - `supervisor_state.json`
 - `vehicle_usage.sqlite`
+- `learning_events.jsonl`
 - `attachments/`
 - `document_drafts/`
 - `embedding_models/`
@@ -33,4 +34,3 @@ uv run python scripts/import_bitrix_var.py --profile cutover --execute
 
 Run the execute step only after the old service is stopped and the target runtime
 directory has been backed up or is safe to replace.
-
