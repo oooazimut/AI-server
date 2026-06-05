@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+from datetime import datetime, timezone
 import math
 import re
 import zipfile
@@ -282,6 +283,29 @@ class DocumentToolset:
                     "required": ["first_query", "second_query", "key_column", "value_columns"],
                 },
             ),
+            ToolDefinition(
+                name="document_draft_create",
+                description="Create a local PTO document draft from explicit LLM-provided content.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "content": {"type": "string"},
+                        "extension": {"type": "string", "enum": [".txt", ".md"]},
+                    },
+                    "required": ["title", "content"],
+                },
+            ),
+            ToolDefinition(
+                name="document_draft_list",
+                description="List recent local PTO document drafts.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 30},
+                    },
+                },
+            ),
         ]
 
     def portal_document_search(self, args: dict[str, Any]) -> ToolResult:
@@ -448,6 +472,64 @@ class DocumentToolset:
                 "schema": schema.as_dict(),
             },
             error="; ".join(report.errors) if report.errors else None,
+        )
+
+    def document_draft_create(self, args: dict[str, Any]) -> ToolResult:
+        title = str(args.get("title") or "").strip()
+        content = str(args.get("content") or "").strip()
+        extension = str(args.get("extension") or ".md").strip().lower()
+        if extension not in {".txt", ".md"}:
+            return ToolResult(
+                status="invalid_tool_call",
+                tool="document_draft_create",
+                error="extension must be .txt or .md",
+            )
+        if not title or not content:
+            return ToolResult(
+                status="invalid_tool_call",
+                tool="document_draft_create",
+                error="title and content are required",
+            )
+
+        drafts_dir = get_settings().document_drafts_dir
+        drafts_dir.mkdir(parents=True, exist_ok=True)
+        path = drafts_dir / f"{datetime.now(timezone.utc).astimezone().strftime('%Y%m%d-%H%M%S')}-{_safe_draft_name(title, extension)}"
+        path.write_text(content + "\n", encoding="utf-8")
+        return ToolResult(
+            status="ok",
+            tool="document_draft_create",
+            data={
+                "title": title,
+                "path": str(path),
+                "bytes": path.stat().st_size,
+                "message": "Draft was created locally; uploading/sending requires a separate approved write action.",
+            },
+        )
+
+    def document_draft_list(self, args: dict[str, Any]) -> ToolResult:
+        limit = max(1, min(_optional_int(args.get("limit")) or 10, 30))
+        drafts_dir = get_settings().document_drafts_dir
+        drafts_dir.mkdir(parents=True, exist_ok=True)
+        drafts = sorted(
+            [path for path in drafts_dir.iterdir() if path.is_file()],
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )[:limit]
+        return ToolResult(
+            status="ok",
+            tool="document_draft_list",
+            data={
+                "drafts": [
+                    {
+                        "name": path.name,
+                        "path": str(path),
+                        "bytes": path.stat().st_size,
+                        "modified_at": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).astimezone().isoformat(),
+                    }
+                    for path in drafts
+                ],
+                "total": len(drafts),
+            },
         )
 
     def _resolve_document(self, args: dict[str, Any]) -> ResolvedDocument | None:
@@ -1120,6 +1202,15 @@ def _document_link(item: PortalSearchResult) -> str:
 
 def _format_document_link(title: str, url: str) -> str:
     return f"[{title}]({url})" if url else title
+
+
+def _safe_draft_name(title: str, extension: str) -> str:
+    name = re.sub(r"[^a-zA-Z0-9а-яА-Я._-]+", "_", title).strip("._")
+    if not name:
+        name = "draft"
+    if not name.lower().endswith(extension):
+        name += extension
+    return name[:120]
 
 
 def _format_field_difference(difference: FieldDifference) -> str:

@@ -186,6 +186,10 @@ class Settings:
         return runtime_paths(self.var_dir).attachments_dir
 
     @property
+    def document_drafts_dir(self) -> Path:
+        return runtime_paths(self.var_dir).document_drafts_dir
+
+    @property
     def transcription_configured(self) -> bool:
         return self.stt_provider == "yandex_speechkit" and bool(
             self.yandex_api_key or (self.yandex_iam_token and self.yandex_folder_id)

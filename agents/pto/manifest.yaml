@@ -15,10 +15,14 @@ capabilities:
   - document_review
   - document_comparison
   - spreadsheet_comparison
+  - document_drafts
 tools:
   - portal_document_search
   - document_read
+  - spreadsheet_preview
   - spreadsheet_compare
+  - document_draft_create
+  - document_draft_list
 data_scopes:
   - bitrix24_documents
   - pto_documents
@@ -27,6 +31,7 @@ allowed_actions:
   - search_project_docs
   - read_project_docs
   - compare_project_docs
+  - create_local_document_draft
 approval_required:
   - create_document_draft
   - upload_document

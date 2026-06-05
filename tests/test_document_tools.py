@@ -64,6 +64,26 @@ def test_spreadsheet_compare_requires_llm_selected_schema(monkeypatch, tmp_path)
     assert "spreadsheet_preview" in (result.error or "")
 
 
+def test_document_toolset_creates_local_draft(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
+    toolset = DocumentToolset(client=FakeDocumentBitrix(), portal_search=_document_index(tmp_path / "search_index.sqlite"), user_id=9)
+
+    result = toolset.document_draft_create(
+        {
+            "title": "../Акт проверки",
+            "content": "Замечаний по комплектности нет.",
+            "extension": ".md",
+        }
+    )
+
+    assert result.status == "ok"
+    path = Path(result.data["path"])
+    assert path.exists()
+    assert path.parent == tmp_path / "var" / "document_drafts"
+    assert ".." not in path.name
+    assert "Замечаний" in path.read_text(encoding="utf-8")
+
+
 def test_pto_specialist_uses_spreadsheet_compare_tool(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     manifest = get_agent_manifest("pto")
@@ -110,6 +130,40 @@ def test_pto_specialist_uses_spreadsheet_compare_tool(monkeypatch, tmp_path):
     assert len(fake_llm.decide_calls[1]["tool_results"]) == 2
     assert result.answer == "В сметах изменился кабель."
     assert result.handoff_to == []
+
+
+def test_pto_specialist_creates_document_draft(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
+    manifest = get_agent_manifest("pto")
+    assert manifest is not None
+    specialist = PtoSpecialist(
+        manifest,
+        retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
+        tools=DocumentToolset(client=FakeDocumentBitrix(), portal_search=_document_index(tmp_path / "search_index.sqlite"), user_id=9),
+        llm=FakePtoLLM(
+            tool_call_steps=[
+                [
+                    PtoLLMToolCall(
+                        name="document_draft_create",
+                        args={
+                            "title": "Акт проверки",
+                            "content": "Черновик акта подготовлен ПТО-специалистом.",
+                            "extension": ".md",
+                        },
+                    )
+                ],
+                [PtoLLMToolCall(name="none")],
+            ],
+            final_answer="Черновик подготовлен.",
+        ),
+    )
+
+    result = anyio_run(specialist.handle(AgentTask(task_id="pto-2", request="Подготовь акт проверки")))
+
+    action = next(item for item in result.actions_taken if item.name == "pto_document_draft_create")
+    assert action.status == "ok"
+    assert Path(action.details["data"]["path"]).exists()
+    assert result.answer == "Черновик подготовлен."
 
 
 class FakeDocumentBitrix:

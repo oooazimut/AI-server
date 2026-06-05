@@ -10,7 +10,15 @@ from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolRes
 from ai_server.retrieval import RetrievalHit
 
 
-ALLOWED_TOOL_NAMES = {"portal_document_search", "document_read", "spreadsheet_preview", "spreadsheet_compare", "none"}
+ALLOWED_TOOL_NAMES = {
+    "portal_document_search",
+    "document_read",
+    "spreadsheet_preview",
+    "spreadsheet_compare",
+    "document_draft_create",
+    "document_draft_list",
+    "none",
+}
 RESULT_STATUSES = {"completed", "needs_clarification", "needs_human", "failed"}
 
 
@@ -176,11 +184,14 @@ def _decision_system_prompt() -> str:
         "По preview сам выбери sheet, header_row_number, key_column и value_columns; только после этого вызывай "
         "spreadsheet_compare с явной схемой. spreadsheet_compare делает точный механический diff и не должен "
         "использоваться без выбранной тобой схемы. "
+        "Если нужно подготовить текстовый черновик документа, сам сформируй его содержание и вызови "
+        "document_draft_create. Этот tool только создаёт локальный черновик; отправка/загрузка в Bitrix требует "
+        "отдельного подтверждаемого write-контура и сейчас не выполняется этим tool. "
         "Верни только JSON-объект без markdown: "
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
-        '"tool_calls":[{"name":"portal_document_search|document_read|spreadsheet_preview|spreadsheet_compare|none","args":{},"summary":""}]}.'
+        '"tool_calls":[{"name":"portal_document_search|document_read|spreadsheet_preview|spreadsheet_compare|document_draft_create|document_draft_list|none","args":{},"summary":""}]}.'
     )
 
 

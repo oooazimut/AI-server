@@ -189,6 +189,12 @@ class PtoSpecialist:
         if tool_call.name == "spreadsheet_compare":
             result = await self.tools.spreadsheet_compare(tool_call.args)
             return result, ActionRecord(name="pto_spreadsheet_compare", status=result.status, details=result.model_dump())
+        if tool_call.name == "document_draft_create":
+            result = self.tools.document_draft_create(tool_call.args)
+            return result, ActionRecord(name="pto_document_draft_create", status=result.status, details=result.model_dump())
+        if tool_call.name == "document_draft_list":
+            result = self.tools.document_draft_list(tool_call.args)
+            return result, ActionRecord(name="pto_document_draft_list", status=result.status, details=result.model_dump())
 
         result = ToolResult(
             status="invalid_tool_call",
