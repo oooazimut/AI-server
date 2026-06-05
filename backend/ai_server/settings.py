@@ -88,6 +88,22 @@ class Settings:
     quality_control_smart_enabled: bool
     quality_control_exempt_responsible_user_ids: str
     quality_control_auto_manage_project_id: int | None
+    supervisor_enabled: bool
+    supervisor_dry_run: bool
+    supervisor_interval_seconds: int
+    supervisor_initial_delay_seconds: int
+    supervisor_max_tasks: int
+    supervisor_max_tasks_per_user: int
+    supervisor_admin_user_ids: str
+    supervisor_notify_responsibles: bool
+    supervisor_reminder_cooldown_hours: int
+    reconcile_enabled: bool
+    reconcile_interval_seconds: int
+    reconcile_initial_delay_seconds: int
+    reconcile_tasks_enabled: bool
+    reconcile_task_lookback_hours: int
+    reconcile_task_limit: int
+    reconcile_disk_delta_enabled: bool
     agent_write_allowed_user_ids: str
     agent_limited_task_create_project_id: int | None
     agent_limited_task_create_user_ids: str
@@ -141,6 +157,14 @@ class Settings:
     @property
     def quality_control_state_path(self) -> Path:
         return runtime_paths(self.var_dir).quality_control_state
+
+    @property
+    def supervisor_state_path(self) -> Path:
+        return runtime_paths(self.var_dir).supervisor_state
+
+    @property
+    def resolved_supervisor_admin_user_ids(self) -> list[int]:
+        return _id_list(self.supervisor_admin_user_ids)
 
     @property
     def resolved_agent_write_allowed_user_ids(self) -> list[int]:
@@ -293,6 +317,22 @@ def get_settings() -> Settings:
         quality_control_smart_enabled=_env_bool("QUALITY_CONTROL_SMART_ENABLED", True),
         quality_control_exempt_responsible_user_ids=_env("QUALITY_CONTROL_EXEMPT_RESPONSIBLE_USER_IDS"),
         quality_control_auto_manage_project_id=_env_int("QUALITY_CONTROL_AUTO_MANAGE_PROJECT_ID"),
+        supervisor_enabled=_env_bool("SUPERVISOR_ENABLED", False),
+        supervisor_dry_run=_env_bool("SUPERVISOR_DRY_RUN", True),
+        supervisor_interval_seconds=_env_int("SUPERVISOR_INTERVAL_SECONDS", 60 * 60) or (60 * 60),
+        supervisor_initial_delay_seconds=_env_int("SUPERVISOR_INITIAL_DELAY_SECONDS", 60) or 60,
+        supervisor_max_tasks=_env_int("SUPERVISOR_MAX_TASKS", 50) or 50,
+        supervisor_max_tasks_per_user=_env_int("SUPERVISOR_MAX_TASKS_PER_USER", 10) or 10,
+        supervisor_admin_user_ids=_env("SUPERVISOR_ADMIN_USER_IDS"),
+        supervisor_notify_responsibles=_env_bool("SUPERVISOR_NOTIFY_RESPONSIBLES", False),
+        supervisor_reminder_cooldown_hours=_env_int("SUPERVISOR_REMINDER_COOLDOWN_HOURS", 12) or 12,
+        reconcile_enabled=_env_bool("RECONCILE_ENABLED", False),
+        reconcile_interval_seconds=_env_int("RECONCILE_INTERVAL_SECONDS", 15 * 60) or (15 * 60),
+        reconcile_initial_delay_seconds=_env_int("RECONCILE_INITIAL_DELAY_SECONDS", 120) or 120,
+        reconcile_tasks_enabled=_env_bool("RECONCILE_TASKS_ENABLED", True),
+        reconcile_task_lookback_hours=_env_int("RECONCILE_TASK_LOOKBACK_HOURS", 24) or 24,
+        reconcile_task_limit=_env_int("RECONCILE_TASK_LIMIT", 500) or 500,
+        reconcile_disk_delta_enabled=_env_bool("RECONCILE_DISK_DELTA_ENABLED", True),
         agent_write_allowed_user_ids=_env("AGENT_WRITE_ALLOWED_USER_IDS"),
         agent_limited_task_create_project_id=_env_int("AGENT_LIMITED_TASK_CREATE_PROJECT_ID"),
         agent_limited_task_create_user_ids=_env("AGENT_LIMITED_TASK_CREATE_USER_IDS"),

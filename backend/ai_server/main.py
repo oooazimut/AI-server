@@ -30,6 +30,8 @@ from .settings import get_settings
 from .skills import SkillStore
 from .workers.bitrix.webhook_event_queue import WebhookEventQueue, run_webhook_event_worker
 from .workers.bitrix.search_indexer import PortalSearchIndexerWorker
+from .workers.bitrix.reconciler import reconcile_once, run_reconciler
+from .workers.bitrix.supervisor import run_task_supervisor, run_task_supervisor_once
 from .workers.registry import (
     get_automation_manifest,
     load_automation_manifests,
@@ -111,9 +113,35 @@ async def lifespan(app: FastAPI):
         "ignored": 0,
         "errors": 0,
     }
+    app.state.task_supervisor_status = {
+        "enabled": settings.supervisor_enabled,
+        "running": False,
+        "dry_run": settings.supervisor_dry_run,
+        "interval_seconds": settings.supervisor_interval_seconds,
+        "last_check_at": None,
+        "last_success_at": None,
+        "last_error": None,
+        "next_check_at": None,
+        "runs": 0,
+        "errors": 0,
+    }
+    app.state.reconciler_status = {
+        "enabled": settings.reconcile_enabled,
+        "running": False,
+        "interval_seconds": settings.reconcile_interval_seconds,
+        "task_lookback_hours": settings.reconcile_task_lookback_hours,
+        "last_check_at": None,
+        "last_success_at": None,
+        "last_error": None,
+        "next_check_at": None,
+        "runs": 0,
+        "errors": 0,
+    }
 
     webhook_worker_task: asyncio.Task | None = None
     search_indexer_task: asyncio.Task | None = None
+    supervisor_task: asyncio.Task | None = None
+    reconciler_task: asyncio.Task | None = None
     if settings.webhook_event_queue_enabled and settings.webhook_event_worker_enabled:
         processor = BitrixWebhookProcessor(
             bitrix=bitrix,
@@ -131,6 +159,19 @@ async def lifespan(app: FastAPI):
         )
     if settings.search_background_indexer_enabled:
         search_indexer_task = asyncio.create_task(portal_search_indexer.run())
+    if settings.supervisor_enabled:
+        supervisor_task = asyncio.create_task(
+            run_task_supervisor(bitrix, status=app.state.task_supervisor_status)
+        )
+    if settings.reconcile_enabled:
+        reconciler_task = asyncio.create_task(
+            run_reconciler(
+                bitrix,
+                webhook_event_queue,
+                portal_search_indexer,
+                status=app.state.reconciler_status,
+            )
+        )
 
     try:
         yield
@@ -147,6 +188,20 @@ async def lifespan(app: FastAPI):
             search_indexer_task.cancel()
             try:
                 await search_indexer_task
+            except asyncio.CancelledError:
+                pass
+        if supervisor_task:
+            app.state.task_supervisor_status["running"] = False
+            supervisor_task.cancel()
+            try:
+                await supervisor_task
+            except asyncio.CancelledError:
+                pass
+        if reconciler_task:
+            app.state.reconciler_status["running"] = False
+            reconciler_task.cancel()
+            try:
+                await reconciler_task
             except asyncio.CancelledError:
                 pass
 
@@ -175,6 +230,8 @@ def health() -> dict[str, object]:
         "bitrix_search_indexer_enabled": settings.search_background_indexer_enabled,
         "bitrix_quality_control_enabled": settings.quality_control_webhook_enabled,
         "bitrix_quality_control_dry_run": settings.quality_control_dry_run,
+        "bitrix_task_supervisor_enabled": settings.supervisor_enabled,
+        "bitrix_reconciler_enabled": settings.reconcile_enabled,
     }
 
 
@@ -257,6 +314,8 @@ def bitrix_status(request: Request) -> dict[str, Any]:
         "portal_search_indexer": request.app.state.portal_search_indexer.public_status(),
         "search_webhook_indexer": dict(request.app.state.search_webhook_indexer_status),
         "quality_control": dict(request.app.state.quality_control_webhook_status),
+        "task_supervisor": dict(request.app.state.task_supervisor_status),
+        "reconciler": dict(request.app.state.reconciler_status),
         "webhook_events": dict(request.app.state.webhook_event_status),
         "webhook_event_queue": {
             **dict(request.app.state.webhook_event_queue_status),
@@ -301,6 +360,36 @@ def bitrix_search_webhook_indexer_status(request: Request) -> dict[str, Any]:
 @app.get("/bitrix/quality-control/status")
 def bitrix_quality_control_status(request: Request) -> dict[str, Any]:
     return dict(request.app.state.quality_control_webhook_status)
+
+
+@app.get("/bitrix/supervisor/status")
+def bitrix_supervisor_status(request: Request) -> dict[str, Any]:
+    return dict(request.app.state.task_supervisor_status)
+
+
+@app.post("/bitrix/supervisor/run-once")
+async def bitrix_supervisor_run_once(request: Request) -> dict[str, Any]:
+    result = await run_task_supervisor_once(
+        request.app.state.bitrix,
+        status=request.app.state.task_supervisor_status,
+    )
+    return {"ok": True, **result, "status": dict(request.app.state.task_supervisor_status)}
+
+
+@app.get("/bitrix/reconciler/status")
+def bitrix_reconciler_status(request: Request) -> dict[str, Any]:
+    return dict(request.app.state.reconciler_status)
+
+
+@app.post("/bitrix/reconciler/run-once")
+async def bitrix_reconciler_run_once(request: Request) -> dict[str, Any]:
+    result = await reconcile_once(
+        request.app.state.bitrix,
+        request.app.state.webhook_event_queue,
+        request.app.state.portal_search_indexer,
+        status=request.app.state.reconciler_status,
+    )
+    return {"ok": True, "result": result, "status": dict(request.app.state.reconciler_status)}
 
 
 @app.post("/bitrix/search/reindex")
