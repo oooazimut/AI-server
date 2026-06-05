@@ -15,8 +15,10 @@ capabilities:
   - daily_vehicle_report
   - staff_status_tracking
 tools:
-  - bitrix_api
-  - llm_gateway
+  - vehicle_usage_context
+  - vehicle_usage_save_draft
+  - vehicle_usage_save_report
+  - vehicle_usage_send_message
 automations:
   - id: logistics_vehicle_usage
     name: Утренний учёт служебных машин
@@ -35,8 +37,10 @@ automations:
       - bitrix_api
       - llm_gateway
     tools:
-      - bitrix_api
-      - llm_gateway
+      - vehicle_usage_context
+      - vehicle_usage_save_draft
+      - vehicle_usage_save_report
+      - vehicle_usage_send_message
     data_scopes:
       - bitrix24_chats
       - bitrix24_users

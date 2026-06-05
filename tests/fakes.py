@@ -12,6 +12,12 @@ from ai_server.agents.bitrix_llm import (
     BitrixLLMToolCall,
 )
 from ai_server.agents.bitrix_task_closure import TaskClosureDecision, TaskClosureToolCall
+from ai_server.agents.logistics_llm import (
+    LogisticsLLMDecision,
+    LogisticsLLMDecisionResult,
+    LogisticsLLMFinalResult,
+    LogisticsLLMToolCall,
+)
 from ai_server.agents.pending_control_llm import PendingControlDecision, PendingControlResult
 from ai_server.agents.pto_llm import (
     PtoLLMDecision,
@@ -202,6 +208,44 @@ class FakePtoLLM:
             status=self.final_status,
             answer=self.final_answer,
             model_usage=_fake_usage(agent_id="pto"),
+        )
+
+
+class FakeLogisticsLLM:
+    def __init__(
+        self,
+        *,
+        tool_call_steps: list[list[LogisticsLLMToolCall]] | None = None,
+        final_status: str = "completed",
+        final_answer: str = "Готово.",
+        confidence: float = 0.84,
+    ) -> None:
+        self.tool_call_steps = tool_call_steps or [[LogisticsLLMToolCall(name="none")]]
+        self.final_status = final_status
+        self.final_answer = final_answer
+        self.confidence = confidence
+        self.decide_calls = []
+        self.compose_calls = []
+
+    async def decide(self, **kwargs):
+        self.decide_calls.append(kwargs)
+        index = min(len(self.decide_calls) - 1, len(self.tool_call_steps) - 1)
+        return LogisticsLLMDecisionResult(
+            decision=LogisticsLLMDecision(
+                status="completed",
+                answer="",
+                confidence=self.confidence,
+                tool_calls=self.tool_call_steps[index],
+            ),
+            model_usage=_fake_usage(agent_id="logistics"),
+        )
+
+    async def compose(self, **kwargs):
+        self.compose_calls.append(kwargs)
+        return LogisticsLLMFinalResult(
+            status=self.final_status,
+            answer=self.final_answer,
+            model_usage=_fake_usage(agent_id="logistics"),
         )
 
 

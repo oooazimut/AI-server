@@ -104,6 +104,10 @@ class Settings:
     reconcile_task_lookback_hours: int
     reconcile_task_limit: int
     reconcile_disk_delta_enabled: bool
+    vehicle_usage_manager_user_id: int | None
+    vehicle_usage_dialog_id: str
+    vehicle_usage_staff_roster: str
+    vehicle_usage_dry_run: bool
     agent_write_allowed_user_ids: str
     agent_limited_task_create_project_id: int | None
     agent_limited_task_create_user_ids: str
@@ -161,6 +165,10 @@ class Settings:
     @property
     def supervisor_state_path(self) -> Path:
         return runtime_paths(self.var_dir).supervisor_state
+
+    @property
+    def vehicle_usage_db_path(self) -> Path:
+        return runtime_paths(self.var_dir).vehicle_usage_db
 
     @property
     def resolved_supervisor_admin_user_ids(self) -> list[int]:
@@ -333,6 +341,10 @@ def get_settings() -> Settings:
         reconcile_task_lookback_hours=_env_int("RECONCILE_TASK_LOOKBACK_HOURS", 24) or 24,
         reconcile_task_limit=_env_int("RECONCILE_TASK_LIMIT", 500) or 500,
         reconcile_disk_delta_enabled=_env_bool("RECONCILE_DISK_DELTA_ENABLED", True),
+        vehicle_usage_manager_user_id=_env_int("VEHICLE_USAGE_MANAGER_USER_ID"),
+        vehicle_usage_dialog_id=_env("VEHICLE_USAGE_DIALOG_ID"),
+        vehicle_usage_staff_roster=_env("VEHICLE_USAGE_STAFF_ROSTER"),
+        vehicle_usage_dry_run=_env_bool("VEHICLE_USAGE_DRY_RUN", True),
         agent_write_allowed_user_ids=_env("AGENT_WRITE_ALLOWED_USER_IDS"),
         agent_limited_task_create_project_id=_env_int("AGENT_LIMITED_TASK_CREATE_PROJECT_ID"),
         agent_limited_task_create_user_ids=_env("AGENT_LIMITED_TASK_CREATE_USER_IDS"),

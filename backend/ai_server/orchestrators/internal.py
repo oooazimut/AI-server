@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist
 from ai_server.agents.bitrix_llm import BitrixAgentLLM
+from ai_server.agents.logistics import LogisticsSpecialist
+from ai_server.agents.logistics_llm import LogisticsAgentLLM
 from ai_server.agents.pto import PtoSpecialist
 from ai_server.agents.pto_llm import PtoAgentLLM
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask
@@ -9,6 +11,7 @@ from ai_server.orchestrators.internal_llm import InternalLLMRouter, InternalOrch
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.tools.bitrix import BitrixToolset
 from ai_server.tools.document_access import DocumentToolset
+from ai_server.tools.vehicle_usage import VehicleUsageToolset
 
 
 class InternalOrchestrator:
@@ -22,6 +25,9 @@ class InternalOrchestrator:
         pto_retriever: HybridKnowledgeRetriever | None = None,
         document_tools: DocumentToolset | None = None,
         pto_llm: PtoAgentLLM | None = None,
+        logistics_retriever: HybridKnowledgeRetriever | None = None,
+        vehicle_usage_tools: VehicleUsageToolset | None = None,
+        logistics_llm: LogisticsAgentLLM | None = None,
         orchestrator_llm: InternalOrchestratorLLM | None = None,
     ) -> None:
         self.manifests = manifests
@@ -31,6 +37,9 @@ class InternalOrchestrator:
         self.pto_retriever = pto_retriever
         self.document_tools = document_tools
         self.pto_llm = pto_llm
+        self.logistics_retriever = logistics_retriever
+        self.vehicle_usage_tools = vehicle_usage_tools
+        self.logistics_llm = logistics_llm
         self.orchestrator_llm = orchestrator_llm or InternalLLMRouter()
 
     async def handle(self, task: AgentTask) -> AgentResult:
@@ -111,6 +120,35 @@ class InternalOrchestrator:
                 actions_requiring_approval=specialist_result.actions_requiring_approval,
                 model_usage=[route_result.model_usage, *specialist_result.model_usage],
                 handoff_to=["pto"],
+                confidence=specialist_result.confidence,
+                logs=specialist_result.logs,
+            )
+
+        logistics = _manifest_by_id(self.manifests, "logistics") if "logistics" in decision.handoff_to else None
+        if logistics is not None:
+            specialist_result = await LogisticsSpecialist(
+                logistics,
+                retriever=self.logistics_retriever,
+                tools=self.vehicle_usage_tools,
+                llm=self.logistics_llm,
+            ).handle(task)
+            return AgentResult(
+                status=specialist_result.status,
+                agent_id="internal_orchestrator",
+                answer=specialist_result.answer,
+                artifacts=specialist_result.artifacts,
+                actions_taken=[
+                    route_action,
+                    ActionRecord(
+                        name="delegate_to_specialist",
+                        status="completed",
+                        details={"specialist": "logistics"},
+                    ),
+                    *specialist_result.actions_taken,
+                ],
+                actions_requiring_approval=specialist_result.actions_requiring_approval,
+                model_usage=[route_result.model_usage, *specialist_result.model_usage],
+                handoff_to=["logistics"],
                 confidence=specialist_result.confidence,
                 logs=specialist_result.logs,
             )

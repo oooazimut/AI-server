@@ -4,7 +4,7 @@ from ai_server.models import AgentTask
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.registry import load_agent_manifests
 from ai_server.retrieval import HybridKnowledgeRetriever
-from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, FakeInternalOrchestratorLLM, FakePtoLLM
+from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, FakeInternalOrchestratorLLM, FakeLogisticsLLM, FakePtoLLM
 
 
 def test_internal_orchestrator_delegates_bitrix_request():
@@ -54,4 +54,20 @@ def test_internal_orchestrator_reports_configured_model(monkeypatch):
     assert result.agent_id == "internal_orchestrator"
     assert "deepseek-v4-flash" in result.answer
     assert result.actions_taken[0].name == "orchestrator_llm_route"
+
+
+def test_internal_orchestrator_delegates_logistics_request():
+    result = asyncio.run(
+        InternalOrchestrator(
+            load_agent_manifests(),
+            logistics_retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
+            logistics_llm=FakeLogisticsLLM(final_answer="Логист обработал отчет."),
+            orchestrator_llm=FakeInternalOrchestratorLLM(handoff_to=["logistics"]),
+        ).handle(AgentTask(task_id="t1", request="Утренний отчет по машинам"))
+    )
+
+    assert result.agent_id == "internal_orchestrator"
+    assert result.handoff_to == ["logistics"]
+    assert result.answer == "Логист обработал отчет."
+    assert result.actions_taken[1].details["specialist"] == "logistics"
 
