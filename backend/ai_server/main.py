@@ -6,6 +6,7 @@ from urllib.parse import parse_qsl
 from uuid import uuid4
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, status
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from .channels.bitrix import BitrixWebhookProcessor
 from .integrations.bitrix.client import BitrixClient
@@ -33,6 +34,7 @@ from .workers.bitrix.webhook_event_queue import WebhookEventQueue, run_webhook_e
 from .workers.bitrix.search_indexer import PortalSearchIndexerWorker
 from .workers.bitrix.reconciler import reconcile_once, run_reconciler
 from .workers.bitrix.supervisor import run_task_supervisor, run_task_supervisor_once
+from .workers.logistics.vehicle_usage import run_vehicle_usage_once, run_vehicle_usage_worker
 from .workers.registry import (
     get_automation_manifest,
     load_automation_manifests,
@@ -140,11 +142,30 @@ async def lifespan(app: FastAPI):
         "runs": 0,
         "errors": 0,
     }
+    app.state.vehicle_usage_status = {
+        "enabled": settings.vehicle_usage_enabled,
+        "running": False,
+        "dry_run": settings.vehicle_usage_dry_run,
+        "interval_seconds": settings.vehicle_usage_interval_seconds,
+        "dialog_id": settings.vehicle_usage_dialog_id,
+        "manager_user_id": settings.vehicle_usage_manager_user_id,
+        "admin_notify_user_ids": settings.resolved_vehicle_usage_admin_notify_user_ids,
+        "request_time": settings.vehicle_usage_request_time,
+        "request_times": settings.vehicle_usage_request_times,
+        "escalation_time": settings.vehicle_usage_escalation_time,
+        "last_check_at": None,
+        "last_sent_at": None,
+        "last_escalated_at": None,
+        "last_error": None,
+        "runs": 0,
+        "errors": 0,
+    }
 
     webhook_worker_task: asyncio.Task | None = None
     search_indexer_task: asyncio.Task | None = None
     supervisor_task: asyncio.Task | None = None
     reconciler_task: asyncio.Task | None = None
+    vehicle_usage_task: asyncio.Task | None = None
     if settings.webhook_event_queue_enabled and settings.webhook_event_worker_enabled:
         processor = BitrixWebhookProcessor(
             bitrix=bitrix,
@@ -175,6 +196,10 @@ async def lifespan(app: FastAPI):
                 portal_search_indexer,
                 status=app.state.reconciler_status,
             )
+        )
+    if settings.vehicle_usage_enabled:
+        vehicle_usage_task = asyncio.create_task(
+            run_vehicle_usage_worker(bitrix, status=app.state.vehicle_usage_status)
         )
 
     try:
@@ -208,6 +233,13 @@ async def lifespan(app: FastAPI):
                 await reconciler_task
             except asyncio.CancelledError:
                 pass
+        if vehicle_usage_task:
+            app.state.vehicle_usage_status["running"] = False
+            vehicle_usage_task.cancel()
+            try:
+                await vehicle_usage_task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="AI Server", version="0.1.0", lifespan=lifespan)
@@ -238,6 +270,7 @@ def health() -> dict[str, object]:
         "bitrix_quality_control_dry_run": settings.quality_control_dry_run,
         "bitrix_task_supervisor_enabled": settings.supervisor_enabled,
         "bitrix_reconciler_enabled": settings.reconcile_enabled,
+        "logistics_vehicle_usage_enabled": settings.vehicle_usage_enabled,
     }
 
 
@@ -365,9 +398,86 @@ def bitrix_status(request: Request) -> dict[str, Any]:
     }
 
 
+@app.get("/agent/status")
+def legacy_agent_status(request: Request) -> dict[str, Any]:
+    return {
+        **bitrix_status(request),
+        "agent_runtime": "multi_agent",
+        "vehicle_usage": dict(request.app.state.vehicle_usage_status),
+    }
+
+
+@app.get("/agent/vehicles/status")
+def legacy_vehicle_usage_status(request: Request) -> dict[str, Any]:
+    return logistics_vehicle_usage_status(request)
+
+
 @app.get("/bitrix/oauth/status")
 def bitrix_oauth_status(request: Request) -> dict[str, Any]:
     return request.app.state.bitrix_oauth.public_status()
+
+
+@app.api_route("/bitrix/app", methods=["GET", "POST"], response_class=HTMLResponse)
+async def bitrix_app(request: Request):
+    settings = get_settings()
+    payload = await _read_bitrix_event_payload(request)
+    if request.query_params:
+        payload = {**dict(request.query_params), **payload}
+    if request.query_params.get("code"):
+        result = await request.app.state.bitrix_oauth.exchange_authorization_code(
+            code=str(request.query_params["code"]),
+            source="oauth_callback",
+        )
+        return _oauth_success_page(result.user_id, result.expires_at.isoformat())
+
+    if _payload_has_oauth(payload):
+        result = await request.app.state.bitrix_oauth.save_from_payload(payload, source="bitrix_app")
+        return _oauth_success_page(result.user_id, result.expires_at.isoformat())
+
+    if settings.resolved_bitrix_oauth_start_url:
+        return RedirectResponse(settings.resolved_bitrix_oauth_start_url)
+
+    return HTMLResponse(
+        _html_page(
+            "AI-помощник",
+            (
+                "<p>OAuth пока не настроен: не задан `BITRIX_OAUTH_CLIENT_ID` "
+                "или публичный `PUBLIC_BASE_URL`.</p>"
+            ),
+        )
+    )
+
+
+@app.post("/bitrix/install", response_class=HTMLResponse)
+async def bitrix_install(request: Request) -> HTMLResponse:
+    payload = await _read_bitrix_event_payload(request)
+    if request.query_params:
+        payload = {**dict(request.query_params), **payload}
+    result = await request.app.state.bitrix_oauth.save_from_payload(payload, source="bitrix_install")
+    return _oauth_success_page(result.user_id, result.expires_at.isoformat())
+
+
+@app.get("/bitrix/oauth/callback", response_class=HTMLResponse)
+async def bitrix_oauth_callback(request: Request) -> HTMLResponse:
+    code = request.query_params.get("code")
+    if not code:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OAuth code is missing")
+    result = await request.app.state.bitrix_oauth.exchange_authorization_code(
+        code=str(code),
+        source="oauth_callback",
+    )
+    return _oauth_success_page(result.user_id, result.expires_at.isoformat())
+
+
+@app.get("/bitrix/oauth/start")
+def bitrix_oauth_start() -> RedirectResponse:
+    settings = get_settings()
+    if not settings.resolved_bitrix_oauth_start_url:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Bitrix OAuth client id or domain is not configured",
+        )
+    return RedirectResponse(settings.resolved_bitrix_oauth_start_url)
 
 
 @app.get("/bitrix/webhook-events/status")
@@ -379,6 +489,11 @@ def bitrix_webhook_events_status(request: Request) -> dict[str, Any]:
     }
 
 
+@app.get("/agent/webhook-events/status")
+def legacy_webhook_events_status(request: Request) -> dict[str, Any]:
+    return bitrix_webhook_events_status(request)
+
+
 @app.get("/bitrix/search/status")
 def bitrix_search_status(request: Request) -> dict[str, Any]:
     return {
@@ -388,9 +503,19 @@ def bitrix_search_status(request: Request) -> dict[str, Any]:
     }
 
 
+@app.get("/agent/search/status")
+def legacy_bitrix_search_status(request: Request) -> dict[str, Any]:
+    return bitrix_search_status(request)
+
+
 @app.get("/bitrix/search/indexer/status")
 def bitrix_search_indexer_status(request: Request) -> dict[str, Any]:
     return request.app.state.portal_search_indexer.public_status()
+
+
+@app.get("/agent/search/indexer/status")
+def legacy_bitrix_search_indexer_status(request: Request) -> dict[str, Any]:
+    return bitrix_search_indexer_status(request)
 
 
 @app.get("/bitrix/search/webhook-indexer/status")
@@ -422,6 +547,11 @@ def bitrix_reconciler_status(request: Request) -> dict[str, Any]:
     return dict(request.app.state.reconciler_status)
 
 
+@app.get("/agent/reconcile/status")
+def legacy_reconciler_status(request: Request) -> dict[str, Any]:
+    return {"enabled": get_settings().reconcile_enabled, "status": dict(request.app.state.reconciler_status)}
+
+
 @app.post("/bitrix/reconciler/run-once")
 async def bitrix_reconciler_run_once(request: Request) -> dict[str, Any]:
     result = await reconcile_once(
@@ -431,6 +561,26 @@ async def bitrix_reconciler_run_once(request: Request) -> dict[str, Any]:
         status=request.app.state.reconciler_status,
     )
     return {"ok": True, "result": result, "status": dict(request.app.state.reconciler_status)}
+
+
+@app.get("/logistics/vehicle-usage/status")
+def logistics_vehicle_usage_status(request: Request) -> dict[str, Any]:
+    from .tools.vehicle_usage import VehicleUsageStore
+
+    store = VehicleUsageStore()
+    return {
+        "status": dict(request.app.state.vehicle_usage_status),
+        "latest_requests": store.latest_requests(limit=10),
+    }
+
+
+@app.post("/logistics/vehicle-usage/run-once")
+async def logistics_vehicle_usage_run_once(request: Request) -> dict[str, Any]:
+    result = await run_vehicle_usage_once(
+        request.app.state.bitrix,
+        status=request.app.state.vehicle_usage_status,
+    )
+    return {"ok": True, "result": result, "status": dict(request.app.state.vehicle_usage_status)}
 
 
 @app.post("/bitrix/search/reindex")
@@ -444,6 +594,11 @@ async def bitrix_search_reindex(request: Request) -> dict[str, Any]:
         "stats": stats,
         "indexer": request.app.state.portal_search_indexer.public_status(),
     }
+
+
+@app.post("/agent/search/reindex")
+async def legacy_bitrix_search_reindex(request: Request) -> dict[str, Any]:
+    return await bitrix_search_reindex(request)
 
 
 @app.post("/bitrix/search/reindex-delta")
@@ -477,6 +632,14 @@ async def bitrix_search_reindex_content(
     }
 
 
+@app.post("/agent/search/reindex-content")
+async def legacy_bitrix_search_reindex_content(
+    request: Request,
+    extensions: str | None = None,
+) -> dict[str, Any]:
+    return await bitrix_search_reindex_content(request, extensions=extensions)
+
+
 @app.get("/bitrix/search")
 def bitrix_search(
     request: Request,
@@ -499,6 +662,46 @@ def bitrix_search(
         "limit": limit,
         "results": [result.as_dict() for result in results],
     }
+
+
+@app.get("/agent/search")
+def legacy_bitrix_search(
+    request: Request,
+    q: str = Query(..., min_length=1),
+    limit: int = Query(default=10, ge=1, le=30),
+) -> dict[str, Any]:
+    return bitrix_search(request, q=q, scope="all", limit=limit)
+
+
+@app.get("/agent/tools")
+def legacy_agent_tools() -> dict[str, Any]:
+    manifests = load_agent_manifests()
+    return {
+        "tools": [
+            {"agent_id": agent.id, "tools": agent.tools, "capabilities": agent.capabilities}
+            for agent in manifests
+        ]
+    }
+
+
+@app.get("/agent/search/readiness")
+def legacy_search_readiness(request: Request) -> dict[str, Any]:
+    status_data = bitrix_search_status(request)
+    return {"summary": status_data.get("summary", ""), **status_data}
+
+
+@app.get("/agent/search/production-status")
+def legacy_search_production_status(request: Request) -> dict[str, Any]:
+    status_data = bitrix_search_status(request)
+    return {"summary": status_data.get("summary", ""), **status_data}
+
+
+@app.post("/agent/documents/compare")
+def legacy_documents_compare() -> dict[str, Any]:
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Document comparison now belongs to the PTO LLM specialist; use the orchestrator/chat flow.",
+    )
 
 
 @app.post("/bitrix/events")
@@ -574,6 +777,11 @@ async def orchestrator_test(request: Request, body: AgentTestRequest):
     return result
 
 
+@app.post("/agent/test")
+async def legacy_agent_test(request: Request, body: AgentTestRequest):
+    return await orchestrator_test(request, body)
+
+
 async def _read_bitrix_event_payload(request: Request) -> dict[str, Any]:
     content_type = request.headers.get("content-type", "").lower()
     if "application/json" in content_type:
@@ -628,6 +836,42 @@ def _payload_secret(payload: dict[str, Any]) -> str | None:
         if value:
             return str(value)
     return None
+
+
+def _payload_has_oauth(payload: dict[str, Any]) -> bool:
+    auth = payload.get("auth")
+    if isinstance(auth, dict) and (auth.get("access_token") or auth.get("refresh_token")):
+        return True
+    return bool(payload.get("AUTH_ID") or payload.get("REFRESH_ID"))
+
+
+def _oauth_success_page(user_id: int, expires_at: str) -> HTMLResponse:
+    return HTMLResponse(
+        _html_page(
+            "OAuth подключён",
+            (
+                f"<p>Готово. OAuth-доступ для пользователя Bitrix #{user_id} сохранён.</p>"
+                f"<p>Текущий access token действует примерно до: <code>{expires_at}</code>.</p>"
+                "<p>Теперь AI-помощник сможет выполнять разрешённые действия от имени этого пользователя.</p>"
+            ),
+        )
+    )
+
+
+def _html_page(title: str, body: str) -> str:
+    return (
+        "<!doctype html>"
+        "<html lang=\"ru\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        f"<title>{title}</title>"
+        "<style>"
+        "body{font-family:Arial,sans-serif;margin:32px;line-height:1.45;color:#1f2937}"
+        "main{max-width:760px}"
+        "code{background:#f3f4f6;padding:2px 5px;border-radius:4px}"
+        "</style></head><body><main>"
+        f"<h1>{title}</h1>{body}"
+        "</main></body></html>"
+    )
 
 
 def _request_secret(request: Request, header_value: str | None = None) -> str | None:

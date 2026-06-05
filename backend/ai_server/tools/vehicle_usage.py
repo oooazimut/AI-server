@@ -70,6 +70,9 @@ class VehicleUsageStore:
                 )
                 """
             )
+            self._ensure_column(db, "vehicle_usage_requests", "reminder_count", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(db, "vehicle_usage_requests", "last_reminder_at", "TEXT")
+            self._ensure_column(db, "vehicle_usage_requests", "escalated_at", "TEXT")
             db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS employees (
@@ -192,6 +195,89 @@ class VehicleUsageStore:
                 (user_id,),
             ).fetchone()
         return _request_row_dict(row)
+
+    def get_request(self, *, request_date: str, user_id: int | None) -> dict[str, Any] | None:
+        self.ensure_schema()
+        with self._connection() as db:
+            row = db.execute(
+                """
+                SELECT *
+                FROM vehicle_usage_requests
+                WHERE request_date = ? AND (user_id = ? OR (? IS NULL AND user_id IS NULL))
+                LIMIT 1
+                """,
+                (request_date, user_id, user_id),
+            ).fetchone()
+        return _request_row_dict(row)
+
+    def latest_requests(self, *, limit: int = 10) -> list[dict[str, Any]]:
+        self.ensure_schema()
+        with self._connection() as db:
+            rows = db.execute(
+                """
+                SELECT *
+                FROM vehicle_usage_requests
+                ORDER BY request_date DESC, id DESC
+                LIMIT ?
+                """,
+                (max(1, min(limit, 100)),),
+            ).fetchall()
+        return [item for row in rows if (item := _request_row_dict(row)) is not None]
+
+    def create_sent_request(
+        self,
+        *,
+        request_date: str,
+        user_id: int | None,
+        dialog_id: str,
+        message: str,
+        sent_at: str,
+        reminder_count: int,
+    ) -> int:
+        self.bootstrap_reference_data()
+        with self._connection() as db:
+            db.execute(
+                """
+                INSERT INTO vehicle_usage_requests (
+                    request_date, user_id, dialog_id, status, message, sent_at,
+                    reminder_count, last_reminder_at
+                )
+                VALUES (?, ?, ?, 'sent', ?, ?, ?, ?)
+                ON CONFLICT(request_date, user_id) DO UPDATE SET
+                    dialog_id = excluded.dialog_id,
+                    status = CASE
+                        WHEN vehicle_usage_requests.status = 'answered' THEN vehicle_usage_requests.status
+                        ELSE 'sent'
+                    END,
+                    message = excluded.message,
+                    sent_at = COALESCE(vehicle_usage_requests.sent_at, excluded.sent_at),
+                    reminder_count = MAX(vehicle_usage_requests.reminder_count, excluded.reminder_count),
+                    last_reminder_at = excluded.last_reminder_at
+                """,
+                (request_date, user_id, dialog_id, message, sent_at, reminder_count, sent_at),
+            )
+            row = db.execute(
+                """
+                SELECT id
+                FROM vehicle_usage_requests
+                WHERE request_date = ? AND (user_id = ? OR (? IS NULL AND user_id IS NULL))
+                """,
+                (request_date, user_id, user_id),
+            ).fetchone()
+        return int(row["id"]) if row else 0
+
+    def mark_escalated(self, *, request_date: str, user_id: int | None, escalated_at: str) -> bool:
+        self.ensure_schema()
+        with self._connection() as db:
+            cursor = db.execute(
+                """
+                UPDATE vehicle_usage_requests
+                SET escalated_at = ?
+                WHERE request_date = ? AND (user_id = ? OR (? IS NULL AND user_id IS NULL))
+                """,
+                (escalated_at, request_date, user_id, user_id),
+            )
+        return cursor.rowcount > 0
 
     def save_draft(
         self,
@@ -316,6 +402,12 @@ class VehicleUsageStore:
         finally:
             connection.close()
 
+    @staticmethod
+    def _ensure_column(db: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+        columns = {str(row["name"]) for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in columns:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
 
 class VehicleUsageToolset:
     def __init__(
@@ -369,6 +461,32 @@ class VehicleUsageToolset:
                 },
             ),
             ToolDefinition(
+                name="vehicle_usage_mark_request_sent",
+                description="Mark a scheduled vehicle usage request/reminder as sent after Logistics LLM sends it.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "request_date": {"type": "string"},
+                        "message": {"type": "string"},
+                        "reminder_count": {"type": "integer"},
+                    },
+                    "required": ["request_date", "message", "reminder_count"],
+                },
+            ),
+            ToolDefinition(
+                name="vehicle_usage_notify_admins",
+                description="Notify configured admins about missing vehicle usage report and mark request escalated.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "request_date": {"type": "string"},
+                        "message": {"type": "string"},
+                        "user_ids": {"type": "array", "items": {"type": "integer"}},
+                    },
+                    "required": ["request_date", "message"],
+                },
+            ),
+            ToolDefinition(
                 name="vehicle_usage_send_message",
                 description="Send a logistics reminder or clarification message to a Bitrix dialog.",
                 parameters={
@@ -416,6 +534,72 @@ class VehicleUsageToolset:
             parsed=parsed,
         )
         return ToolResult(status="ok", tool="vehicle_usage_save_report", data=saved)
+
+    def vehicle_usage_mark_request_sent(self, args: dict[str, Any]) -> ToolResult:
+        request_date = _request_date(args.get("request_date"))
+        message = str(args.get("message") or "")
+        reminder_count = _optional_int(args.get("reminder_count")) or 1
+        if not message.strip():
+            return ToolResult(
+                status="invalid_tool_call",
+                tool="vehicle_usage_mark_request_sent",
+                error="message is required",
+            )
+        request_id = self.store.create_sent_request(
+            request_date=request_date,
+            user_id=self.user_id,
+            dialog_id=self.dialog_id or get_settings().vehicle_usage_dialog_id,
+            message=message,
+            sent_at=_now().isoformat(),
+            reminder_count=reminder_count,
+        )
+        return ToolResult(
+            status="ok",
+            tool="vehicle_usage_mark_request_sent",
+            data={"request_id": request_id, "request_date": request_date, "reminder_count": reminder_count},
+        )
+
+    async def vehicle_usage_notify_admins(self, args: dict[str, Any]) -> ToolResult:
+        request_date = _request_date(args.get("request_date"))
+        message = str(args.get("message") or "").strip()
+        if not message:
+            return ToolResult(
+                status="invalid_tool_call",
+                tool="vehicle_usage_notify_admins",
+                error="message is required",
+            )
+        raw_user_ids = args.get("user_ids")
+        user_ids = _int_list(raw_user_ids) if isinstance(raw_user_ids, list) else get_settings().resolved_vehicle_usage_admin_notify_user_ids
+        if not user_ids:
+            return ToolResult(
+                status="skipped",
+                tool="vehicle_usage_notify_admins",
+                data={"reason": "no_admin_user_ids", "request_date": request_date},
+            )
+        if get_settings().vehicle_usage_dry_run:
+            return ToolResult(
+                status="dry_run",
+                tool="vehicle_usage_notify_admins",
+                data={"request_date": request_date, "user_ids": user_ids, "message": message},
+            )
+        notified = []
+        for user_id in user_ids:
+            await self.client.notify_user(
+                user_id=user_id,
+                message=message,
+                tag=f"vehicle_usage_no_response_{request_date}",
+            )
+            notified.append(user_id)
+        marked = self.store.mark_escalated(
+            request_date=request_date,
+            user_id=self.user_id,
+            escalated_at=_now().isoformat(),
+        )
+        return ToolResult(
+            status="ok",
+            tool="vehicle_usage_notify_admins",
+            data={"request_date": request_date, "notified_user_ids": notified, "marked_escalated": marked},
+        )
 
     async def vehicle_usage_send_message(self, args: dict[str, Any]) -> ToolResult:
         dialog_id = str(args.get("dialog_id") or self.dialog_id or get_settings().vehicle_usage_dialog_id).strip()
@@ -505,3 +689,12 @@ def _optional_int(value: object) -> int | None:
         return int(str(value).strip())
     except (TypeError, ValueError):
         return None
+
+
+def _int_list(values: list[object]) -> list[int]:
+    result: list[int] = []
+    for value in values:
+        parsed = _optional_int(value)
+        if parsed is not None and parsed not in result:
+            result.append(parsed)
+    return result

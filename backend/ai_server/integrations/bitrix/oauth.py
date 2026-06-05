@@ -40,6 +40,16 @@ class BitrixOAuthToken:
         return self.expires_at <= datetime.now(timezone.utc) + timedelta(minutes=5)
 
 
+@dataclass(frozen=True)
+class BitrixOAuthSaveResult:
+    user_id: int
+    domain: str
+    member_id: str
+    scope: str
+    expires_at: datetime
+    source: str
+
+
 class BitrixOAuthService:
     def __init__(self, db_path: Path | str | None = None) -> None:
         settings = get_settings()
@@ -77,6 +87,60 @@ class BitrixOAuthService:
                 )
                 """
             )
+
+    async def save_from_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        source: str,
+    ) -> BitrixOAuthSaveResult:
+        auth = _extract_auth(payload)
+        if not auth.access_token:
+            raise BitrixOAuthError("OAuth access token is missing in Bitrix payload")
+        if not auth.refresh_token:
+            raise BitrixOAuthError("OAuth refresh token is missing in Bitrix payload")
+
+        user_id = await self._resolve_user_id(auth)
+        token = BitrixOAuthToken(
+            user_id=user_id,
+            access_token=auth.access_token,
+            refresh_token=auth.refresh_token,
+            client_endpoint=auth.client_endpoint,
+            server_endpoint=auth.server_endpoint,
+            domain=auth.domain,
+            member_id=auth.member_id,
+            scope=auth.scope,
+            expires_at=auth.expires_at,
+            updated_at=datetime.now(timezone.utc),
+        )
+        self.save_token(token, source=source)
+        return BitrixOAuthSaveResult(
+            user_id=user_id,
+            domain=token.domain,
+            member_id=token.member_id,
+            scope=token.scope,
+            expires_at=token.expires_at,
+            source=source,
+        )
+
+    async def exchange_authorization_code(
+        self,
+        *,
+        code: str,
+        source: str,
+    ) -> BitrixOAuthSaveResult:
+        settings = get_settings()
+        if not settings.bitrix_oauth_client_id or not settings.bitrix_oauth_client_secret:
+            raise BitrixConfigError("BITRIX_OAUTH_CLIENT_ID and BITRIX_OAUTH_CLIENT_SECRET are required")
+        payload = await self._request_token(
+            {
+                "grant_type": "authorization_code",
+                "client_id": settings.bitrix_oauth_client_id,
+                "client_secret": settings.bitrix_oauth_client_secret,
+                "code": code,
+            }
+        )
+        return await self.save_from_payload({"auth": payload}, source=source)
 
     def get_token(self, user_id: int) -> BitrixOAuthToken | None:
         self.ensure_schema()
@@ -165,6 +229,19 @@ class BitrixOAuthService:
                     source,
                 ),
             )
+            connection.execute(
+                """
+                INSERT INTO bitrix_oauth_events (user_id, event_type, source, created_at, details)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    token.user_id,
+                    "token_saved",
+                    source,
+                    datetime.now(timezone.utc).isoformat(),
+                    f"domain={token.domain}; scope={token.scope}",
+                ),
+            )
 
     def public_status(self) -> dict[str, Any]:
         settings = get_settings()
@@ -195,7 +272,34 @@ class BitrixOAuthService:
                 }
                 for row in rows
             ],
+            "authorization": self.authorization_hint(),
         }
+
+    def authorization_hint(self, user_id: int | None = None) -> dict[str, Any]:
+        settings = get_settings()
+        return {
+            "user_id": user_id,
+            "app_url": settings.resolved_bitrix_app_url,
+            "marketplace_app_url": settings.resolved_bitrix_marketplace_app_url,
+            "marketplace_app_path": settings.resolved_bitrix_marketplace_app_path,
+            "oauth_start_url": settings.resolved_bitrix_oauth_start_url,
+            "message": (
+                "Откройте локальное приложение AI-помощника в Bitrix24 один раз, "
+                "чтобы помощник получил OAuth-доступ от вашего имени."
+            ),
+        }
+
+    async def _resolve_user_id(self, auth: "_NormalizedAuth") -> int:
+        if auth.user_id:
+            return auth.user_id
+        client = BitrixClient(access_token=auth.access_token, client_endpoint=auth.client_endpoint)
+        result = await client.result("user.current", {})
+        if not isinstance(result, dict):
+            raise BitrixOAuthError("user.current did not return user data")
+        raw_id = result.get("ID") or result.get("id")
+        if not str(raw_id or "").isdigit():
+            raise BitrixOAuthError("Could not resolve Bitrix user id from OAuth token")
+        return int(raw_id)
 
     async def _request_token(self, data: dict[str, str], *, endpoint: str | None = None) -> dict[str, Any]:
         settings = get_settings()
@@ -249,6 +353,20 @@ class _NormalizedAuth:
     scope: str
     expires_at: datetime
     user_id: int | None = None
+
+
+def _extract_auth(payload: dict[str, Any]) -> _NormalizedAuth:
+    auth = payload.get("auth") if isinstance(payload.get("auth"), dict) else {}
+    values = {**payload, **auth}
+    if "AUTH_ID" in payload:
+        values["access_token"] = payload.get("AUTH_ID")
+    if "REFRESH_ID" in payload:
+        values["refresh_token"] = payload.get("REFRESH_ID")
+    if "AUTH_EXPIRES" in payload:
+        values["expires_in"] = payload.get("AUTH_EXPIRES")
+    if "DOMAIN" in payload and "domain" not in values:
+        values["domain"] = payload.get("DOMAIN")
+    return _normalize_auth(values)
 
 
 def _normalize_auth(value: dict[str, Any], *, fallback: BitrixOAuthToken | None = None) -> _NormalizedAuth:

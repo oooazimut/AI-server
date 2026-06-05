@@ -23,6 +23,8 @@ class Settings:
     bitrix_oauth_client_secret: str
     bitrix_oauth_enabled: bool
     bitrix_oauth_required_for_writes: bool
+    bitrix_oauth_app_path: str
+    bitrix_oauth_callback_path: str
     bitrix_oauth_db_path_override: str
     bitrix_oauth_token_endpoint: str
     bitrix_rest_webhook_url: str
@@ -107,8 +109,15 @@ class Settings:
     reconcile_task_lookback_hours: int
     reconcile_task_limit: int
     reconcile_disk_delta_enabled: bool
+    vehicle_usage_enabled: bool
     vehicle_usage_manager_user_id: int | None
     vehicle_usage_dialog_id: str
+    vehicle_usage_request_time: str
+    vehicle_usage_request_times: str
+    vehicle_usage_escalation_time: str
+    vehicle_usage_interval_seconds: int
+    vehicle_usage_request_grace_minutes: int
+    vehicle_usage_admin_notify_user_ids: str
     vehicle_usage_staff_roster: str
     vehicle_usage_dry_run: bool
     attachment_max_bytes: int
@@ -127,6 +136,8 @@ class Settings:
     agent_limited_task_create_user_ids: str
     agent_private_disk_path_markers: str
     agent_private_disk_restricted_user_ids: str
+    agent_working_dates: str
+    agent_non_working_dates: str
     agent_dry_run: bool
     var_dir: Path
 
@@ -159,6 +170,41 @@ class Settings:
         if self.public_base_url:
             return self._with_webhook_secret(self.public_base_url.rstrip("/") + "/bitrix/events")
         return ""
+
+    @property
+    def resolved_bitrix_app_url(self) -> str:
+        if not self.public_base_url:
+            return ""
+        return self.public_base_url.rstrip("/") + _normalized_path(self.bitrix_oauth_app_path)
+
+    @property
+    def resolved_bitrix_oauth_callback_url(self) -> str:
+        if not self.public_base_url:
+            return ""
+        return self.public_base_url.rstrip("/") + _normalized_path(self.bitrix_oauth_callback_path)
+
+    @property
+    def resolved_bitrix_oauth_start_url(self) -> str:
+        if not self.bitrix_domain or not self.bitrix_oauth_client_id:
+            return ""
+        domain = self.bitrix_domain.strip().removeprefix("https://").removeprefix("http://").rstrip("/")
+        query_params = {"client_id": self.bitrix_oauth_client_id}
+        if self.resolved_bitrix_oauth_callback_url:
+            query_params["redirect_uri"] = self.resolved_bitrix_oauth_callback_url
+        return f"https://{domain}/oauth/authorize/?{urlencode(query_params)}"
+
+    @property
+    def resolved_bitrix_marketplace_app_url(self) -> str:
+        if not self.bitrix_domain or not self.bitrix_oauth_client_id:
+            return ""
+        domain = self.bitrix_domain.strip().removeprefix("https://").removeprefix("http://").rstrip("/")
+        return f"https://{domain}/marketplace/view/{self.bitrix_oauth_client_id}/"
+
+    @property
+    def resolved_bitrix_marketplace_app_path(self) -> str:
+        if not self.bitrix_oauth_client_id:
+            return ""
+        return f"/marketplace/view/{self.bitrix_oauth_client_id}/"
 
     @property
     def webhook_event_queue_path(self) -> Path:
@@ -243,6 +289,10 @@ class Settings:
         return _id_list(self.quality_control_exempt_responsible_user_ids)
 
     @property
+    def resolved_vehicle_usage_admin_notify_user_ids(self) -> list[int]:
+        return _id_list(self.vehicle_usage_admin_notify_user_ids)
+
+    @property
     def search_index_path(self) -> Path:
         return runtime_paths(self.var_dir).search_index_db
 
@@ -292,6 +342,8 @@ def get_settings() -> Settings:
         bitrix_oauth_client_secret=_env("BITRIX_OAUTH_CLIENT_SECRET"),
         bitrix_oauth_enabled=_env_bool("BITRIX_OAUTH_ENABLED", True),
         bitrix_oauth_required_for_writes=_env_bool("BITRIX_OAUTH_REQUIRED_FOR_WRITES", True),
+        bitrix_oauth_app_path=_env("BITRIX_OAUTH_APP_PATH", "/bitrix/app"),
+        bitrix_oauth_callback_path=_env("BITRIX_OAUTH_CALLBACK_PATH", "/bitrix/oauth/callback"),
         bitrix_oauth_db_path_override=_env("BITRIX_OAUTH_DB_PATH"),
         bitrix_oauth_token_endpoint=_env("BITRIX_OAUTH_TOKEN_ENDPOINT", "https://oauth.bitrix.info/oauth/token/"),
         bitrix_rest_webhook_url=_env("BITRIX_REST_WEBHOOK_URL"),
@@ -376,8 +428,15 @@ def get_settings() -> Settings:
         reconcile_task_lookback_hours=_env_int("RECONCILE_TASK_LOOKBACK_HOURS", 24) or 24,
         reconcile_task_limit=_env_int("RECONCILE_TASK_LIMIT", 500) or 500,
         reconcile_disk_delta_enabled=_env_bool("RECONCILE_DISK_DELTA_ENABLED", True),
+        vehicle_usage_enabled=_env_bool("VEHICLE_USAGE_ENABLED", False),
         vehicle_usage_manager_user_id=_env_int("VEHICLE_USAGE_MANAGER_USER_ID"),
         vehicle_usage_dialog_id=_env("VEHICLE_USAGE_DIALOG_ID"),
+        vehicle_usage_request_time=_env("VEHICLE_USAGE_REQUEST_TIME", "08:30"),
+        vehicle_usage_request_times=_env("VEHICLE_USAGE_REQUEST_TIMES", "08:30,09:00,09:30"),
+        vehicle_usage_escalation_time=_env("VEHICLE_USAGE_ESCALATION_TIME", "10:00"),
+        vehicle_usage_interval_seconds=_env_int("VEHICLE_USAGE_INTERVAL_SECONDS", 60) or 60,
+        vehicle_usage_request_grace_minutes=_env_int("VEHICLE_USAGE_REQUEST_GRACE_MINUTES", 15) or 15,
+        vehicle_usage_admin_notify_user_ids=_env("VEHICLE_USAGE_ADMIN_NOTIFY_USER_IDS"),
         vehicle_usage_staff_roster=_env("VEHICLE_USAGE_STAFF_ROSTER"),
         vehicle_usage_dry_run=_env_bool("VEHICLE_USAGE_DRY_RUN", True),
         attachment_max_bytes=_env_int("ATTACHMENT_MAX_BYTES", 30 * 1024 * 1024) or (30 * 1024 * 1024),
@@ -396,6 +455,8 @@ def get_settings() -> Settings:
         agent_limited_task_create_user_ids=_env("AGENT_LIMITED_TASK_CREATE_USER_IDS"),
         agent_private_disk_path_markers=_env("AGENT_PRIVATE_DISK_PATH_MARKERS", "Приватный доступ"),
         agent_private_disk_restricted_user_ids=_env("AGENT_PRIVATE_DISK_RESTRICTED_USER_IDS"),
+        agent_working_dates=_env("AGENT_WORKING_DATES"),
+        agent_non_working_dates=_env("AGENT_NON_WORKING_DATES"),
         agent_dry_run=_env_bool("AGENT_DRY_RUN", False),
         var_dir=paths.root,
     )
@@ -508,3 +569,10 @@ def _unique_ints(values: list[int]) -> list[int]:
         if value not in result:
             result.append(value)
     return result
+
+
+def _normalized_path(value: str) -> str:
+    stripped = value.strip()
+    if not stripped:
+        return "/"
+    return stripped if stripped.startswith("/") else f"/{stripped}"

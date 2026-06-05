@@ -28,6 +28,7 @@ from ai_server.settings import get_settings
 from ai_server.technical_footer import TechnicalFooterService, append_footer
 from ai_server.tools.bitrix import BitrixToolset
 from ai_server.tools.document_access import DocumentToolset
+from ai_server.tools.vehicle_usage import VehicleUsageToolset
 from ai_server.transcription import TranscriptionResult, build_transcriber
 from ai_server.workers.bitrix.search_webhook_indexer import (
     prepare_search_webhook_job,
@@ -176,6 +177,11 @@ class BitrixWebhookProcessor:
                 client=self.bitrix,
                 portal_search=self.portal_search,
                 user_id=incoming.user_id,
+            ),
+            vehicle_usage_tools=VehicleUsageToolset(
+                client=self.bitrix,
+                user_id=incoming.user_id,
+                dialog_id=incoming.dialog_id,
             ),
         )
         task = AgentTask(

@@ -14,6 +14,8 @@ ALLOWED_TOOL_NAMES = {
     "vehicle_usage_context",
     "vehicle_usage_save_draft",
     "vehicle_usage_save_report",
+    "vehicle_usage_mark_request_sent",
+    "vehicle_usage_notify_admins",
     "vehicle_usage_send_message",
     "none",
 }
@@ -178,13 +180,17 @@ def _decision_system_prompt() -> str:
         "Сам распознавай естественный язык: кто работает, кто в отпуске/болеет/на объекте, какая машина за кем, "
         "является ли ответ подтверждением, исправлением или просьбой начать заново. "
         "Если данных не хватает, не сохраняй финальный отчет: сохрани черновик при необходимости и задай уточнение. "
+        "Если задача пришла от scheduler и пора отправить утренний запрос или повторное напоминание, "
+        "сформулируй сообщение, вызови vehicle_usage_send_message, затем vehicle_usage_mark_request_sent. "
+        "Если scheduler сообщает, что ответа нет к времени эскалации, сформулируй уведомление и вызови "
+        "vehicle_usage_notify_admins. "
         "vehicle_usage_save_report вызывай только когда отчет явно подтвержден человеком или задача от scheduler "
         "содержит уже подтвержденный структурированный отчет. "
         "Верни только JSON-объект без markdown: "
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
-        '"tool_calls":[{"name":"vehicle_usage_context|vehicle_usage_save_draft|vehicle_usage_save_report|vehicle_usage_send_message|none","args":{},"summary":""}]}.'
+        '"tool_calls":[{"name":"vehicle_usage_context|vehicle_usage_save_draft|vehicle_usage_save_report|vehicle_usage_mark_request_sent|vehicle_usage_notify_admins|vehicle_usage_send_message|none","args":{},"summary":""}]}.'
     )
 
 

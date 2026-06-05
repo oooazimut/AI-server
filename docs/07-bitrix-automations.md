@@ -141,6 +141,15 @@ uv run python scripts/import_bitrix_var.py --profile cutover --execute
   `POST /bitrix/search/reindex-delta`, `POST /bitrix/search/reindex-content` -
   статус и ручной запуск индексатора.
 - `GET /bitrix/quality-control/status` - статус webhook-контроля качества.
+- `GET /logistics/vehicle-usage/status`,
+  `POST /logistics/vehicle-usage/run-once` - статус и ручной tick утреннего
+  учёта служебных машин через LLM-субагента `Логист`.
+
+Для совместимости на время переезда добавлены legacy alias endpoints
+`/agent/status`, `/agent/vehicles/status`, `/agent/webhook-events/status`,
+`/agent/search/*`, `/agent/reconcile/status`, `/agent/tools` и `/agent/test`.
+Прямое `/agent/documents/compare` оставлено только как отказ с объяснением:
+сравнение документов должно идти через ПТО-субагента, а не в обход модели.
 
 Worker очереди включается отдельно:
 
@@ -177,3 +186,41 @@ SEARCH_WEBHOOK_CONTENT_ENABLED=true
 `dialog:{dialog_id}:user:{user_id}` или `user:{user_id}`. Это позволяет при
 cutover перенести незавершённые подтверждения из старого агента без ручной
 конвертации.
+
+## OAuth local app
+
+Локальное приложение Bitrix используется для получения OAuth-токена конкретного
+пользователя или служебного actor. Чатовый webhook остаётся входным каналом, а
+OAuth является слоем прав для write-действий.
+
+- `/bitrix/app` - iframe/local app entrypoint. Если Bitrix передал auth payload,
+  токен сохраняется; иначе endpoint ведёт в OAuth start.
+- `/bitrix/install` - install payload локального приложения.
+- `/bitrix/oauth/callback` - callback по authorization code.
+- `/bitrix/oauth/start` - redirect на Bitrix OAuth authorize URL.
+- `/bitrix/oauth/status` - безопасный статус без секретов.
+
+Старые кнопки переносим только как ссылку для регистрации OAuth, если она нужна
+в интерфейсе. Сами кнопки не должны становиться бизнес-логикой агента.
+
+## Registration scripts
+
+Скрипты `register_bot.py`, `register_oauth_bot_and_chat_app.py`,
+`register_rest_app_uri_placement.py` и `register_task_events.py` из старого
+проекта - это одноразовые production/cutover утилиты. Они регистрируют бота,
+chat iframe app, REST_APP_URI placement и event bindings в Bitrix24.
+
+Это не runtime-сервисы и не субагенты. В новом проекте их нужно запускать только
+осознанно на этапе настройки портала: сначала dry-run/план, потом ручное
+подтверждение и боевой вызов.
+
+## Result templates
+
+Из старого проекта перенесён один шаблон результата:
+
+- `default_result_v1` - "Базовый результат задачи". Первая строка должна
+  отвечать, сделал исполнитель всё или не всё; ниже идёт описание результата
+  либо причины неполного выполнения.
+
+Каталог лежит в `config/result_templates.example.json` и передаётся
+quality-control LLM в контекст проверки.

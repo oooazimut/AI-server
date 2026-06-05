@@ -188,6 +188,12 @@ class LogisticsSpecialist:
         if tool_call.name == "vehicle_usage_save_report":
             result = self.tools.vehicle_usage_save_report(tool_call.args)
             return result, ActionRecord(name="logistics_vehicle_usage_save_report", status=result.status, details=result.model_dump())
+        if tool_call.name == "vehicle_usage_mark_request_sent":
+            result = self.tools.vehicle_usage_mark_request_sent(tool_call.args)
+            return result, ActionRecord(name="logistics_vehicle_usage_mark_request_sent", status=result.status, details=result.model_dump())
+        if tool_call.name == "vehicle_usage_notify_admins":
+            result = await self.tools.vehicle_usage_notify_admins(tool_call.args)
+            return result, ActionRecord(name="logistics_vehicle_usage_notify_admins", status=result.status, details=result.model_dump())
         if tool_call.name == "vehicle_usage_send_message":
             result = await self.tools.vehicle_usage_send_message(tool_call.args)
             return result, ActionRecord(name="logistics_vehicle_usage_send_message", status=result.status, details=result.model_dump())

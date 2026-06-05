@@ -12,6 +12,7 @@ from typing import Any, Protocol
 
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
+from ai_server.result_templates import active_result_templates_context
 from ai_server.settings import get_settings
 
 
@@ -174,6 +175,7 @@ class LLMQualityReviewer:
                             "task_title": title,
                             "task_description": _truncate(description, 7000),
                             "executor_result": _truncate(_clean_result_text(result_text), 5000),
+                            "result_templates": active_result_templates_context(),
                         },
                         ensure_ascii=False,
                     ),
@@ -236,6 +238,7 @@ class LLMQualityControlService:
                                 "current_datetime": datetime.now(MOSCOW_TZ).isoformat(),
                             },
                             "policy": _quality_policy_context(settings),
+                            "result_templates": active_result_templates_context(),
                             "tools": tool_definitions,
                             "tool_results": tool_results,
                         },
@@ -1484,7 +1487,8 @@ QUALITY_CONTROL_AGENT_SYSTEM_PROMPT = """
 6. Если ответственный входит в policy.exempt_responsible_user_ids, считай
    результат достаточным и вызови `quality_control_action` с `action="approve"`.
 7. Иначе сравни описание задачи и последний результат исполнителя по смыслу.
-   Не придумывай требований, которых нет в описании.
+   Учитывай `result_templates`, если они переданы в user JSON. Не придумывай
+   требований, которых нет в описании или применимом шаблоне.
 8. Если результат достаточный, вызови `quality_control_action` с
    `action="approve"` и `validation.valid=true`.
 9. Если результат пустой, слишком общий, не связан с задачей или не закрывает
@@ -1511,7 +1515,8 @@ SMART_QUALITY_SYSTEM_PROMPT = """
 Ты LLM-проверяющий качества результата задачи Bitrix24.
 
 Тебе дают JSON с названием задачи, описанием задачи и текстом результата исполнителя.
-Нужно сравнить описание задачи и результат по смыслу.
+Нужно сравнить описание задачи и результат по смыслу. Если в JSON есть
+`result_templates`, учитывай активный шаблон результата.
 
 Правила оценки:
 1. Не придумывай требования, которых нет в описании задачи.

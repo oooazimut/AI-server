@@ -18,6 +18,8 @@ tools:
   - vehicle_usage_context
   - vehicle_usage_save_draft
   - vehicle_usage_save_report
+  - vehicle_usage_mark_request_sent
+  - vehicle_usage_notify_admins
   - vehicle_usage_send_message
 automations:
   - id: logistics_vehicle_usage
@@ -30,7 +32,7 @@ automations:
       - app.agent.vehicle_usage
     entrypoint: backend.ai_server.workers.logistics.vehicle_usage.VehicleUsageWorker
     schedule_hint: daily request/escalation times from settings
-    status_endpoint: /automations/logistics_vehicle_usage
+    status_endpoint: /logistics/vehicle-usage/status
     enabled_by_default: false
     uses_llm: true
     dependencies:
@@ -40,6 +42,8 @@ automations:
       - vehicle_usage_context
       - vehicle_usage_save_draft
       - vehicle_usage_save_report
+      - vehicle_usage_mark_request_sent
+      - vehicle_usage_notify_admins
       - vehicle_usage_send_message
     data_scopes:
       - bitrix24_chats

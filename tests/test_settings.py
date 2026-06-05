@@ -70,6 +70,21 @@ def test_bitrix_oauth_bot_settings_can_be_loaded(monkeypatch, tmp_path):
     assert settings.bitrix_oauth_db_path == oauth_db
 
 
+def test_bitrix_oauth_urls_are_resolved(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://ai.example.com")
+    monkeypatch.setenv("BITRIX_DOMAIN", "portal.bitrix24.ru")
+    monkeypatch.setenv("BITRIX_OAUTH_CLIENT_ID", "local.123")
+
+    settings = get_settings()
+
+    assert settings.resolved_bitrix_app_url == "https://ai.example.com/bitrix/app"
+    assert settings.resolved_bitrix_oauth_callback_url == "https://ai.example.com/bitrix/oauth/callback"
+    assert settings.resolved_bitrix_oauth_start_url.startswith(
+        "https://portal.bitrix24.ru/oauth/authorize/?client_id=local.123"
+    )
+
+
 def test_technical_footer_allowed_user_ids(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_TECH_FOOTER_ALLOWED_USER_IDS", "1,9")

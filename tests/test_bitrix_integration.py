@@ -692,6 +692,37 @@ def test_bitrix_oauth_service_reads_migrated_sqlite(tmp_path):
     assert token.access_token == "access"
 
 
+def test_bitrix_oauth_service_saves_token_from_app_payload(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "example.bitrix24.ru")
+    db_path = tmp_path / "bitrix_oauth.sqlite"
+    service = BitrixOAuthService(db_path)
+
+    result = anyio_run(
+        service.save_from_payload(
+            {
+                "auth": {
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "domain": "example.bitrix24.ru",
+                    "member_id": "member",
+                    "scope": "tasks,user",
+                    "expires_in": 3600,
+                    "user_id": 9,
+                }
+            },
+            source="bitrix_app",
+        )
+    )
+    token = service.get_token(9)
+
+    assert result.user_id == 9
+    assert token is not None
+    assert token.access_token == "access"
+    assert service.public_status()["linked_users_count"] == 1
+    assert service.public_status()["authorization"]["message"]
+
+
 def test_bitrix_oauth_token_endpoint_handles_rest_server_endpoint(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("BITRIX_OAUTH_TOKEN_ENDPOINT", "")

@@ -1,5 +1,6 @@
 import asyncio
 
+from ai_server.result_templates import active_result_templates_context
 from ai_server.workers.bitrix.quality_control import (
     QualityControlDecision,
     QualityControlToolCall,
@@ -104,6 +105,13 @@ def test_quality_control_approves_valid_waiting_control_result(monkeypatch, tmp_
     assert result["actions"] == ["approve"]
     assert ("approve_task", 101) in bitrix.calls
     assert ("add_task_comment", 101) in [call[:2] for call in bitrix.calls]
+
+
+def test_result_templates_catalog_contains_default_template():
+    context = active_result_templates_context()
+
+    assert context["templates"][0]["id"] == "default_result_v1"
+    assert "Первая строка" in context["templates"][0]["rules"][0]
 
 
 class FakeQualityControlLLM:
