@@ -3,12 +3,12 @@ from __future__ import annotations
 from typing import Any
 
 from ai_server.agents.pto_llm import PtoAgentLLM, PtoLLMService, PtoLLMToolCall, pto_llm_failure_result
-from ai_server.utils import unique
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
 from ai_server.tools.document_access import DocumentToolset
+from ai_server.utils import unique
 
 
 class PtoSpecialist:
@@ -30,7 +30,15 @@ class PtoSpecialist:
         self.llm = llm or PtoLLMService()
 
     @classmethod
-    def build(cls, manifest: AgentManifest, *, document_tools: DocumentToolset | None = None, pto_retriever: HybridKnowledgeRetriever | None = None, pto_llm: PtoAgentLLM | None = None, **_: Any) -> "PtoSpecialist":
+    def build(
+        cls,
+        manifest: AgentManifest,
+        *,
+        document_tools: DocumentToolset | None = None,
+        pto_retriever: HybridKnowledgeRetriever | None = None,
+        pto_llm: PtoAgentLLM | None = None,
+        **_: Any,
+    ) -> PtoSpecialist:
         return cls(manifest, retriever=pto_retriever, tools=document_tools, llm=pto_llm)
 
     async def handle(self, task: AgentTask) -> AgentResult:

@@ -169,9 +169,7 @@ async def lifespan(app: FastAPI):
     if settings.search_background_indexer_enabled:
         search_indexer_task = asyncio.create_task(portal_search_indexer.run())
     if settings.supervisor_enabled:
-        supervisor_task = asyncio.create_task(
-            run_task_supervisor(bitrix, status=app.state.task_supervisor_status)
-        )
+        supervisor_task = asyncio.create_task(run_task_supervisor(bitrix, status=app.state.task_supervisor_status))
     if settings.reconcile_enabled:
         reconciler_task = asyncio.create_task(
             run_reconciler(

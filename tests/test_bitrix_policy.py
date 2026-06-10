@@ -14,13 +14,16 @@ def test_whitespace_only_denied():
 
 
 # Explicitly denied methods
-@pytest.mark.parametrize("method", [
-    "user.delete",
-    "user.update",
-    "user.add",
-    "user.dismiss",
-    "imbot.bot.unregister",
-])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "user.delete",
+        "user.update",
+        "user.add",
+        "user.dismiss",
+        "imbot.bot.unregister",
+    ],
+)
 def test_explicitly_denied_methods(method):
     assert decide_bitrix_method_policy(method).decision == "deny"
 
@@ -43,65 +46,80 @@ def test_calendar_update_requires_confirmation():
 
 
 # Known read methods
-@pytest.mark.parametrize("method", [
-    "profile",
-    "user.current",
-    "user.get",
-    "user.search",
-    "tasks.task.get",
-    "tasks.task.list",
-    "disk.file.get",
-    "crm.lead.get",
-    "crm.deal.list",
-])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "profile",
+        "user.current",
+        "user.get",
+        "user.search",
+        "tasks.task.get",
+        "tasks.task.list",
+        "disk.file.get",
+        "crm.lead.get",
+        "crm.deal.list",
+    ],
+)
 def test_known_read_methods_allowed(method):
     assert decide_bitrix_method_policy(method).decision == "allow"
 
 
 # Known write methods requiring confirmation
-@pytest.mark.parametrize("method", [
-    "disk.storage.addfolder",
-    "disk.storage.uploadfile",
-    "disk.folder.addsubfolder",
-    "disk.folder.uploadfile",
-])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "disk.storage.addfolder",
+        "disk.storage.uploadfile",
+        "disk.folder.addsubfolder",
+        "disk.folder.uploadfile",
+    ],
+)
 def test_known_write_methods_require_confirmation(method):
     assert decide_bitrix_method_policy(method).decision == "confirm"
 
 
 # Denied prefixes
-@pytest.mark.parametrize("method", [
-    "user.makeAdmin",
-    "department.get",
-    "humanresources.employee.list",
-    "imbot.message.send",
-    "im.chat.get",
-    "rest.app.get",
-])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "user.makeAdmin",
+        "department.get",
+        "humanresources.employee.list",
+        "imbot.message.send",
+        "im.chat.get",
+        "rest.app.get",
+    ],
+)
 def test_denied_prefix_methods_denied(method):
     assert decide_bitrix_method_policy(method).decision == "deny"
 
 
 # Read-like suffix
-@pytest.mark.parametrize("method", [
-    "crm.contact.list",
-    "crm.activity.search",
-    "sonet_group.get",
-])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "crm.contact.list",
+        "crm.activity.search",
+        "sonet_group.get",
+    ],
+)
 def test_read_like_suffix_allowed(method):
     assert decide_bitrix_method_policy(method).decision == "allow"
 
 
 # Write-like suffix with confirmation-required prefix
-@pytest.mark.parametrize("method", [
-    "tasks.task.add",
-    "tasks.task.update",
-    "tasks.task.delete",
-    "crm.deal.update",
-    "crm.lead.create",
-    "sonet_group.user.add",
-    "disk.folder.delete",
-])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "tasks.task.add",
+        "tasks.task.update",
+        "tasks.task.delete",
+        "crm.deal.update",
+        "crm.lead.create",
+        "sonet_group.user.add",
+        "disk.folder.delete",
+    ],
+)
 def test_write_like_suffix_requires_confirmation(method):
     assert decide_bitrix_method_policy(method).decision == "confirm"
 

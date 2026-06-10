@@ -159,5 +159,3 @@ def _format_provider_error(error: object) -> str:
         message = error.get("message") or error.get("error") or error
         return f"LLM provider error: {message}"
     return f"LLM provider error: {error}"
-
-

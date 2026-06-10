@@ -116,8 +116,7 @@ def legacy_agent_tools(request: Request) -> dict[str, Any]:
     manifests: list[AgentManifest] = request.app.state.manifests
     return {
         "tools": [
-            {"agent_id": agent.id, "tools": agent.tools, "capabilities": agent.capabilities}
-            for agent in manifests
+            {"agent_id": agent.id, "tools": agent.tools, "capabilities": agent.capabilities} for agent in manifests
         ]
     }
 

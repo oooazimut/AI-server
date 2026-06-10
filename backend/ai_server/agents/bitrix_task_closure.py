@@ -510,7 +510,9 @@ def build_task_closure_draft_from_args(task: AgentTask, args: dict[str, Any]) ->
     args = args or {}
     task_id = optional_int(args.get("task_id") or args.get("taskId") or args.get("id"))
     task_query = compact_text(str(args.get("task_query") or args.get("query") or ""))
-    result_text = compact_text(str(args.get("result_text") or args.get("result") or args.get("completion_result") or ""))
+    result_text = compact_text(
+        str(args.get("result_text") or args.get("result") or args.get("completion_result") or "")
+    )
 
     contract_errors: list[str] = []
     params: dict[str, Any] = {}
@@ -936,8 +938,6 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 40)].rstrip() + "\n...[обрезано]..."
-
-
 
 
 TASK_CLOSURE_SYSTEM_PROMPT = """

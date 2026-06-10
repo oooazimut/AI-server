@@ -8,12 +8,12 @@ from ai_server.agents.logistics_llm import (
     LogisticsLLMToolCall,
     logistics_llm_failure_result,
 )
-from ai_server.utils import unique
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
 from ai_server.tools.vehicle_usage import VehicleUsageToolset
+from ai_server.utils import unique
 
 
 class LogisticsSpecialist:
@@ -35,7 +35,15 @@ class LogisticsSpecialist:
         self.llm = llm or LogisticsLLMService()
 
     @classmethod
-    def build(cls, manifest: AgentManifest, *, vehicle_usage_tools: VehicleUsageToolset | None = None, logistics_retriever: HybridKnowledgeRetriever | None = None, logistics_llm: LogisticsAgentLLM | None = None, **_: Any) -> "LogisticsSpecialist":
+    def build(
+        cls,
+        manifest: AgentManifest,
+        *,
+        vehicle_usage_tools: VehicleUsageToolset | None = None,
+        logistics_retriever: HybridKnowledgeRetriever | None = None,
+        logistics_llm: LogisticsAgentLLM | None = None,
+        **_: Any,
+    ) -> LogisticsSpecialist:
         return cls(manifest, retriever=logistics_retriever, tools=vehicle_usage_tools, llm=logistics_llm)
 
     async def handle(self, task: AgentTask) -> AgentResult:
@@ -145,7 +153,9 @@ class LogisticsSpecialist:
             )
 
         try:
-            final_result = await self.llm.compose(manifest=self.manifest, task=task, decision=decision, tool_results=tool_results)
+            final_result = await self.llm.compose(
+                manifest=self.manifest, task=task, decision=decision, tool_results=tool_results
+            )
         except Exception as exc:
             failure = logistics_llm_failure_result(f"{type(exc).__name__}: {exc}", agent_id=self.manifest.id)
             return AgentResult(

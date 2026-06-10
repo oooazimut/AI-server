@@ -1,8 +1,6 @@
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
-import pytest
-
 from fastapi.testclient import TestClient
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist
@@ -34,7 +32,6 @@ from tests.fakes import (
     FakeBitrixLLM,
     FakeEmbeddingProvider,
     FakeInternalOrchestratorLLM,
-    FakeTaskClosureLLM,
 )
 
 
@@ -562,11 +559,16 @@ def test_bitrix_task_create_chat_flow_saves_and_confirms_pending_action(monkeypa
         tools=bitrix_tools,
         llm=FakeBitrixLLM(
             tool_call_steps=[
-                [BitrixLLMToolCall(name="task_create_draft", args={
-                    "title": "проверить IP-камеру",
-                    "responsible_id": 9,
-                    "deadline_iso": "2026-06-15T19:00:00+03:00",
-                })],
+                [
+                    BitrixLLMToolCall(
+                        name="task_create_draft",
+                        args={
+                            "title": "проверить IP-камеру",
+                            "responsible_id": 9,
+                            "deadline_iso": "2026-06-15T19:00:00+03:00",
+                        },
+                    )
+                ],
                 [BitrixLLMToolCall(name="bitrix_api", args={"action": "confirm_pending"})],
             ],
             final_answer="Готово.",

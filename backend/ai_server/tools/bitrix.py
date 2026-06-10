@@ -444,5 +444,3 @@ def _truthy(value: object, *, default: bool = False) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on", "да"}
     return bool(value)
-
-

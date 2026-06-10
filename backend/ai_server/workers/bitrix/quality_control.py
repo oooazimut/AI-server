@@ -14,7 +14,7 @@ from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.result_templates import active_result_templates_context
 from ai_server.settings import get_settings
-from ai_server.utils import MOSCOW_TZ, confidence, optional_int
+from ai_server.utils import MOSCOW_TZ, confidence
 
 logger = logging.getLogger(__name__)
 TASK_QUALITY_WEBHOOK_EVENTS = {"ONTASKUPDATE"}

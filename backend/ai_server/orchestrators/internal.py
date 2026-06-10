@@ -22,9 +22,7 @@ class InternalOrchestrator:
     async def handle(self, task: AgentTask) -> AgentResult:
         if task.context.get("pending_action"):
             pending_data = task.context["pending_action"]
-            default_specialist_id = next(
-                (m.id for m in self.manifests if m.kind == "specialist"), ""
-            )
+            default_specialist_id = next((m.id for m in self.manifests if m.kind == "specialist"), "")
             specialist_id = (
                 pending_data.get("specialist_id") or default_specialist_id
                 if isinstance(pending_data, dict)
@@ -102,19 +100,23 @@ class InternalOrchestrator:
         delegate_actions: list[ActionRecord] = []
         all_model_usage = [route_result.model_usage]
 
-        for (agent_id, _), result in zip(targets, raw_results):
+        for (agent_id, _), result in zip(targets, raw_results, strict=False):
             if isinstance(result, Exception):
-                delegate_actions.append(ActionRecord(
-                    name="delegate_to_specialist",
-                    status="error",
-                    details={"specialist": agent_id, "error": f"{type(result).__name__}: {result}"},
-                ))
+                delegate_actions.append(
+                    ActionRecord(
+                        name="delegate_to_specialist",
+                        status="error",
+                        details={"specialist": agent_id, "error": f"{type(result).__name__}: {result}"},
+                    )
+                )
             else:
-                delegate_actions.append(ActionRecord(
-                    name="delegate_to_specialist",
-                    status="completed",
-                    details={"specialist": agent_id},
-                ))
+                delegate_actions.append(
+                    ActionRecord(
+                        name="delegate_to_specialist",
+                        status="completed",
+                        details={"specialist": agent_id},
+                    )
+                )
                 good.append((agent_id, result))
                 all_model_usage.extend(result.model_usage)
 
@@ -153,18 +155,22 @@ class InternalOrchestrator:
         try:
             synthesis = await self.orchestrator_llm.synthesize(task=task, specialist_results=good)
             all_model_usage.append(synthesis.model_usage)
-            all_actions.append(ActionRecord(
-                name="orchestrator_synthesize",
-                status="completed",
-                details={"specialists": agent_ids},
-            ))
+            all_actions.append(
+                ActionRecord(
+                    name="orchestrator_synthesize",
+                    status="completed",
+                    details={"specialists": agent_ids},
+                )
+            )
             synthesized_answer = synthesis.answer
         except Exception as exc:
-            all_actions.append(ActionRecord(
-                name="orchestrator_synthesize",
-                status="error",
-                details={"error": f"{type(exc).__name__}: {exc}"},
-            ))
+            all_actions.append(
+                ActionRecord(
+                    name="orchestrator_synthesize",
+                    status="error",
+                    details={"error": f"{type(exc).__name__}: {exc}"},
+                )
+            )
             # Fall back to first specialist's answer
             synthesized_answer = good[0][1].answer
 

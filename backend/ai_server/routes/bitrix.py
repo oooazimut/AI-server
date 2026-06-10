@@ -18,10 +18,9 @@ from ..integrations.bitrix.portal_search import (
     format_portal_search_results,
     format_portal_sync_stats,
 )
-from ..settings import get_settings
 from ..workers.bitrix.reconciler import reconcile_once
 from ..workers.bitrix.supervisor import run_task_supervisor_once
-from ._common import now_ts, request_secret, validate_webhook_secret
+from ._common import now_ts, validate_webhook_secret
 
 router = APIRouter()
 
@@ -29,6 +28,7 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 # Status endpoints
 # ---------------------------------------------------------------------------
+
 
 @router.get("/bitrix/status")
 def bitrix_status(request: Request) -> dict[str, Any]:
@@ -70,6 +70,7 @@ def bitrix_oauth_status(request: Request) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # OAuth / app install
 # ---------------------------------------------------------------------------
+
 
 @router.api_route("/bitrix/app", methods=["GET", "POST"], response_class=HTMLResponse)
 async def bitrix_app(request: Request) -> HTMLResponse:
@@ -134,6 +135,7 @@ def bitrix_oauth_start(request: Request) -> RedirectResponse:
 # ---------------------------------------------------------------------------
 # Webhook events
 # ---------------------------------------------------------------------------
+
 
 @router.get("/bitrix/webhook-events/status")
 def bitrix_webhook_events_status(request: Request) -> dict[str, Any]:
@@ -209,6 +211,7 @@ async def bitrix_events(
 # ---------------------------------------------------------------------------
 # Search
 # ---------------------------------------------------------------------------
+
 
 @router.get("/bitrix/search/status")
 def bitrix_search_status(request: Request) -> dict[str, Any]:
@@ -345,6 +348,7 @@ def legacy_bitrix_search(
 # Quality control / supervisor / reconciler
 # ---------------------------------------------------------------------------
 
+
 @router.get("/bitrix/quality-control/status")
 def bitrix_quality_control_status(request: Request) -> dict[str, Any]:
     return dict(request.app.state.quality_control_webhook_status)
@@ -391,6 +395,7 @@ async def bitrix_reconciler_run_once(request: Request) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
 
 async def _read_bitrix_event_payload(request: Request) -> dict[str, Any]:
     content_type = request.headers.get("content-type", "").lower()

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -157,5 +156,3 @@ def _truthy(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().casefold() in {"1", "true", "yes", "y", "да", "on"}
     return bool(value)
-
-

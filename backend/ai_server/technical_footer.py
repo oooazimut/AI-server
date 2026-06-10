@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -240,7 +239,11 @@ class TechnicalFooterService:
         return "\n".join(line for line in lines if line)
 
     async def _collect_balance_lines(self, providers: set[str]) -> list[str]:
-        clients = [(provider, self._balance_registry[provider]) for provider in sorted(providers) if provider in self._balance_registry]
+        clients = [
+            (provider, self._balance_registry[provider])
+            for provider in sorted(providers)
+            if provider in self._balance_registry
+        ]
         if not clients:
             return []
         snapshots = await asyncio.gather(*[client.snapshot() for _, client in clients], return_exceptions=True)

@@ -124,14 +124,17 @@ def test_parse_decision_non_list_handoff_ignored():
 
 
 # _status
-@pytest.mark.parametrize("value,expected", [
-    ("completed", "completed"),
-    ("needs_clarification", "needs_clarification"),
-    ("failed", "failed"),
-    ("nonsense", "completed"),
-    (None, "completed"),
-    ("", "completed"),
-    ("needs_human", "completed"),  # not a valid orchestrator status
-])
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("completed", "completed"),
+        ("needs_clarification", "needs_clarification"),
+        ("failed", "failed"),
+        ("nonsense", "completed"),
+        (None, "completed"),
+        ("", "completed"),
+        ("needs_human", "completed"),  # not a valid orchestrator status
+    ],
+)
 def test_status_normalization(value, expected):
     assert _status(value) == expected

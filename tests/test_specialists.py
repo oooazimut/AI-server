@@ -1,5 +1,4 @@
 import ai_server.specialists as _specialists_module
-
 from ai_server.models import AgentManifest
 from ai_server.registry import load_agent_manifests
 from ai_server.specialists import build_specialist_registry, manifest_by_id

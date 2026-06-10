@@ -117,8 +117,7 @@ class InternalLLMRouter:
                         {
                             "request": task.request,
                             "specialist_answers": [
-                                {"specialist": agent_id, "answer": sr.answer}
-                                for agent_id, sr in specialist_results
+                                {"specialist": agent_id, "answer": sr.answer} for agent_id, sr in specialist_results
                             ],
                         },
                         ensure_ascii=False,
@@ -192,5 +191,3 @@ def _parse_decision(data: dict[str, Any], manifests: list[AgentManifest]) -> Int
 def _status(value: object) -> str:
     status = str(value or "completed").strip()
     return status if status in {"completed", "needs_clarification", "failed"} else "completed"
-
-

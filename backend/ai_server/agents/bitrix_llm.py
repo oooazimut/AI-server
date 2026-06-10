@@ -279,7 +279,6 @@ def _result_status(value: object) -> str:
     return status if status in RESULT_STATUSES else "completed"
 
 
-
 def _retrieval_context(hits: list[RetrievalHit]) -> list[dict[str, Any]]:
     context = []
     for hit in hits[:5]:
@@ -328,7 +327,6 @@ def _permission_context(task: AgentTask) -> dict[str, Any]:
 
 def _allowed_tool_definitions(definitions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [definition for definition in definitions if definition.get("name") in ALLOWED_TOOL_NAMES]
-
 
 
 def _decision_dict(decision: BitrixLLMDecision) -> dict[str, Any]:

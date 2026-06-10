@@ -495,7 +495,6 @@ def prepare_no_deadline_fields(fields: dict[str, Any]) -> None:
     fields["DEADLINE"] = ""
 
 
-
 def _task_closure_result_message(data: dict[str, Any]) -> str:
     status = str(data.get("status") or "")
     outcome = str(data.get("outcome") or "")

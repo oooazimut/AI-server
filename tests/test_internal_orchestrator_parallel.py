@@ -21,7 +21,6 @@ from tests.fakes import (
 
 
 def _make_fake_specialist_cls():
-    from ai_server.models import AgentResult
 
     class _FakeCls:
         @classmethod
@@ -152,7 +151,9 @@ def test_orchestrator_handles_specialist_exception():
     # Should still get a result from the healthy specialist
     error_actions = [a for a in result.actions_taken if a.status == "error" and a.name == "delegate_to_specialist"]
     assert len(error_actions) == 1
-    assert "BrokenSpecialist" in error_actions[0].details["error"] or "RuntimeError" in error_actions[0].details["error"]
+    assert (
+        "BrokenSpecialist" in error_actions[0].details["error"] or "RuntimeError" in error_actions[0].details["error"]
+    )
 
 
 def test_orchestrator_all_specialists_fail_returns_failed():
@@ -265,13 +266,16 @@ def test_orchestrator_llm_failure_returns_failed(monkeypatch):
 
 
 # _merge_status helper
-@pytest.mark.parametrize("statuses,expected", [
-    (["completed", "completed"], "completed"),
-    (["completed", "needs_clarification"], "needs_clarification"),
-    (["needs_clarification", "needs_human"], "needs_human"),   # needs_human is higher urgency
-    (["completed", "failed"], "failed"),
-    (["failed", "needs_human"], "failed"),
-    (["needs_human"], "needs_human"),
-])
+@pytest.mark.parametrize(
+    "statuses,expected",
+    [
+        (["completed", "completed"], "completed"),
+        (["completed", "needs_clarification"], "needs_clarification"),
+        (["needs_clarification", "needs_human"], "needs_human"),  # needs_human is higher urgency
+        (["completed", "failed"], "failed"),
+        (["failed", "needs_human"], "failed"),
+        (["needs_human"], "needs_human"),
+    ],
+)
 def test_merge_status(statuses, expected):
     assert _merge_status(statuses) == expected

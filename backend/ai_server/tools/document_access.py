@@ -1403,5 +1403,3 @@ def _first(data: dict[str, Any], *keys: str) -> object | None:
 
 def _dict_value(value: Any, key: str) -> Any:
     return value.get(key) if isinstance(value, dict) else None
-
-

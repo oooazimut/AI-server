@@ -560,5 +560,3 @@ def _request_date(value: object) -> str:
 
 def _now() -> datetime:
     return datetime.now(MOSCOW_TZ)
-
-

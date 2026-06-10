@@ -1,7 +1,5 @@
 from pathlib import Path
 
-import pytest
-
 from ai_server.knowledge import (
     MarkdownKnowledgeBase,
     _find_section,
@@ -119,7 +117,9 @@ def test_execute_outline_returns_sections(tmp_path):
 def test_execute_read_section_found(tmp_path):
     _write_topic(tmp_path, "contracts.md", _SAMPLE_DOC)
     kb = MarkdownKnowledgeBase()
-    result = kb.execute(_manifest(tmp_path), {"action": "read_section", "topic": "contracts", "section": "Общие положения"})
+    result = kb.execute(
+        _manifest(tmp_path), {"action": "read_section", "topic": "contracts", "section": "Общие положения"}
+    )
     assert result["status"] == "ok"
     assert "Текст раздела один" in result["content"]
 

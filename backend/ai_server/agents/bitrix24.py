@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from typing import Any
-
-from ai_server.utils import optional_int, unique
 from ai_server.agents.bitrix_llm import (
     BitrixAgentLLM,
     BitrixLLMService,
@@ -24,6 +21,7 @@ from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
 from ai_server.tools.bitrix import BitrixToolset
+from ai_server.utils import optional_int, unique
 
 
 class Bitrix24Specialist:
@@ -45,7 +43,15 @@ class Bitrix24Specialist:
         self.llm = llm or BitrixLLMService()
 
     @classmethod
-    def build(cls, manifest: AgentManifest, *, bitrix_tools: BitrixToolset | None = None, bitrix_retriever: HybridKnowledgeRetriever | None = None, bitrix_llm: BitrixAgentLLM | None = None, **_: object) -> "Bitrix24Specialist":
+    def build(
+        cls,
+        manifest: AgentManifest,
+        *,
+        bitrix_tools: BitrixToolset | None = None,
+        bitrix_retriever: HybridKnowledgeRetriever | None = None,
+        bitrix_llm: BitrixAgentLLM | None = None,
+        **_: object,
+    ) -> Bitrix24Specialist:
         return cls(manifest, retriever=bitrix_retriever, tools=bitrix_tools, llm=bitrix_llm)
 
     async def handle(self, task: AgentTask) -> AgentResult:
@@ -463,7 +469,9 @@ def _tool_result_from_task_create_draft(draft: BitrixTaskCreateDraft) -> ToolRes
     )
 
 
-def _approval_actions_from_task_create_draft(draft: BitrixTaskCreateDraft, manifest: AgentManifest) -> list[ActionRecord]:
+def _approval_actions_from_task_create_draft(
+    draft: BitrixTaskCreateDraft, manifest: AgentManifest
+) -> list[ActionRecord]:
     if not draft.is_ready:
         return []
     needs_approval = "bitrix_write" in manifest.approval_required
@@ -474,7 +482,10 @@ def _approval_actions_from_task_create_draft(draft: BitrixTaskCreateDraft, manif
             details={
                 "method": draft.method,
                 "params": draft.params,
-                "policy": {"decision": "confirm" if needs_approval else "allow", "reason": "manifest.approval_required"},
+                "policy": {
+                    "decision": "confirm" if needs_approval else "allow",
+                    "reason": "manifest.approval_required",
+                },
                 "summary": draft.summary,
                 "specialist_id": manifest.id,
             },
@@ -491,7 +502,9 @@ def _tool_result_from_task_closure_draft(draft: BitrixTaskClosureDraft) -> ToolR
     )
 
 
-def _approval_actions_from_task_closure_draft(draft: BitrixTaskClosureDraft, manifest: AgentManifest) -> list[ActionRecord]:
+def _approval_actions_from_task_closure_draft(
+    draft: BitrixTaskClosureDraft, manifest: AgentManifest
+) -> list[ActionRecord]:
     if not draft.is_ready:
         return []
     needs_approval = "close_task" in manifest.approval_required
@@ -502,7 +515,10 @@ def _approval_actions_from_task_closure_draft(draft: BitrixTaskClosureDraft, man
             details={
                 "method": TASK_CLOSURE_PENDING_METHOD,
                 "params": draft.params,
-                "policy": {"decision": "confirm" if needs_approval else "allow", "reason": "manifest.approval_required"},
+                "policy": {
+                    "decision": "confirm" if needs_approval else "allow",
+                    "reason": "manifest.approval_required",
+                },
                 "summary": draft.summary,
                 "specialist_id": manifest.id,
             },
@@ -520,5 +536,3 @@ def _logs() -> list[str]:
 def _draft_fields(draft: BitrixTaskCreateDraft) -> dict:
     fields = draft.params.get("fields")
     return fields if isinstance(fields, dict) else {}
-
-

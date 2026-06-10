@@ -98,7 +98,7 @@ class ProjectShellService:
                 process.communicate(),
                 timeout=settings.agent_shell_timeout_seconds,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             process.kill()
             await process.communicate()
             return {

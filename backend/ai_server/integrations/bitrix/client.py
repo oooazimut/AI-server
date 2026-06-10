@@ -608,5 +608,3 @@ def _extract_user(result: Any, *, user_id: int) -> dict[str, Any] | None:
             if isinstance(item, dict) and optional_int(item.get("ID") or item.get("id")) == user_id:
                 return item
     return None
-
-

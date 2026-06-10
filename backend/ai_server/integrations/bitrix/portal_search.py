@@ -15,6 +15,7 @@ from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.runtime import runtime_paths
 from ai_server.settings import get_settings
 from ai_server.utils import MOSCOW_TZ
+
 CONTENT_INDEX_VERSION = "2026-05-07-doc-v3"
 CONTENT_TERMINAL_STATUSES = {"empty", "too_large", "failed", "no_download_url"}
 

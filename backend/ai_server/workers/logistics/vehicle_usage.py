@@ -360,5 +360,3 @@ def _vehicle_usage_dialog_id() -> str:
         return configured
     manager_id = settings.vehicle_usage_manager_user_id
     return str(manager_id) if manager_id else ""
-
-

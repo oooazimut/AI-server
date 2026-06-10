@@ -1,7 +1,4 @@
-from pathlib import Path
 from typing import Any
-
-import pytest
 
 from ai_server.integrations.bitrix.dialog_state import (
     BitrixDialogState,
