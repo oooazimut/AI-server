@@ -6,8 +6,6 @@ from dataclasses import asdict
 from typing import Any
 from uuid import uuid4
 
-_MARKETPLACE_PATH_RE = re.compile(r"(/marketplace/view/[A-Za-z0-9._-]+/?)")
-
 from ai_server.agents.bitrix_llm import BitrixAgentLLM
 from ai_server.agents.bitrix_task_closure import TaskClosureService
 from ai_server.attachments import AttachmentService, StoredAttachment
@@ -41,6 +39,8 @@ from ai_server.workers.bitrix.search_webhook_indexer import (
 )
 
 logger = logging.getLogger(__name__)
+
+_MARKETPLACE_PATH_RE = re.compile(r"(/marketplace/view/[A-Za-z0-9._-]+/?)")
 
 
 class _BitrixTaskClosureHandler:

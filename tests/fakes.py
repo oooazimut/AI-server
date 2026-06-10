@@ -4,6 +4,7 @@ import hashlib
 import math
 import re
 from collections import Counter
+from dataclasses import dataclass as _dataclass
 
 from ai_server.agents.bitrix_llm import (
     BitrixLLMDecision,
@@ -18,7 +19,14 @@ from ai_server.agents.logistics_llm import (
     LogisticsLLMFinalResult,
     LogisticsLLMToolCall,
 )
-from dataclasses import dataclass as _dataclass
+from ai_server.agents.pto_llm import (
+    PtoLLMDecision,
+    PtoLLMDecisionResult,
+    PtoLLMFinalResult,
+    PtoLLMToolCall,
+)
+from ai_server.models import ModelUsageRecord
+from ai_server.orchestrators.internal_llm import InternalRouteDecision, InternalRouteResult, InternalSynthesisResult
 
 
 @_dataclass
@@ -32,15 +40,7 @@ class PendingControlDecision:
 @_dataclass
 class PendingControlResult:
     decision: PendingControlDecision
-    model_usage: "ModelUsageRecord"
-from ai_server.agents.pto_llm import (
-    PtoLLMDecision,
-    PtoLLMDecisionResult,
-    PtoLLMFinalResult,
-    PtoLLMToolCall,
-)
-from ai_server.models import ModelUsageRecord
-from ai_server.orchestrators.internal_llm import InternalRouteDecision, InternalRouteResult, InternalSynthesisResult
+    model_usage: ModelUsageRecord
 
 
 class FakeEmbeddingProvider:

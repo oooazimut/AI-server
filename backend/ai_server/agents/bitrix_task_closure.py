@@ -928,15 +928,6 @@ def _first_ci(data: dict[str, Any], *keys: str) -> object | None:
     return None
 
 
-def optional_int(value: object) -> int | None:
-    try:
-        if value in (None, ""):
-            return None
-        return int(str(value).strip().lstrip("#"))
-    except (TypeError, ValueError):
-        return None
-
-
 def _usage_payload(model_usage: list[ModelUsageRecord]) -> list[dict[str, Any]]:
     return [usage.model_dump() for usage in model_usage]
 
