@@ -4,7 +4,6 @@ import yaml
 
 from .models import AgentManifest, AgentSummary
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 AGENT_PACKAGE_DIR = PROJECT_ROOT / "agents"
 LEGACY_AGENT_CONFIG_DIR = PROJECT_ROOT / "config" / "agents"

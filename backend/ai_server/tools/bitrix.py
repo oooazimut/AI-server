@@ -11,6 +11,7 @@ from ai_server.integrations.bitrix.portal_search import (
 )
 from ai_server.models import ToolDefinition, ToolResult
 from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
+from ai_server.utils import optional_int
 
 
 class BitrixToolset:
@@ -217,7 +218,7 @@ class BitrixToolset:
         mode = str(args.get("mode") or "list").strip().lower()
         select = args.get("select") if isinstance(args.get("select"), list) else None
         if mode == "get":
-            task_id = _optional_int(args.get("task_id"))
+            task_id = optional_int(args.get("task_id"))
             if task_id is None:
                 return ToolResult(status="invalid_tool_call", tool="task_search", error="task_id is required")
             try:
@@ -242,7 +243,7 @@ class BitrixToolset:
 
         filter_ = args.get("filter") if isinstance(args.get("filter"), dict) else {}
         order = args.get("order") if isinstance(args.get("order"), dict) else {"CHANGED_DATE": "desc"}
-        limit = max(1, min(_optional_int(args.get("limit")) or 5, 10))
+        limit = max(1, min(optional_int(args.get("limit")) or 5, 10))
         try:
             tasks = await self.client.list_all_tasks(
                 filter_=filter_,
@@ -272,7 +273,7 @@ class BitrixToolset:
 
     async def current_user_profile(self, args: dict[str, Any] | None = None) -> ToolResult:
         args = args or {}
-        user_id = self.user_id if self.user_id is not None else _optional_int(args.get("user_id"))
+        user_id = self.user_id if self.user_id is not None else optional_int(args.get("user_id"))
         if user_id is None:
             return ToolResult(
                 status="not_available",
@@ -340,12 +341,14 @@ def _resolution_result(tool: str, *, query: str, candidates: list[dict[str, Any]
     if not candidates:
         return ToolResult(status="not_found", tool=tool, data={"query": query, "candidates": []})
     if len(candidates) == 1:
-        return ToolResult(status="ok", tool=tool, data={"query": query, "candidate": candidates[0], "candidates": candidates})
+        return ToolResult(
+            status="ok", tool=tool, data={"query": query, "candidate": candidates[0], "candidates": candidates}
+        )
     return ToolResult(status="ambiguous", tool=tool, data={"query": query, "candidates": candidates})
 
 
 def _user_candidate(user: dict[str, Any]) -> dict[str, Any] | None:
-    user_id = _optional_int(user.get("ID") or user.get("id"))
+    user_id = optional_int(user.get("ID") or user.get("id"))
     if user_id is None:
         return None
     first_name = str(user.get("NAME") or user.get("name") or "").strip()
@@ -362,7 +365,7 @@ def _user_candidate(user: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _project_candidate(project: dict[str, Any]) -> dict[str, Any] | None:
-    project_id = _optional_int(project.get("ID") or project.get("id"))
+    project_id = optional_int(project.get("ID") or project.get("id"))
     if project_id is None:
         return None
     name = str(project.get("NAME") or project.get("name") or "").strip()
@@ -385,7 +388,7 @@ def _extract_task(result: Any) -> dict[str, Any] | None:
 
 
 def _compact_user_profile(user: dict[str, Any]) -> dict[str, Any]:
-    user_id = _optional_int(user.get("ID") or user.get("id"))
+    user_id = optional_int(user.get("ID") or user.get("id"))
     first_name = str(user.get("NAME") or user.get("name") or "").strip()
     last_name = str(user.get("LAST_NAME") or user.get("lastName") or user.get("last_name") or "").strip()
     second_name = str(user.get("SECOND_NAME") or user.get("secondName") or user.get("second_name") or "").strip()
@@ -398,10 +401,7 @@ def _compact_user_profile(user: dict[str, Any]) -> dict[str, Any]:
         "label": full_name or email or (f"Bitrix user #{user_id}" if user_id is not None else "Bitrix user"),
         "active": _truthy(user.get("ACTIVE") or user.get("active"), default=True),
         "is_admin": _truthy(
-            user.get("IS_ADMIN")
-            or user.get("ADMIN")
-            or user.get("isAdmin")
-            or user.get("is_admin"),
+            user.get("IS_ADMIN") or user.get("ADMIN") or user.get("isAdmin") or user.get("is_admin"),
             default=False,
         ),
         "department_ids": departments,
@@ -428,7 +428,7 @@ def _int_list(value: object) -> list[int]:
     raw_values = value if isinstance(value, list) else [value]
     result: list[int] = []
     for raw in raw_values:
-        item = _optional_int(raw)
+        item = optional_int(raw)
         if item is not None and item not in result:
             result.append(item)
     return result
@@ -442,14 +442,7 @@ def _truthy(value: object, *, default: bool = False) -> bool:
     if isinstance(value, (int, float)):
         return value != 0
     if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y", "on", "да", "y"}
+        return value.strip().lower() in {"1", "true", "yes", "y", "on", "да"}
     return bool(value)
 
 
-def _optional_int(value: object) -> int | None:
-    try:
-        if value in (None, ""):
-            return None
-        return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None

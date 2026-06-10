@@ -40,4 +40,3 @@ def _with_owner(automation: AgentAutomationManifest, agent_id: str) -> AgentAuto
     if automation.owner_agent_id == agent_id:
         return automation
     return automation.model_copy(update={"owner_agent_id": agent_id})
-

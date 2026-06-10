@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
 import sqlite3
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixClient, BitrixConfigError
-from ai_server.settings import get_settings
+from ai_server.settings import Settings, get_settings
+from ai_server.utils import optional_int
 
 
 class BitrixOAuthError(RuntimeError):
@@ -37,7 +38,7 @@ class BitrixOAuthToken:
 
     @property
     def expires_soon(self) -> bool:
-        return self.expires_at <= datetime.now(timezone.utc) + timedelta(minutes=5)
+        return self.expires_at <= datetime.now(UTC) + timedelta(minutes=5)
 
 
 @dataclass(frozen=True)
@@ -51,9 +52,9 @@ class BitrixOAuthSaveResult:
 
 
 class BitrixOAuthService:
-    def __init__(self, db_path: Path | str | None = None) -> None:
-        settings = get_settings()
-        self.db_path = Path(db_path or settings.bitrix_oauth_db_path)
+    def __init__(self, settings: Settings | None = None, db_path: Path | str | None = None) -> None:
+        _settings = settings or get_settings()
+        self.db_path = Path(db_path or _settings.bitrix_oauth_db_path)
 
     def ensure_schema(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -111,7 +112,7 @@ class BitrixOAuthService:
             member_id=auth.member_id,
             scope=auth.scope,
             expires_at=auth.expires_at,
-            updated_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(UTC),
         )
         self.save_token(token, source=source)
         return BitrixOAuthSaveResult(
@@ -188,7 +189,7 @@ class BitrixOAuthService:
             member_id=normalized.member_id,
             scope=normalized.scope,
             expires_at=normalized.expires_at,
-            updated_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(UTC),
         )
         self.save_token(refreshed, source="refresh")
         return refreshed
@@ -238,7 +239,7 @@ class BitrixOAuthService:
                     token.user_id,
                     "token_saved",
                     source,
-                    datetime.now(timezone.utc).isoformat(),
+                    datetime.now(UTC).isoformat(),
                     f"domain={token.domain}; scope={token.scope}",
                 ),
             )
@@ -289,7 +290,7 @@ class BitrixOAuthService:
             ),
         }
 
-    async def _resolve_user_id(self, auth: "_NormalizedAuth") -> int:
+    async def _resolve_user_id(self, auth: _NormalizedAuth) -> int:
         if auth.user_id:
             return auth.user_id
         client = BitrixClient(access_token=auth.access_token, client_endpoint=auth.client_endpoint)
@@ -383,13 +384,13 @@ def _normalize_auth(value: dict[str, Any], *, fallback: BitrixOAuthToken | None 
     )
     member_id = str(value.get("member_id") or (fallback.member_id if fallback else "") or "")
     scope = str(value.get("scope") or (fallback.scope if fallback else "") or "")
-    user_id = _optional_int(value.get("user_id") or value.get("USER_ID") or value.get("member_user_id"))
+    user_id = optional_int(value.get("user_id") or value.get("USER_ID") or value.get("member_user_id"))
 
-    expires_in = _optional_int(value.get("expires_in") or value.get("expires") or value.get("AUTH_EXPIRES"))
+    expires_in = optional_int(value.get("expires_in") or value.get("expires") or value.get("AUTH_EXPIRES"))
     if expires_in is None and fallback is not None:
         expires_at = fallback.expires_at
     else:
-        expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(60, expires_in or 3600))
+        expires_at = datetime.now(UTC) + timedelta(seconds=max(60, expires_in or 3600))
 
     return _NormalizedAuth(
         access_token=access_token,
@@ -408,15 +409,15 @@ def _parse_datetime(value: str) -> datetime:
     normalized = value.replace("Z", "+00:00")
     parsed = datetime.fromisoformat(normalized)
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _expires_at(expires: Any, expires_in: Any) -> datetime:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     if expires:
         try:
-            return datetime.fromtimestamp(int(expires), tz=timezone.utc)
+            return datetime.fromtimestamp(int(expires), tz=UTC)
         except (TypeError, ValueError, OSError):
             pass
     try:
@@ -440,15 +441,6 @@ def _token_endpoint_from_server(server_endpoint: str) -> str:
 
 def _domain(value: str) -> str:
     return value.strip().removeprefix("https://").removeprefix("http://").rstrip("/")
-
-
-def _optional_int(value: object) -> int | None:
-    try:
-        if value in (None, ""):
-            return None
-        return int(str(value).strip())
-    except (TypeError, ValueError):
-        return None
 
 
 def _response_json(response: httpx.Response) -> dict[str, Any]:

@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any, Protocol
 
 from ai_server.integrations.bitrix.client import BitrixClient
@@ -11,10 +10,9 @@ from ai_server.integrations.bitrix.portal_search import PortalSearchIndex
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import AgentTask, ModelUsageRecord
 from ai_server.settings import get_settings
-
+from ai_server.utils import MOSCOW_TZ, compact_text, confidence, optional_int, truthy, unique
 
 TASK_CLOSURE_PENDING_METHOD = "ai_server.task_closure"
-MOSCOW_TZ = timezone(timedelta(hours=3))
 
 
 class TaskClosureError(RuntimeError):
@@ -30,7 +28,7 @@ class TaskClosureLLM(Protocol):
         tool_results: list[dict[str, Any]],
         tool_definitions: list[dict[str, Any]],
         policy: dict[str, Any],
-    ) -> "TaskClosureDecision":
+    ) -> TaskClosureDecision:
         pass
 
 
@@ -74,8 +72,9 @@ class TaskClosureDecision:
 
 
 class LLMTaskClosureService:
-    def __init__(self, client: LLMClient | None = None) -> None:
+    def __init__(self, client: LLMClient | None = None, agent_id: str = "bitrix24") -> None:
         self.client = client or OpenAICompatibleLLMClient()
+        self._agent_id = agent_id
 
     async def decide(
         self,
@@ -91,7 +90,7 @@ class LLMTaskClosureService:
             raise TaskClosureError("task_closure_llm_not_configured")
 
         completion = await self.client.complete(
-            agent_id="bitrix24",
+            agent_id=self._agent_id,
             messages=[
                 {"role": "system", "content": TASK_CLOSURE_SYSTEM_PROMPT},
                 {
@@ -287,7 +286,7 @@ class TaskClosureService:
         }
 
     async def _tool_task_get(self, args: dict[str, Any], *, params: dict[str, Any]) -> dict[str, Any]:
-        task_id = _optional_int(args.get("task_id")) or _optional_int(params.get("task_id"))
+        task_id = optional_int(args.get("task_id")) or optional_int(params.get("task_id"))
         if task_id is None:
             return {
                 "status": "contract_violation",
@@ -340,7 +339,7 @@ class TaskClosureService:
 
         candidates: list[dict[str, Any]] = []
         for item in self.portal_search.search(query, entity_types={"task"}, limit=20):
-            task_id = _optional_int(item.entity_id)
+            task_id = optional_int(item.entity_id)
             if task_id is None:
                 continue
             metadata = item.metadata if isinstance(item.metadata, dict) else {}
@@ -350,8 +349,8 @@ class TaskClosureService:
                     "title": item.title,
                     "url": item.url,
                     "status": str(metadata.get("status") or ""),
-                    "responsible_id": _optional_int(metadata.get("responsible_id")),
-                    "group_id": _optional_int(metadata.get("group_id")),
+                    "responsible_id": optional_int(metadata.get("responsible_id")),
+                    "group_id": optional_int(metadata.get("group_id")),
                 }
             )
         return {
@@ -373,7 +372,7 @@ class TaskClosureService:
             return {"tool": "bitrix_task_result_add", **policy_error}
 
         text = str(args.get("text") or args.get("result_text") or "").strip()
-        if not text and _truthy(args.get("use_pending_result_text")):
+        if not text and truthy(args.get("use_pending_result_text")):
             text = str(params.get("result_text") or "").strip()
         if not text:
             return {
@@ -384,10 +383,7 @@ class TaskClosureService:
             }
         stored_text = text
         if current_user_id:
-            stored_text = (
-                text.rstrip()
-                + f"\n\n[Отправлено через AI-server пользователем Bitrix #{current_user_id}]"
-            )
+            stored_text = text.rstrip() + f"\n\n[Отправлено через AI-server пользователем Bitrix #{current_user_id}]"
 
         try:
             result = await self.bitrix.add_task_result(task_id, stored_text)
@@ -477,7 +473,7 @@ class TaskClosureService:
         }
 
     async def _tool_notify_user(self, args: dict[str, Any], *, context: dict[str, Any]) -> dict[str, Any]:
-        user_id = _optional_int(args.get("user_id"))
+        user_id = optional_int(args.get("user_id"))
         message = str(args.get("message") or "").strip()
         if user_id is None or not message:
             return {
@@ -512,11 +508,9 @@ class TaskClosureService:
 
 def build_task_closure_draft_from_args(task: AgentTask, args: dict[str, Any]) -> BitrixTaskClosureDraft:
     args = args or {}
-    task_id = _optional_int(args.get("task_id") or args.get("taskId") or args.get("id"))
-    task_query = _compact(str(args.get("task_query") or args.get("query") or ""))
-    result_text = _compact(
-        str(args.get("result_text") or args.get("result") or args.get("completion_result") or "")
-    )
+    task_id = optional_int(args.get("task_id") or args.get("taskId") or args.get("id"))
+    task_query = compact_text(str(args.get("task_query") or args.get("query") or ""))
+    result_text = compact_text(str(args.get("result_text") or args.get("result") or args.get("completion_result") or ""))
 
     contract_errors: list[str] = []
     params: dict[str, Any] = {}
@@ -536,7 +530,7 @@ def build_task_closure_draft_from_args(task: AgentTask, args: dict[str, Any]) ->
     return BitrixTaskClosureDraft(
         params=params,
         summary=summary,
-        contract_errors=_unique(contract_errors),
+        contract_errors=unique(contract_errors),
         notes=[f"Запрос пользователя #{task.user.id} подготовил LLM-субагент Bitrix24."] if task.user.id else [],
     )
 
@@ -655,7 +649,7 @@ def _parse_task_closure_decision(data: dict[str, Any]) -> TaskClosureDecision:
         status=status,
         answer=str(data.get("answer") or "").strip(),
         tool_calls=tool_calls,
-        confidence=_confidence(data.get("confidence")),
+        confidence=confidence(data.get("confidence")),
         raw=data,
     )
 
@@ -676,7 +670,7 @@ def _update_task_closure_context(context: dict[str, Any], tool_result: dict[str,
     data = tool_result.get("data") if isinstance(tool_result.get("data"), dict) else {}
     if tool_result.get("tool") == "bitrix_task_get" and tool_result.get("status") == "ok":
         task = data.get("task") if isinstance(data.get("task"), dict) else {}
-        task_id = _optional_int(data.get("task_id")) or _task_id_from_detail(task)
+        task_id = optional_int(data.get("task_id")) or _task_id_from_detail(task)
         if task_id is not None:
             context.setdefault("tasks", {})[str(task_id)] = task
     action = data.get("action")
@@ -786,7 +780,7 @@ def _write_target(
     context: dict[str, Any],
     current_user_id: int | None,
 ) -> tuple[int, dict[str, Any] | None]:
-    task_id = _optional_int(args.get("task_id"))
+    task_id = optional_int(args.get("task_id"))
     if task_id is None:
         return 0, {
             "status": "contract_violation",
@@ -825,7 +819,10 @@ def _write_policy_error(task: dict[str, Any], current_user_id: int | None) -> di
             "data": {"task": _task_payload_from_detail(task)},
         }
     responsible_id = _task_responsible_id(task)
-    if current_user_id != responsible_id and current_user_id not in get_settings().resolved_agent_write_allowed_user_ids:
+    if (
+        current_user_id != responsible_id
+        and current_user_id not in get_settings().resolved_agent_write_allowed_user_ids
+    ):
         return {
             "status": "denied",
             "reason": "Закрывать задачу через AI-server может её исполнитель или администратор агента.",
@@ -838,10 +835,7 @@ def _can_notify_user(user_id: int, *, context: dict[str, Any]) -> bool:
     settings = get_settings()
     if user_id in settings.resolved_quality_control_director_user_ids:
         return True
-    for task in _known_tasks(context):
-        if user_id == _task_responsible_id(task):
-            return True
-    return False
+    return any(user_id == _task_responsible_id(task) for task in _known_tasks(context))
 
 
 def _known_task(context: dict[str, Any], task_id: int) -> dict[str, Any]:
@@ -880,15 +874,15 @@ def _task_payload_from_detail(task: dict[str, Any]) -> dict[str, Any]:
 
 
 def _task_id_from_detail(task: dict[str, Any]) -> int | None:
-    return _optional_int(_first_ci(task, "id", "ID", "taskId", "TASK_ID"))
+    return optional_int(_first_ci(task, "id", "ID", "taskId", "TASK_ID"))
 
 
 def _task_group_id(task: dict[str, Any]) -> int | None:
-    return _optional_int(_first_ci(task, "groupId", "GROUP_ID", "group_id"))
+    return optional_int(_first_ci(task, "groupId", "GROUP_ID", "group_id"))
 
 
 def _task_responsible_id(task: dict[str, Any]) -> int | None:
-    return _optional_int(_first_ci(task, "responsibleId", "RESPONSIBLE_ID", "responsible_id"))
+    return optional_int(_first_ci(task, "responsibleId", "RESPONSIBLE_ID", "responsible_id"))
 
 
 def _summary(*, task_id: int | None, task_query: str, result_text: str) -> str:
@@ -934,7 +928,7 @@ def _first_ci(data: dict[str, Any], *keys: str) -> object | None:
     return None
 
 
-def _optional_int(value: object) -> int | None:
+def optional_int(value: object) -> int | None:
     try:
         if value in (None, ""):
             return None
@@ -943,30 +937,8 @@ def _optional_int(value: object) -> int | None:
         return None
 
 
-def _truthy(value: object) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y", "да"}
-    return bool(value)
-
-
-def _confidence(value: object) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return 0.5
-    return min(max(number, 0.0), 1.0)
-
-
 def _usage_payload(model_usage: list[ModelUsageRecord]) -> list[dict[str, Any]]:
     return [usage.model_dump() for usage in model_usage]
-
-
-def _compact(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -975,12 +947,6 @@ def _truncate(text: str, limit: int) -> str:
     return text[: max(0, limit - 40)].rstrip() + "\n...[обрезано]..."
 
 
-def _unique(values: list[str]) -> list[str]:
-    result: list[str] = []
-    for value in values:
-        if value not in result:
-            result.append(value)
-    return result
 
 
 TASK_CLOSURE_SYSTEM_PROMPT = """

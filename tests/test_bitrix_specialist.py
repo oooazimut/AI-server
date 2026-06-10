@@ -64,9 +64,7 @@ def test_bitrix_specialist_searches_task_by_id():
                 )
             ),
             llm=FakeBitrixLLM(
-                tool_calls=[
-                    BitrixLLMToolCall(name="task_search", args={"mode": "get", "task_id": 8413})
-                ],
+                tool_calls=[BitrixLLMToolCall(name="task_search", args={"mode": "get", "task_id": 8413})],
                 final_answer="Нашёл задачу #8413 без срока.",
             ),
         ).handle(AgentTask(task_id="t1", request="Найди задачу #8413"))
@@ -111,9 +109,7 @@ def test_bitrix_specialist_searches_my_open_tasks():
                 ],
                 final_answer="Нашёл задачу: Проверить камеру.",
             ),
-        ).handle(
-            AgentTask(task_id="t1", request="Покажи мои открытые задачи", user={"id": "9"})
-        )
+        ).handle(AgentTask(task_id="t1", request="Покажи мои открытые задачи", user={"id": "9"}))
     )
 
     assert result.status == "completed"
@@ -197,9 +193,7 @@ def test_bitrix_specialist_marks_write_for_approval():
                 final_status="needs_human",
                 final_answer="Подготовил черновик задачи, нужно подтверждение.",
             )
-        ).handle(
-            AgentTask(task_id="t1", request="Создай задачу на меня проверить IP-камеру завтра", user={"id": "9"})
-        )
+        ).handle(AgentTask(task_id="t1", request="Создай задачу на меня проверить IP-камеру завтра", user={"id": "9"}))
     )
 
     assert result.status == "needs_human"
@@ -225,9 +219,7 @@ def test_bitrix_specialist_prepares_task_closure_for_approval():
                 final_status="needs_human",
                 final_answer="Подготовил закрытие задачи, нужно подтверждение.",
             )
-        ).handle(
-            AgentTask(task_id="t1", request="Закрой задачу #8413, камера перезагружена", user={"id": "9"})
-        )
+        ).handle(AgentTask(task_id="t1", request="Закрой задачу #8413, камера перезагружена", user={"id": "9"}))
     )
 
     assert result.status == "needs_human"
@@ -267,9 +259,7 @@ def test_bitrix_specialist_asks_for_responsible_before_task_create():
                 final_status="needs_clarification",
                 final_answer="Кого поставить ответственным?",
             )
-        ).handle(
-            AgentTask(task_id="t1", request="Создай задачу проверить IP-камеру")
-        )
+        ).handle(AgentTask(task_id="t1", request="Создай задачу проверить IP-камеру"))
     )
 
     assert result.status == "needs_clarification"
@@ -464,8 +454,7 @@ def test_bitrix_llm_decision_payload_includes_permission_context(monkeypatch):
     monkeypatch.setenv("AGENT_LIMITED_TASK_CREATE_PROJECT_ID", "44")
     monkeypatch.setenv("AGENT_LIMITED_TASK_CREATE_USER_IDS", "15")
     client = RecordingLLMClient(
-        '{"status":"completed","answer":"","confidence":0.7,'
-        '"tool_calls":[{"name":"none","args":{},"summary":""}]}'
+        '{"status":"completed","answer":"","confidence":0.7,"tool_calls":[{"name":"none","args":{},"summary":""}]}'
     )
     manifest = get_agent_manifest("bitrix24")
     context = {
@@ -597,6 +586,7 @@ def _fake_resolution(tool: str, query: str, candidates: list[dict]) -> ToolResul
     if not candidates:
         return ToolResult(status="not_found", tool=tool, data={"query": query, "candidates": []})
     if len(candidates) == 1:
-        return ToolResult(status="ok", tool=tool, data={"query": query, "candidate": candidates[0], "candidates": candidates})
+        return ToolResult(
+            status="ok", tool=tool, data={"query": query, "candidate": candidates[0], "candidates": candidates}
+        )
     return ToolResult(status="ambiguous", tool=tool, data={"query": query, "candidates": candidates})
-

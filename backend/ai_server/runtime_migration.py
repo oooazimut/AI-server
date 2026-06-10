@@ -1,13 +1,12 @@
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-import shutil
 from typing import Any
 
 from ai_server.registry import PROJECT_ROOT
-
 
 DEFAULT_BITRIX_AGENT_VAR = Path(r"C:\Users\office3pc\PyProjects\BitrixAIAgent\var")
 DEFAULT_AI_SERVER_VAR = PROJECT_ROOT / "var"
@@ -148,8 +147,7 @@ def build_var_migration_plan(
     source_root = Path(source_var)
     target_root = Path(target_var)
     return [
-        _plan_item(item, source_root=source_root, target_root=target_root)
-        for item in selected_migration_items(profile)
+        _plan_item(item, source_root=source_root, target_root=target_root) for item in selected_migration_items(profile)
     ]
 
 

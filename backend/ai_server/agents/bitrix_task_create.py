@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any
 
 from ai_server.models import AgentTask
+from ai_server.utils import compact_text, optional_int, unique
 
 
 @dataclass(frozen=True)
@@ -51,17 +52,17 @@ def build_task_create_draft_from_args(
 ) -> BitrixTaskCreateDraft:
     resolution = resolution or BitrixTaskCreateResolution()
     args = args or {}
-    title = _compact(str(args.get("title") or "")).strip(" .,:;-")
-    description = _compact(str(args.get("description") or ""))
-    responsible_id = _optional_int(args.get("responsible_id"))
-    responsible_query = _compact(str(args.get("responsible_query") or ""))
+    title = compact_text(str(args.get("title") or "")).strip(" .,:;-")
+    description = compact_text(str(args.get("description") or ""))
+    responsible_id = optional_int(args.get("responsible_id"))
+    responsible_query = compact_text(str(args.get("responsible_query") or ""))
     responsible_note = ""
-    group_id = _optional_int(args.get("group_id"))
-    project_query = _compact(str(args.get("project_query") or ""))
+    group_id = optional_int(args.get("group_id"))
+    project_query = compact_text(str(args.get("project_query") or ""))
     group_note = ""
 
     if responsible_id is None and _truthy(args.get("responsible_self")):
-        responsible_id = _optional_int(task.user.id)
+        responsible_id = optional_int(task.user.id)
         if responsible_id is not None:
             responsible_note = "Ответственным выбран текущий пользователь."
         else:
@@ -79,7 +80,7 @@ def build_task_create_draft_from_args(
     contract_errors: list[str] = []
     notes = [note for note in (responsible_note, group_note, deadline_note, *resolution.notes) if note]
     fields: dict[str, Any] = {}
-    current_user_id = _optional_int(task.user.id)
+    current_user_id = optional_int(task.user.id)
     if title:
         fields["TITLE"] = title
         if description:
@@ -116,7 +117,7 @@ def build_task_create_draft_from_args(
     return BitrixTaskCreateDraft(
         params={"fields": fields} if fields else {},
         summary=_summary(title=title, responsible_id=responsible_id, deadline=deadline, group_id=group_id),
-        contract_errors=_unique(contract_errors),
+        contract_errors=unique(contract_errors),
         notes=notes,
         responsible_query=responsible_query,
         project_query=project_query,
@@ -148,19 +149,6 @@ def _summary(*, title: str, responsible_id: int | None, deadline: str | None, gr
     return ", ".join(parts)
 
 
-def _optional_int(value: object) -> int | None:
-    try:
-        if value in (None, ""):
-            return None
-        return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None
-
-
-def _compact(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
-
-
 def _truthy(value: object) -> bool:
     if isinstance(value, bool):
         return value
@@ -171,9 +159,3 @@ def _truthy(value: object) -> bool:
     return bool(value)
 
 
-def _unique(values: list[str]) -> list[str]:
-    result: list[str] = []
-    for value in values:
-        if value not in result:
-            result.append(value)
-    return result

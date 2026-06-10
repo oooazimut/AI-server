@@ -2,9 +2,10 @@ id: logistics
 name: Логист
 version: 0.1.0
 kind: specialist
+audience: employee
 description: Отвечает за ежедневный учёт служебных автомобилей, статусы сотрудников и логистические отчёты.
 handoff_description: Использовать для запросов про служебные автомобили, утренний отчёт по машинам, закрепление авто, выезды, смены и логистику.
-entrypoint: null
+entrypoint: backend.ai_server.agents.logistics.LogisticsSpecialist
 instructions_file: agents/logistics/instructions.md
 skills_path: agents/logistics/skills
 knowledge_path: agents/logistics/knowledge/topics

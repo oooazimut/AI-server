@@ -8,8 +8,8 @@ from ai_server.agents.logistics_llm import LogisticsLLMToolCall
 from ai_server.models import AgentTask, UserContext
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
-from ai_server.workers.logistics.vehicle_usage import run_vehicle_usage_once
 from ai_server.tools.vehicle_usage import VehicleUsageStore, VehicleUsageToolset
+from ai_server.workers.logistics.vehicle_usage import run_vehicle_usage_once
 from tests.fakes import FakeEmbeddingProvider, FakeLogisticsLLM
 
 
@@ -103,9 +103,7 @@ def test_logistics_specialist_saves_confirmed_report(monkeypatch, tmp_path):
         llm=fake_llm,
     )
 
-    result = anyio_run(
-        specialist.handle(AgentTask(task_id="log-2", request="подтверждаю", user=UserContext(id="9")))
-    )
+    result = anyio_run(specialist.handle(AgentTask(task_id="log-2", request="подтверждаю", user=UserContext(id="9"))))
 
     assert result.answer == "Сохранил утренний отчет."
     with sqlite3.connect(store.path) as db:

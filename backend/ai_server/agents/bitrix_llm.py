@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
-from ai_server.llm import LLMClient, LLMError, OpenAICompatibleLLMClient
+from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
+from ai_server.registry import resolve_project_path
 from ai_server.retrieval import RetrievalHit
 from ai_server.settings import get_settings
+from ai_server.utils import confidence, optional_int
 
+logger = logging.getLogger(__name__)
 
 ALLOWED_TOOL_NAMES = {
     "current_user_profile",
@@ -30,17 +34,18 @@ class BitrixAgentLLM(Protocol):
         task: AgentTask,
         retrieval_hits: list[RetrievalHit],
         tool_definitions: list[dict[str, Any]],
-    ) -> "BitrixLLMDecisionResult":
+    ) -> BitrixLLMDecisionResult:
         pass
 
     async def compose(
         self,
         *,
+        manifest: AgentManifest | None = None,
         task: AgentTask,
-        decision: "BitrixLLMDecision",
+        decision: BitrixLLMDecision,
         tool_results: list[ToolResult],
         approval_actions: list[dict[str, Any]],
-    ) -> "BitrixLLMFinalResult":
+    ) -> BitrixLLMFinalResult:
         pass
 
 
@@ -86,10 +91,11 @@ class BitrixLLMService:
         retrieval_hits: list[RetrievalHit],
         tool_definitions: list[dict[str, Any]],
     ) -> BitrixLLMDecisionResult:
+        instructions = _load_instructions(manifest)
         completion = await self.client.complete(
             agent_id=manifest.id,
             messages=[
-                {"role": "system", "content": _decision_system_prompt()},
+                {"role": "system", "content": _decision_system_prompt(instructions)},
                 {
                     "role": "user",
                     "content": json.dumps(
@@ -102,7 +108,7 @@ class BitrixLLMService:
                             "request": task.request,
                             "user": task.user.model_dump(),
                             "files": task.files,
-                            "current_datetime": datetime.now(timezone.utc).astimezone().isoformat(),
+                            "current_datetime": datetime.now(UTC).astimezone().isoformat(),
                             "permission_context": _permission_context(task),
                             "retrieval_context": _retrieval_context(retrieval_hits),
                             "tools": _allowed_tool_definitions(tool_definitions),
@@ -122,13 +128,15 @@ class BitrixLLMService:
     async def compose(
         self,
         *,
+        manifest: AgentManifest | None = None,
         task: AgentTask,
         decision: BitrixLLMDecision,
         tool_results: list[ToolResult],
         approval_actions: list[dict[str, Any]],
     ) -> BitrixLLMFinalResult:
+        agent_id = manifest.id if manifest is not None else "bitrix24"
         completion = await self.client.complete(
-            agent_id="bitrix24",
+            agent_id=agent_id,
             messages=[
                 {"role": "system", "content": _compose_system_prompt()},
                 {
@@ -156,12 +164,12 @@ class BitrixLLMService:
         )
 
 
-def llm_failure_result(message: str) -> BitrixLLMFinalResult:
+def llm_failure_result(message: str, agent_id: str = "bitrix24") -> BitrixLLMFinalResult:
     return BitrixLLMFinalResult(
         status="failed",
         answer=f"Не смог обработать Bitrix-запрос через LLM-субагента: {message}",
         model_usage=ModelUsageRecord(
-            agent_id="bitrix24",
+            agent_id=agent_id,
             provider="",
             model="",
             status="error",
@@ -170,7 +178,19 @@ def llm_failure_result(message: str) -> BitrixLLMFinalResult:
     )
 
 
-def _decision_system_prompt() -> str:
+def _load_instructions(manifest: AgentManifest) -> str:
+    if not manifest.instructions_file:
+        return ""
+    try:
+        path = resolve_project_path(manifest.instructions_file)
+        return path.read_text(encoding="utf-8").strip()
+    except Exception as exc:
+        logger.warning("Failed to load instructions from %s: %s", manifest.instructions_file, exc)
+        return ""
+
+
+def _decision_system_prompt(instructions: str = "") -> str:
+    extra = f"\n\nДополнительные инструкции:\n{instructions}" if instructions else ""
     return (
         "Ты LLM-субагент Bitrix24 внутри корпоративного AI-server. "
         "Оркестратор уже передал тебе запрос человека. "
@@ -191,7 +211,7 @@ def _decision_system_prompt() -> str:
         '"tool_calls":[{"name":"current_user_profile|task_search|task_create_draft|task_closure|portal_search|none","args":{},"summary":""}]}. '
         "Перед каждым tool_call сам проверь, хватает ли данных для его корректного вызова. "
         "Нельзя вызывать tool с надеждой, что backend или tool сам разберётся с недостающими данными. "
-        "Если данных не хватает, не вызывай tool: верни status=needs_clarification, tool_calls=[{\"name\":\"none\"}], "
+        'Если данных не хватает, не вызывай tool: верни status=needs_clarification, tool_calls=[{"name":"none"}], '
         "а в answer задай короткий уточняющий вопрос. "
         "Для проверки фактов о текущем пользователе можно использовать current_user_profile, но перед write-tool "
         "обычно уже есть permission_context.bitrix_current_user_profile. "
@@ -207,6 +227,7 @@ def _decision_system_prompt() -> str:
         "В result_text передавай только результат выполнения, без команды закрыть задачу. "
         "Не вызывай task_closure без result_text и одного из task_id/task_query. "
         "Для поиска документов/файлов используй portal_search. Если данных не хватает, status=needs_clarification."
+        f"{extra}"
     )
 
 
@@ -243,7 +264,7 @@ def _parse_decision(data: dict[str, Any]) -> BitrixLLMDecision:
     return BitrixLLMDecision(
         status=_decision_status(data.get("status")),
         answer=str(data.get("answer") or "").strip(),
-        confidence=_confidence(data.get("confidence")),
+        confidence=confidence(data.get("confidence")),
         tool_calls=tool_calls,
     )
 
@@ -257,13 +278,6 @@ def _result_status(value: object) -> str:
     status = str(value or "completed").strip()
     return status if status in RESULT_STATUSES else "completed"
 
-
-def _confidence(value: object) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return 0.5
-    return min(max(number, 0.0), 1.0)
 
 
 def _retrieval_context(hits: list[RetrievalHit]) -> list[dict[str, Any]]:
@@ -282,16 +296,12 @@ def _retrieval_context(hits: list[RetrievalHit]) -> list[dict[str, Any]]:
 
 def _permission_context(task: AgentTask) -> dict[str, Any]:
     settings = get_settings()
-    user_id = _optional_int(task.user.id)
+    user_id = optional_int(task.user.id)
     full_write_user_ids = settings.resolved_agent_write_allowed_user_ids
     limited_user_ids = settings.resolved_agent_limited_task_create_user_ids
     limited_project_id = settings.agent_limited_task_create_project_id
     full_write = user_id is not None and user_id in full_write_user_ids
-    limited_task_create = (
-        user_id is not None
-        and limited_project_id is not None
-        and user_id in limited_user_ids
-    )
+    limited_task_create = user_id is not None and limited_project_id is not None and user_id in limited_user_ids
     if full_write:
         profile = "full_bitrix_write"
     elif limited_task_create:
@@ -320,24 +330,13 @@ def _allowed_tool_definitions(definitions: list[dict[str, Any]]) -> list[dict[st
     return [definition for definition in definitions if definition.get("name") in ALLOWED_TOOL_NAMES]
 
 
-def _optional_int(value: object) -> int | None:
-    try:
-        if value in (None, ""):
-            return None
-        return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None
-
 
 def _decision_dict(decision: BitrixLLMDecision) -> dict[str, Any]:
     return {
         "status": decision.status,
         "answer": decision.answer,
         "confidence": decision.confidence,
-        "tool_calls": [
-            {"name": call.name, "args": call.args, "summary": call.summary}
-            for call in decision.tool_calls
-        ],
+        "tool_calls": [{"name": call.name, "args": call.args, "summary": call.summary} for call in decision.tool_calls],
     }
 
 

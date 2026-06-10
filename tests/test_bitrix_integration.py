@@ -1,11 +1,15 @@
-from datetime import datetime, timedelta, timezone
 import sqlite3
+from datetime import UTC, datetime, timedelta
+
+import pytest
 
 from fastapi.testclient import TestClient
 
+from ai_server.agents.bitrix24 import Bitrix24Specialist
 from ai_server.agents.bitrix_llm import BitrixLLMToolCall
 from ai_server.attachments import StoredAttachment
 from ai_server.channels.bitrix import BitrixWebhookProcessor
+from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.dialog_state import (
     BitrixPendingActionService,
     DialogStateStore,
@@ -13,13 +17,16 @@ from ai_server.integrations.bitrix.dialog_state import (
     apply_write_policy,
     make_dialog_key,
 )
-from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.events import parse_incoming_message
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService, _token_endpoint_from_server
 from ai_server.main import app
 from ai_server.models import ActionRecord, AgentResult, ModelUsageRecord, ToolResult
+from ai_server.orchestrators.internal import InternalOrchestrator
+from ai_server.registry import load_agent_manifests
 from ai_server.retrieval import HybridKnowledgeRetriever
+from ai_server.specialists import manifest_by_id
 from ai_server.technical_footer import ProviderBalanceSnapshot, TechnicalFooterService
+from ai_server.tools.bitrix import BitrixToolset
 from ai_server.transcription import TranscriptionResult
 from ai_server.workers.bitrix.webhook_event_queue import WebhookEventQueue
 from scripts.create_bitrix_dev_chat import chat_reference, sanitize_result
@@ -27,7 +34,6 @@ from tests.fakes import (
     FakeBitrixLLM,
     FakeEmbeddingProvider,
     FakeInternalOrchestratorLLM,
-    FakePendingControlLLM,
     FakeTaskClosureLLM,
 )
 
@@ -220,7 +226,7 @@ def test_bitrix_webhook_processor_appends_admin_technical_footer(monkeypatch):
     processor = BitrixWebhookProcessor(
         bitrix=fake_bitrix,
         orchestrator=FakeOrchestrator(),
-        technical_footer=TechnicalFooterService(deepseek_balance=FakeDeepSeekBalance()),
+        technical_footer=TechnicalFooterService(balance_registry={"deepseek": FakeDeepSeekBalance()}),
     )
 
     result = anyio_run(processor.process(_bitrix_v2_message_payload()))
@@ -306,12 +312,19 @@ def test_bitrix_webhook_processor_saves_pending_action_from_specialist(monkeypat
 
 
 def test_bitrix_pending_action_confirm_executes_and_clears_state(monkeypatch, tmp_path):
-    monkeypatch.setenv("AGENT_DRY_RUN", "false")
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("AGENT_DRY_RUN", "true")
     monkeypatch.setenv("AGENT_WRITE_ALLOWED_USER_IDS", "9")
     monkeypatch.setenv("BITRIX_OAUTH_REQUIRED_FOR_WRITES", "false")
     store = DialogStateStore(tmp_path / "dialog_state.sqlite")
     fake_bitrix = FakeBitrixClient()
     key = make_dialog_key(chat_id=77, dialog_id="chat99", user_id=9)
+    pending_service = BitrixPendingActionService(
+        store=store,
+        bitrix=fake_bitrix,
+        audit_log_path=tmp_path / "bitrix_write_audit.jsonl",
+        dry_run=False,
+    )
     store.set_pending(
         key,
         PendingBitrixAction(
@@ -323,38 +336,44 @@ def test_bitrix_pending_action_confirm_executes_and_clears_state(monkeypatch, tm
     )
     payload = _bitrix_v2_message_payload()
     payload["data"]["message"]["text"] = "ну давай, запускай это"
-
-    class ForbiddenOrchestrator:
-        async def handle(self, task):
-            raise AssertionError("pending confirmation should not reach orchestrator")
-
-    pending_control = FakePendingControlLLM("confirm")
+    manifests = load_agent_manifests()
+    specialist = Bitrix24Specialist(
+        manifest_by_id(manifests, "bitrix24"),
+        retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
+        tools=BitrixToolset(client=fake_bitrix, pending_actions=pending_service, dialog_key=key, user_id=9),
+        llm=FakeBitrixLLM(
+            tool_calls=[BitrixLLMToolCall(name="bitrix_api", args={"action": "confirm_pending"})],
+            final_answer="Подтвердил, задача создана.",
+        ),
+    )
     processor = BitrixWebhookProcessor(
         bitrix=fake_bitrix,
-        orchestrator=ForbiddenOrchestrator(),
-        pending_control_llm=pending_control,
-        pending_actions=BitrixPendingActionService(
-            store=store,
-            bitrix=fake_bitrix,
-            audit_log_path=tmp_path / "bitrix_write_audit.jsonl",
+        orchestrator=InternalOrchestrator(
+            manifests,
+            specialists={"bitrix24": specialist},
+            orchestrator_llm=FakeInternalOrchestratorLLM(),
         ),
+        pending_actions=pending_service,
     )
 
     result = anyio_run(processor.process(payload))
 
-    assert result["agent_result_status"] == "executed"
-    assert pending_control.classify_calls[0]["user_text"] == "ну давай, запускай это"
+    assert result["agent_result_status"] == "completed"
     assert fake_bitrix.calls == [("tasks.task.add", {"fields": {"TITLE": "Тестовая задача"}})]
-    assert fake_bitrix.messages[0][1].startswith("Готово")
     assert store.load(key).pending_action is None
-    assert '"status": "executed"' in (tmp_path / "bitrix_write_audit.jsonl").read_text(encoding="utf-8")
 
 
 def test_bitrix_pending_action_cancel_clears_state_without_call(monkeypatch, tmp_path):
-    monkeypatch.setenv("AGENT_DRY_RUN", "false")
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("AGENT_DRY_RUN", "true")
     store = DialogStateStore(tmp_path / "dialog_state.sqlite")
     fake_bitrix = FakeBitrixClient()
     key = make_dialog_key(chat_id=77, dialog_id="chat99", user_id=9)
+    pending_service = BitrixPendingActionService(
+        store=store,
+        bitrix=fake_bitrix,
+        audit_log_path=tmp_path / "bitrix_write_audit.jsonl",
+    )
     store.set_pending(
         key,
         PendingBitrixAction(
@@ -366,25 +385,31 @@ def test_bitrix_pending_action_cancel_clears_state_without_call(monkeypatch, tmp
     )
     payload = _bitrix_v2_message_payload()
     payload["data"]["message"]["text"] = "не надо выполнять"
-
-    pending_control = FakePendingControlLLM("cancel")
+    manifests = load_agent_manifests()
+    specialist = Bitrix24Specialist(
+        manifest_by_id(manifests, "bitrix24"),
+        retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
+        tools=BitrixToolset(client=fake_bitrix, pending_actions=pending_service, dialog_key=key, user_id=9),
+        llm=FakeBitrixLLM(
+            tool_calls=[BitrixLLMToolCall(name="bitrix_api", args={"action": "cancel_pending"})],
+            final_answer="Отменил, создавать не буду.",
+        ),
+    )
     processor = BitrixWebhookProcessor(
         bitrix=fake_bitrix,
-        pending_control_llm=pending_control,
-        pending_actions=BitrixPendingActionService(
-            store=store,
-            bitrix=fake_bitrix,
-            audit_log_path=tmp_path / "bitrix_write_audit.jsonl",
+        orchestrator=InternalOrchestrator(
+            manifests,
+            specialists={"bitrix24": specialist},
+            orchestrator_llm=FakeInternalOrchestratorLLM(),
         ),
+        pending_actions=pending_service,
     )
 
     result = anyio_run(processor.process(payload))
 
-    assert result["agent_result_status"] == "cancelled"
-    assert pending_control.classify_calls[0]["user_text"] == "не надо выполнять"
+    assert result["agent_result_status"] == "completed"
     assert fake_bitrix.calls == []
     assert store.load(key).pending_action is None
-    assert '"status": "cancelled"' in (tmp_path / "bitrix_write_audit.jsonl").read_text(encoding="utf-8")
 
 
 def test_bitrix_pending_action_new_request_goes_to_orchestrator(monkeypatch, tmp_path):
@@ -421,7 +446,6 @@ def test_bitrix_pending_action_new_request_goes_to_orchestrator(monkeypatch, tmp
     processor = BitrixWebhookProcessor(
         bitrix=fake_bitrix,
         orchestrator=orchestrator,
-        pending_control_llm=FakePendingControlLLM("new_request"),
         pending_actions=BitrixPendingActionService(
             store=store,
             bitrix=fake_bitrix,
@@ -517,73 +541,75 @@ def test_create_bitrix_dev_chat_helpers_extract_reference_and_redact_tokens():
 
 
 def test_bitrix_task_create_chat_flow_saves_and_confirms_pending_action(monkeypatch, tmp_path):
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AGENT_DRY_RUN", "true")
+    monkeypatch.setenv("AGENT_WRITE_ALLOWED_USER_IDS", "9")
+    monkeypatch.setenv("BITRIX_OAUTH_REQUIRED_FOR_WRITES", "false")
     store = DialogStateStore(tmp_path / "dialog_state.sqlite")
     fake_bitrix = FakeBitrixClient()
-    processor = BitrixWebhookProcessor(
+    key = make_dialog_key(chat_id=77, dialog_id="chat99", user_id=9)
+    pending_service = BitrixPendingActionService(
+        store=store,
         bitrix=fake_bitrix,
-        bitrix_tools=FakeBitrixTools(),
-        orchestrator_llm=FakeInternalOrchestratorLLM(handoff_to=["bitrix24"]),
-        bitrix_llm=FakeBitrixLLM(
-            tool_calls=[
-                BitrixLLMToolCall(
-                    name="task_create_draft",
-                    args={
-                        "title": "проверить IP-камеру",
-                        "responsible_query": "Иванова",
-                        "deadline_iso": "2026-06-05T19:00:00+03:00",
-                    },
-                )
+        audit_log_path=tmp_path / "bitrix_write_audit.jsonl",
+        dry_run=False,
+    )
+    manifests = load_agent_manifests()
+    bitrix_tools = BitrixToolset(client=fake_bitrix, pending_actions=pending_service, dialog_key=key, user_id=9)
+    specialist = Bitrix24Specialist(
+        manifest_by_id(manifests, "bitrix24"),
+        retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
+        tools=bitrix_tools,
+        llm=FakeBitrixLLM(
+            tool_call_steps=[
+                [BitrixLLMToolCall(name="task_create_draft", args={
+                    "title": "проверить IP-камеру",
+                    "responsible_id": 9,
+                    "deadline_iso": "2026-06-15T19:00:00+03:00",
+                })],
+                [BitrixLLMToolCall(name="bitrix_api", args={"action": "confirm_pending"})],
             ],
-            final_status="needs_human",
-            final_answer="Подготовил черновик задачи, нужно подтверждение.",
-        ),
-        bitrix_retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
-        pending_control_llm=FakePendingControlLLM("confirm"),
-        pending_actions=BitrixPendingActionService(
-            store=store,
-            bitrix=fake_bitrix,
-            audit_log_path=tmp_path / "bitrix_write_audit.jsonl",
+            final_answer="Готово.",
         ),
     )
+    processor = BitrixWebhookProcessor(
+        bitrix=fake_bitrix,
+        orchestrator=InternalOrchestrator(
+            manifests,
+            specialists={"bitrix24": specialist},
+            orchestrator_llm=FakeInternalOrchestratorLLM(handoff_to=["bitrix24"]),
+        ),
+        pending_actions=pending_service,
+    )
     payload = _bitrix_v2_message_payload()
-    payload["data"]["message"]["text"] = "Создай задачу на Иванова проверить IP-камеру завтра"
+    payload["data"]["message"]["text"] = "Создай задачу на себя проверить IP-камеру 15 июня"
 
     draft_result = anyio_run(processor.process(payload))
-    key = make_dialog_key(chat_id=77, dialog_id="chat99", user_id=9)
-    pending = store.load(key).pending_action
+    saved_pending = store.load(key).pending_action
 
     assert draft_result["handled"] is True
     assert draft_result["agent_result_status"] == "needs_human"
     assert draft_result["pending_action_saved"] is True
-    assert pending is not None
-    assert pending.method == "tasks.task.add"
-    fields = pending.params["fields"]
+    assert saved_pending is not None
+    assert saved_pending.method == "tasks.task.add"
+    fields = saved_pending.params["fields"]
     assert fields["TITLE"] == "проверить IP-камеру"
-    assert fields["RESPONSIBLE_ID"] == 15
+    assert fields["RESPONSIBLE_ID"] == 9
     assert fields["CREATED_BY"] == 9
     assert "DEADLINE" in fields
 
-    monkeypatch.setenv("AGENT_DRY_RUN", "false")
-    monkeypatch.setenv("AGENT_WRITE_ALLOWED_USER_IDS", "9")
-    monkeypatch.setenv("BITRIX_OAUTH_REQUIRED_FOR_WRITES", "false")
     payload["data"]["message"]["text"] = "подтверждаю создание"
-
     confirm_result = anyio_run(processor.process(payload))
 
-    assert confirm_result["agent_result_status"] == "executed"
+    assert confirm_result["agent_result_status"] == "completed"
     assert fake_bitrix.calls == [("tasks.task.add", {"fields": fields})]
-    assert fake_bitrix.messages[0][0] == "chat99"
-    assert fake_bitrix.messages[0][1].startswith("Готово")
     assert store.load(key).pending_action is None
 
 
 def test_bitrix_task_closure_pending_confirm_executes_llm_tool_steps(monkeypatch, tmp_path):
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
-    monkeypatch.setenv("AGENT_DRY_RUN", "false")
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("AGENT_DRY_RUN", "true")
     monkeypatch.setenv("BITRIX_OAUTH_REQUIRED_FOR_WRITES", "false")
-    monkeypatch.setenv("QUALITY_CONTROL_SMART_ENABLED", "false")
     store = DialogStateStore(tmp_path / "dialog_state.sqlite")
     fake_bitrix = FakeBitrixClient()
     key = make_dialog_key(chat_id=77, dialog_id="chat99", user_id=9)
@@ -599,66 +625,56 @@ def test_bitrix_task_closure_pending_confirm_executes_llm_tool_steps(monkeypatch
     payload = _bitrix_v2_message_payload()
     payload["data"]["message"]["text"] = "можно закрывать"
 
+    class FakeTaskClosureHandler:
+        def __init__(self):
+            self.calls = []
+
+        async def execute(self, params, *, current_user_id, write_client, actor_client):
+            self.calls.append({"params": params, "user_id": current_user_id})
+            return {"status": "executed", "outcome": "closed", "task": {"id": params.get("task_id")}}
+
+    fake_task_closure_handler = FakeTaskClosureHandler()
+    pending_service = BitrixPendingActionService(
+        store=store,
+        bitrix=fake_bitrix,
+        task_closure_handler=fake_task_closure_handler,
+        audit_log_path=tmp_path / "bitrix_write_audit.jsonl",
+        dry_run=False,
+    )
+    manifests = load_agent_manifests()
+    specialist = Bitrix24Specialist(
+        manifest_by_id(manifests, "bitrix24"),
+        retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
+        tools=BitrixToolset(client=fake_bitrix, pending_actions=pending_service, dialog_key=key, user_id=9),
+        llm=FakeBitrixLLM(
+            tool_calls=[BitrixLLMToolCall(name="bitrix_api", args={"action": "confirm_pending"})],
+            final_answer="Задача закрыта.",
+        ),
+    )
     processor = BitrixWebhookProcessor(
         bitrix=fake_bitrix,
-        pending_control_llm=FakePendingControlLLM("confirm"),
-        pending_actions=BitrixPendingActionService(
-            store=store,
-            bitrix=fake_bitrix,
-            task_closure_llm=FakeTaskClosureLLM(
-                decisions=[
-                    {
-                        "status": "continue",
-                        "answer": "Читаю задачу перед записью.",
-                        "tool_calls": [
-                            {"name": "bitrix_task_get", "args": {"task_id": 8413}},
-                        ],
-                    },
-                    {
-                        "status": "completed",
-                        "outcome": "closed",
-                        "answer": "Готово, закрыл задачу #8413.",
-                        "tool_calls": [
-                            {
-                                "name": "bitrix_task_result_add",
-                                "args": {"task_id": 8413, "use_pending_result_text": True},
-                            },
-                            {"name": "bitrix_task_complete", "args": {"task_id": 8413}},
-                        ],
-                    },
-                ]
-            ),
-            audit_log_path=tmp_path / "bitrix_write_audit.jsonl",
+        orchestrator=InternalOrchestrator(
+            manifests,
+            specialists={"bitrix24": specialist},
+            orchestrator_llm=FakeInternalOrchestratorLLM(),
         ),
+        pending_actions=pending_service,
     )
 
     result = anyio_run(processor.process(payload))
 
-    assert result["agent_result_status"] == "executed"
-    assert fake_bitrix.calls[:2] == [
-        (
-            "tasks.task.result.add",
-            {
-                "taskId": 8413,
-                "fields": {
-                    "text": (
-                        "Камера перезагружена, изображение восстановлено.\n\n"
-                        "[Отправлено через AI-server пользователем Bitrix #9]"
-                    )
-                },
-            },
-        ),
-        ("tasks.task.complete", {"taskId": 8413}),
-    ]
-    assert fake_bitrix.messages[0][1].startswith("Готово, закрыл задачу #8413.")
+    assert result["agent_result_status"] == "completed"
+    assert len(fake_task_closure_handler.calls) == 1
+    assert fake_task_closure_handler.calls[0]["params"]["task_id"] == 8413
+    assert fake_task_closure_handler.calls[0]["user_id"] == 9
     assert store.load(key).pending_action is None
 
 
 def test_bitrix_oauth_service_reads_migrated_sqlite(tmp_path):
     db_path = tmp_path / "bitrix_oauth.sqlite"
-    service = BitrixOAuthService(db_path)
+    service = BitrixOAuthService(db_path=db_path)
     service.ensure_schema()
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=2)
+    expires_at = datetime.now(UTC) + timedelta(hours=2)
     with sqlite3.connect(db_path) as connection:
         connection.execute(
             """
@@ -678,7 +694,7 @@ def test_bitrix_oauth_service_reads_migrated_sqlite(tmp_path):
                 "refresh",
                 "tasks,user",
                 expires_at.isoformat(),
-                datetime.now(timezone.utc).isoformat(),
+                datetime.now(UTC).isoformat(),
                 "test",
             ),
         )
@@ -696,7 +712,7 @@ def test_bitrix_oauth_service_saves_token_from_app_payload(monkeypatch, tmp_path
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("BITRIX_DOMAIN", "example.bitrix24.ru")
     db_path = tmp_path / "bitrix_oauth.sqlite"
-    service = BitrixOAuthService(db_path)
+    service = BitrixOAuthService(db_path=db_path)
 
     result = anyio_run(
         service.save_from_payload(
@@ -727,10 +743,7 @@ def test_bitrix_oauth_token_endpoint_handles_rest_server_endpoint(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("BITRIX_OAUTH_TOKEN_ENDPOINT", "")
 
-    assert (
-        _token_endpoint_from_server("https://oauth.bitrix.info/rest/")
-        == "https://oauth.bitrix.info/oauth/token/"
-    )
+    assert _token_endpoint_from_server("https://oauth.bitrix.info/rest/") == "https://oauth.bitrix.info/oauth/token/"
 
 
 def anyio_run(awaitable):

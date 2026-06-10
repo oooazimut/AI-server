@@ -2,6 +2,7 @@ id: internal_orchestrator
 name: Внутренний оркестратор
 version: 0.1.0
 kind: orchestrator
+audience: employee
 description: Принимает запросы сотрудников, выбирает специалистов, собирает результат и контролирует подтверждения.
 handoff_description: Использовать для входящих внутренних запросов сотрудников из Битрикс24-чата или web-интерфейса.
 entrypoint: backend.ai_server.orchestrators.internal.InternalOrchestrator

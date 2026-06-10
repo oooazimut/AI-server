@@ -23,7 +23,7 @@ def test_technical_footer_shows_model_usage_and_provider_balance_for_allowed_use
             )
         ],
     )
-    service = TechnicalFooterService(deepseek_balance=FakeDeepSeekBalance())
+    service = TechnicalFooterService(balance_registry={"deepseek": FakeDeepSeekBalance()})
 
     async def build_footer():
         return await service.build_for_agent_result(result, user_id=9, channel="bitrix24_chat")
@@ -39,7 +39,7 @@ def test_technical_footer_is_hidden_for_non_allowed_user(monkeypatch):
     monkeypatch.setenv("AI_SERVER_TECH_FOOTER_ENABLED", "true")
     monkeypatch.setenv("AI_SERVER_TECH_FOOTER_ALLOWED_USER_IDS", "1,9")
 
-    service = TechnicalFooterService(deepseek_balance=FakeDeepSeekBalance())
+    service = TechnicalFooterService(balance_registry={"deepseek": FakeDeepSeekBalance()})
     result = AgentResult(status="completed", agent_id="internal_orchestrator", answer="Готово")
 
     async def build_footer():

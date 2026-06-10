@@ -1,48 +1,58 @@
 from __future__ import annotations
 
-from ai_server.agents.bitrix24 import Bitrix24Specialist
-from ai_server.agents.bitrix_llm import BitrixAgentLLM
-from ai_server.agents.logistics import LogisticsSpecialist
-from ai_server.agents.logistics_llm import LogisticsAgentLLM
-from ai_server.agents.pto import PtoSpecialist
-from ai_server.agents.pto_llm import PtoAgentLLM
+import asyncio
+
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask
 from ai_server.orchestrators.internal_llm import InternalLLMRouter, InternalOrchestratorLLM
-from ai_server.retrieval import HybridKnowledgeRetriever
-from ai_server.tools.bitrix import BitrixToolset
-from ai_server.tools.document_access import DocumentToolset
-from ai_server.tools.vehicle_usage import VehicleUsageToolset
+from ai_server.specialists import Specialist, build_specialist_registry
 
 
 class InternalOrchestrator:
     def __init__(
         self,
         manifests: list[AgentManifest],
+        specialists: dict[str, Specialist] | None = None,
         *,
-        bitrix_retriever: HybridKnowledgeRetriever | None = None,
-        bitrix_tools: BitrixToolset | None = None,
-        bitrix_llm: BitrixAgentLLM | None = None,
-        pto_retriever: HybridKnowledgeRetriever | None = None,
-        document_tools: DocumentToolset | None = None,
-        pto_llm: PtoAgentLLM | None = None,
-        logistics_retriever: HybridKnowledgeRetriever | None = None,
-        vehicle_usage_tools: VehicleUsageToolset | None = None,
-        logistics_llm: LogisticsAgentLLM | None = None,
         orchestrator_llm: InternalOrchestratorLLM | None = None,
     ) -> None:
         self.manifests = manifests
-        self.bitrix_retriever = bitrix_retriever
-        self.bitrix_tools = bitrix_tools
-        self.bitrix_llm = bitrix_llm
-        self.pto_retriever = pto_retriever
-        self.document_tools = document_tools
-        self.pto_llm = pto_llm
-        self.logistics_retriever = logistics_retriever
-        self.vehicle_usage_tools = vehicle_usage_tools
-        self.logistics_llm = logistics_llm
+        self.specialists = specialists or build_specialist_registry(manifests)
         self.orchestrator_llm = orchestrator_llm or InternalLLMRouter()
 
     async def handle(self, task: AgentTask) -> AgentResult:
+        if task.context.get("pending_action"):
+            pending_data = task.context["pending_action"]
+            default_specialist_id = next(
+                (m.id for m in self.manifests if m.kind == "specialist"), ""
+            )
+            specialist_id = (
+                pending_data.get("specialist_id") or default_specialist_id
+                if isinstance(pending_data, dict)
+                else default_specialist_id
+            )
+            specialist = self.specialists.get(specialist_id)
+            if specialist is not None:
+                specialist_result = await specialist.handle(task)
+                return AgentResult(
+                    status=specialist_result.status,
+                    agent_id="internal_orchestrator",
+                    answer=specialist_result.answer,
+                    artifacts=specialist_result.artifacts,
+                    actions_taken=[
+                        ActionRecord(
+                            name="orchestrator_pending_route",
+                            status="completed",
+                            details={"handoff_to": specialist_id, "reason": "pending_action"},
+                        ),
+                        *specialist_result.actions_taken,
+                    ],
+                    actions_requiring_approval=specialist_result.actions_requiring_approval,
+                    model_usage=specialist_result.model_usage,
+                    handoff_to=[specialist_id],
+                    confidence=specialist_result.confidence,
+                    logs=specialist_result.logs,
+                )
+
         try:
             route_result = await self.orchestrator_llm.route(task=task, manifests=self.manifests)
         except Exception as exc:
@@ -66,102 +76,113 @@ class InternalOrchestrator:
             status=decision.status,
             details={"handoff_to": decision.handoff_to, "confidence": decision.confidence},
         )
-        bitrix = _manifest_by_id(self.manifests, "bitrix24") if "bitrix24" in decision.handoff_to else None
-        if bitrix is not None:
-            specialist_result = await Bitrix24Specialist(
-                bitrix,
-                retriever=self.bitrix_retriever,
-                tools=self.bitrix_tools,
-                llm=self.bitrix_llm,
-            ).handle(task)
+
+        targets = [
+            (agent_id, specialist)
+            for agent_id in decision.handoff_to
+            if (specialist := self.specialists.get(agent_id)) is not None
+        ]
+
+        if not targets:
             return AgentResult(
-                status=specialist_result.status,
+                status=decision.status,
                 agent_id="internal_orchestrator",
-                answer=specialist_result.answer,
-                artifacts=specialist_result.artifacts,
-                actions_taken=[
-                    route_action,
-                    ActionRecord(
-                        name="delegate_to_specialist",
-                        status="completed",
-                        details={"specialist": "bitrix24"},
-                    ),
-                    *specialist_result.actions_taken,
-                ],
-                actions_requiring_approval=specialist_result.actions_requiring_approval,
-                model_usage=[route_result.model_usage, *specialist_result.model_usage],
-                handoff_to=["bitrix24"],
-                confidence=specialist_result.confidence,
-                logs=specialist_result.logs,
+                answer=decision.answer,
+                actions_taken=[route_action],
+                model_usage=[route_result.model_usage],
+                confidence=decision.confidence,
             )
 
-        pto = _manifest_by_id(self.manifests, "pto") if "pto" in decision.handoff_to else None
-        if pto is not None:
-            specialist_result = await PtoSpecialist(
-                pto,
-                retriever=self.pto_retriever,
-                tools=self.document_tools,
-                llm=self.pto_llm,
-            ).handle(task)
+        raw_results = await asyncio.gather(
+            *[specialist.handle(task) for _, specialist in targets],
+            return_exceptions=True,
+        )
+
+        good: list[tuple[str, AgentResult]] = []
+        delegate_actions: list[ActionRecord] = []
+        all_model_usage = [route_result.model_usage]
+
+        for (agent_id, _), result in zip(targets, raw_results):
+            if isinstance(result, Exception):
+                delegate_actions.append(ActionRecord(
+                    name="delegate_to_specialist",
+                    status="error",
+                    details={"specialist": agent_id, "error": f"{type(result).__name__}: {result}"},
+                ))
+            else:
+                delegate_actions.append(ActionRecord(
+                    name="delegate_to_specialist",
+                    status="completed",
+                    details={"specialist": agent_id},
+                ))
+                good.append((agent_id, result))
+                all_model_usage.extend(result.model_usage)
+
+        if not good:
             return AgentResult(
-                status=specialist_result.status,
+                status="failed",
                 agent_id="internal_orchestrator",
-                answer=specialist_result.answer,
-                artifacts=specialist_result.artifacts,
-                actions_taken=[
-                    route_action,
-                    ActionRecord(
-                        name="delegate_to_specialist",
-                        status="completed",
-                        details={"specialist": "pto"},
-                    ),
-                    *specialist_result.actions_taken,
-                ],
-                actions_requiring_approval=specialist_result.actions_requiring_approval,
-                model_usage=[route_result.model_usage, *specialist_result.model_usage],
-                handoff_to=["pto"],
-                confidence=specialist_result.confidence,
-                logs=specialist_result.logs,
+                answer="Специалисты не смогли обработать запрос.",
+                actions_taken=[route_action, *delegate_actions],
+                model_usage=all_model_usage,
+                confidence=0.0,
             )
 
-        logistics = _manifest_by_id(self.manifests, "logistics") if "logistics" in decision.handoff_to else None
-        if logistics is not None:
-            specialist_result = await LogisticsSpecialist(
-                logistics,
-                retriever=self.logistics_retriever,
-                tools=self.vehicle_usage_tools,
-                llm=self.logistics_llm,
-            ).handle(task)
+        all_actions = [route_action, *delegate_actions, *[a for _, sr in good for a in sr.actions_taken]]
+        all_approvals = [a for _, sr in good for a in sr.actions_requiring_approval]
+        all_artifacts = [art for _, sr in good for art in sr.artifacts]
+        all_logs = [log for _, sr in good for log in sr.logs]
+        agent_ids = [aid for aid, _ in good]
+
+        if len(good) == 1:
+            agent_id, sr = good[0]
             return AgentResult(
-                status=specialist_result.status,
+                status=sr.status,
                 agent_id="internal_orchestrator",
-                answer=specialist_result.answer,
-                artifacts=specialist_result.artifacts,
-                actions_taken=[
-                    route_action,
-                    ActionRecord(
-                        name="delegate_to_specialist",
-                        status="completed",
-                        details={"specialist": "logistics"},
-                    ),
-                    *specialist_result.actions_taken,
-                ],
-                actions_requiring_approval=specialist_result.actions_requiring_approval,
-                model_usage=[route_result.model_usage, *specialist_result.model_usage],
-                handoff_to=["logistics"],
-                confidence=specialist_result.confidence,
-                logs=specialist_result.logs,
+                answer=sr.answer,
+                artifacts=sr.artifacts,
+                actions_taken=all_actions,
+                actions_requiring_approval=all_approvals,
+                model_usage=all_model_usage,
+                handoff_to=[agent_id],
+                confidence=sr.confidence,
+                logs=sr.logs,
             )
 
+        # Multiple specialists — synthesize answers into one response
+        try:
+            synthesis = await self.orchestrator_llm.synthesize(task=task, specialist_results=good)
+            all_model_usage.append(synthesis.model_usage)
+            all_actions.append(ActionRecord(
+                name="orchestrator_synthesize",
+                status="completed",
+                details={"specialists": agent_ids},
+            ))
+            synthesized_answer = synthesis.answer
+        except Exception as exc:
+            all_actions.append(ActionRecord(
+                name="orchestrator_synthesize",
+                status="error",
+                details={"error": f"{type(exc).__name__}: {exc}"},
+            ))
+            # Fall back to first specialist's answer
+            synthesized_answer = good[0][1].answer
+
+        status = "needs_human" if all_approvals else _merge_status([sr.status for _, sr in good])
         return AgentResult(
-            status=decision.status,
+            status=status,
             agent_id="internal_orchestrator",
-            answer=decision.answer,
-            actions_taken=[route_action],
-            model_usage=[route_result.model_usage],
-            confidence=decision.confidence,
+            answer=synthesized_answer,
+            artifacts=all_artifacts,
+            actions_taken=all_actions,
+            actions_requiring_approval=all_approvals,
+            model_usage=all_model_usage,
+            handoff_to=agent_ids,
+            confidence=min(sr.confidence for _, sr in good),
+            logs=all_logs,
         )
 
 
-def _manifest_by_id(manifests: list[AgentManifest], agent_id: str) -> AgentManifest | None:
-    return next((manifest for manifest in manifests if manifest.id == agent_id), None)
+def _merge_status(statuses: list[str]) -> str:
+    priority = {"failed": 0, "needs_human": 1, "needs_clarification": 2, "completed": 3}
+    return min(statuses, key=lambda s: priority.get(s, 2))

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from ai_server.workers.bitrix.reconciler import reconcile_once
 from ai_server.workers.bitrix.supervisor import run_task_supervisor_once
 from ai_server.workers.bitrix.webhook_event_queue import WebhookEventQueue

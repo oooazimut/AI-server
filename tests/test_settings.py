@@ -5,9 +5,7 @@ def test_settings_loads_layered_env_files(monkeypatch, tmp_path):
     first = tmp_path / "first.env"
     second = tmp_path / "second.env"
     first.write_text(
-        "AI_SERVER_LLM_PROVIDER=from-file\n"
-        "AI_SERVER_LLM_MODEL=first-model\n"
-        "AI_SERVER_LLM_API_KEY=file-secret\n",
+        "AI_SERVER_LLM_PROVIDER=from-file\nAI_SERVER_LLM_MODEL=first-model\nAI_SERVER_LLM_API_KEY=file-secret\n",
         encoding="utf-8",
     )
     second.write_text("AI_SERVER_LLM_MODEL=second-model\n", encoding="utf-8")

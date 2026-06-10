@@ -5,7 +5,8 @@ from typing import Any
 
 import httpx
 
-from ai_server.settings import get_settings
+from ai_server.settings import Settings, get_settings
+from ai_server.utils import optional_int
 
 
 class BitrixApiError(RuntimeError):
@@ -25,18 +26,17 @@ class BitrixClient:
         self,
         base_url: str | None = None,
         *,
+        settings: Settings | None = None,
         access_token: str | None = None,
         client_endpoint: str | None = None,
     ) -> None:
-        settings = get_settings()
+        _settings = settings or get_settings()
         self.access_token = access_token or ""
         resolved_base_url = client_endpoint if self.access_token else base_url
-        self.base_url = (resolved_base_url or settings.bitrix_rest_webhook_url).rstrip("/") + "/"
+        self.base_url = (resolved_base_url or _settings.bitrix_rest_webhook_url).rstrip("/") + "/"
         self.api_base_url = _to_rest_api_base_url(self.base_url)
         self.projects_base_url = (
-            self.base_url
-            if self.access_token
-            else (settings.bitrix_projects_webhook_url or self.base_url)
+            self.base_url if self.access_token else (_settings.bitrix_projects_webhook_url or self.base_url)
         ).rstrip("/") + "/"
         self.timeout = httpx.Timeout(30.0)
 
@@ -492,26 +492,28 @@ class BitrixClient:
         destination.parent.mkdir(parents=True, exist_ok=True)
         bytes_read = 0
         try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(120.0),
-                follow_redirects=True,
-                trust_env=False,
-            ) as client:
-                async with client.stream("GET", url) as response:
-                    if response.status_code >= 400:
-                        raise BitrixApiError("download_file", f"HTTP_{response.status_code}")
-                    with destination.open("wb") as handle:
-                        async for chunk in response.aiter_bytes():
-                            if not chunk:
-                                continue
-                            bytes_read += len(chunk)
-                            if bytes_read > max_bytes:
-                                raise BitrixApiError(
-                                    "download_file",
-                                    "FILE_TOO_LARGE",
-                                    f"File exceeds {max_bytes} bytes",
-                                )
-                            handle.write(chunk)
+            async with (
+                httpx.AsyncClient(
+                    timeout=httpx.Timeout(120.0),
+                    follow_redirects=True,
+                    trust_env=False,
+                ) as client,
+                client.stream("GET", url) as response,
+            ):
+                if response.status_code >= 400:
+                    raise BitrixApiError("download_file", f"HTTP_{response.status_code}")
+                with destination.open("wb") as handle:
+                    async for chunk in response.aiter_bytes():
+                        if not chunk:
+                            continue
+                        bytes_read += len(chunk)
+                        if bytes_read > max_bytes:
+                            raise BitrixApiError(
+                                "download_file",
+                                "FILE_TOO_LARGE",
+                                f"File exceeds {max_bytes} bytes",
+                            )
+                        handle.write(chunk)
         except Exception:
             if destination.exists():
                 destination.unlink(missing_ok=True)
@@ -593,7 +595,7 @@ def _extract_workgroups(result: Any) -> list[dict[str, Any]]:
 
 def _extract_user(result: Any, *, user_id: int) -> dict[str, Any] | None:
     if isinstance(result, dict):
-        if _optional_int(result.get("ID") or result.get("id")) == user_id:
+        if optional_int(result.get("ID") or result.get("id")) == user_id:
             return result
         for key in ("users", "items", "result"):
             items = result.get(key)
@@ -603,15 +605,8 @@ def _extract_user(result: Any, *, user_id: int) -> dict[str, Any] | None:
                     return user
     if isinstance(result, list):
         for item in result:
-            if isinstance(item, dict) and _optional_int(item.get("ID") or item.get("id")) == user_id:
+            if isinstance(item, dict) and optional_int(item.get("ID") or item.get("id")) == user_id:
                 return item
     return None
 
 
-def _optional_int(value: object) -> int | None:
-    try:
-        if value in (None, ""):
-            return None
-        return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None

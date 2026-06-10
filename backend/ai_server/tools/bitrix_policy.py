@@ -1,6 +1,5 @@
 from ai_server.models import PolicyDecision
 
-
 READ_METHODS = {
     "app.info",
     "profile",

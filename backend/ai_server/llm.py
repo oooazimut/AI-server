@@ -7,7 +7,8 @@ from typing import Any, Protocol
 import httpx
 
 from ai_server.models import ModelUsageRecord
-from ai_server.settings import get_settings
+from ai_server.settings import Settings, get_settings
+from ai_server.utils import optional_int
 
 
 class LLMError(RuntimeError):
@@ -21,7 +22,7 @@ class LLMClient(Protocol):
         agent_id: str,
         messages: list[dict[str, str]],
         json_mode: bool = False,
-    ) -> "LLMCompletion":
+    ) -> LLMCompletion:
         pass
 
 
@@ -43,8 +44,8 @@ class LLMCompletion:
 
 
 class OpenAICompatibleLLMClient:
-    def __init__(self) -> None:
-        self.settings = get_settings()
+    def __init__(self, settings: Settings | None = None) -> None:
+        self._settings = settings or get_settings()
         self.timeout = httpx.Timeout(60.0)
 
     async def complete(
@@ -54,7 +55,7 @@ class OpenAICompatibleLLMClient:
         messages: list[dict[str, str]],
         json_mode: bool = False,
     ) -> LLMCompletion:
-        settings = get_settings()
+        settings = self._settings
         if not settings.llm_configured:
             raise LLMError("LLM is not configured")
         url = _chat_completions_url(settings.llm_provider, settings.llm_base_url)
@@ -85,8 +86,12 @@ class OpenAICompatibleLLMClient:
             raise LLMError(f"LLM HTTP error {response.status_code}: {_response_text(response)}")
 
         content = _extract_content(data)
-        usage = _model_usage(agent_id=agent_id, data=data)
+        usage = _model_usage(agent_id=agent_id, data=data, settings=settings)
         return LLMCompletion(content=content, model_usage=usage, raw=data)
+
+
+def build_llm_client(settings: Settings | None = None) -> OpenAICompatibleLLMClient:
+    return OpenAICompatibleLLMClient(settings or get_settings())
 
 
 def _chat_completions_url(provider: str, base_url: str) -> str:
@@ -114,16 +119,15 @@ def _extract_content(data: dict[str, Any]) -> str:
     return content
 
 
-def _model_usage(*, agent_id: str, data: dict[str, Any]) -> ModelUsageRecord:
-    settings = get_settings()
+def _model_usage(*, agent_id: str, data: dict[str, Any], settings: Settings) -> ModelUsageRecord:
     usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
     return ModelUsageRecord(
         agent_id=agent_id,
         provider=settings.llm_provider,
         model=str(data.get("model") or settings.llm_model),
         status="used",
-        input_tokens=_optional_int(usage.get("prompt_tokens")),
-        output_tokens=_optional_int(usage.get("completion_tokens")),
+        input_tokens=optional_int(usage.get("prompt_tokens")),
+        output_tokens=optional_int(usage.get("completion_tokens")),
     )
 
 
@@ -157,10 +161,3 @@ def _format_provider_error(error: object) -> str:
     return f"LLM provider error: {error}"
 
 
-def _optional_int(value: object) -> int | None:
-    try:
-        if value in (None, ""):
-            return None
-        return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None

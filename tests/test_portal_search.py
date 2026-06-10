@@ -224,9 +224,7 @@ def test_search_webhook_indexer_upserts_and_deletes_file(monkeypatch, tmp_path):
     index = PortalSearchIndex(tmp_path / "search_index.sqlite")
     status: dict[str, object] = {}
 
-    job, prepared = prepare_search_webhook_job(
-        {"event": "ONDISKFILEUPDATE", "data": {"FIELDS_AFTER": {"ID": "777"}}}
-    )
+    job, prepared = prepare_search_webhook_job({"event": "ONDISKFILEUPDATE", "data": {"FIELDS_AFTER": {"ID": "777"}}})
 
     assert job is not None
     assert prepared["handled"] is True
@@ -348,7 +346,7 @@ class FakePortalBitrix:
         return f"fake://disk/{file_id}"
 
     async def download_file_from_url(self, url: str, destination: Path, *, max_bytes: int):
-        data = "Содержимое файла: секретное слово Альфа и данные склада.".encode("utf-8")
+        data = "Содержимое файла: секретное слово Альфа и данные склада.".encode()
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(data)
         return len(data)

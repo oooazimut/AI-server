@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 import json
-from pathlib import Path
 import re
 import sqlite3
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
 
@@ -14,9 +14,7 @@ from ai_server.document_text import extract_text_from_file
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.runtime import runtime_paths
 from ai_server.settings import get_settings
-
-
-MOSCOW_TZ = timezone(timedelta(hours=3))
+from ai_server.utils import MOSCOW_TZ
 CONTENT_INDEX_VERSION = "2026-05-07-doc-v3"
 CONTENT_TERMINAL_STATUSES = {"empty", "too_large", "failed", "no_download_url"}
 
@@ -40,7 +38,7 @@ class PortalSyncStats:
     task_attachments: int = 0
     stale_deleted: int = 0
     prune_skipped: list[str] | None = None
-    content: "PortalContentSyncStats | None" = None
+    content: PortalContentSyncStats | None = None
     errors: list[str] | None = None
 
     @property
@@ -155,7 +153,9 @@ class PortalSearchIndex:
             )
             self._ensure_column(connection, "portal_search_items", "last_seen_at", "TEXT")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_portal_search_type ON portal_search_items(entity_type)")
-            connection.execute("CREATE INDEX IF NOT EXISTS idx_portal_search_indexed ON portal_search_items(indexed_at)")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_portal_search_indexed ON portal_search_items(indexed_at)"
+            )
             connection.execute("CREATE INDEX IF NOT EXISTS idx_portal_search_seen ON portal_search_items(last_seen_at)")
 
     def upsert_item(
@@ -176,11 +176,15 @@ class PortalSearchIndex:
         normalized_body = _clean_text(body)
         normalized_metadata = dict(metadata or {})
         existing = self._get_existing_item(entity_type=entity_type, entity_id=entity_id)
-        if preserve_content and existing and _should_preserve_content(
-            existing_metadata=existing["metadata"],
-            new_metadata=normalized_metadata,
-            existing_source_updated_at=existing["source_updated_at"],
-            new_source_updated_at=source_updated_at,
+        if (
+            preserve_content
+            and existing
+            and _should_preserve_content(
+                existing_metadata=existing["metadata"],
+                new_metadata=normalized_metadata,
+                existing_source_updated_at=existing["source_updated_at"],
+                new_source_updated_at=source_updated_at,
+            )
         ):
             normalized_metadata = _merge_content_metadata(
                 base=normalized_metadata,
@@ -190,9 +194,7 @@ class PortalSearchIndex:
             if existing_content:
                 normalized_body = _body_with_content(normalized_body, existing_content)
 
-        search_text = _normalize_search_text(
-            " ".join([entity_type, str(entity_id), normalized_title, normalized_body])
-        )
+        search_text = _normalize_search_text(" ".join([entity_type, str(entity_id), normalized_title, normalized_body]))
         with self._connect() as connection:
             connection.execute(
                 """
@@ -290,9 +292,7 @@ class PortalSearchIndex:
 
         sql = (
             "SELECT entity_type, entity_id, title, body, url, metadata_json, search_text "
-            "FROM portal_search_items WHERE "
-            + " AND ".join(where)
-            + " LIMIT 500"
+            "FROM portal_search_items WHERE " + " AND ".join(where) + " LIMIT 500"
         )
         with self._connect() as connection:
             rows = connection.execute(sql, params).fetchall()
@@ -470,9 +470,7 @@ class PortalSearchIndex:
             ).fetchone()
             if not row:
                 return
-            search_text = _normalize_search_text(
-                " ".join([entity_type, str(entity_id), row["title"], normalized_body])
-            )
+            search_text = _normalize_search_text(" ".join([entity_type, str(entity_id), row["title"], normalized_body]))
             connection.execute(
                 """
                 UPDATE portal_search_items
@@ -564,10 +562,7 @@ class PortalSearchIndex:
         column_name: str,
         column_type: str,
     ) -> None:
-        columns = {
-            str(row["name"])
-            for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
-        }
+        columns = {str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()}
         if column_name not in columns:
             connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
 
@@ -706,10 +701,13 @@ async def sync_portal_content_index(
             continue
         if status == "indexed" and (content_version == CONTENT_INDEX_VERSION or not extensions):
             continue
-        if (
-            content_version == CONTENT_INDEX_VERSION
-            and status in {"unsupported", "too_large", "empty", "failed", "no_download_url"}
-        ):
+        if content_version == CONTENT_INDEX_VERSION and status in {
+            "unsupported",
+            "too_large",
+            "empty",
+            "failed",
+            "no_download_url",
+        }:
             continue
 
         stats.candidates += 1
@@ -880,15 +878,9 @@ async def sync_portal_content_item(
             metadata=metadata,
         )
         stats.failed += 1
-        stats.errors = [
-            f"{item.entity_type} #{item.entity_id} {item.title}: {type(exc).__name__}"
-        ]
+        stats.errors = [f"{item.entity_type} #{item.entity_id} {item.title}: {type(exc).__name__}"]
     finally:
-        if (
-            downloaded_for_indexing
-            and target_path is not None
-            and not settings.search_content_keep_local_files
-        ):
+        if downloaded_for_indexing and target_path is not None and not settings.search_content_keep_local_files:
             delete_portal_file_cache_path(target_path)
 
     return stats
@@ -1329,8 +1321,7 @@ async def _sync_disk(bitrix: BitrixClient, index: PortalSearchIndex) -> dict[str
         "storages": len(storages),
         "items": indexed_items,
         "complete": (
-            len(storages) < settings.search_index_max_storages
-            and indexed_items < settings.search_index_max_disk_items
+            len(storages) < settings.search_index_max_storages and indexed_items < settings.search_index_max_disk_items
         ),
     }
 

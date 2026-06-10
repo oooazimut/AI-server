@@ -1,49 +1,76 @@
 from __future__ import annotations
 
 import logging
+import re
+from dataclasses import asdict
 from typing import Any
 from uuid import uuid4
 
+_MARKETPLACE_PATH_RE = re.compile(r"(/marketplace/view/[A-Za-z0-9._-]+/?)")
+
+from ai_server.agents.bitrix_llm import BitrixAgentLLM
+from ai_server.agents.bitrix_task_closure import TaskClosureService
 from ai_server.attachments import AttachmentService, StoredAttachment
-from ai_server.learning import LearningEventRecorder
+from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.dialog_state import (
     BitrixPendingActionService,
     DialogStateStore,
-    PendingActionResult,
     PendingBitrixAction,
     make_dialog_key,
 )
-from ai_server.agents.bitrix_llm import BitrixAgentLLM
-from ai_server.agents.pending_control_llm import PendingControlLLM, PendingControlLLMService
-from ai_server.orchestrators.internal_llm import InternalOrchestratorLLM
-from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.events import MESSAGE_EVENTS, parse_incoming_message, payload_event_type
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
 from ai_server.integrations.bitrix.portal_search import PortalSearchIndex
-from ai_server.models import ActionRecord, AgentTask, UserContext
+from ai_server.learning import LearningEventRecorder
+from ai_server.models import ActionRecord, AgentManifest, AgentTask, UserContext
 from ai_server.orchestrators.internal import InternalOrchestrator
+from ai_server.orchestrators.internal_llm import InternalOrchestratorLLM
 from ai_server.registry import load_agent_manifests
 from ai_server.retrieval import HybridKnowledgeRetriever
-from ai_server.settings import get_settings
+from ai_server.settings import Settings, get_settings
+from ai_server.specialists import build_specialist_registry
 from ai_server.technical_footer import TechnicalFooterService, append_footer
 from ai_server.tools.bitrix import BitrixToolset
 from ai_server.tools.document_access import DocumentToolset
 from ai_server.tools.vehicle_usage import VehicleUsageToolset
 from ai_server.transcription import TranscriptionResult, build_transcriber
+from ai_server.workers.bitrix.quality_control import handle_quality_control_webhook_event
 from ai_server.workers.bitrix.search_webhook_indexer import (
     prepare_search_webhook_job,
     process_search_webhook_job,
 )
-from ai_server.workers.bitrix.quality_control import handle_quality_control_webhook_event
-
 
 logger = logging.getLogger(__name__)
+
+
+class _BitrixTaskClosureHandler:
+    def __init__(self, portal_search: PortalSearchIndex, llm: Any | None = None) -> None:
+        self._portal_search = portal_search
+        self._llm = llm
+
+    async def execute(
+        self,
+        params: dict[str, Any],
+        *,
+        current_user_id: int,
+        write_client: BitrixClient,
+        actor_client: BitrixClient,
+    ) -> dict[str, Any]:
+        service = TaskClosureService(
+            write_client,
+            self._portal_search,
+            actor_bitrix=actor_client,
+            llm=self._llm,
+        )
+        return await service.execute(params, current_user_id=current_user_id)
 
 
 class BitrixWebhookProcessor:
     def __init__(
         self,
         *,
+        settings: Settings | None = None,
+        manifests: list[AgentManifest] | None = None,
         bitrix: BitrixClient | None = None,
         portal_search: PortalSearchIndex | None = None,
         bitrix_oauth: BitrixOAuthService | None = None,
@@ -54,14 +81,14 @@ class BitrixWebhookProcessor:
         bitrix_tools: BitrixToolset | None = None,
         bitrix_retriever: HybridKnowledgeRetriever | None = None,
         bitrix_llm: BitrixAgentLLM | None = None,
-        pending_control_llm: PendingControlLLM | None = None,
         orchestrator_llm: InternalOrchestratorLLM | None = None,
         technical_footer: TechnicalFooterService | None = None,
         attachment_service: AttachmentService | None = None,
         transcriber: Any | None = None,
         learning_recorder: LearningEventRecorder | None = None,
     ) -> None:
-        settings = get_settings()
+        self._settings = settings or get_settings()
+        self._manifests = manifests or load_agent_manifests()
         self.bitrix = bitrix or BitrixClient()
         self.portal_search = portal_search or PortalSearchIndex()
         self.bitrix_oauth = bitrix_oauth
@@ -71,17 +98,18 @@ class BitrixWebhookProcessor:
         self.bitrix_tools = bitrix_tools
         self.bitrix_retriever = bitrix_retriever
         self.bitrix_llm = bitrix_llm
-        self.pending_control_llm = pending_control_llm or PendingControlLLMService()
         self.orchestrator_llm = orchestrator_llm
         self.technical_footer = technical_footer or TechnicalFooterService()
         self.attachment_service = attachment_service or AttachmentService(self.bitrix)
         self.transcriber = transcriber or build_transcriber()
         self.learning_recorder = learning_recorder
         self.pending_actions = pending_actions or BitrixPendingActionService(
-            store=DialogStateStore(settings.dialog_state_path),
+            store=DialogStateStore(self._settings.dialog_state_path),
             bitrix=self.bitrix,
             bitrix_oauth=bitrix_oauth,
-            audit_log_path=settings.bitrix_write_audit_log_path,
+            task_closure_handler=_BitrixTaskClosureHandler(self.portal_search),
+            audit_log_path=self._settings.bitrix_write_audit_log_path,
+            dry_run=self._settings.agent_dry_run,
         )
 
     async def process(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -114,75 +142,47 @@ class BitrixWebhookProcessor:
         incoming = parse_incoming_message(payload)
         attachment_context = await self._prepare_attachments(incoming)
         if attachment_context["transcription_text"]:
-            incoming = incoming.model_copy(update={"text": _merge_text_and_transcription(incoming.text, attachment_context["transcription_text"])})
-        settings = get_settings()
+            incoming = incoming.model_copy(
+                update={"text": _merge_text_and_transcription(incoming.text, attachment_context["transcription_text"])}
+            )
+        settings = self._settings
         dialog_key = make_dialog_key(
             chat_id=incoming.chat_id,
             dialog_id=incoming.dialog_id,
             user_id=incoming.user_id,
         )
-        direct_result = await self._maybe_handle_pending_control(dialog_key, incoming.text, user_id=incoming.user_id)
-        if direct_result:
-            footer = await self.technical_footer.build_for_pending_action(
-                user_id=incoming.user_id,
-                channel="bitrix24_chat",
-                status=direct_result.status,
-                model_usage=direct_result.data.get("model_usage"),
-            )
-            reply_sent, send_error = await self._send_reply(
-                incoming.dialog_id,
-                append_footer(direct_result.message, footer),
-                bot_id=incoming.bot_id or settings.bitrix_bot_id,
-            )
-            learning_event = self._record_pending_result(
-                dialog_key,
-                incoming.text,
-                direct_result,
-                metadata={
-                    "bitrix_event_type": incoming.event_type,
-                    "message_id": incoming.message_id,
-                    "bot_id": incoming.bot_id,
-                    "reply_sent": reply_sent,
-                    "send_error": send_error,
-                },
-                user_id=incoming.user_id,
-            )
-            return {
-                "handled": True,
-                "event": event_type,
-                "agent_result_status": direct_result.status,
-                "reply_sent": reply_sent,
-                "send_error": send_error,
-                "handoff_to": ["bitrix24"],
-                "actions": [_pending_result_action(direct_result)],
-                "approval_actions": [],
-                "dialog_key": dialog_key,
-                "learning_event": learning_event,
-            }
+        dialog_state = self.pending_actions.store.load(dialog_key)
+        pending_action = dialog_state.pending_action
+        recent_turns = dialog_state.turns[-8:]
 
+        manifests = self._manifests
         orchestrator = self.orchestrator or InternalOrchestrator(
-            load_agent_manifests(),
-            bitrix_retriever=self.bitrix_retriever,
-            bitrix_llm=self.bitrix_llm,
+            manifests,
+            specialists=build_specialist_registry(
+                manifests,
+                audience="employee",
+                bitrix_retriever=self.bitrix_retriever,
+                bitrix_llm=self.bitrix_llm,
+                bitrix_tools=self.bitrix_tools
+                or BitrixToolset(
+                    client=self.bitrix,
+                    portal_search=self.portal_search,
+                    pending_actions=self.pending_actions,
+                    dialog_key=dialog_key,
+                    user_id=incoming.user_id,
+                ),
+                document_tools=DocumentToolset(
+                    client=self.bitrix,
+                    portal_search=self.portal_search,
+                    user_id=incoming.user_id,
+                ),
+                vehicle_usage_tools=VehicleUsageToolset(
+                    client=self.bitrix,
+                    user_id=incoming.user_id,
+                    dialog_id=incoming.dialog_id,
+                ),
+            ),
             orchestrator_llm=self.orchestrator_llm,
-            bitrix_tools=self.bitrix_tools
-            or BitrixToolset(
-                client=self.bitrix,
-                portal_search=self.portal_search,
-                pending_actions=self.pending_actions,
-                dialog_key=dialog_key,
-                user_id=incoming.user_id,
-            ),
-            document_tools=DocumentToolset(
-                client=self.bitrix,
-                portal_search=self.portal_search,
-                user_id=incoming.user_id,
-            ),
-            vehicle_usage_tools=VehicleUsageToolset(
-                client=self.bitrix,
-                user_id=incoming.user_id,
-                dialog_id=incoming.dialog_id,
-            ),
         )
         task = AgentTask(
             task_id=str(uuid4()),
@@ -206,9 +206,15 @@ class BitrixWebhookProcessor:
                 "bitrix_event_type": incoming.event_type,
                 "transcriptions": attachment_context["transcriptions"],
                 "attachment_errors": attachment_context["errors"],
+                "dialog_key": dialog_key,
+                "pending_action": asdict(pending_action) if pending_action is not None else None,
+                "dialog_history": recent_turns,
             },
         )
         result = await orchestrator.handle(task)
+
+        if incoming.text and result.answer:
+            self.pending_actions.append_turn(dialog_key, incoming.text, result.answer)
 
         pending_action = self._save_first_pending_action(
             dialog_key,
@@ -283,67 +289,6 @@ class BitrixWebhookProcessor:
             "errors": errors,
         }
 
-    async def _maybe_handle_pending_control(
-        self,
-        dialog_key: str,
-        text: str,
-        *,
-        user_id: int | None,
-    ) -> PendingActionResult | None:
-        pending = self.pending_actions.pending_for(dialog_key)
-        if not pending:
-            return None
-
-        try:
-            control_result = await self.pending_control_llm.classify(
-                dialog_key=dialog_key,
-                user_id=user_id,
-                user_text=text,
-                pending_action=pending,
-            )
-        except Exception as exc:
-            return PendingActionResult(
-                status="needs_clarification",
-                message=(
-                    "Не смог уверенно понять, подтверждаете вы ожидающее действие или отменяете его. "
-                    f"Ожидающее действие: {pending.summary}. Подтверждаем или отменяем?"
-                ),
-                action=pending,
-                data={"classification_error": f"{type(exc).__name__}: {exc}"},
-            )
-
-        decision = control_result.decision.decision
-        if decision == "new_request":
-            return None
-        if decision == "cancel":
-            return self.pending_actions.cancel(dialog_key)
-        if decision != "confirm":
-            return PendingActionResult(
-                status="needs_clarification",
-                message=(
-                    control_result.decision.answer
-                    or f"У меня есть ожидающее действие: {pending.summary}. Подтверждаем выполнение или отменяем?"
-                ),
-                action=pending,
-                data={
-                    "pending_control_decision": decision,
-                    "pending_control_confidence": control_result.decision.confidence,
-                    "pending_control_reasoning": control_result.decision.reasoning,
-                },
-            )
-
-        settings = get_settings()
-        if settings.agent_dry_run:
-            return PendingActionResult(
-                status="dry_run",
-                message=(
-                    "AGENT_DRY_RUN включён: действие не выполнено. "
-                    "Ожидающее действие оставлено без изменений."
-                ),
-                action=pending,
-            )
-        return await self.pending_actions.confirm(dialog_key, user_id=user_id)
-
     async def _send_reply(
         self,
         dialog_id: str,
@@ -351,7 +296,7 @@ class BitrixWebhookProcessor:
         *,
         bot_id: int | None = None,
     ) -> tuple[bool, str | None]:
-        settings = get_settings()
+        settings = self._settings
         if not message or not dialog_id or settings.agent_dry_run:
             return False, None
         try:
@@ -359,6 +304,7 @@ class BitrixWebhookProcessor:
                 dialog_id,
                 message,
                 bot_id=bot_id or settings.bitrix_bot_id,
+                keyboard=_keyboard_for_message(message),
             )
             return True, None
         except Exception as exc:
@@ -393,31 +339,8 @@ class BitrixWebhookProcessor:
             logger.exception("Failed to record Bitrix learning event")
             return {"recorded": False, "reason": "unexpected_error"}
 
-    def _record_pending_result(
-        self,
-        dialog_key: str,
-        request_text: str,
-        result: PendingActionResult,
-        *,
-        metadata: dict[str, Any],
-        user_id: int | None,
-    ) -> dict[str, Any] | None:
-        if self.learning_recorder is None:
-            return None
-        try:
-            return self.learning_recorder.record_pending_result(
-                dialog_key=dialog_key,
-                user_id=user_id,
-                request_text=request_text,
-                result=result,
-                metadata=metadata,
-            )
-        except Exception:
-            logger.exception("Failed to record pending Bitrix learning event")
-            return {"recorded": False, "reason": "unexpected_error"}
-
     async def _quality_control_bitrix_client(self) -> tuple[BitrixClient, dict[str, Any] | None]:
-        settings = get_settings()
+        settings = self._settings
         if not settings.quality_control_webhook_enabled:
             return self.bitrix, None
         actor_user_id = settings.quality_control_actor_user_id
@@ -477,26 +400,21 @@ def _pending_from_approval_action(
         params=raw_params,
         summary=str(details.get("summary") or method),
         created_by=user_id,
+        specialist_id=str(details.get("specialist_id") or "bitrix24"),
     )
-
-
-def _pending_result_action(result: PendingActionResult) -> dict[str, Any]:
-    details: dict[str, Any] = {"message": result.message, **result.data}
-    if result.action:
-        details.update(
-            {
-                "method": result.action.method,
-                "params": result.action.params,
-                "summary": result.action.summary,
-            }
-        )
-    return ActionRecord(name="bitrix_pending_action", status=result.status, details=details).model_dump()
 
 
 def _record_quality_actor_error(status: dict[str, Any], error: dict[str, Any]) -> None:
     status["last_error"] = error.get("message") or error.get("reason")
     status["last_reason"] = error.get("reason")
     status["errors"] = int(status.get("errors") or 0) + 1
+
+
+def _keyboard_for_message(message: str) -> dict[str, Any] | None:
+    match = _MARKETPLACE_PATH_RE.search(message or "")
+    if not match:
+        return None
+    return {"BUTTONS": [{"TEXT": "Открыть AI-помощник", "LINK": match.group(1)}]}
 
 
 def _merge_text_and_transcription(text: str, transcription: str) -> str:

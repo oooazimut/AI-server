@@ -1,18 +1,17 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
 import logging
+from datetime import datetime, timedelta
 from typing import Any
 
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.settings import get_settings
+from ai_server.utils import MOSCOW_TZ, optional_int
 from ai_server.workers.bitrix.search_indexer import PortalSearchIndexerWorker
 from ai_server.workers.bitrix.webhook_event_queue import WebhookEventQueue
 
-
 logger = logging.getLogger(__name__)
-MOSCOW_TZ = timezone(timedelta(hours=3))
 
 
 async def run_reconciler(
@@ -102,7 +101,7 @@ async def _reconcile_tasks(
     duplicates = 0
     seen = 0
     for task in tasks:
-        task_id = _optional_int(_first(task, "id", "ID")) if isinstance(task, dict) else None
+        task_id = optional_int(_first(task, "id", "ID")) if isinstance(task, dict) else None
         if task_id is None:
             continue
         seen += 1
@@ -170,15 +169,6 @@ def _first(data: dict[str, Any], *keys: str) -> object | None:
         if key in data:
             return data[key]
     return None
-
-
-def _optional_int(value: object) -> int | None:
-    if value in (None, ""):
-        return None
-    try:
-        return int(str(value).strip())
-    except (TypeError, ValueError):
-        return None
 
 
 def _optional_str(value: object) -> str | None:

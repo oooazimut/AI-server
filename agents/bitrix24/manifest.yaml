@@ -2,6 +2,7 @@ id: bitrix24
 name: Специалист Битрикс24
 version: 0.1.0
 kind: specialist
+audience: employee
 description: Работает с задачами, проектами, CRM, чатами, комментариями, доступом к файлам и локальным индексом портала Битрикс24.
 handoff_description: Использовать для запросов про Битрикс24, задачи, проекты, CRM, поиск/доступ к файлам портала, заявки и комментарии. Смысловой анализ технических документов передавать ПТО.
 entrypoint: backend.ai_server.agents.bitrix24.Bitrix24Specialist

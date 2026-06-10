@@ -6,7 +6,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -14,10 +14,9 @@ from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.result_templates import active_result_templates_context
 from ai_server.settings import get_settings
-
+from ai_server.utils import MOSCOW_TZ, confidence, optional_int
 
 logger = logging.getLogger(__name__)
-MOSCOW_TZ = timezone(timedelta(hours=3))
 TASK_QUALITY_WEBHOOK_EVENTS = {"ONTASKUPDATE"}
 _WEBHOOK_QUALITY_LOCK = asyncio.Lock()
 
@@ -37,7 +36,7 @@ class QualityReviewer(Protocol):
         title: str,
         description: str,
         result_text: str,
-    ) -> "TemplateValidation":
+    ) -> TemplateValidation:
         pass
 
 
@@ -50,7 +49,7 @@ class QualityControlLLM(Protocol):
         payload: dict[str, Any],
         tool_results: list[dict[str, Any]],
         tool_definitions: list[dict[str, Any]],
-    ) -> "QualityControlDecision":
+    ) -> QualityControlDecision:
         pass
 
 
@@ -681,9 +680,7 @@ async def apply_quality_actions(bitrix: BitrixClient, report: QualityReport) -> 
     state = _load_state(settings.quality_control_state_path)
     actions: list[QualityAction] = []
     director_user_ids = (
-        settings.resolved_quality_control_director_user_ids
-        if settings.quality_control_notify_director
-        else []
+        settings.resolved_quality_control_director_user_ids if settings.quality_control_notify_director else []
     )
 
     for task in report.tasks:
@@ -1004,8 +1001,7 @@ def format_quality_success_message(task: QualityTask) -> str:
 def is_quality_exempt_responsible(responsible_id: int | None) -> bool:
     settings = get_settings()
     return (
-        responsible_id is not None
-        and responsible_id in settings.resolved_quality_control_exempt_responsible_user_ids
+        responsible_id is not None and responsible_id in settings.resolved_quality_control_exempt_responsible_user_ids
     )
 
 
@@ -1099,7 +1095,7 @@ def _parse_quality_control_decision(data: dict[str, Any]) -> QualityControlDecis
         status=status,
         answer=str(data.get("answer") or "").strip(),
         tool_calls=tool_calls,
-        confidence=_confidence(data.get("confidence")),
+        confidence=confidence(data.get("confidence")),
         raw=data,
     )
 
@@ -1429,14 +1425,6 @@ def _to_bool(value: object) -> bool:
     if isinstance(value, bool):
         return value
     return str(value or "").strip().lower() in {"true", "1", "yes", "y", "да"}
-
-
-def _confidence(value: object) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return 0.5
-    return min(max(number, 0.0), 1.0)
 
 
 def _string_list(value: object) -> list[str]:

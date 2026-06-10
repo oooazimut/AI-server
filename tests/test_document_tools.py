@@ -66,7 +66,9 @@ def test_spreadsheet_compare_requires_llm_selected_schema(monkeypatch, tmp_path)
 
 def test_document_toolset_creates_local_draft(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
-    toolset = DocumentToolset(client=FakeDocumentBitrix(), portal_search=_document_index(tmp_path / "search_index.sqlite"), user_id=9)
+    toolset = DocumentToolset(
+        client=FakeDocumentBitrix(), portal_search=_document_index(tmp_path / "search_index.sqlite"), user_id=9
+    )
 
     result = toolset.document_draft_create(
         {
@@ -119,9 +121,7 @@ def test_pto_specialist_uses_spreadsheet_compare_tool(monkeypatch, tmp_path):
         llm=fake_llm,
     )
 
-    result = anyio_run(
-        specialist.handle(AgentTask(task_id="pto-1", request="Сравни сметы за январь и февраль"))
-    )
+    result = anyio_run(specialist.handle(AgentTask(task_id="pto-1", request="Сравни сметы за январь и февраль")))
 
     preview_actions = [item for item in result.actions_taken if item.name == "pto_spreadsheet_preview"]
     assert len(preview_actions) == 2
@@ -139,7 +139,9 @@ def test_pto_specialist_creates_document_draft(monkeypatch, tmp_path):
     specialist = PtoSpecialist(
         manifest,
         retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
-        tools=DocumentToolset(client=FakeDocumentBitrix(), portal_search=_document_index(tmp_path / "search_index.sqlite"), user_id=9),
+        tools=DocumentToolset(
+            client=FakeDocumentBitrix(), portal_search=_document_index(tmp_path / "search_index.sqlite"), user_id=9
+        ),
         llm=FakePtoLLM(
             tool_call_steps=[
                 [

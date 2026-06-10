@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import re
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-import re
 from xml.etree import ElementTree
-import zipfile
 
 
 @dataclass(frozen=True)
@@ -87,9 +87,7 @@ def _extract_xlsx(path: Path) -> str:
     with zipfile.ZipFile(path) as archive:
         shared_strings = _xlsx_shared_strings(archive)
         worksheet_names = sorted(
-            name
-            for name in archive.namelist()
-            if name.startswith("xl/worksheets/") and name.endswith(".xml")
+            name for name in archive.namelist() if name.startswith("xl/worksheets/") and name.endswith(".xml")
         )
         rows: list[str] = []
         for worksheet_name in worksheet_names:
@@ -118,9 +116,7 @@ def _xlsx_shared_strings(archive: zipfile.ZipFile) -> list[str]:
     for item in root:
         if _local_name(item.tag) != "si":
             continue
-        strings.append(
-            "".join(node.text or "" for node in item.iter() if _local_name(node.tag) == "t").strip()
-        )
+        strings.append("".join(node.text or "" for node in item.iter() if _local_name(node.tag) == "t").strip())
     return strings
 
 
@@ -174,8 +170,7 @@ def _extract_xls(path: Path) -> str:
             lines.append(sheet.name)
             for row_index in range(sheet.nrows):
                 values = [
-                    _format_xlrd_value(sheet.cell_value(row_index, column_index))
-                    for column_index in range(sheet.ncols)
+                    _format_xlrd_value(sheet.cell_value(row_index, column_index)) for column_index in range(sheet.ncols)
                 ]
                 row_text = " | ".join(value for value in values if value)
                 if row_text:

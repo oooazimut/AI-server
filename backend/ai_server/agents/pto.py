@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from typing import Any
+
 from ai_server.agents.pto_llm import PtoAgentLLM, PtoLLMService, PtoLLMToolCall, pto_llm_failure_result
+from ai_server.utils import unique
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult
 from ai_server.retrieval import HybridKnowledgeRetriever
@@ -26,6 +29,10 @@ class PtoSpecialist:
         self.tools = tools or DocumentToolset()
         self.llm = llm or PtoLLMService()
 
+    @classmethod
+    def build(cls, manifest: AgentManifest, *, document_tools: DocumentToolset | None = None, pto_retriever: HybridKnowledgeRetriever | None = None, pto_llm: PtoAgentLLM | None = None, **_: Any) -> "PtoSpecialist":
+        return cls(manifest, retriever=pto_retriever, tools=document_tools, llm=pto_llm)
+
     async def handle(self, task: AgentTask) -> AgentResult:
         available_skills = self.skill_store.list_skills(self.manifest)
         retrieval_hits = self.retriever.search(self.manifest, task.request, limit=5)
@@ -35,10 +42,9 @@ class PtoSpecialist:
                 status="completed",
                 details={
                     "available_skills": [
-                        {"id": skill.id, "title": skill.title, "preview": skill.preview}
-                        for skill in available_skills
+                        {"id": skill.id, "title": skill.title, "preview": skill.preview} for skill in available_skills
                     ],
-                    "retrieval_topics": _unique([hit.chunk.topic for hit in retrieval_hits]),
+                    "retrieval_topics": unique([hit.chunk.topic for hit in retrieval_hits]),
                     "retrieval_hits": [
                         {
                             "topic": hit.chunk.topic,
@@ -68,7 +74,7 @@ class PtoSpecialist:
                     tool_results=list(tool_results),
                 )
             except Exception as exc:
-                failure = pto_llm_failure_result(f"{type(exc).__name__}: {exc}")
+                failure = pto_llm_failure_result(f"{type(exc).__name__}: {exc}", agent_id=self.manifest.id)
                 return AgentResult(
                     status="failed",
                     agent_id=self.manifest.id,
@@ -121,7 +127,7 @@ class PtoSpecialist:
                     )
                 )
         if decision is None:
-            failure = pto_llm_failure_result("empty PTO LLM decision loop")
+            failure = pto_llm_failure_result("empty PTO LLM decision loop", agent_id=self.manifest.id)
             return AgentResult(
                 status="failed",
                 agent_id=self.manifest.id,
@@ -134,12 +140,13 @@ class PtoSpecialist:
 
         try:
             final_result = await self.llm.compose(
+                manifest=self.manifest,
                 task=task,
                 decision=decision,
                 tool_results=tool_results,
             )
         except Exception as exc:
-            failure = pto_llm_failure_result(f"{type(exc).__name__}: {exc}")
+            failure = pto_llm_failure_result(f"{type(exc).__name__}: {exc}", agent_id=self.manifest.id)
             return AgentResult(
                 status="failed",
                 agent_id=self.manifest.id,
@@ -179,22 +186,32 @@ class PtoSpecialist:
             return None, None
         if tool_call.name == "portal_document_search":
             result = self.tools.portal_document_search(tool_call.args)
-            return result, ActionRecord(name="pto_portal_document_search", status=result.status, details=result.model_dump())
+            return result, ActionRecord(
+                name="pto_portal_document_search", status=result.status, details=result.model_dump()
+            )
         if tool_call.name == "document_read":
             result = await self.tools.document_read(tool_call.args)
             return result, ActionRecord(name="pto_document_read", status=result.status, details=result.model_dump())
         if tool_call.name == "spreadsheet_preview":
             result = await self.tools.spreadsheet_preview(tool_call.args)
-            return result, ActionRecord(name="pto_spreadsheet_preview", status=result.status, details=result.model_dump())
+            return result, ActionRecord(
+                name="pto_spreadsheet_preview", status=result.status, details=result.model_dump()
+            )
         if tool_call.name == "spreadsheet_compare":
             result = await self.tools.spreadsheet_compare(tool_call.args)
-            return result, ActionRecord(name="pto_spreadsheet_compare", status=result.status, details=result.model_dump())
+            return result, ActionRecord(
+                name="pto_spreadsheet_compare", status=result.status, details=result.model_dump()
+            )
         if tool_call.name == "document_draft_create":
             result = self.tools.document_draft_create(tool_call.args)
-            return result, ActionRecord(name="pto_document_draft_create", status=result.status, details=result.model_dump())
+            return result, ActionRecord(
+                name="pto_document_draft_create", status=result.status, details=result.model_dump()
+            )
         if tool_call.name == "document_draft_list":
             result = self.tools.document_draft_list(tool_call.args)
-            return result, ActionRecord(name="pto_document_draft_list", status=result.status, details=result.model_dump())
+            return result, ActionRecord(
+                name="pto_document_draft_list", status=result.status, details=result.model_dump()
+            )
 
         result = ToolResult(
             status="invalid_tool_call",
@@ -209,11 +226,3 @@ def _logs() -> list[str]:
         "PTO specialist is an LLM specialist; backend document tools only search/read/compare and apply access guardrails.",
         "Bitrix24 remains the transport/source layer for portal files; PTO owns document interpretation.",
     ]
-
-
-def _unique(values: list[str]) -> list[str]:
-    result: list[str] = []
-    for value in values:
-        if value not in result:
-            result.append(value)
-    return result

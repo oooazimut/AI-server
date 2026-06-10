@@ -1,36 +1,20 @@
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixClient, BitrixConfigError
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
-from ai_server.integrations.bitrix.portal_search import PortalSearchIndex
 from ai_server.runtime import runtime_paths
 from ai_server.settings import get_settings
 from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
+from ai_server.utils import optional_int, truthy
 
-
-CONFIRM_WORDS = {
-    "да",
-    "ок",
-    "окей",
-    "подтверждаю",
-    "подтвердить",
-    "создай",
-    "выполняй",
-    "выполнить",
-    "делай",
-    "запускай",
-    "согласен",
-}
-CANCEL_WORDS = {"отмена", "отмени", "не надо", "сбрось", "не создавай", "не выполняй", "cancel"}
 NO_DEADLINE_FIELD_NAMES = {
     "NO_DEADLINE",
     "WITHOUT_DEADLINE",
@@ -45,7 +29,8 @@ class PendingBitrixAction:
     params: dict[str, Any]
     summary: str
     created_by: int | None
-    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    specialist_id: str = "bitrix24"
 
 
 @dataclass
@@ -87,9 +72,7 @@ class DialogStateStore:
                 )
                 """
             )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_dialog_states_updated ON dialog_states(updated_at)"
-            )
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_dialog_states_updated ON dialog_states(updated_at)")
 
     def load_raw(self, key: str) -> dict[str, Any] | None:
         self.ensure_schema()
@@ -108,7 +91,7 @@ class DialogStateStore:
 
     def save_raw(self, key: str, state: dict[str, Any]) -> None:
         self.ensure_schema()
-        updated_at = datetime.now(timezone.utc).isoformat()
+        updated_at = datetime.now(UTC).isoformat()
         with sqlite3.connect(self.path) as connection:
             connection.execute(
                 """
@@ -140,6 +123,17 @@ class DialogStateStore:
         return state
 
 
+class TaskClosureHandler(Protocol):
+    async def execute(
+        self,
+        params: dict[str, Any],
+        *,
+        current_user_id: int,
+        write_client: BitrixClient,
+        actor_client: BitrixClient,
+    ) -> dict[str, Any]: ...
+
+
 class BitrixPendingActionService:
     def __init__(
         self,
@@ -147,21 +141,28 @@ class BitrixPendingActionService:
         store: DialogStateStore | None = None,
         bitrix: BitrixClient | None = None,
         bitrix_oauth: BitrixOAuthService | None = None,
-        task_closure_llm: object | None = None,
+        task_closure_handler: TaskClosureHandler | None = None,
         audit_log_path: Path | str | None = None,
+        dry_run: bool = False,
     ) -> None:
         self.store = store or DialogStateStore()
         self.bitrix = bitrix or BitrixClient()
         self.bitrix_oauth = bitrix_oauth
-        self.task_closure_llm = task_closure_llm
+        self.task_closure_handler = task_closure_handler
+        self.dry_run = dry_run
         self.audit_log_path = (
-            Path(audit_log_path)
-            if audit_log_path is not None
-            else runtime_paths().bitrix_write_audit_log
+            Path(audit_log_path) if audit_log_path is not None else runtime_paths().bitrix_write_audit_log
         )
 
     def pending_for(self, key: str) -> PendingBitrixAction | None:
         return self.store.load(key).pending_action
+
+    def append_turn(self, key: str, user_text: str, agent_response: str) -> None:
+        state = self.store.load(key)
+        state.turns.append({"role": "user", "content": user_text})
+        state.turns.append({"role": "assistant", "content": agent_response})
+        state.turns = state.turns[-20:]
+        self.store.save(state)
 
     def save_pending(self, key: str, action: PendingBitrixAction) -> None:
         self.store.set_pending(key, action)
@@ -181,11 +182,20 @@ class BitrixPendingActionService:
     async def confirm(self, key: str, *, user_id: int | None = None) -> PendingActionResult:
         action = self.pending_for(key)
         if not action:
-            return PendingActionResult(status="nothing_to_confirm", message="Нет ожидающего действия для подтверждения.")
+            return PendingActionResult(
+                status="nothing_to_confirm", message="Нет ожидающего действия для подтверждения."
+            )
         if action.created_by and user_id and action.created_by != user_id:
             return PendingActionResult(
                 status="denied",
                 message="Подтвердить действие может только пользователь, который его запросил.",
+                action=action,
+            )
+
+        if self.dry_run:
+            return PendingActionResult(
+                status="dry_run",
+                message="AGENT_DRY_RUN включён: действие не выполнено. Ожидающее действие оставлено без изменений.",
                 action=action,
             )
 
@@ -217,9 +227,7 @@ class BitrixPendingActionService:
             )
             return PendingActionResult(
                 status="denied",
-                message=(
-                    "Не выполнил действие: у пользователя нет права на Bitrix-запись через агента."
-                ),
+                message=("Не выполнил действие: у пользователя нет права на Bitrix-запись через агента."),
                 action=action,
             )
 
@@ -299,16 +307,22 @@ class BitrixPendingActionService:
             return write_client
         actor_client = await self._task_closure_actor_client(user_id, fallback=write_client)
 
-        from ai_server.agents.bitrix_task_closure import TaskClosureService
+        if self.task_closure_handler is None:
+            self._audit("denied", key=key, action=action, data={"reason": "task_closure_handler not configured"})
+            self.store.clear_pending(key)
+            return PendingActionResult(
+                status="denied",
+                message="Обработчик закрытия задач не настроен.",
+                action=action,
+            )
 
-        service = TaskClosureService(
-            write_client,
-            PortalSearchIndex(),
-            actor_bitrix=actor_client,
-            llm=self.task_closure_llm,
-        )
         try:
-            data = await service.execute(action.params, current_user_id=user_id)
+            data = await self.task_closure_handler.execute(
+                action.params,
+                current_user_id=user_id,
+                write_client=write_client,
+                actor_client=actor_client,
+            )
         except Exception as exc:
             self._audit("error", key=key, action=action, data={"error": f"{type(exc).__name__}: {exc}"})
             return PendingActionResult(
@@ -356,7 +370,7 @@ class BitrixPendingActionService:
     ) -> None:
         self.audit_log_path.parent.mkdir(parents=True, exist_ok=True)
         record = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "dialog_key": key,
             "status": status,
             "method": action.method,
@@ -377,20 +391,6 @@ def make_dialog_key(*, chat_id: int | None = None, dialog_id: str = "", user_id:
     if dialog_id:
         return f"dialog:{dialog_id}:user:{resolved_user_id}"
     return f"user:{resolved_user_id}"
-
-
-def normalize_control_text(text: str) -> str:
-    value = text.strip().lower().replace("ё", "е")
-    value = re.sub(r"[.!?,:;]+", " ", value)
-    return re.sub(r"\s+", " ", value).strip()
-
-
-def is_confirm_text(text: str) -> bool:
-    return normalize_control_text(text) in CONFIRM_WORDS
-
-
-def is_cancel_text(text: str) -> bool:
-    return normalize_control_text(text) in CANCEL_WORDS
 
 
 def state_from_dict(key: str, data: dict[str, Any] | None) -> BitrixDialogState:
@@ -416,17 +416,9 @@ def pending_bitrix_from_dict(data: object) -> PendingBitrixAction | None:
         params=params if isinstance(params, dict) else {},
         summary=str(data.get("summary") or method),
         created_by=optional_int(data.get("created_by")),
-        created_at=str(data.get("created_at") or datetime.now(timezone.utc).isoformat()),
+        created_at=str(data.get("created_at") or datetime.now(UTC).isoformat()),
+        specialist_id=str(data.get("specialist_id") or "bitrix24"),
     )
-
-
-def optional_int(value: object) -> int | None:
-    try:
-        if value in (None, ""):
-            return None
-        return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None
 
 
 def can_prepare_write_action(method: str, params: dict[str, Any], user_id: int | None) -> bool:
@@ -476,7 +468,7 @@ def task_add_group_id(params: dict[str, Any]) -> int | None:
 
 def no_deadline_requested(fields: dict[str, Any]) -> bool:
     for key in NO_DEADLINE_FIELD_NAMES:
-        if _truthy(fields.get(key)):
+        if truthy(fields.get(key)):
             return True
     for key, value in fields.items():
         if key.lower() != "deadline":
@@ -502,15 +494,6 @@ def prepare_no_deadline_fields(fields: dict[str, Any]) -> None:
             fields.pop(key, None)
     fields["DEADLINE"] = ""
 
-
-def _truthy(value: object) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y", "да", "без срока", "бессрочно"}
-    return bool(value)
 
 
 def _task_closure_result_message(data: dict[str, Any]) -> str:

@@ -23,7 +23,6 @@ from ai_server.integrations.bitrix.portal_search import (
 )
 from ai_server.settings import get_settings
 
-
 logger = logging.getLogger(__name__)
 
 PERSISTED_STATUS_KEYS = {
@@ -166,18 +165,14 @@ class PortalSearchIndexerWorker:
                 if now >= next_metadata_at:
                     await self.run_metadata_once()
                     self._heartbeat_lock()
-                    next_metadata_at = _now() + timedelta(
-                        seconds=settings.search_background_metadata_interval_seconds
-                    )
+                    next_metadata_at = _now() + timedelta(seconds=settings.search_background_metadata_interval_seconds)
                     self.status["next_metadata_sync_at"] = _format_time(next_metadata_at)
 
                 now = _now()
                 if settings.search_content_enabled and now >= next_content_at:
                     await self.run_content_once()
                     self._heartbeat_lock()
-                    next_content_at = _now() + timedelta(
-                        seconds=settings.search_background_content_interval_seconds
-                    )
+                    next_content_at = _now() + timedelta(seconds=settings.search_background_content_interval_seconds)
                     self.status["next_content_sync_at"] = _format_time(next_content_at)
 
                 now = _now()
@@ -448,7 +443,8 @@ class PortalSearchIndexerWorker:
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as exc:
+            logger.debug("search_indexer lock file corrupt, treating as stale: %s", exc)
             return {"pid": None, "heartbeat_at": None, "corrupt": True}
         return data if isinstance(data, dict) else {"pid": None, "heartbeat_at": None}
 
@@ -478,9 +474,7 @@ class PortalSearchIndexerWorker:
     def _set_lock_status(self, *, acquired: bool, owner: dict[str, Any] | None) -> None:
         self.status["lock_acquired"] = acquired
         self.status["lock_owner"] = owner
-        self.status["lock_last_heartbeat_at"] = (
-            str(owner.get("heartbeat_at") or "") if owner else None
-        )
+        self.status["lock_last_heartbeat_at"] = str(owner.get("heartbeat_at") or "") if owner else None
         self.status["lock_path"] = str(get_settings().search_background_lock_path)
         if acquired:
             self.status["lock_retry_at"] = None

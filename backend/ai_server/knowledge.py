@@ -1,5 +1,5 @@
-from pathlib import Path
 import re
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
@@ -67,7 +67,11 @@ class MarkdownKnowledgeBase:
                 "title": topic.title,
                 "query": query,
                 "matches": [
-                    {"section": section.slug, "title": section.title, "preview": _preview(section.content, max_chars=500)}
+                    {
+                        "section": section.slug,
+                        "title": section.title,
+                        "preview": _preview(section.content, max_chars=500),
+                    }
                     for section in matches
                 ],
             }
@@ -78,9 +82,7 @@ class MarkdownKnowledgeBase:
             if section is None:
                 return {
                     "status": "not_found",
-                    "available_sections": [
-                        {"section": item.slug, "title": item.title} for item in sections
-                    ],
+                    "available_sections": [{"section": item.slug, "title": item.title} for item in sections],
                 }
             return {
                 "status": "ok",

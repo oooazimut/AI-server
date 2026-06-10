@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from collections import Counter, deque
-from dataclasses import asdict, is_dataclass
-from datetime import datetime, timezone
 import json
 import logging
+from collections import Counter, deque
+from dataclasses import asdict, is_dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -12,8 +12,7 @@ from uuid import uuid4
 from pydantic import BaseModel
 
 from ai_server.models import AgentResult, AgentTask
-from ai_server.settings import get_settings
-
+from ai_server.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -25,17 +24,18 @@ class LearningEventRecorder:
 
     def __init__(
         self,
+        settings: Settings | None = None,
         path: Path | str | None = None,
         *,
         enabled: bool | None = None,
         capture_text: bool | None = None,
         max_text_chars: int | None = None,
     ) -> None:
-        settings = get_settings()
-        self.path = Path(path) if path is not None else settings.learning_events_path
-        self.enabled = settings.learning_events_enabled if enabled is None else enabled
-        self.capture_text = settings.learning_events_capture_text if capture_text is None else capture_text
-        self.max_text_chars = max_text_chars or settings.learning_events_max_text_chars
+        _settings = settings or get_settings()
+        self.path = Path(path) if path is not None else _settings.learning_events_path
+        self.enabled = _settings.learning_events_enabled if enabled is None else enabled
+        self.capture_text = _settings.learning_events_capture_text if capture_text is None else capture_text
+        self.max_text_chars = max_text_chars or _settings.learning_events_max_text_chars
 
     def record_event(
         self,
@@ -103,12 +103,8 @@ class LearningEventRecorder:
         event_type: str = "agent_result",
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        actions = [
-            {"kind": "taken", **action.model_dump()}
-            for action in result.actions_taken
-        ] + [
-            {"kind": "approval_required", **action.model_dump()}
-            for action in result.actions_requiring_approval
+        actions = [{"kind": "taken", **action.model_dump()} for action in result.actions_taken] + [
+            {"kind": "approval_required", **action.model_dump()} for action in result.actions_requiring_approval
         ]
         user_id = task.user.id if task.user else None
         channel = task.user.channel if task.user and task.user.channel else task.source
@@ -133,45 +129,6 @@ class LearningEventRecorder:
             actions=actions,
             model_usage=[usage.model_dump() for usage in result.model_usage],
             metadata=event_metadata,
-        )
-
-    def record_pending_result(
-        self,
-        *,
-        dialog_key: str,
-        user_id: str | int | None,
-        request_text: str,
-        result: Any,
-        source: str = "bitrix24_chat",
-        channel: str = "bitrix24_chat",
-        metadata: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        action = getattr(result, "action", None)
-        data = getattr(result, "data", {}) if result is not None else {}
-        action_record = {
-            "kind": "pending_action",
-            "name": "bitrix_pending_action",
-            "status": getattr(result, "status", ""),
-            "details": {
-                "message": getattr(result, "message", ""),
-                "data": data,
-                "pending": _pending_action_payload(action),
-            },
-        }
-        return self.record_event(
-            event_type="pending_action_result",
-            source=source,
-            agent_id="bitrix24_pending_control",
-            task_id=dialog_key,
-            user_id=user_id,
-            channel=channel,
-            request=request_text,
-            response=getattr(result, "message", ""),
-            status=getattr(result, "status", ""),
-            handoff_to=["bitrix24"],
-            actions=[action_record],
-            model_usage=data.get("model_usage", []) if isinstance(data, dict) else [],
-            metadata={"dialog_key": dialog_key, **(metadata or {})},
         )
 
     def record_feedback(
@@ -269,28 +226,13 @@ class LearningEventRecorder:
             handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
-def _pending_action_payload(action: Any) -> dict[str, Any] | None:
-    if action is None:
-        return None
-    return {
-        "method": getattr(action, "method", ""),
-        "params": getattr(action, "params", {}),
-        "summary": getattr(action, "summary", ""),
-        "created_by": getattr(action, "created_by", None),
-        "created_at": getattr(action, "created_at", None),
-    }
-
-
 def _compact_value(value: Any, *, max_chars: int) -> Any:
     if isinstance(value, BaseModel):
         return _compact_value(value.model_dump(), max_chars=max_chars)
     if is_dataclass(value) and not isinstance(value, type):
         return _compact_value(asdict(value), max_chars=max_chars)
     if isinstance(value, dict):
-        return {
-            str(key): _compact_value(item, max_chars=max(1000, max_chars // 2))
-            for key, item in value.items()
-        }
+        return {str(key): _compact_value(item, max_chars=max(1000, max_chars // 2)) for key, item in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [_compact_value(item, max_chars=max(1000, max_chars // 2)) for item in value]
     if isinstance(value, Path):
@@ -307,4 +249,4 @@ def _truncate_text(value: str, max_chars: int) -> str:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()

@@ -6,7 +6,6 @@ from typing import Any
 
 from ai_server.registry import PROJECT_ROOT
 
-
 DEFAULT_RESULT_TEMPLATES_PATH = PROJECT_ROOT / "config" / "result_templates.example.json"
 
 

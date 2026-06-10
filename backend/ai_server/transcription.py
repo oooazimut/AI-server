@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 import shutil
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from ai_server.attachments import StoredAttachment
 from ai_server.integrations.yandex_auth import YandexAuthError, yandex_auth_header
-from ai_server.settings import get_settings
+from ai_server.settings import Settings, get_settings
 
 
 class TranscriptionResult(BaseModel):
@@ -31,27 +31,27 @@ class TranscriptionError(RuntimeError):
 class YandexSpeechKitTranscriber:
     def __init__(
         self,
+        settings: Settings | None = None,
         *,
         base_url: str | None = None,
         language: str | None = None,
         max_bytes: int | None = None,
         ffmpeg_path: str | None = None,
     ) -> None:
-        settings = get_settings()
-        self.base_url = (base_url or settings.yandex_speechkit_base_url).rstrip("/")
-        self.language = language or settings.yandex_speechkit_lang
-        self.max_bytes = max_bytes or settings.yandex_speechkit_max_bytes
-        self.ffmpeg_path = ffmpeg_path or settings.ffmpeg_path
+        _settings = settings or get_settings()
+        self._settings = _settings
+        self.base_url = (base_url or _settings.yandex_speechkit_base_url).rstrip("/")
+        self.language = language or _settings.yandex_speechkit_lang
+        self.max_bytes = max_bytes or _settings.yandex_speechkit_max_bytes
+        self.ffmpeg_path = ffmpeg_path or _settings.ffmpeg_path
 
     @property
     def configured(self) -> bool:
-        return get_settings().transcription_configured
+        return self._settings.transcription_configured
 
     async def transcribe(self, attachment: StoredAttachment) -> TranscriptionResult:
         if not self.configured:
-            raise TranscriptionNotConfigured(
-                "YANDEX_API_KEY or YANDEX_IAM_TOKEN/YANDEX_FOLDER_ID is not configured"
-            )
+            raise TranscriptionNotConfigured("YANDEX_API_KEY or YANDEX_IAM_TOKEN/YANDEX_FOLDER_ID is not configured")
 
         source = Path(attachment.path)
         if not source.exists():
@@ -65,7 +65,7 @@ class YandexSpeechKitTranscriber:
         return TranscriptionResult(text=text, model="yandex_speechkit", attachment=attachment, raw=payload)
 
     async def _recognize_file(self, path: Path, content_type: str) -> tuple[str, dict[str, Any]]:
-        settings = get_settings()
+        settings = self._settings
         params = {"lang": self.language}
         if not settings.yandex_api_key:
             params["folderId"] = settings.yandex_folder_id
@@ -98,7 +98,7 @@ class YandexSpeechKitTranscriber:
         if suffix in {".ogg", ".opus"}:
             return source, "audio/ogg"
 
-        settings = get_settings()
+        settings = self._settings
         if not settings.yandex_speechkit_convert_to_ogg:
             raise TranscriptionError(f"Yandex SpeechKit does not accept {suffix or 'this'} audio directly")
 
@@ -139,8 +139,8 @@ class UnconfiguredTranscriber:
         raise TranscriptionNotConfigured(self.reason)
 
 
-def build_transcriber() -> YandexSpeechKitTranscriber | UnconfiguredTranscriber:
-    settings = get_settings()
-    if settings.stt_provider == "yandex_speechkit":
-        return YandexSpeechKitTranscriber()
-    return UnconfiguredTranscriber(f"Unknown STT_PROVIDER: {settings.stt_provider}")
+def build_transcriber(settings: Settings | None = None) -> YandexSpeechKitTranscriber | UnconfiguredTranscriber:
+    _settings = settings or get_settings()
+    if _settings.stt_provider == "yandex_speechkit":
+        return YandexSpeechKitTranscriber(_settings)
+    return UnconfiguredTranscriber(f"Unknown STT_PROVIDER: {_settings.stt_provider}")

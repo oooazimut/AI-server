@@ -4,8 +4,8 @@ import argparse
 import asyncio
 import json
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -16,7 +16,6 @@ sys.path.insert(0, str(BACKEND_DIR))
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixClient, BitrixConfigError
 from ai_server.integrations.bitrix.oauth import BitrixOAuthError
 from ai_server.settings import get_settings
-
 
 DEFAULT_TITLE = "AI dev"
 DEFAULT_USERS = "1,9"

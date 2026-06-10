@@ -6,7 +6,6 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from ai_server.registry import PROJECT_ROOT
 from ai_server.runtime import runtime_paths
 
-
 _LOADED_ENV_FILE_SPEC: str | None = None
 _LOADED_ENV_KEYS: set[str] = set()
 
@@ -139,6 +138,14 @@ class Settings:
     agent_working_dates: str
     agent_non_working_dates: str
     agent_dry_run: bool
+    yandex_billing_account_id: str
+    yandex_billing_iam_token: str
+    yandex_billing_base_url: str
+    agent_shell_enabled: bool
+    agent_shell_executable: str
+    agent_shell_timeout_seconds: float
+    agent_shell_max_command_chars: int
+    agent_shell_max_output_chars: int
     var_dir: Path
 
     @property
@@ -263,9 +270,7 @@ class Settings:
     @property
     def resolved_agent_private_disk_path_markers(self) -> list[str]:
         return [
-            item.strip()
-            for item in self.agent_private_disk_path_markers.replace(";", ",").split(",")
-            if item.strip()
+            item.strip() for item in self.agent_private_disk_path_markers.replace(";", ",").split(",") if item.strip()
         ]
 
     @property
@@ -313,8 +318,7 @@ class Settings:
         return {
             extension if extension.startswith(".") else f".{extension}"
             for extension in (
-                part.strip().lower()
-                for part in self.search_content_allowed_extensions.replace(";", ",").split(",")
+                part.strip().lower() for part in self.search_content_allowed_extensions.replace(";", ",").split(",")
             )
             if extension
         }
@@ -374,7 +378,8 @@ def get_settings() -> Settings:
         webhook_event_queue_max_attempts=_env_int("WEBHOOK_EVENT_QUEUE_MAX_ATTEMPTS", 8) or 8,
         webhook_event_queue_retry_base_seconds=_env_int("WEBHOOK_EVENT_QUEUE_RETRY_BASE_SECONDS", 10) or 10,
         webhook_event_queue_retry_max_seconds=_env_int("WEBHOOK_EVENT_QUEUE_RETRY_MAX_SECONDS", 300) or 300,
-        webhook_event_queue_stale_processing_seconds=_env_int("WEBHOOK_EVENT_QUEUE_STALE_PROCESSING_SECONDS", 300) or 300,
+        webhook_event_queue_stale_processing_seconds=_env_int("WEBHOOK_EVENT_QUEUE_STALE_PROCESSING_SECONDS", 300)
+        or 300,
         search_index_max_tasks=_env_int("SEARCH_INDEX_MAX_TASKS", 5000) or 5000,
         search_index_max_projects=_env_int("SEARCH_INDEX_MAX_PROJECTS", 200) or 200,
         search_index_max_storages=_env_int("SEARCH_INDEX_MAX_STORAGES", 500) or 500,
@@ -388,16 +393,21 @@ def get_settings() -> Settings:
         search_content_max_files=_env_int("SEARCH_CONTENT_MAX_FILES", 80) or 80,
         search_content_max_bytes=_env_int("SEARCH_CONTENT_MAX_BYTES", 20 * 1024 * 1024) or (20 * 1024 * 1024),
         search_content_max_chars=_env_int("SEARCH_CONTENT_MAX_CHARS", 40_000) or 40_000,
-        search_content_allowed_extensions=_env("SEARCH_CONTENT_ALLOWED_EXTENSIONS", ".txt,.csv,.doc,.docx,.xlsx,.xls,.pdf"),
+        search_content_allowed_extensions=_env(
+            "SEARCH_CONTENT_ALLOWED_EXTENSIONS", ".txt,.csv,.doc,.docx,.xlsx,.xls,.pdf"
+        ),
         search_background_indexer_enabled=_env_bool("SEARCH_BACKGROUND_INDEXER_ENABLED", False),
         search_background_initial_delay_seconds=_env_int("SEARCH_BACKGROUND_INITIAL_DELAY_SECONDS", 60) or 60,
-        search_background_metadata_interval_seconds=_env_int("SEARCH_BACKGROUND_METADATA_INTERVAL_SECONDS", 6 * 60 * 60) or (6 * 60 * 60),
-        search_background_content_interval_seconds=_env_int("SEARCH_BACKGROUND_CONTENT_INTERVAL_SECONDS", 10 * 60) or (10 * 60),
+        search_background_metadata_interval_seconds=_env_int("SEARCH_BACKGROUND_METADATA_INTERVAL_SECONDS", 6 * 60 * 60)
+        or (6 * 60 * 60),
+        search_background_content_interval_seconds=_env_int("SEARCH_BACKGROUND_CONTENT_INTERVAL_SECONDS", 10 * 60)
+        or (10 * 60),
         search_delta_indexer_enabled=_env_bool("SEARCH_DELTA_INDEXER_ENABLED", True),
         search_delta_interval_seconds=_env_int("SEARCH_DELTA_INTERVAL_SECONDS", 5 * 60) or (5 * 60),
         search_delta_folders_per_run=_env_int("SEARCH_DELTA_FOLDERS_PER_RUN", 15) or 15,
         search_delta_max_children_per_folder=_env_int("SEARCH_DELTA_MAX_CHILDREN_PER_FOLDER", 1000) or 1000,
-        search_background_lock_stale_seconds=_env_int("SEARCH_BACKGROUND_LOCK_STALE_SECONDS", 2 * 60 * 60) or (2 * 60 * 60),
+        search_background_lock_stale_seconds=_env_int("SEARCH_BACKGROUND_LOCK_STALE_SECONDS", 2 * 60 * 60)
+        or (2 * 60 * 60),
         search_webhook_indexer_enabled=_env_bool("SEARCH_WEBHOOK_INDEXER_ENABLED", False),
         search_webhook_content_enabled=_env_bool("SEARCH_WEBHOOK_CONTENT_ENABLED", True),
         quality_control_webhook_enabled=_env_bool("QUALITY_CONTROL_WEBHOOK_ENABLED", False),
@@ -458,6 +468,14 @@ def get_settings() -> Settings:
         agent_working_dates=_env("AGENT_WORKING_DATES"),
         agent_non_working_dates=_env("AGENT_NON_WORKING_DATES"),
         agent_dry_run=_env_bool("AGENT_DRY_RUN", False),
+        yandex_billing_account_id=_env("YANDEX_BILLING_ACCOUNT_ID"),
+        yandex_billing_iam_token=_env("YANDEX_BILLING_IAM_TOKEN"),
+        yandex_billing_base_url=_env("YANDEX_BILLING_BASE_URL", "https://billing.api.cloud.yandex.net"),
+        agent_shell_enabled=_env_bool("AGENT_SHELL_ENABLED", False),
+        agent_shell_executable=_env("AGENT_SHELL_EXECUTABLE", "pwsh"),
+        agent_shell_timeout_seconds=_env_float("AGENT_SHELL_TIMEOUT_SECONDS", 30.0) or 30.0,
+        agent_shell_max_command_chars=_env_int("AGENT_SHELL_MAX_COMMAND_CHARS", 500) or 500,
+        agent_shell_max_output_chars=_env_int("AGENT_SHELL_MAX_OUTPUT_CHARS", 4000) or 4000,
         var_dir=paths.root,
     )
 

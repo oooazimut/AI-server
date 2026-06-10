@@ -1,19 +1,17 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
-import json
+from datetime import date, datetime
 from pathlib import Path
-import sqlite3
 from typing import Any
 
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.models import ToolDefinition, ToolResult
 from ai_server.settings import get_settings
-
-
-MOSCOW_TZ = timezone(timedelta(hours=3))
+from ai_server.utils import MOSCOW_TZ, optional_int
 
 
 @dataclass(frozen=True)
@@ -349,7 +347,7 @@ class VehicleUsageStore:
             db.execute("DELETE FROM employee_daily_statuses WHERE status_date = ?", (request_date,))
             db.execute("DELETE FROM vehicle_daily_assignments WHERE assignment_date = ?", (request_date,))
             for entry in staff_entries:
-                employee_id = _optional_int(entry.get("staff_order")) or employees_by_name.get(
+                employee_id = optional_int(entry.get("staff_order")) or employees_by_name.get(
                     str(entry.get("full_name") or "").casefold()
                 )
                 if employee_id is None:
@@ -370,10 +368,10 @@ class VehicleUsageStore:
                     ),
                 )
             for entry in vehicle_entries:
-                vehicle_id = _optional_int(entry.get("vehicle_id"))
+                vehicle_id = optional_int(entry.get("vehicle_id"))
                 if vehicle_id is None:
                     continue
-                employee_id = _optional_int(entry.get("employee_id")) or employees_by_name.get(
+                employee_id = optional_int(entry.get("employee_id")) or employees_by_name.get(
                     str(entry.get("employee_name") or "").casefold()
                 )
                 db.execute(
@@ -473,7 +471,9 @@ class VehicleUsageToolset:
     def vehicle_usage_save_draft(self, args: dict[str, Any]) -> ToolResult:
         parsed = args.get("parsed")
         if not isinstance(parsed, dict):
-            return ToolResult(status="invalid_tool_call", tool="vehicle_usage_save_draft", error="parsed object is required")
+            return ToolResult(
+                status="invalid_tool_call", tool="vehicle_usage_save_draft", error="parsed object is required"
+            )
         request_id = self.store.save_draft(
             request_date=_request_date(args.get("request_date") or parsed.get("date")),
             user_id=self.user_id,
@@ -487,7 +487,9 @@ class VehicleUsageToolset:
     def vehicle_usage_save_report(self, args: dict[str, Any]) -> ToolResult:
         parsed = args.get("parsed")
         if not isinstance(parsed, dict):
-            return ToolResult(status="invalid_tool_call", tool="vehicle_usage_save_report", error="parsed object is required")
+            return ToolResult(
+                status="invalid_tool_call", tool="vehicle_usage_save_report", error="parsed object is required"
+            )
         saved = self.store.save_report(
             request_date=_request_date(args.get("request_date") or parsed.get("date")),
             user_id=self.user_id,
@@ -497,6 +499,7 @@ class VehicleUsageToolset:
         )
         return ToolResult(status="ok", tool="vehicle_usage_save_report", data=saved)
 
+
 def _staff_roster_from_settings() -> list[StaffMember]:
     roster: list[StaffMember] = []
     for raw_item in get_settings().vehicle_usage_staff_roster.replace(";", "\n").splitlines():
@@ -505,11 +508,11 @@ def _staff_roster_from_settings() -> list[StaffMember]:
             continue
         parts = [part.strip() for part in item.split("|")]
         if len(parts) == 3:
-            order = _optional_int(parts[0])
-            user_id = _optional_int(parts[1])
+            order = optional_int(parts[0])
+            user_id = optional_int(parts[1])
             name = parts[2]
         elif len(parts) == 2:
-            order = _optional_int(parts[0])
+            order = optional_int(parts[0])
             user_id = None
             name = parts[1]
         else:
@@ -559,10 +562,3 @@ def _now() -> datetime:
     return datetime.now(MOSCOW_TZ)
 
 
-def _optional_int(value: object) -> int | None:
-    if value in (None, ""):
-        return None
-    try:
-        return int(str(value).strip())
-    except (TypeError, ValueError):
-        return None

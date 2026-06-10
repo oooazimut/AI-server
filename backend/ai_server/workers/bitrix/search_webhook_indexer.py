@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any
 
 from ai_server.integrations.bitrix.client import BitrixClient
@@ -15,10 +15,9 @@ from ai_server.integrations.bitrix.portal_search import (
     sync_portal_content_item,
 )
 from ai_server.settings import get_settings
-
+from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)
-MOSCOW_TZ = timezone(timedelta(hours=3))
 
 DISK_FILE_EVENT_MARKERS = ("DISK", "FILE")
 DELETE_MARKERS = ("DELETE", "TRASH", "MARKDELETED")

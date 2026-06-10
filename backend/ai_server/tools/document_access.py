@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import csv
-from datetime import datetime, timezone
 import math
 import re
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from xml.etree import ElementTree
 
 from ai_server.document_text import extract_text_from_file
@@ -22,7 +23,7 @@ from ai_server.integrations.bitrix.portal_search import (
 )
 from ai_server.models import ToolDefinition, ToolResult
 from ai_server.settings import get_settings
-
+from ai_server.utils import optional_int
 
 SPREADSHEET_EXTENSIONS = {".csv", ".xls", ".xlsx"}
 VALUE_FIELD_PRIORITY = {"цена": 10, "стоимость": 20, "количество": 30}
@@ -311,7 +312,7 @@ class DocumentToolset:
     def portal_document_search(self, args: dict[str, Any]) -> ToolResult:
         query = str(args.get("query") or "").strip()
         scope = str(args.get("scope") or "documents").strip().lower()
-        limit = max(1, min(_optional_int(args.get("limit")) or 10, 30))
+        limit = max(1, min(optional_int(args.get("limit")) or 10, 30))
         if not query:
             return ToolResult(status="invalid_tool_call", tool="portal_document_search", error="query is required")
 
@@ -363,7 +364,7 @@ class DocumentToolset:
                 extract_text_from_file,
                 path,
                 original_name=resolved.item.title,
-                max_chars=max(1, _optional_int(args.get("max_chars")) or get_settings().search_content_max_chars),
+                max_chars=max(1, optional_int(args.get("max_chars")) or get_settings().search_content_max_chars),
             )
         except Exception as exc:
             return ToolResult(
@@ -405,8 +406,8 @@ class DocumentToolset:
             )
 
         path: Path | None = None
-        max_rows = max(1, min(_optional_int(args.get("max_rows")) or 12, 30))
-        max_sheets = max(1, min(_optional_int(args.get("max_sheets")) or 5, 10))
+        max_rows = max(1, min(optional_int(args.get("max_rows")) or 12, 30))
+        max_sheets = max(1, min(optional_int(args.get("max_sheets")) or 5, 10))
         try:
             path = await self._ensure_local_document(resolved.item)
             preview = await asyncio.to_thread(
@@ -443,7 +444,7 @@ class DocumentToolset:
     async def spreadsheet_compare(self, args: dict[str, Any]) -> ToolResult:
         first_query = str(args.get("first_query") or "").strip()
         second_query = str(args.get("second_query") or "").strip()
-        limit = max(1, min(_optional_int(args.get("limit")) or 20, 50))
+        limit = max(1, min(optional_int(args.get("limit")) or 20, 50))
         if not first_query or not second_query:
             return ToolResult(
                 status="invalid_tool_call",
@@ -493,7 +494,10 @@ class DocumentToolset:
 
         drafts_dir = get_settings().document_drafts_dir
         drafts_dir.mkdir(parents=True, exist_ok=True)
-        path = drafts_dir / f"{datetime.now(timezone.utc).astimezone().strftime('%Y%m%d-%H%M%S')}-{_safe_draft_name(title, extension)}"
+        path = (
+            drafts_dir
+            / f"{datetime.now(UTC).astimezone().strftime('%Y%m%d-%H%M%S')}-{_safe_draft_name(title, extension)}"
+        )
         path.write_text(content + "\n", encoding="utf-8")
         return ToolResult(
             status="ok",
@@ -507,7 +511,7 @@ class DocumentToolset:
         )
 
     def document_draft_list(self, args: dict[str, Any]) -> ToolResult:
-        limit = max(1, min(_optional_int(args.get("limit")) or 10, 30))
+        limit = max(1, min(optional_int(args.get("limit")) or 10, 30))
         drafts_dir = get_settings().document_drafts_dir
         drafts_dir.mkdir(parents=True, exist_ok=True)
         drafts = sorted(
@@ -524,7 +528,7 @@ class DocumentToolset:
                         "name": path.name,
                         "path": str(path),
                         "bytes": path.stat().st_size,
-                        "modified_at": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).astimezone().isoformat(),
+                        "modified_at": datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).astimezone().isoformat(),
                     }
                     for path in drafts
                 ],
@@ -553,7 +557,7 @@ class DocumentToolset:
                 for item in self.portal_search.search(
                     query,
                     entity_types=_document_search_types(),
-                    limit=max(10, (_optional_int(args.get("limit")) or 10) * 3),
+                    limit=max(10, (optional_int(args.get("limit")) or 10) * 3),
                 )
                 if _is_file_item(item)
             ],
@@ -647,7 +651,9 @@ async def compare_spreadsheets_by_query(
                 if path is not None:
                     delete_portal_file_cache_path(path)
 
-    compared = _compare_datasets(first_dataset, second_dataset, first_query=report.first_query, second_query=report.second_query)
+    compared = _compare_datasets(
+        first_dataset, second_dataset, first_query=report.first_query, second_query=report.second_query
+    )
     compared.changed = compared.changed[:limit]
     compared.only_first = compared.only_first[:limit]
     compared.only_second = compared.only_second[:limit]
@@ -697,7 +703,7 @@ def format_document_comparison_report(report: DocumentCompareReport, *, limit: i
 
 async def resolve_portal_file_download_url(bitrix: BitrixClient, item: PortalSearchResult) -> str | None:
     if item.entity_type == "task_attachment":
-        attached_object_id = _optional_int(item.metadata.get("attached_object_id")) or _optional_int(item.entity_id)
+        attached_object_id = optional_int(item.metadata.get("attached_object_id")) or optional_int(item.entity_id)
         if attached_object_id is None:
             return None
         attached = await bitrix.get_attached_object(attached_object_id)
@@ -706,7 +712,7 @@ async def resolve_portal_file_download_url(bitrix: BitrixClient, item: PortalSea
         return None
 
     if item.entity_type == "disk_file":
-        disk_file_id = _optional_int(item.metadata.get("disk_object_id")) or _optional_int(item.entity_id)
+        disk_file_id = optional_int(item.metadata.get("disk_object_id")) or optional_int(item.entity_id)
         if disk_file_id is None:
             return None
         return await bitrix.get_disk_file_download_url(disk_file_id)
@@ -736,7 +742,11 @@ def can_user_see_portal_item(item: Any, *, user_id: int | None) -> bool:
 
 
 def filter_portal_items_for_user(items: list[Any], *, user_id: int | None) -> list[Any]:
-    return items if not user_has_private_disk_restrictions(user_id) else [item for item in items if not is_private_disk_item(item)]
+    return (
+        items
+        if not user_has_private_disk_restrictions(user_id)
+        else [item for item in items if not is_private_disk_item(item)]
+    )
 
 
 async def _ensure_local_document(bitrix: BitrixClient, item: PortalSearchResult) -> Path:
@@ -758,9 +768,13 @@ def _find_spreadsheet_document(
     item_filter: Callable[[PortalSearchResult], bool] | None = None,
 ) -> PortalSearchResult | None:
     direct = _direct_index_reference(index, query)
-    if direct and _is_spreadsheet(direct) and (direct.entity_type, str(direct.entity_id)) not in (exclude or set()):
-        if item_filter is None or item_filter(direct):
-            return direct
+    if (
+        direct
+        and _is_spreadsheet(direct)
+        and (direct.entity_type, str(direct.entity_id)) not in (exclude or set())
+        and (item_filter is None or item_filter(direct))
+    ):
+        return direct
     for item in _spreadsheet_candidates(index, query, limit=12, item_filter=item_filter):
         if (item.entity_type, str(item.entity_id)) not in (exclude or set()):
             return item
@@ -790,9 +804,9 @@ def _spreadsheet_candidates(
 
 
 def _spreadsheet_compare_schema_from_args(args: dict[str, Any]) -> tuple[SpreadsheetCompareSchema, ToolResult | None]:
-    header_row_number = _optional_int(args.get("header_row_number"))
-    first_header_row_number = _optional_int(args.get("first_header_row_number"))
-    second_header_row_number = _optional_int(args.get("second_header_row_number"))
+    header_row_number = optional_int(args.get("header_row_number"))
+    first_header_row_number = optional_int(args.get("first_header_row_number"))
+    second_header_row_number = optional_int(args.get("second_header_row_number"))
     if header_row_number is None:
         if first_header_row_number is None or second_header_row_number is None:
             return _empty_schema(), ToolResult(
@@ -804,8 +818,10 @@ def _spreadsheet_compare_schema_from_args(args: dict[str, Any]) -> tuple[Spreads
                 ),
             )
         header_row_number = first_header_row_number
-    if header_row_number <= 0 or (first_header_row_number is not None and first_header_row_number <= 0) or (
-        second_header_row_number is not None and second_header_row_number <= 0
+    if (
+        header_row_number <= 0
+        or (first_header_row_number is not None and first_header_row_number <= 0)
+        or (second_header_row_number is not None and second_header_row_number <= 0)
     ):
         return _empty_schema(), ToolResult(
             status="invalid_tool_call",
@@ -872,23 +888,40 @@ def _compare_datasets(
         first_entry = first.entries[key]
         second_entry = second.entries[key]
         fields: list[FieldDifference] = []
-        for field in sorted(
+        for column in sorted(
             set(first_entry.values) & set(second_entry.values),
             key=lambda item: (VALUE_FIELD_PRIORITY.get(_normalize_header(item), 100), _normalize_header(item)),
         ):
-            difference = _compare_values(field, first_entry.values[field], second_entry.values[field])
+            difference = _compare_values(column, first_entry.values[column], second_entry.values[column])
             if difference:
                 fields.append(difference)
         if fields:
-            changed.append(RowDifference(first_entry.key, first_entry.sheet, first_entry.row_number, second_entry.sheet, second_entry.row_number, fields))
+            changed.append(
+                RowDifference(
+                    first_entry.key,
+                    first_entry.sheet,
+                    first_entry.row_number,
+                    second_entry.sheet,
+                    second_entry.row_number,
+                    fields,
+                )
+            )
     return DocumentCompareReport(
         first_query=first_query,
         second_query=second_query,
         first=first.document,
         second=second.document,
         changed=changed,
-        only_first=[MissingEntry(entry.key, entry.sheet, entry.row_number) for key, entry in sorted(first.entries.items()) if key not in second_keys],
-        only_second=[MissingEntry(entry.key, entry.sheet, entry.row_number) for key, entry in sorted(second.entries.items()) if key not in first_keys],
+        only_first=[
+            MissingEntry(entry.key, entry.sheet, entry.row_number)
+            for key, entry in sorted(first.entries.items())
+            if key not in second_keys
+        ],
+        only_second=[
+            MissingEntry(entry.key, entry.sheet, entry.row_number)
+            for key, entry in sorted(second.entries.items())
+            if key not in first_keys
+        ],
         common_rows=len(common_keys),
         duplicate_keys_first=first.duplicates,
         duplicate_keys_second=second.duplicates,
@@ -1026,7 +1059,9 @@ def _read_xls(path: Path) -> list[SheetRows]:
         for sheet in workbook.sheets():
             rows = []
             for row_index in range(sheet.nrows):
-                values = [_format_xls_value(sheet.cell_value(row_index, column_index)) for column_index in range(sheet.ncols)]
+                values = [
+                    _format_xls_value(sheet.cell_value(row_index, column_index)) for column_index in range(sheet.ncols)
+                ]
                 if any(value.strip() for value in values):
                     rows.append((row_index + 1, values))
             if rows:
@@ -1179,7 +1214,11 @@ def _path_has_private_marker(path: str) -> bool:
 
 def _matches_private_marker(value: str) -> bool:
     normalized = value.strip().casefold()
-    return bool(normalized) and any(normalized == marker.strip().casefold() for marker in get_settings().resolved_agent_private_disk_path_markers if marker.strip())
+    return bool(normalized) and any(
+        normalized == marker.strip().casefold()
+        for marker in get_settings().resolved_agent_private_disk_path_markers
+        if marker.strip()
+    )
 
 
 def _document_dict(item: PortalSearchResult) -> dict[str, Any]:
@@ -1293,8 +1332,16 @@ def _xlsx_worksheet_paths(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
         workbook = ElementTree.fromstring(archive.read("xl/workbook.xml"))
         rels = ElementTree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
     except Exception:
-        return [(Path(name).stem, name) for name in sorted(archive.namelist()) if name.startswith("xl/worksheets/") and name.endswith(".xml")]
-    rel_targets = {rel.attrib.get("Id"): rel.attrib.get("Target") for rel in rels if rel.attrib.get("Id") and rel.attrib.get("Target")}
+        return [
+            (Path(name).stem, name)
+            for name in sorted(archive.namelist())
+            if name.startswith("xl/worksheets/") and name.endswith(".xml")
+        ]
+    rel_targets = {
+        rel.attrib.get("Id"): rel.attrib.get("Target")
+        for rel in rels
+        if rel.attrib.get("Id") and rel.attrib.get("Target")
+    }
     result: list[tuple[str, str]] = []
     for sheet in workbook.iter():
         if _local_name(sheet.tag) != "sheet":
@@ -1310,7 +1357,11 @@ def _xlsx_shared_strings(archive: zipfile.ZipFile) -> list[str]:
     if "xl/sharedStrings.xml" not in archive.namelist():
         return []
     root = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
-    return ["".join(node.text or "" for node in item.iter() if _local_name(node.tag) == "t").strip() for item in root if _local_name(item.tag) == "si"]
+    return [
+        "".join(node.text or "" for node in item.iter() if _local_name(node.tag) == "t").strip()
+        for item in root
+        if _local_name(item.tag) == "si"
+    ]
 
 
 def _xlsx_cell_value(cell: ElementTree.Element, shared_strings: list[str]) -> str:
@@ -1354,10 +1405,3 @@ def _dict_value(value: Any, key: str) -> Any:
     return value.get(key) if isinstance(value, dict) else None
 
 
-def _optional_int(value: object) -> int | None:
-    try:
-        if value in (None, ""):
-            return None
-        return int(str(value).strip())
-    except (TypeError, ValueError):
-        return None

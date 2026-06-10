@@ -38,4 +38,3 @@ def test_bitrix_specialist_includes_retrieval_hits():
     assert retrieval_hits
     assert retrieval_hits[0]["score"] > 0
     assert retrieval_hits[0]["embedding_provider"] == "test_embeddings"
-

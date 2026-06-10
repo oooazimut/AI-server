@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
+from ai_server.registry import resolve_project_path
 from ai_server.retrieval import RetrievalHit
+from ai_server.utils import confidence
 
+logger = logging.getLogger(__name__)
 
 ALLOWED_TOOL_NAMES = {
     "portal_document_search",
@@ -31,16 +35,17 @@ class PtoAgentLLM(Protocol):
         retrieval_hits: list[RetrievalHit],
         tool_definitions: list[dict[str, Any]],
         tool_results: list[ToolResult] | None = None,
-    ) -> "PtoLLMDecisionResult":
+    ) -> PtoLLMDecisionResult:
         pass
 
     async def compose(
         self,
         *,
+        manifest: AgentManifest,
         task: AgentTask,
-        decision: "PtoLLMDecision",
+        decision: PtoLLMDecision,
         tool_results: list[ToolResult],
-    ) -> "PtoLLMFinalResult":
+    ) -> PtoLLMFinalResult:
         pass
 
 
@@ -87,10 +92,11 @@ class PtoLLMService:
         tool_definitions: list[dict[str, Any]],
         tool_results: list[ToolResult] | None = None,
     ) -> PtoLLMDecisionResult:
+        instructions = _load_instructions(manifest)
         completion = await self.client.complete(
             agent_id=manifest.id,
             messages=[
-                {"role": "system", "content": _decision_system_prompt()},
+                {"role": "system", "content": _decision_system_prompt(instructions)},
                 {
                     "role": "user",
                     "content": json.dumps(
@@ -103,7 +109,7 @@ class PtoLLMService:
                             "request": task.request,
                             "user": task.user.model_dump(),
                             "files": task.files,
-                            "current_datetime": datetime.now(timezone.utc).astimezone().isoformat(),
+                            "current_datetime": datetime.now(UTC).astimezone().isoformat(),
                             "retrieval_context": _retrieval_context(retrieval_hits),
                             "tools": _allowed_tool_definitions(tool_definitions),
                             "tool_results": [_compact_tool_result(result) for result in (tool_results or [])],
@@ -123,12 +129,13 @@ class PtoLLMService:
     async def compose(
         self,
         *,
+        manifest: AgentManifest,
         task: AgentTask,
         decision: PtoLLMDecision,
         tool_results: list[ToolResult],
     ) -> PtoLLMFinalResult:
         completion = await self.client.complete(
-            agent_id="pto",
+            agent_id=manifest.id,
             messages=[
                 {"role": "system", "content": _compose_system_prompt()},
                 {
@@ -154,12 +161,12 @@ class PtoLLMService:
         )
 
 
-def pto_llm_failure_result(message: str) -> PtoLLMFinalResult:
+def pto_llm_failure_result(message: str, agent_id: str = "pto") -> PtoLLMFinalResult:
     return PtoLLMFinalResult(
         status="failed",
         answer=f"Не смог обработать ПТО-запрос через LLM-специалиста: {message}",
         model_usage=ModelUsageRecord(
-            agent_id="pto",
+            agent_id=agent_id,
             provider="",
             model="",
             status="error",
@@ -168,7 +175,19 @@ def pto_llm_failure_result(message: str) -> PtoLLMFinalResult:
     )
 
 
-def _decision_system_prompt() -> str:
+def _load_instructions(manifest: AgentManifest) -> str:
+    if not manifest.instructions_file:
+        return ""
+    try:
+        path = resolve_project_path(manifest.instructions_file)
+        return path.read_text(encoding="utf-8").strip()
+    except Exception as exc:
+        logger.warning("Failed to load instructions from %s: %s", manifest.instructions_file, exc)
+        return ""
+
+
+def _decision_system_prompt(instructions: str = "") -> str:
+    extra = f"\n\nДополнительные инструкции:\n{instructions}" if instructions else ""
     return (
         "Ты LLM-специалист ПТО внутри корпоративного AI-server. "
         "Твоя зона: исполнительная и проектная документация, акты, письма по объектам, "
@@ -192,6 +211,7 @@ def _decision_system_prompt() -> str:
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
         '"tool_calls":[{"name":"portal_document_search|document_read|spreadsheet_preview|spreadsheet_compare|document_draft_create|document_draft_list|none","args":{},"summary":""}]}.'
+        f"{extra}"
     )
 
 
@@ -228,7 +248,7 @@ def _parse_decision(data: dict[str, Any]) -> PtoLLMDecision:
     return PtoLLMDecision(
         status=_decision_status(data.get("status")),
         answer=str(data.get("answer") or "").strip(),
-        confidence=_confidence(data.get("confidence")),
+        confidence=confidence(data.get("confidence")),
         tool_calls=tool_calls,
     )
 
@@ -241,14 +261,6 @@ def _decision_status(value: object) -> str:
 def _result_status(value: object) -> str:
     status = str(value or "completed").strip()
     return status if status in RESULT_STATUSES else "completed"
-
-
-def _confidence(value: object) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return 0.5
-    return min(max(number, 0.0), 1.0)
 
 
 def _retrieval_context(hits: list[RetrievalHit]) -> list[dict[str, Any]]:
@@ -272,10 +284,7 @@ def _decision_dict(decision: PtoLLMDecision) -> dict[str, Any]:
         "status": decision.status,
         "answer": decision.answer,
         "confidence": decision.confidence,
-        "tool_calls": [
-            {"name": call.name, "args": call.args, "summary": call.summary}
-            for call in decision.tool_calls
-        ],
+        "tool_calls": [{"name": call.name, "args": call.args, "summary": call.summary} for call in decision.tool_calls],
     }
 
 

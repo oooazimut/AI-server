@@ -1,21 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Collection
-from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
-from pathlib import Path
 import sqlite3
+from collections.abc import Awaitable, Callable, Collection
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from ai_server.settings import get_settings
-
+from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)
-MOSCOW_TZ = timezone(timedelta(hours=3))
 WebhookProcessor = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
@@ -489,4 +488,3 @@ def _payload_data(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _now() -> datetime:
     return datetime.now(MOSCOW_TZ)
-

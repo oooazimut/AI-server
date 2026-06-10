@@ -23,4 +23,3 @@ def test_test_embedding_provider_is_deterministic():
 
     assert first
     assert first == second
-

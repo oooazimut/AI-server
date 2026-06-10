@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections import Counter
 import hashlib
 import math
 import re
+from collections import Counter
 
 from ai_server.agents.bitrix_llm import (
     BitrixLLMDecision,
@@ -18,7 +18,21 @@ from ai_server.agents.logistics_llm import (
     LogisticsLLMFinalResult,
     LogisticsLLMToolCall,
 )
-from ai_server.agents.pending_control_llm import PendingControlDecision, PendingControlResult
+from dataclasses import dataclass as _dataclass
+
+
+@_dataclass
+class PendingControlDecision:
+    decision: str
+    answer: str = ""
+    confidence: float = 0.9
+    reasoning: str = ""
+
+
+@_dataclass
+class PendingControlResult:
+    decision: PendingControlDecision
+    model_usage: "ModelUsageRecord"
 from ai_server.agents.pto_llm import (
     PtoLLMDecision,
     PtoLLMDecisionResult,
@@ -26,7 +40,7 @@ from ai_server.agents.pto_llm import (
     PtoLLMToolCall,
 )
 from ai_server.models import ModelUsageRecord
-from ai_server.orchestrators.internal_llm import InternalRouteDecision, InternalRouteResult
+from ai_server.orchestrators.internal_llm import InternalRouteDecision, InternalRouteResult, InternalSynthesisResult
 
 
 class FakeEmbeddingProvider:
@@ -54,6 +68,7 @@ class FakeBitrixLLM:
         self,
         *,
         tool_calls: list[BitrixLLMToolCall] | None = None,
+        tool_call_steps: list[list[BitrixLLMToolCall]] | None = None,
         decision_status: str = "completed",
         decision_answer: str = "",
         final_status: str = "completed",
@@ -61,6 +76,7 @@ class FakeBitrixLLM:
         confidence: float = 0.82,
     ) -> None:
         self.tool_calls = tool_calls or [BitrixLLMToolCall(name="none")]
+        self.tool_call_steps = tool_call_steps
         self.decision_status = decision_status
         self.decision_answer = decision_answer
         self.final_status = final_status
@@ -71,12 +87,17 @@ class FakeBitrixLLM:
 
     async def decide(self, **kwargs):
         self.decide_calls.append(kwargs)
+        if self.tool_call_steps is not None:
+            index = min(len(self.decide_calls) - 1, len(self.tool_call_steps) - 1)
+            tool_calls = self.tool_call_steps[index]
+        else:
+            tool_calls = self.tool_calls
         return BitrixLLMDecisionResult(
             decision=BitrixLLMDecision(
                 status=self.decision_status,
                 answer=self.decision_answer,
                 confidence=self.confidence,
-                tool_calls=self.tool_calls,
+                tool_calls=tool_calls,
             ),
             model_usage=_fake_usage(),
         )
@@ -266,12 +287,15 @@ class FakeInternalOrchestratorLLM:
         status: str = "completed",
         answer: str = "",
         confidence: float = 0.9,
+        synthesized_answer: str = "",
     ) -> None:
         self.handoff_to = handoff_to or []
         self.status = status
         self.answer = answer
         self.confidence = confidence
+        self.synthesized_answer = synthesized_answer
         self.route_calls = []
+        self.synthesize_calls = []
 
     async def route(self, **kwargs):
         self.route_calls.append(kwargs)
@@ -290,3 +314,14 @@ class FakeInternalOrchestratorLLM:
             ),
         )
 
+    async def synthesize(self, **kwargs):
+        self.synthesize_calls.append(kwargs)
+        return InternalSynthesisResult(
+            answer=self.synthesized_answer or "Синтезированный ответ.",
+            model_usage=ModelUsageRecord(
+                agent_id="internal_orchestrator",
+                provider="fake",
+                model="fake-orchestrator-llm",
+                status="used",
+            ),
+        )

@@ -1,2 +1,1 @@
 """Bitrix worker implementations."""
-

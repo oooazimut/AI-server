@@ -4,7 +4,6 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-
 MESSAGE_EVENTS = {
     "ONIMBOTV2MESSAGEADD",
     "ONIMBOTMESSAGEADD",
@@ -140,11 +139,7 @@ def _extract_files_from_value(value: Any, *, source: str) -> list[IncomingFile]:
         return []
 
     direct_id = _int(
-        value.get("id")
-        or value.get("ID")
-        or value.get("fileId")
-        or value.get("FILE_ID")
-        or value.get("file_id")
+        value.get("id") or value.get("ID") or value.get("fileId") or value.get("FILE_ID") or value.get("file_id")
     )
     if direct_id is not None:
         return [
@@ -198,4 +193,3 @@ def _int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
-

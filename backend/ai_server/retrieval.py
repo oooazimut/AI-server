@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections import Counter
 import math
-from pathlib import Path
 import re
+from collections import Counter
+from pathlib import Path
 
 from pydantic import BaseModel, Field
 
@@ -167,10 +167,7 @@ def _inverse_document_frequency(chunks: list[RetrievalChunk]) -> dict[str, float
         document_frequency.update(set(_tokenize(_chunk_vector_text(chunk))))
 
     total = len(chunks)
-    return {
-        term: math.log((total + 1) / (count + 0.5)) + 1.0
-        for term, count in document_frequency.items()
-    }
+    return {term: math.log((total + 1) / (count + 0.5)) + 1.0 for term, count in document_frequency.items()}
 
 
 def _chunk_vector_text(chunk: RetrievalChunk) -> str:

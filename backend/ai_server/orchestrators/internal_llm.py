@@ -5,8 +5,9 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
-from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord
-from ai_server.settings import get_settings
+from ai_server.models import AgentManifest, AgentResult, AgentTask, ModelUsageRecord
+from ai_server.settings import Settings, get_settings
+from ai_server.utils import confidence
 
 
 class InternalOrchestratorLLM(Protocol):
@@ -15,7 +16,15 @@ class InternalOrchestratorLLM(Protocol):
         *,
         task: AgentTask,
         manifests: list[AgentManifest],
-    ) -> "InternalRouteResult":
+    ) -> InternalRouteResult:
+        pass
+
+    async def synthesize(
+        self,
+        *,
+        task: AgentTask,
+        specialist_results: list[tuple[str, AgentResult]],
+    ) -> InternalSynthesisResult:
         pass
 
 
@@ -34,9 +43,17 @@ class InternalRouteResult:
     raw: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class InternalSynthesisResult:
+    answer: str
+    model_usage: ModelUsageRecord
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
 class InternalLLMRouter:
-    def __init__(self, client: LLMClient | None = None) -> None:
+    def __init__(self, client: LLMClient | None = None, settings: Settings | None = None) -> None:
         self.client = client or OpenAICompatibleLLMClient()
+        self._settings = settings or get_settings()
 
     async def route(
         self,
@@ -44,21 +61,21 @@ class InternalLLMRouter:
         task: AgentTask,
         manifests: list[AgentManifest],
     ) -> InternalRouteResult:
-        settings = get_settings()
         completion = await self.client.complete(
             agent_id="internal_orchestrator",
             messages=[
-                {"role": "system", "content": _system_prompt()},
+                {"role": "system", "content": _system_prompt(manifests)},
                 {
                     "role": "user",
                     "content": json.dumps(
                         {
                             "request": task.request,
                             "user": task.user.model_dump(),
+                            "dialog_history": task.context.get("dialog_history") or [],
                             "runtime_context": {
-                                "llm_provider": settings.llm_provider,
-                                "llm_model": settings.llm_model,
-                                "llm_configured": settings.llm_configured,
+                                "llm_provider": self._settings.llm_provider,
+                                "llm_model": self._settings.llm_model,
+                                "llm_configured": self._settings.llm_configured,
                             },
                             "available_specialists": [
                                 {
@@ -84,23 +101,74 @@ class InternalLLMRouter:
             raw=completion.raw,
         )
 
+    async def synthesize(
+        self,
+        *,
+        task: AgentTask,
+        specialist_results: list[tuple[str, AgentResult]],
+    ) -> InternalSynthesisResult:
+        completion = await self.client.complete(
+            agent_id="internal_orchestrator",
+            messages=[
+                {"role": "system", "content": _synthesis_prompt()},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "request": task.request,
+                            "specialist_answers": [
+                                {"specialist": agent_id, "answer": sr.answer}
+                                for agent_id, sr in specialist_results
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            json_mode=True,
+        )
+        raw = completion.json_content()
+        return InternalSynthesisResult(
+            answer=str(raw.get("answer") or "").strip(),
+            model_usage=completion.model_usage,
+            raw=raw,
+        )
 
-def _system_prompt() -> str:
+
+def _system_prompt(manifests: list[AgentManifest]) -> str:
+    routing_hints = _specialist_routing_hints(manifests)
     return (
         "Ты LLM-оркестратор корпоративного AI-server. "
         "Ты не выполняешь бизнес-действия и не вызываешь инструменты. "
         "Твоя задача: понять запрос, выбрать одного или несколько доступных специалистов, "
         "или вернуть уточняющий/информационный ответ, если специалист не нужен или не найден. "
-        "Никогда не притворяйся Bitrix/ПТО/сетевым специалистом и не выполняй их работу сам. "
+        "Если предоставлена dialog_history — учитывай контекст предыдущих сообщений для понимания текущего запроса. "
+        "Никогда не притворяйся специалистом и не выполняй их работу сам. "
         "Верни только JSON-объект без markdown: "
         '{"status":"completed|needs_clarification|failed",'
         '"answer":"короткий ответ, если handoff_to пустой",'
-        '"handoff_to":["bitrix24"],'
+        '"handoff_to":["specialist_id"],'
         '"confidence":0.0}. '
-        "Если запрос относится к Bitrix24, задачам, проектам, CRM или заявкам, выбери bitrix24. "
-        "Если запрос относится к техническим документам, сметам, ведомостям или сравнению документов, выбери pto. "
-        "Если запрос относится к служебным автомобилям, утреннему отчёту, сменам, выездам или логистике, выбери logistics. "
+        f"{routing_hints}"
         "Если подходящего специалиста нет, handoff_to=[] и честно скажи, что специалист еще не подключен."
+    )
+
+
+def _specialist_routing_hints(manifests: list[AgentManifest]) -> str:
+    hints = [
+        f"{m.handoff_description} → выбери {m.id}."
+        for m in manifests
+        if m.kind == "specialist" and m.handoff_description
+    ]
+    return " ".join(hints) + " " if hints else ""
+
+
+def _synthesis_prompt() -> str:
+    return (
+        "Ты LLM-оркестратор. Несколько специалистов выполнили задание и вернули ответы. "
+        "Объедини их в единый связный ответ для пользователя. "
+        "Не дублируй информацию. Не добавляй ничего от себя — только синтез ответов специалистов. "
+        'Верни только JSON-объект без markdown: {"answer": "..."}.'
     )
 
 
@@ -117,7 +185,7 @@ def _parse_decision(data: dict[str, Any], manifests: list[AgentManifest]) -> Int
         status=_status(data.get("status")),
         answer=str(data.get("answer") or "").strip(),
         handoff_to=handoff_to,
-        confidence=_confidence(data.get("confidence")),
+        confidence=confidence(data.get("confidence")),
     )
 
 
@@ -126,9 +194,3 @@ def _status(value: object) -> str:
     return status if status in {"completed", "needs_clarification", "failed"} else "completed"
 
 
-def _confidence(value: object) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return 0.5
-    return min(max(number, 0.0), 1.0)

@@ -2,7 +2,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-
 AgentKind = Literal["orchestrator", "operator", "specialist"]
 AgentAutomationKind = Literal[
     "channel_adapter",
@@ -71,6 +70,7 @@ class AgentManifest(BaseModel):
     data_scopes: list[str] = Field(default_factory=list)
     allowed_actions: list[str] = Field(default_factory=list)
     approval_required: list[str] = Field(default_factory=list)
+    audience: str = "employee"
 
 
 class AgentSummary(BaseModel):

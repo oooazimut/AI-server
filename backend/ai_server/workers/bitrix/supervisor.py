@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 import json
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.settings import get_settings
-
+from ai_server.utils import MOSCOW_TZ, optional_int
 
 logger = logging.getLogger(__name__)
-MOSCOW_TZ = timezone(timedelta(hours=3))
 
 
 @dataclass(frozen=True)
@@ -272,7 +272,7 @@ def _parse_overdue_tasks(raw_tasks: object) -> list[OverdueTask]:
             OverdueTask(
                 id=int(task_id),
                 title=str(_first(raw, "title", "TITLE") or "Без названия"),
-                responsible_id=_optional_int(_first(raw, "responsibleId", "RESPONSIBLE_ID")),
+                responsible_id=optional_int(_first(raw, "responsibleId", "RESPONSIBLE_ID")),
                 deadline=_optional_str(_first(raw, "deadline", "DEADLINE")),
                 status=_optional_str(_first(raw, "status", "STATUS")),
             )
@@ -390,15 +390,6 @@ def _first(data: dict[str, Any], *keys: str) -> object | None:
         if key in data and data[key] is not None:
             return data[key]
     return None
-
-
-def _optional_int(value: object) -> int | None:
-    if value in (None, ""):
-        return None
-    try:
-        return int(str(value).strip())
-    except (TypeError, ValueError):
-        return None
 
 
 def _optional_str(value: object) -> str | None:

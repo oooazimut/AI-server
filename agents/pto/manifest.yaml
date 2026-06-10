@@ -1,10 +1,11 @@
 id: pto
 name: ПТО
 kind: specialist
+audience: employee
 description: Работа с исполнительной, проектной и технической документацией, актами, письмами, сметами и ведомостями как техническими документами.
 version: 0.1.0
 handoff_description: Используй для ПТО-документов, исполнительной документации, актов по объектам, писем, смет/ведомостей, проверки комплектности и сравнения версий технических документов.
-entrypoint: backend.ai_server.agents.pto
+entrypoint: backend.ai_server.agents.pto.PtoSpecialist
 instructions_file: agents/pto/instructions.md
 skills_path: agents/pto/skills
 knowledge_path: agents/pto/knowledge/topics

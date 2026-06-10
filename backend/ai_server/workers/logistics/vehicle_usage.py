@@ -13,7 +13,7 @@ from ai_server.models import AgentTask, UserContext
 from ai_server.registry import get_agent_manifest
 from ai_server.settings import get_settings
 from ai_server.tools.vehicle_usage import MOSCOW_TZ, VehicleUsageStore, VehicleUsageToolset
-
+from ai_server.utils import optional_int
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +119,7 @@ async def run_vehicle_usage_once(
         return _skipped(status, "no_due_reminder")
     if existing and str(existing.get("status") or "") != "sent":
         return _skipped(status, "request_already_in_progress")
-    if existing and _optional_int(existing.get("reminder_count")) >= reminder_number:
+    if existing and optional_int(existing.get("reminder_count")) >= reminder_number:
         return _skipped(status, "reminder_already_sent")
 
     result = await _run_logistics_event(
@@ -362,10 +362,3 @@ def _vehicle_usage_dialog_id() -> str:
     return str(manager_id) if manager_id else ""
 
 
-def _optional_int(value: object) -> int | None:
-    if value in (None, ""):
-        return None
-    try:
-        return int(str(value).strip())
-    except (TypeError, ValueError):
-        return None

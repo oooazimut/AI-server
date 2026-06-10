@@ -10,8 +10,7 @@ from pydantic import BaseModel
 
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.events import IncomingFile, IncomingMessage
-from ai_server.settings import get_settings
-
+from ai_server.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -36,14 +35,15 @@ class AttachmentService:
     def __init__(
         self,
         bitrix: BitrixClient,
+        settings: Settings | None = None,
         *,
         storage_dir: Path | None = None,
         max_bytes: int | None = None,
     ) -> None:
-        settings = get_settings()
+        _settings = settings or get_settings()
         self.bitrix = bitrix
-        self.storage_dir = storage_dir or settings.attachment_storage_dir
-        self.max_bytes = max_bytes or settings.attachment_max_bytes
+        self.storage_dir = storage_dir or _settings.attachment_storage_dir
+        self.max_bytes = max_bytes or _settings.attachment_max_bytes
 
     async def download_message_files(self, message: IncomingMessage) -> list[StoredAttachment]:
         stored = []
@@ -61,21 +61,23 @@ class AttachmentService:
         size = 0
         target: Path | None = None
         content_type: str | None = None
-        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0), follow_redirects=True, trust_env=False) as client:
-            async with client.stream("GET", download_url) as response:
-                response.raise_for_status()
-                content_type = response.headers.get("content-type")
-                filename = self._build_filename(file, message, response.headers.get("content-disposition"))
-                target = self.storage_dir / filename
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with target.open("wb") as output:
-                    async for chunk in response.aiter_bytes():
-                        size += len(chunk)
-                        if size > self.max_bytes:
-                            output.close()
-                            target.unlink(missing_ok=True)
-                            raise AttachmentDownloadError(f"Attachment {file.id} exceeds {self.max_bytes} bytes")
-                        output.write(chunk)
+        async with (
+            httpx.AsyncClient(timeout=httpx.Timeout(120.0), follow_redirects=True, trust_env=False) as client,
+            client.stream("GET", download_url) as response,
+        ):
+            response.raise_for_status()
+            content_type = response.headers.get("content-type")
+            filename = self._build_filename(file, message, response.headers.get("content-disposition"))
+            target = self.storage_dir / filename
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("wb") as output:
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > self.max_bytes:
+                        output.close()
+                        target.unlink(missing_ok=True)
+                        raise AttachmentDownloadError(f"Attachment {file.id} exceeds {self.max_bytes} bytes")
+                    output.write(chunk)
 
         if target is None:
             raise AttachmentDownloadError(f"Attachment {file.id} was not downloaded")
@@ -96,9 +98,7 @@ class AttachmentService:
         content_disposition: str | None = None,
     ) -> str:
         name = self._safe_filename(
-            file.name
-            or self._filename_from_content_disposition(content_disposition)
-            or f"file-{file.id}"
+            file.name or self._filename_from_content_disposition(content_disposition) or f"file-{file.id}"
         )
         message_part = message.message_id or "message"
         return f"{message_part}-{file.id}-{name}"
@@ -136,4 +136,4 @@ class AttachmentService:
                 return await self.bitrix.get_chat_file_download_url(file.id, dialog_id=message.dialog_id)
             except Exception:
                 logger.exception("Chat file download failed: file_id=%s dialog_id=%s", file.id, message.dialog_id)
-                raise bot_exc
+                raise bot_exc from None

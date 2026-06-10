@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 
 from ai_server.models import AgentResult, ModelUsageRecord
-from ai_server.settings import get_settings
+from ai_server.settings import Settings, get_settings
 
 
 @dataclass(frozen=True)
@@ -20,24 +22,37 @@ class ProviderBalanceSnapshot:
     error: str = ""
 
 
+class BalanceClient(Protocol):
+    async def snapshot(self) -> ProviderBalanceSnapshot: ...
+
+
 class DeepSeekBalanceClient:
-    def __init__(self) -> None:
+    def __init__(self, settings: Settings) -> None:
+        self._lock = asyncio.Lock()
+        self._api_key = settings.deepseek_api_key
+        self._base_url = settings.deepseek_balance_base_url
+        self._timeout_seconds = settings.deepseek_balance_timeout_seconds
+        self._cache_seconds = settings.tech_footer_balance_cache_seconds
         self._cached_until: datetime | None = None
         self._cached_snapshot: ProviderBalanceSnapshot | None = None
 
     async def snapshot(self) -> ProviderBalanceSnapshot:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         if self._cached_snapshot and self._cached_until and now < self._cached_until:
             return self._cached_snapshot
 
-        settings = get_settings()
-        snapshot = await self._fetch(settings)
-        self._cached_snapshot = snapshot
-        self._cached_until = now + timedelta(seconds=settings.tech_footer_balance_cache_seconds)
-        return snapshot
+        async with self._lock:
+            now = datetime.now(UTC)
+            if self._cached_snapshot and self._cached_until and now < self._cached_until:
+                return self._cached_snapshot
 
-    async def _fetch(self, settings: Any) -> ProviderBalanceSnapshot:
-        if not settings.deepseek_api_key:
+            snapshot = await self._fetch()
+            self._cached_snapshot = snapshot
+            self._cached_until = now + timedelta(seconds=self._cache_seconds)
+            return snapshot
+
+    async def _fetch(self) -> ProviderBalanceSnapshot:
+        if not self._api_key:
             return ProviderBalanceSnapshot(
                 provider="deepseek",
                 status="not_configured",
@@ -45,15 +60,15 @@ class DeepSeekBalanceClient:
                 available=None,
             )
 
-        url = settings.deepseek_balance_base_url.rstrip("/") + "/user/balance"
+        url = self._base_url.rstrip("/") + "/user/balance"
         try:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(settings.deepseek_balance_timeout_seconds),
+                timeout=httpx.Timeout(self._timeout_seconds),
                 trust_env=False,
             ) as client:
                 response = await client.get(
                     url,
-                    headers={"Authorization": f"Bearer {settings.deepseek_api_key}"},
+                    headers={"Authorization": f"Bearer {self._api_key}"},
                 )
             response.raise_for_status()
             payload = response.json()
@@ -75,9 +90,114 @@ class DeepSeekBalanceClient:
         )
 
 
+class YandexBalanceClient:
+    def __init__(self, settings: Settings) -> None:
+        self._lock = asyncio.Lock()
+        self._account_id = settings.yandex_billing_account_id
+        self._token = settings.yandex_billing_iam_token or settings.yandex_iam_token
+        self._base_url = settings.yandex_billing_base_url
+        self._cache_seconds = settings.tech_footer_balance_cache_seconds
+        self._cached_until: datetime | None = None
+        self._cached_snapshot: ProviderBalanceSnapshot | None = None
+
+    async def snapshot(self) -> ProviderBalanceSnapshot:
+        now = datetime.now(UTC)
+        if self._cached_snapshot and self._cached_until and now < self._cached_until:
+            return self._cached_snapshot
+
+        async with self._lock:
+            now = datetime.now(UTC)
+            if self._cached_snapshot and self._cached_until and now < self._cached_until:
+                return self._cached_snapshot
+
+            snapshot = await self._fetch()
+            self._cached_snapshot = snapshot
+            self._cached_until = now + timedelta(seconds=self._cache_seconds)
+            return snapshot
+
+    async def _fetch(self) -> ProviderBalanceSnapshot:
+        if not self._account_id:
+            return ProviderBalanceSnapshot(
+                provider="yandex",
+                status="not_configured",
+                lines=["Yandex Cloud: баланс недоступен, YANDEX_BILLING_ACCOUNT_ID не задан."],
+                available=None,
+            )
+
+        if not self._token:
+            return ProviderBalanceSnapshot(
+                provider="yandex",
+                status="not_configured",
+                lines=["Yandex Cloud: баланс недоступен, YANDEX_BILLING_IAM_TOKEN не задан."],
+                available=None,
+            )
+
+        url = self._base_url.rstrip("/") + f"/billing/v1/billingAccounts/{self._account_id}"
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0), trust_env=False) as client:
+                response = await client.get(url, headers={"Authorization": f"Bearer {self._token}"})
+        except Exception as exc:
+            return ProviderBalanceSnapshot(
+                provider="yandex",
+                status="error",
+                lines=[f"Yandex Cloud: баланс недоступен ({type(exc).__name__})."],
+                available=None,
+                error=str(exc),
+            )
+
+        if response.status_code >= 400:
+            return ProviderBalanceSnapshot(
+                provider="yandex",
+                status="error",
+                lines=[f"Yandex Cloud: нет доступа (HTTP {response.status_code})."],
+                available=None,
+            )
+
+        try:
+            body = response.json()
+        except ValueError:
+            return ProviderBalanceSnapshot(
+                provider="yandex",
+                status="error",
+                lines=["Yandex Cloud: не разобрал ответ API."],
+                available=None,
+            )
+
+        balance = _decimal_from_any(body.get("balance"))
+        currency = str(body.get("currency") or "RUB")
+        if balance is None:
+            return ProviderBalanceSnapshot(
+                provider="yandex",
+                status="error",
+                lines=["Yandex Cloud: баланс не найден в ответе."],
+                available=None,
+            )
+
+        active = bool(body.get("active", True))
+        suffix = "" if active else "; аккаунт неактивен"
+        return ProviderBalanceSnapshot(
+            provider="yandex",
+            status="ok",
+            lines=[f"Yandex Cloud: баланс {_format_money(balance, currency)}{suffix}."],
+            available=active,
+        )
+
+
+def build_balance_registry(settings: Settings) -> dict[str, BalanceClient]:
+    registry: dict[str, BalanceClient] = {}
+    if settings.deepseek_api_key:
+        registry["deepseek"] = DeepSeekBalanceClient(settings)
+    if settings.yandex_billing_account_id and (settings.yandex_billing_iam_token or settings.yandex_iam_token):
+        registry["yandex"] = YandexBalanceClient(settings)
+    return registry
+
+
 class TechnicalFooterService:
-    def __init__(self, *, deepseek_balance: DeepSeekBalanceClient | None = None) -> None:
-        self.deepseek_balance = deepseek_balance or DeepSeekBalanceClient()
+    def __init__(self, *, balance_registry: dict[str, BalanceClient] | None = None) -> None:
+        settings = get_settings()
+        self._balance_registry: dict[str, BalanceClient] = (
+            balance_registry if balance_registry is not None else build_balance_registry(settings)
+        )
 
     async def build_for_agent_result(
         self,
@@ -90,11 +210,11 @@ class TechnicalFooterService:
             return ""
 
         lines = [_format_model_usage(result.model_usage)]
-        providers = {usage.provider.casefold() for usage in result.model_usage if usage.provider}
         settings = get_settings()
-        if settings.tech_footer_balance_enabled and "deepseek" in providers:
-            balance = await self.deepseek_balance.snapshot()
-            lines.extend(balance.lines)
+        if settings.tech_footer_balance_enabled:
+            providers = {usage.provider.casefold() for usage in result.model_usage if usage.provider}
+            balance_lines = await self._collect_balance_lines(providers)
+            lines.extend(balance_lines)
         return "\n".join(line for line in lines if line)
 
     async def build_for_pending_action(
@@ -112,12 +232,23 @@ class TechnicalFooterService:
             return f"LLM: не использовалась; Bitrix action: {status}."
 
         lines = [_format_model_usage(usages), f"Bitrix action: {status}."]
-        providers = {usage.provider.casefold() for usage in usages if usage.provider}
         settings = get_settings()
-        if settings.tech_footer_balance_enabled and "deepseek" in providers:
-            balance = await self.deepseek_balance.snapshot()
-            lines.extend(balance.lines)
+        if settings.tech_footer_balance_enabled:
+            providers = {usage.provider.casefold() for usage in usages if usage.provider}
+            balance_lines = await self._collect_balance_lines(providers)
+            lines.extend(balance_lines)
         return "\n".join(line for line in lines if line)
+
+    async def _collect_balance_lines(self, providers: set[str]) -> list[str]:
+        clients = [(provider, self._balance_registry[provider]) for provider in sorted(providers) if provider in self._balance_registry]
+        if not clients:
+            return []
+        snapshots = await asyncio.gather(*[client.snapshot() for _, client in clients], return_exceptions=True)
+        lines: list[str] = []
+        for snapshot in snapshots:
+            if isinstance(snapshot, ProviderBalanceSnapshot):
+                lines.extend(snapshot.lines)
+        return lines
 
 
 def append_footer(message: str, footer: str) -> str:
@@ -209,3 +340,7 @@ def _format_money(amount: Decimal, currency: str) -> str:
 
 def _optional_bool(value: Any) -> bool | None:
     return value if isinstance(value, bool) else None
+
+
+# Legacy alias kept for backward compat within this session
+_DeepSeekBalanceClient = DeepSeekBalanceClient

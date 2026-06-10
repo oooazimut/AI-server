@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from typing import Any
+
 from ai_server.agents.logistics_llm import (
     LogisticsAgentLLM,
     LogisticsLLMService,
     LogisticsLLMToolCall,
     logistics_llm_failure_result,
 )
+from ai_server.utils import unique
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult
 from ai_server.retrieval import HybridKnowledgeRetriever
@@ -31,6 +34,10 @@ class LogisticsSpecialist:
         self.tools = tools or VehicleUsageToolset()
         self.llm = llm or LogisticsLLMService()
 
+    @classmethod
+    def build(cls, manifest: AgentManifest, *, vehicle_usage_tools: VehicleUsageToolset | None = None, logistics_retriever: HybridKnowledgeRetriever | None = None, logistics_llm: LogisticsAgentLLM | None = None, **_: Any) -> "LogisticsSpecialist":
+        return cls(manifest, retriever=logistics_retriever, tools=vehicle_usage_tools, llm=logistics_llm)
+
     async def handle(self, task: AgentTask) -> AgentResult:
         available_skills = self.skill_store.list_skills(self.manifest)
         retrieval_hits = self.retriever.search(self.manifest, task.request, limit=5)
@@ -40,10 +47,9 @@ class LogisticsSpecialist:
                 status="completed",
                 details={
                     "available_skills": [
-                        {"id": skill.id, "title": skill.title, "preview": skill.preview}
-                        for skill in available_skills
+                        {"id": skill.id, "title": skill.title, "preview": skill.preview} for skill in available_skills
                     ],
-                    "retrieval_topics": _unique([hit.chunk.topic for hit in retrieval_hits]),
+                    "retrieval_topics": unique([hit.chunk.topic for hit in retrieval_hits]),
                     "retrieval_hits": [
                         {
                             "topic": hit.chunk.topic,
@@ -73,7 +79,7 @@ class LogisticsSpecialist:
                     tool_results=list(tool_results),
                 )
             except Exception as exc:
-                failure = logistics_llm_failure_result(f"{type(exc).__name__}: {exc}")
+                failure = logistics_llm_failure_result(f"{type(exc).__name__}: {exc}", agent_id=self.manifest.id)
                 return AgentResult(
                     status="failed",
                     agent_id=self.manifest.id,
@@ -127,7 +133,7 @@ class LogisticsSpecialist:
                 )
 
         if decision is None:
-            failure = logistics_llm_failure_result("empty Logistics LLM decision loop")
+            failure = logistics_llm_failure_result("empty Logistics LLM decision loop", agent_id=self.manifest.id)
             return AgentResult(
                 status="failed",
                 agent_id=self.manifest.id,
@@ -139,9 +145,9 @@ class LogisticsSpecialist:
             )
 
         try:
-            final_result = await self.llm.compose(task=task, decision=decision, tool_results=tool_results)
+            final_result = await self.llm.compose(manifest=self.manifest, task=task, decision=decision, tool_results=tool_results)
         except Exception as exc:
-            failure = logistics_llm_failure_result(f"{type(exc).__name__}: {exc}")
+            failure = logistics_llm_failure_result(f"{type(exc).__name__}: {exc}", agent_id=self.manifest.id)
             return AgentResult(
                 status="failed",
                 agent_id=self.manifest.id,
@@ -181,13 +187,19 @@ class LogisticsSpecialist:
             return None, None
         if tool_call.name == "vehicle_usage_context":
             result = self.tools.vehicle_usage_context(tool_call.args)
-            return result, ActionRecord(name="logistics_vehicle_usage_context", status=result.status, details=result.model_dump())
+            return result, ActionRecord(
+                name="logistics_vehicle_usage_context", status=result.status, details=result.model_dump()
+            )
         if tool_call.name == "vehicle_usage_save_draft":
             result = self.tools.vehicle_usage_save_draft(tool_call.args)
-            return result, ActionRecord(name="logistics_vehicle_usage_save_draft", status=result.status, details=result.model_dump())
+            return result, ActionRecord(
+                name="logistics_vehicle_usage_save_draft", status=result.status, details=result.model_dump()
+            )
         if tool_call.name == "vehicle_usage_save_report":
             result = self.tools.vehicle_usage_save_report(tool_call.args)
-            return result, ActionRecord(name="logistics_vehicle_usage_save_report", status=result.status, details=result.model_dump())
+            return result, ActionRecord(
+                name="logistics_vehicle_usage_save_report", status=result.status, details=result.model_dump()
+            )
 
         result = ToolResult(
             status="invalid_tool_call",
@@ -203,11 +215,3 @@ def _logs() -> list[str]:
         "User-facing delivery belongs to the Negotiator/channel runtime.",
         "Bitrix remains the channel/source layer; Logistics owns vehicle usage interpretation.",
     ]
-
-
-def _unique(values: list[str]) -> list[str]:
-    result: list[str] = []
-    for value in values:
-        if value not in result:
-            result.append(value)
-    return result

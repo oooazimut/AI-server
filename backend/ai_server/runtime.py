@@ -4,7 +4,6 @@ from pathlib import Path
 
 from ai_server.registry import PROJECT_ROOT
 
-
 DEFAULT_VAR_DIR = PROJECT_ROOT / "var"
 
 

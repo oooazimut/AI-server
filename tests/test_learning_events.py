@@ -8,7 +8,7 @@ from ai_server.models import ActionRecord, AgentResult, AgentTask, ModelUsageRec
 
 
 def test_learning_recorder_records_agent_result_and_feedback(tmp_path):
-    recorder = LearningEventRecorder(tmp_path / "learning_events.jsonl", enabled=True)
+    recorder = LearningEventRecorder(path=tmp_path / "learning_events.jsonl", enabled=True)
     task = AgentTask(
         task_id="task-1",
         source="local_test",
@@ -66,7 +66,7 @@ def test_learning_recorder_records_agent_result_and_feedback(tmp_path):
 
 def test_learning_recorder_can_disable_text_capture(tmp_path):
     recorder = LearningEventRecorder(
-        tmp_path / "learning_events.jsonl",
+        path=tmp_path / "learning_events.jsonl",
         enabled=True,
         capture_text=False,
     )
@@ -89,7 +89,7 @@ def test_learning_recorder_can_disable_text_capture(tmp_path):
 def test_bitrix_webhook_processor_records_learning_event(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_DRY_RUN", "true")
     monkeypatch.setenv("AI_SERVER_TECH_FOOTER_ENABLED", "false")
-    recorder = LearningEventRecorder(tmp_path / "learning_events.jsonl", enabled=True)
+    recorder = LearningEventRecorder(path=tmp_path / "learning_events.jsonl", enabled=True)
 
     class FakeOrchestrator:
         async def handle(self, task):

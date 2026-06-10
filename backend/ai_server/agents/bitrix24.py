@@ -1,27 +1,29 @@
 from __future__ import annotations
 
-from ai_server.agents.bitrix_task_create import (
-    BitrixTaskCreateDraft,
-    BitrixTaskCreateResolution,
-    build_task_create_draft_from_args,
-)
-from ai_server.agents.bitrix_task_closure import (
-    TASK_CLOSURE_PENDING_METHOD,
-    BitrixTaskClosureDraft,
-    build_task_closure_draft_from_args,
-)
+from typing import Any
+
+from ai_server.utils import optional_int, unique
 from ai_server.agents.bitrix_llm import (
     BitrixAgentLLM,
     BitrixLLMService,
     BitrixLLMToolCall,
     llm_failure_result,
 )
+from ai_server.agents.bitrix_task_closure import (
+    TASK_CLOSURE_PENDING_METHOD,
+    BitrixTaskClosureDraft,
+    build_task_closure_draft_from_args,
+)
+from ai_server.agents.bitrix_task_create import (
+    BitrixTaskCreateDraft,
+    BitrixTaskCreateResolution,
+    build_task_create_draft_from_args,
+)
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
 from ai_server.tools.bitrix import BitrixToolset
-from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
 
 
 class Bitrix24Specialist:
@@ -42,6 +44,10 @@ class Bitrix24Specialist:
         self.tools = tools or BitrixToolset()
         self.llm = llm or BitrixLLMService()
 
+    @classmethod
+    def build(cls, manifest: AgentManifest, *, bitrix_tools: BitrixToolset | None = None, bitrix_retriever: HybridKnowledgeRetriever | None = None, bitrix_llm: BitrixAgentLLM | None = None, **_: object) -> "Bitrix24Specialist":
+        return cls(manifest, retriever=bitrix_retriever, tools=bitrix_tools, llm=bitrix_llm)
+
     async def handle(self, task: AgentTask) -> AgentResult:
         available_skills = self.skill_store.list_skills(self.manifest)
         permission_context = await self._load_permission_context(task)
@@ -53,10 +59,9 @@ class Bitrix24Specialist:
                 status="completed",
                 details={
                     "available_skills": [
-                        {"id": skill.id, "title": skill.title, "preview": skill.preview}
-                        for skill in available_skills
+                        {"id": skill.id, "title": skill.title, "preview": skill.preview} for skill in available_skills
                     ],
-                    "retrieval_topics": _unique([hit.chunk.topic for hit in retrieval_hits]),
+                    "retrieval_topics": unique([hit.chunk.topic for hit in retrieval_hits]),
                     "retrieval_hits": [
                         {
                             "topic": hit.chunk.topic,
@@ -88,7 +93,7 @@ class Bitrix24Specialist:
                 tool_definitions=self.tool_definitions(),
             )
         except Exception as exc:
-            failure = llm_failure_result(f"{type(exc).__name__}: {exc}")
+            failure = llm_failure_result(f"{type(exc).__name__}: {exc}", agent_id=self.manifest.id)
             return AgentResult(
                 status="failed",
                 agent_id=self.manifest.id,
@@ -113,8 +118,7 @@ class Bitrix24Specialist:
                 status=decision.status,
                 details={
                     "tool_calls": [
-                        {"name": call.name, "args": call.args, "summary": call.summary}
-                        for call in decision.tool_calls
+                        {"name": call.name, "args": call.args, "summary": call.summary} for call in decision.tool_calls
                     ],
                     "confidence": decision.confidence,
                 },
@@ -133,13 +137,14 @@ class Bitrix24Specialist:
 
         try:
             final_result = await self.llm.compose(
+                manifest=self.manifest,
                 task=task,
                 decision=decision,
                 tool_results=tool_results,
                 approval_actions=[action.model_dump() for action in approval_actions],
             )
         except Exception as exc:
-            failure = llm_failure_result(f"{type(exc).__name__}: {exc}")
+            failure = llm_failure_result(f"{type(exc).__name__}: {exc}", agent_id=self.manifest.id)
             return AgentResult(
                 status="failed",
                 agent_id=self.manifest.id,
@@ -297,7 +302,7 @@ class Bitrix24Specialist:
                 status=result.status,
                 details=draft.as_action_details(),
             )
-            return result, action, _approval_actions_from_task_create_draft(draft)
+            return result, action, _approval_actions_from_task_create_draft(draft, self.manifest)
         if tool_call.name == "task_closure":
             draft = await self._task_closure_draft(task, tool_call.args)
             result = _tool_result_from_task_closure_draft(draft)
@@ -306,7 +311,14 @@ class Bitrix24Specialist:
                 status=result.status,
                 details=draft.as_action_details(),
             )
-            return result, action, _approval_actions_from_task_closure_draft(draft)
+            return result, action, _approval_actions_from_task_closure_draft(draft, self.manifest)
+        if tool_call.name == "bitrix_api":
+            result = await self.tools.bitrix_api(tool_call.args)
+            return (
+                result,
+                ActionRecord(name="bitrix_api", status=result.status, details=result.model_dump()),
+                [],
+            )
         result = ToolResult(
             status="invalid_tool_call",
             tool=tool_call.name,
@@ -336,7 +348,7 @@ class Bitrix24Specialist:
         }
 
     async def _current_user_profile_result(self, task: AgentTask) -> ToolResult:
-        user_id = _optional_int(task.user.id)
+        user_id = optional_int(task.user.id)
         tool = getattr(self.tools, "current_user_profile", None)
         if user_id is None or tool is None:
             return ToolResult(
@@ -370,8 +382,10 @@ class Bitrix24Specialist:
             if result.status == "ok":
                 candidate = result.data.get("candidate") if isinstance(result.data, dict) else None
                 if isinstance(candidate, dict):
-                    responsible_id = _optional_int(candidate.get("id"))
-                    responsible_note = f"Ответственный найден в Bitrix: {candidate.get('label') or draft.responsible_query}."
+                    responsible_id = optional_int(candidate.get("id"))
+                    responsible_note = (
+                        f"Ответственный найден в Bitrix: {candidate.get('label') or draft.responsible_query}."
+                    )
             elif result.status == "ambiguous":
                 notes.append(_format_ambiguous_note("Найдено несколько сотрудников", result.data.get("candidates")))
             elif result.status == "not_found":
@@ -384,7 +398,7 @@ class Bitrix24Specialist:
             if result.status == "ok":
                 candidate = result.data.get("candidate") if isinstance(result.data, dict) else None
                 if isinstance(candidate, dict):
-                    group_id = _optional_int(candidate.get("id"))
+                    group_id = optional_int(candidate.get("id"))
                     group_note = f"Проект найден в Bitrix: {candidate.get('label') or draft.project_query}."
             elif result.status == "ambiguous":
                 notes.append(_format_ambiguous_note("Найдено несколько проектов", result.data.get("candidates")))
@@ -402,6 +416,7 @@ class Bitrix24Specialist:
             group_note=group_note,
             notes=notes,
         )
+
 
 def _format_ambiguous_note(prefix: str, candidates: object) -> str:
     if not isinstance(candidates, list):
@@ -448,19 +463,20 @@ def _tool_result_from_task_create_draft(draft: BitrixTaskCreateDraft) -> ToolRes
     )
 
 
-def _approval_actions_from_task_create_draft(draft: BitrixTaskCreateDraft) -> list[ActionRecord]:
+def _approval_actions_from_task_create_draft(draft: BitrixTaskCreateDraft, manifest: AgentManifest) -> list[ActionRecord]:
     if not draft.is_ready:
         return []
-    decision = decide_bitrix_method_policy(draft.method)
+    needs_approval = "bitrix_write" in manifest.approval_required
     return [
         ActionRecord(
             name="bitrix_api",
-            status="approval_required" if decision.decision == "confirm" else decision.decision,
+            status="approval_required" if needs_approval else "allow",
             details={
                 "method": draft.method,
                 "params": draft.params,
-                "policy": decision.model_dump(),
+                "policy": {"decision": "confirm" if needs_approval else "allow", "reason": "manifest.approval_required"},
                 "summary": draft.summary,
+                "specialist_id": manifest.id,
             },
         )
     ]
@@ -475,18 +491,20 @@ def _tool_result_from_task_closure_draft(draft: BitrixTaskClosureDraft) -> ToolR
     )
 
 
-def _approval_actions_from_task_closure_draft(draft: BitrixTaskClosureDraft) -> list[ActionRecord]:
+def _approval_actions_from_task_closure_draft(draft: BitrixTaskClosureDraft, manifest: AgentManifest) -> list[ActionRecord]:
     if not draft.is_ready:
         return []
+    needs_approval = "close_task" in manifest.approval_required
     return [
         ActionRecord(
             name="bitrix_task_closure",
-            status="approval_required",
+            status="approval_required" if needs_approval else "allow",
             details={
                 "method": TASK_CLOSURE_PENDING_METHOD,
                 "params": draft.params,
-                "policy": {"decision": "confirm", "reason": "task closure requires chat confirmation"},
+                "policy": {"decision": "confirm" if needs_approval else "allow", "reason": "manifest.approval_required"},
                 "summary": draft.summary,
+                "specialist_id": manifest.id,
             },
         )
     ]
@@ -499,25 +517,8 @@ def _logs() -> list[str]:
     ]
 
 
-def _optional_int(value: object) -> int | None:
-    try:
-        if value in (None, ""):
-            return None
-        return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None
-
-
 def _draft_fields(draft: BitrixTaskCreateDraft) -> dict:
     fields = draft.params.get("fields")
     return fields if isinstance(fields, dict) else {}
-
-
-def _unique(values: list[str]) -> list[str]:
-    result: list[str] = []
-    for value in values:
-        if value not in result:
-            result.append(value)
-    return result
 
 
