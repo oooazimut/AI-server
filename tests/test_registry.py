@@ -6,9 +6,9 @@ def test_load_agent_manifests():
 
     assert {agent.id for agent in manifests} >= {
         "internal_orchestrator",
-        "support_operator",
         "bitrix24",
-        "networking",
+        "logistics",
+        "pto",
     }
 
 

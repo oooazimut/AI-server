@@ -492,8 +492,10 @@ def test_task_add_write_policy_translates_internal_no_deadline_marker(monkeypatc
 
 
 def test_bitrix_client_create_bot_chat_builds_v2_payload(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("BITRIX_BOT_ID", "42")
     monkeypatch.setenv("BITRIX_BOT_TOKEN", "bot-token")
+    monkeypatch.setenv("BITRIX_BOT_AUTH_MODE", "webhook")
 
     client = RecordingCreateChatClient()
 
