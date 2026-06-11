@@ -28,6 +28,61 @@ class TranscriptionError(RuntimeError):
     pass
 
 
+class OpenAITranscriber:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        model: str | None = None,
+        max_bytes: int | None = None,
+    ) -> None:
+        _settings = settings or get_settings()
+        self._settings = _settings
+        self.api_key = api_key if api_key is not None else _settings.openai_api_key
+        self.base_url = (base_url or _settings.openai_base_url).rstrip("/")
+        self.model = model or _settings.openai_transcribe_model
+        self.max_bytes = max_bytes or _settings.transcription_max_bytes
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key)
+
+    async def transcribe(self, attachment: StoredAttachment) -> TranscriptionResult:
+        if not self.configured:
+            raise TranscriptionNotConfigured("OPENAI_API_KEY is not configured")
+
+        path = Path(attachment.path)
+        if not path.exists():
+            raise TranscriptionError(f"Attachment does not exist: {path}")
+        if path.stat().st_size > self.max_bytes:
+            raise TranscriptionError(f"Attachment exceeds transcription limit of {self.max_bytes} bytes")
+
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        data = {"model": self.model, "response_format": "json"}
+
+        with path.open("rb") as audio:
+            files = {"file": (path.name, audio, attachment.content_type or "application/octet-stream")}
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0), trust_env=False) as client:
+                response = await client.post(
+                    f"{self.base_url}/audio/transcriptions",
+                    headers=headers,
+                    data=data,
+                    files=files,
+                )
+
+        if response.status_code >= 400:
+            raise TranscriptionError(f"OpenAI transcription failed: {response.status_code} {response.text}")
+
+        payload = response.json()
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            raise TranscriptionError("OpenAI transcription returned empty text")
+
+        return TranscriptionResult(text=text, model=self.model, attachment=attachment, raw=payload)
+
+
 class YandexSpeechKitTranscriber:
     def __init__(
         self,
@@ -139,8 +194,12 @@ class UnconfiguredTranscriber:
         raise TranscriptionNotConfigured(self.reason)
 
 
-def build_transcriber(settings: Settings | None = None) -> YandexSpeechKitTranscriber | UnconfiguredTranscriber:
+def build_transcriber(
+    settings: Settings | None = None,
+) -> OpenAITranscriber | YandexSpeechKitTranscriber | UnconfiguredTranscriber:
     _settings = settings or get_settings()
+    if _settings.stt_provider == "openai":
+        return OpenAITranscriber(_settings)
     if _settings.stt_provider == "yandex_speechkit":
         return YandexSpeechKitTranscriber(_settings)
     return UnconfiguredTranscriber(f"Unknown STT_PROVIDER: {_settings.stt_provider}")

@@ -122,6 +122,9 @@ class Settings:
     attachment_max_bytes: int
     stt_provider: str
     transcription_max_bytes: int
+    openai_api_key: str
+    openai_base_url: str
+    openai_transcribe_model: str
     yandex_api_key: str
     yandex_iam_token: str
     yandex_folder_id: str
@@ -251,6 +254,8 @@ class Settings:
 
     @property
     def transcription_configured(self) -> bool:
+        if self.stt_provider == "openai":
+            return bool(self.openai_api_key)
         return self.stt_provider == "yandex_speechkit" and bool(
             self.yandex_api_key or (self.yandex_iam_token and self.yandex_folder_id)
         )
@@ -452,6 +457,9 @@ def get_settings() -> Settings:
         attachment_max_bytes=_env_int("ATTACHMENT_MAX_BYTES", 30 * 1024 * 1024) or (30 * 1024 * 1024),
         stt_provider=_env("STT_PROVIDER", "yandex_speechkit"),
         transcription_max_bytes=_env_int("TRANSCRIPTION_MAX_BYTES", 25 * 1024 * 1024) or (25 * 1024 * 1024),
+        openai_api_key=_env("OPENAI_API_KEY"),
+        openai_base_url=_env("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        openai_transcribe_model=_env("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe"),
         yandex_api_key=_env("YANDEX_API_KEY"),
         yandex_iam_token=_env("YANDEX_IAM_TOKEN"),
         yandex_folder_id=_env("YANDEX_FOLDER_ID"),
