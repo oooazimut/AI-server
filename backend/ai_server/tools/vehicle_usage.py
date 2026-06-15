@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from ai_server.agent_store import AgentStore
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.models import ToolDefinition, ToolResult
 from ai_server.settings import get_settings
@@ -44,12 +44,12 @@ SERVICE_VEHICLES: tuple[ServiceVehicle, ...] = (
 )
 
 
-class VehicleUsageStore:
+class VehicleUsageStore(AgentStore):
     def __init__(self, path: Path | None = None) -> None:
-        self.path = path or get_settings().vehicle_usage_db_path
+        super().__init__("logistics", path or get_settings().vehicle_usage_db_path)
 
     def ensure_schema(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        super().ensure_schema()
         with self._connection() as db:
             db.execute(
                 """
@@ -117,11 +117,11 @@ class VehicleUsageStore:
                 """
             )
 
-    def bootstrap_reference_data(self) -> None:
+    def bootstrap_reference_data(self, roster: list[StaffMember] | None = None) -> None:
         self.ensure_schema()
-        roster = _staff_roster_from_settings()
+        members = roster if roster is not None else _staff_roster_from_settings()
         with self._connection() as db:
-            for member in roster:
+            for member in members:
                 db.execute(
                     """
                     INSERT INTO employees (id, bitrix_user_id, full_name, position)
@@ -390,22 +390,6 @@ class VehicleUsageStore:
             "vehicle_assignments_saved": len(vehicle_entries),
         }
 
-    @contextmanager
-    def _connection(self):
-        connection = sqlite3.connect(self.path)
-        connection.row_factory = sqlite3.Row
-        try:
-            with connection:
-                yield connection
-        finally:
-            connection.close()
-
-    @staticmethod
-    def _ensure_column(db: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
-        columns = {str(row["name"]) for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
-        if column not in columns:
-            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-
 
 class VehicleUsageToolset:
     def __init__(
@@ -498,6 +482,31 @@ class VehicleUsageToolset:
             parsed=parsed,
         )
         return ToolResult(status="ok", tool="vehicle_usage_save_report", data=saved)
+
+
+async def fetch_staff_roster(
+    client: BitrixClient,
+    *,
+    exclude_user_ids: set[int] | None = None,
+) -> list[StaffMember]:
+    users = await client.list_all_users(
+        filter_={"ACTIVE": True, "USER_TYPE": "employee"},
+        select=["ID", "NAME", "LAST_NAME", "WORK_POSITION"],
+    )
+    excluded = exclude_user_ids or set()
+    candidates: list[tuple[str, int, str]] = []
+    for user in users:
+        user_id = optional_int(user.get("ID") or user.get("id"))
+        if user_id is None or user_id in excluded:
+            continue
+        first = str(user.get("NAME") or "").strip()
+        last = str(user.get("LAST_NAME") or "").strip()
+        name = f"{last} {first}".strip() if last else first
+        if not name:
+            continue
+        candidates.append((last.casefold() or first.casefold(), user_id, name))
+    candidates.sort(key=lambda x: x[0])
+    return [StaffMember(order=i + 1, user_id=uid, name=name) for i, (_, uid, name) in enumerate(candidates)]
 
 
 def _staff_roster_from_settings() -> list[StaffMember]:

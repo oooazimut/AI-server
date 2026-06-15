@@ -29,10 +29,19 @@ class InternalOrchestratorLLM(Protocol):
 
 
 @dataclass(frozen=True)
+class ScheduledTaskDecision:
+    agent_id: str
+    job_id: str
+    trigger: dict[str, Any]
+    task_description: str
+
+
+@dataclass(frozen=True)
 class InternalRouteDecision:
     status: str
     answer: str
     handoff_to: list[str] = field(default_factory=list)
+    scheduled_tasks: list[ScheduledTaskDecision] = field(default_factory=list)
     confidence: float = 0.5
 
 
@@ -139,17 +148,22 @@ def _system_prompt(manifests: list[AgentManifest]) -> str:
     return (
         "Ты LLM-оркестратор корпоративного AI-server. "
         "Ты не выполняешь бизнес-действия и не вызываешь инструменты. "
-        "Твоя задача: понять запрос, выбрать одного или несколько доступных специалистов, "
-        "или вернуть уточняющий/информационный ответ, если специалист не нужен или не найден. "
-        "Если предоставлена dialog_history — учитывай контекст предыдущих сообщений для понимания текущего запроса. "
+        "Твоя задача: понять запрос, выбрать одного или нескольких доступных специалистов, "
+        "или запланировать задачу на будущее, или вернуть ответ, если специалист не нужен. "
+        "Если предоставлена dialog_history — учитывай контекст предыдущих сообщений. "
         "Никогда не притворяйся специалистом и не выполняй их работу сам. "
         "Верни только JSON-объект без markdown: "
         '{"status":"completed|needs_clarification|failed",'
-        '"answer":"короткий ответ, если handoff_to пустой",'
+        '"answer":"ответ пользователю (обязателен если handoff_to пустой)",'
         '"handoff_to":["specialist_id"],'
+        '"scheduled_tasks":[],'
         '"confidence":0.0}. '
         f"{routing_hints}"
-        "Если подходящего специалиста нет, handoff_to=[] и честно скажи, что специалист еще не подключен."
+        "Если запрос — отложенная задача (через N времени, послезавтра, каждую неделю и т.п.) — "
+        "используй scheduled_tasks вместо или вместе с handoff_to. "
+        'Формат элемента scheduled_tasks: {"agent_id":"...","job_id":"краткий_slug","trigger":{"type":"date","run_date":"ISO"},"task_description":"..."}. '
+        'Для повторяющихся задач trigger: {"type":"cron","hour":9,"minute":0,"day_of_week":"mon"}. '
+        "Если подходящего специалиста нет, handoff_to=[] и честно скажи что специалист не подключён."
     )
 
 
@@ -180,12 +194,40 @@ def _parse_decision(data: dict[str, Any], manifests: list[AgentManifest]) -> Int
             value = str(item or "").strip()
             if value in known_specialists and value not in handoff_to:
                 handoff_to.append(value)
+    scheduled_tasks = _parse_scheduled_tasks(data.get("scheduled_tasks"), known_specialists)
     return InternalRouteDecision(
         status=_status(data.get("status")),
         answer=str(data.get("answer") or "").strip(),
         handoff_to=handoff_to,
+        scheduled_tasks=scheduled_tasks,
         confidence=confidence(data.get("confidence")),
     )
+
+
+def _parse_scheduled_tasks(raw: object, known_specialists: set[str]) -> list[ScheduledTaskDecision]:
+    if not isinstance(raw, list):
+        return []
+    result = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        agent_id = str(item.get("agent_id") or "").strip()
+        trigger = item.get("trigger")
+        task_description = str(item.get("task_description") or "").strip()
+        if not agent_id or not isinstance(trigger, dict) or not task_description:
+            continue
+        if agent_id not in known_specialists:
+            continue
+        job_id = str(item.get("job_id") or "").strip() or agent_id
+        result.append(
+            ScheduledTaskDecision(
+                agent_id=agent_id,
+                job_id=job_id,
+                trigger=trigger,
+                task_description=task_description,
+            )
+        )
+    return result
 
 
 def _status(value: object) -> str:

@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from .agent_scheduler import AgentScheduler
 from .channels.bitrix import BitrixWebhookProcessor
 from .integrations.bitrix.client import BitrixClient
 from .integrations.bitrix.oauth import BitrixOAuthService
@@ -17,7 +18,7 @@ from .workers.bitrix.reconciler import run_reconciler
 from .workers.bitrix.search_indexer import PortalSearchIndexerWorker
 from .workers.bitrix.supervisor import run_task_supervisor
 from .workers.bitrix.webhook_event_queue import WebhookEventQueue, run_webhook_event_worker
-from .workers.logistics.vehicle_usage import run_vehicle_usage_worker
+from .workers.logistics.vehicle_usage import VehicleUsageWorker
 
 
 @asynccontextmanager
@@ -142,11 +143,14 @@ async def lifespan(app: FastAPI):
         "errors": 0,
     }
 
+    scheduler = AgentScheduler()
+    scheduler.start()
+    app.state.scheduler = scheduler
+
     webhook_worker_task: asyncio.Task | None = None
     search_indexer_task: asyncio.Task | None = None
     supervisor_task: asyncio.Task | None = None
     reconciler_task: asyncio.Task | None = None
-    vehicle_usage_task: asyncio.Task | None = None
 
     if settings.webhook_event_queue_enabled and settings.webhook_event_worker_enabled:
         processor = BitrixWebhookProcessor(
@@ -158,6 +162,7 @@ async def lifespan(app: FastAPI):
             search_webhook_status=app.state.search_webhook_indexer_status,
             quality_control_status=app.state.quality_control_webhook_status,
             learning_recorder=learning_recorder,
+            scheduler=scheduler,
         )
         webhook_worker_task = asyncio.create_task(
             run_webhook_event_worker(
@@ -180,9 +185,10 @@ async def lifespan(app: FastAPI):
             )
         )
     if settings.vehicle_usage_enabled:
-        vehicle_usage_task = asyncio.create_task(
-            run_vehicle_usage_worker(bitrix, status=app.state.vehicle_usage_status)
-        )
+        vehicle_usage_worker = VehicleUsageWorker(scheduler, bitrix, settings=settings)
+        vehicle_usage_worker.setup_today()
+        vehicle_usage_worker.setup_midnight_cron()
+        app.state.vehicle_usage_worker = vehicle_usage_worker
 
     try:
         yield
@@ -215,10 +221,4 @@ async def lifespan(app: FastAPI):
                 await reconciler_task
             except asyncio.CancelledError:
                 pass
-        if vehicle_usage_task:
-            app.state.vehicle_usage_status["running"] = False
-            vehicle_usage_task.cancel()
-            try:
-                await vehicle_usage_task
-            except asyncio.CancelledError:
-                pass
+        scheduler.stop()
