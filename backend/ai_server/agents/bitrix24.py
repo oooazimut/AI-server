@@ -97,6 +97,7 @@ class Bitrix24Specialist:
                 task=task,
                 retrieval_hits=retrieval_hits,
                 tool_definitions=self.tool_definitions(),
+                dialog_history=task.context.get("dialog_history"),
             )
         except Exception as exc:
             failure = llm_failure_result(f"{type(exc).__name__}: {exc}", agent_id=self.manifest.id)
