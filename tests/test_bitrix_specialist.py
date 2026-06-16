@@ -47,31 +47,38 @@ def test_bitrix_specialist_searches_task_by_id():
     result = asyncio.run(
         _bitrix_specialist(
             tools=FakeResolverTools(
-                task_result=ToolResult(
+                bitrix_api_result=ToolResult(
                     status="ok",
-                    tool="task_search",
+                    tool="bitrix_api",
                     data={
-                        "mode": "get",
-                        "task_id": 8413,
-                        "task": {
-                            "id": "8413",
-                            "title": "AI-server private smoke test",
-                            "status": "2",
-                            "responsibleId": "9",
-                            "deadline": None,
+                        "method": "tasks.task.get",
+                        "params": {"taskId": 8413},
+                        "result": {
+                            "task": {
+                                "id": "8413",
+                                "title": "AI-server private smoke test",
+                                "status": "2",
+                                "responsibleId": "9",
+                                "deadline": None,
+                            }
                         },
                     },
                 )
             ),
             llm=FakeBitrixLLM(
-                tool_calls=[BitrixLLMToolCall(name="task_search", args={"mode": "get", "task_id": 8413})],
+                tool_calls=[
+                    BitrixLLMToolCall(
+                        name="bitrix_api",
+                        args={"action": "call", "method": "tasks.task.get", "params": {"taskId": 8413}},
+                    )
+                ],
                 final_answer="Нашёл задачу #8413 без срока.",
             ),
         ).handle(AgentTask(task_id="t1", request="Найди задачу #8413"))
     )
 
     assert result.status == "completed"
-    assert result.actions_taken[2].name == "bitrix_task_search"
+    assert result.actions_taken[2].name == "bitrix_api"
     assert result.actions_taken[2].status == "ok"
     assert "#8413" in result.answer
     assert "без срока" in result.answer
@@ -79,12 +86,13 @@ def test_bitrix_specialist_searches_task_by_id():
 
 def test_bitrix_specialist_searches_my_open_tasks():
     tools = FakeResolverTools(
-        task_result=ToolResult(
+        bitrix_api_result=ToolResult(
             status="ok",
-            tool="task_search",
+            tool="bitrix_api",
             data={
-                "mode": "list",
-                "tasks": [
+                "method": "tasks.task.list",
+                "params": {"filter": {"!STATUS": 5, "RESPONSIBLE_ID": 9}},
+                "result": [
                     {
                         "id": "101",
                         "title": "Проверить камеру",
@@ -92,7 +100,6 @@ def test_bitrix_specialist_searches_my_open_tasks():
                         "responsibleId": "9",
                     }
                 ],
-                "total": 1,
             },
         )
     )
@@ -103,8 +110,12 @@ def test_bitrix_specialist_searches_my_open_tasks():
             llm=FakeBitrixLLM(
                 tool_calls=[
                     BitrixLLMToolCall(
-                        name="task_search",
-                        args={"mode": "list", "filter": {"!STATUS": 5, "RESPONSIBLE_ID": 9}},
+                        name="bitrix_api",
+                        args={
+                            "action": "call",
+                            "method": "tasks.task.list",
+                            "params": {"filter": {"!STATUS": 5, "RESPONSIBLE_ID": 9}},
+                        },
                     )
                 ],
                 final_answer="Нашёл задачу: Проверить камеру.",
@@ -113,8 +124,8 @@ def test_bitrix_specialist_searches_my_open_tasks():
     )
 
     assert result.status == "completed"
-    assert tools.task_search_calls[0]["mode"] == "list"
-    assert tools.task_search_calls[0]["filter"] == {"!STATUS": 5, "RESPONSIBLE_ID": 9}
+    assert tools.bitrix_api_calls[0]["method"] == "tasks.task.list"
+    assert tools.bitrix_api_calls[0]["params"]["filter"] == {"!STATUS": 5, "RESPONSIBLE_ID": 9}
     assert "Проверить камеру" in result.answer
 
 
@@ -539,14 +550,14 @@ class FakeResolverTools:
         *,
         users: dict[str, list[dict]] | None = None,
         projects: dict[str, list[dict]] | None = None,
-        task_result: ToolResult | None = None,
+        bitrix_api_result: ToolResult | None = None,
         profile_result: ToolResult | None = None,
     ) -> None:
         self.users = users or {}
         self.projects = projects or {}
-        self.task_result = task_result or ToolResult(status="not_configured", tool="task_search")
+        self.bitrix_api_result = bitrix_api_result or ToolResult(status="not_configured", tool="bitrix_api")
         self.profile_result = profile_result or ToolResult(status="not_available", tool="current_user_profile")
-        self.task_search_calls: list[dict] = []
+        self.bitrix_api_calls: list[dict] = []
 
     def definitions(self) -> list:
         return []
@@ -560,9 +571,9 @@ class FakeResolverTools:
     def portal_search_contract(self, args: dict) -> ToolResult:
         return ToolResult(status="not_configured", tool="portal_search", data={"args": args})
 
-    async def task_search(self, args: dict) -> ToolResult:
-        self.task_search_calls.append(args)
-        return self.task_result
+    async def bitrix_api(self, args: dict) -> ToolResult:
+        self.bitrix_api_calls.append(args)
+        return self.bitrix_api_result
 
     async def current_user_profile(self, args: dict | None = None) -> ToolResult:
         return self.profile_result
