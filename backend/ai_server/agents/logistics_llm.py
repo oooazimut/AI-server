@@ -6,9 +6,17 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from ai_server.agents.specialist_llm_shared import (
+    DIALOG_HISTORY_PROMPT_FRAGMENT,
+    allowed_tool_definitions,
+    compact_tool_result,
+    decision_status,
+    load_instructions,
+    result_status,
+    retrieval_context,
+)
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
-from ai_server.registry import resolve_project_path
 from ai_server.retrieval import RetrievalHit
 from ai_server.utils import confidence
 
@@ -20,7 +28,6 @@ ALLOWED_TOOL_NAMES = {
     "vehicle_usage_save_report",
     "none",
 }
-RESULT_STATUSES = {"completed", "needs_clarification", "needs_human", "failed"}
 
 
 class LogisticsAgentLLM(Protocol):
@@ -32,6 +39,7 @@ class LogisticsAgentLLM(Protocol):
         retrieval_hits: list[RetrievalHit],
         tool_definitions: list[dict[str, Any]],
         tool_results: list[ToolResult] | None = None,
+        dialog_history: list[dict[str, str]] | None = None,
     ) -> LogisticsLLMDecisionResult:
         pass
 
@@ -42,6 +50,7 @@ class LogisticsAgentLLM(Protocol):
         task: AgentTask,
         decision: LogisticsLLMDecision,
         tool_results: list[ToolResult],
+        approval_actions: list[dict[str, Any]] | None = None,
     ) -> LogisticsLLMFinalResult:
         pass
 
@@ -88,8 +97,9 @@ class LogisticsLLMService:
         retrieval_hits: list[RetrievalHit],
         tool_definitions: list[dict[str, Any]],
         tool_results: list[ToolResult] | None = None,
+        dialog_history: list[dict[str, str]] | None = None,
     ) -> LogisticsLLMDecisionResult:
-        instructions = _load_instructions(manifest)
+        instructions = load_instructions(manifest)
         completion = await self.client.complete(
             agent_id=manifest.id,
             messages=[
@@ -107,9 +117,10 @@ class LogisticsLLMService:
                             "user": task.user.model_dump(),
                             "context": task.context,
                             "current_datetime": datetime.now(UTC).astimezone().isoformat(),
-                            "retrieval_context": _retrieval_context(retrieval_hits),
-                            "tools": _allowed_tool_definitions(tool_definitions),
-                            "tool_results": [_compact_tool_result(result) for result in (tool_results or [])],
+                            "dialog_history": dialog_history or [],
+                            "retrieval_context": retrieval_context(retrieval_hits),
+                            "tools": allowed_tool_definitions(tool_definitions, ALLOWED_TOOL_NAMES),
+                            "tool_results": [compact_tool_result(result) for result in (tool_results or [])],
                         },
                         ensure_ascii=False,
                     ),
@@ -130,6 +141,7 @@ class LogisticsLLMService:
         task: AgentTask,
         decision: LogisticsLLMDecision,
         tool_results: list[ToolResult],
+        approval_actions: list[dict[str, Any]] | None = None,
     ) -> LogisticsLLMFinalResult:
         completion = await self.client.complete(
             agent_id=manifest.id,
@@ -141,7 +153,8 @@ class LogisticsLLMService:
                         {
                             "request": task.request,
                             "initial_decision": _decision_dict(decision),
-                            "tool_results": [_compact_tool_result(result) for result in tool_results],
+                            "tool_results": [compact_tool_result(result) for result in tool_results],
+                            "approval_actions": approval_actions or [],
                         },
                         ensure_ascii=False,
                     ),
@@ -151,7 +164,7 @@ class LogisticsLLMService:
         )
         parsed = completion.json_content()
         return LogisticsLLMFinalResult(
-            status=_result_status(parsed.get("status")),
+            status=result_status(parsed.get("status")),
             answer=str(parsed.get("answer") or "").strip() or "Готово.",
             model_usage=completion.model_usage,
             raw=completion.raw,
@@ -172,17 +185,6 @@ def logistics_llm_failure_result(message: str, agent_id: str = "logistics") -> L
     )
 
 
-def _load_instructions(manifest: AgentManifest) -> str:
-    if not manifest.instructions_file:
-        return ""
-    try:
-        path = resolve_project_path(manifest.instructions_file)
-        return path.read_text(encoding="utf-8").strip()
-    except Exception as exc:
-        logger.warning("Failed to load instructions from %s: %s", manifest.instructions_file, exc)
-        return ""
-
-
 def _decision_system_prompt(instructions: str = "") -> str:
     extra = f"\n\nДополнительные инструкции:\n{instructions}" if instructions else ""
     return (
@@ -192,6 +194,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Ты не вызываешь Bitrix напрямую, не пишешь в чат сам и не пишешь в SQLite сам: выбирай vehicle_usage tools. "
         "Backend-tools только читают/пишут структурированные данные; "
         "они не решают, что имел в виду человек. "
+        f"{DIALOG_HISTORY_PROMPT_FRAGMENT}"
         "Сначала получи vehicle_usage_context, если в tool_results еще нет roster/vehicles/latest_request. "
         "Сам распознавай естественный язык: кто работает, кто в отпуске/болеет/на объекте, какая машина за кем, "
         "является ли ответ подтверждением, исправлением или просьбой начать заново. "
@@ -244,37 +247,11 @@ def _parse_decision(data: dict[str, Any]) -> LogisticsLLMDecision:
     if not tool_calls:
         tool_calls = [LogisticsLLMToolCall(name="none")]
     return LogisticsLLMDecision(
-        status=_decision_status(data.get("status")),
+        status=decision_status(data.get("status")),
         answer=str(data.get("answer") or "").strip(),
         confidence=confidence(data.get("confidence")),
         tool_calls=tool_calls,
     )
-
-
-def _decision_status(value: object) -> str:
-    status = str(value or "completed").strip()
-    return status if status in {"completed", "needs_clarification", "needs_human"} else "completed"
-
-
-def _result_status(value: object) -> str:
-    status = str(value or "completed").strip()
-    return status if status in RESULT_STATUSES else "completed"
-
-
-def _retrieval_context(hits: list[RetrievalHit]) -> list[dict[str, Any]]:
-    return [
-        {
-            "topic": hit.chunk.topic,
-            "section": hit.chunk.section,
-            "score": hit.score,
-            "text": hit.chunk.text[:1200],
-        }
-        for hit in hits[:5]
-    ]
-
-
-def _allowed_tool_definitions(definitions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [definition for definition in definitions if definition.get("name") in ALLOWED_TOOL_NAMES]
 
 
 def _decision_dict(decision: LogisticsLLMDecision) -> dict[str, Any]:
@@ -284,7 +261,3 @@ def _decision_dict(decision: LogisticsLLMDecision) -> dict[str, Any]:
         "confidence": decision.confidence,
         "tool_calls": [{"name": call.name, "args": call.args, "summary": call.summary} for call in decision.tool_calls],
     }
-
-
-def _compact_tool_result(result: ToolResult) -> dict[str, Any]:
-    return {"status": result.status, "tool": result.tool, "data": result.data, "error": result.error}

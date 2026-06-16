@@ -4,14 +4,13 @@ import json
 from ai_server.agents.bitrix24 import Bitrix24Specialist
 from ai_server.agents.bitrix_llm import BitrixLLMService, BitrixLLMToolCall
 from ai_server.knowledge import MarkdownKnowledgeBase
-from ai_server.llm import LLMCompletion
-from ai_server.models import AgentTask, ModelUsageRecord, ToolResult
+from ai_server.models import AgentTask, ToolResult
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
 from ai_server.tools.bitrix import BitrixToolset
 from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
-from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider
+from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, RecordingLLMClient
 
 
 def _bitrix_specialist(*, tools=None, llm=None) -> Bitrix24Specialist:
@@ -108,6 +107,7 @@ def test_bitrix_specialist_searches_task_by_id():
     assert result.actions_taken[2].status == "ok"
     assert "#8413" in result.answer
     assert "без срока" in result.answer
+    assert "bitrix_tool_loop_guardrail" not in {action.name for action in result.actions_taken}
 
 
 def test_bitrix_specialist_searches_my_open_tasks():
@@ -603,20 +603,6 @@ class FakeResolverTools:
 
     async def current_user_profile(self, args: dict | None = None) -> ToolResult:
         return self.profile_result
-
-
-class RecordingLLMClient:
-    def __init__(self, content: str) -> None:
-        self.content = content
-        self.calls: list[dict] = []
-
-    async def complete(self, **kwargs):
-        self.calls.append(kwargs)
-        return LLMCompletion(
-            content=self.content,
-            model_usage=ModelUsageRecord(agent_id=kwargs["agent_id"], provider="fake", model="fake"),
-            raw={},
-        )
 
 
 def _fake_resolution(tool: str, query: str, candidates: list[dict]) -> ToolResult:

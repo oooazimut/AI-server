@@ -1,18 +1,74 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from ai_server.agents.logistics import LogisticsSpecialist
-from ai_server.agents.logistics_llm import LogisticsLLMToolCall
+from ai_server.agents.logistics_llm import LogisticsLLMService, LogisticsLLMToolCall
 from ai_server.models import AgentTask, UserContext
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.tools.vehicle_usage import VehicleUsageStore, VehicleUsageToolset
 from ai_server.workers.logistics.vehicle_usage import run_vehicle_usage_once
-from tests.fakes import FakeEmbeddingProvider, FakeLogisticsLLM
+from tests.fakes import FakeEmbeddingProvider, FakeLogisticsLLM, RecordingLLMClient
 
 _FAKE_RETRIEVER = HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider())
+
+
+def test_logistics_specialist_forwards_dialog_history_to_decide(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
+    manifest = get_agent_manifest("logistics")
+    assert manifest is not None
+    llm = FakeLogisticsLLM()
+    history = [
+        {"role": "user", "content": "кто сегодня на смене"},
+        {"role": "assistant", "content": "Уточните дату смены."},
+    ]
+
+    specialist = LogisticsSpecialist(
+        manifest,
+        retriever=_FAKE_RETRIEVER,
+        tools=VehicleUsageToolset(store=VehicleUsageStore(tmp_path / "vehicle_usage.sqlite"), user_id=9),
+        llm=llm,
+    )
+    anyio_run(
+        specialist.handle(
+            AgentTask(
+                task_id="log-history",
+                request="на сегодня",
+                user=UserContext(id="9"),
+                context={"dialog_history": history},
+            )
+        )
+    )
+
+    assert llm.decide_calls[0]["dialog_history"] == history
+    assert llm.decide_calls[0]["task"].context == {"dialog_history": history}
+
+
+def test_logistics_llm_decide_payload_includes_dialog_history_and_raw_context():
+    manifest = get_agent_manifest("logistics")
+    assert manifest is not None
+    client = RecordingLLMClient(
+        '{"status":"completed","answer":"","confidence":0.7,"tool_calls":[{"name":"none","args":{},"summary":""}]}'
+    )
+    history = [{"role": "user", "content": "кто сегодня на смене"}]
+    scheduler_context = {"event": "vehicle_usage_reminder_due", "request_date": "2026-06-05", "dialog_history": history}
+
+    anyio_run(
+        LogisticsLLMService(client).decide(
+            manifest=manifest,
+            task=AgentTask(task_id="t1", request="на сегодня", context=scheduler_context),
+            retrieval_hits=[],
+            tool_definitions=[],
+            dialog_history=history,
+        )
+    )
+
+    payload = json.loads(client.calls[0]["messages"][1]["content"])
+    assert payload["dialog_history"] == history
+    assert payload["context"] == scheduler_context
 
 
 def test_logistics_specialist_saves_llm_parsed_draft(monkeypatch, tmp_path):

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from ai_server.agent_scheduler import AgentScheduler
+from ai_server.agent_store import AgentStore
+from ai_server.agents.base import BaseSpecialist
 from ai_server.agents.bitrix_llm import (
     BitrixAgentLLM,
     BitrixLLMService,
@@ -17,14 +20,17 @@ from ai_server.agents.bitrix_task_create import (
     build_task_create_draft_from_args,
 )
 from ai_server.knowledge import MarkdownKnowledgeBase
-from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult
+from ai_server.models import ActionRecord, AgentManifest, AgentTask, ToolResult
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
 from ai_server.tools.bitrix import BitrixToolset
-from ai_server.utils import optional_int, unique
+from ai_server.utils import optional_int
 
 
-class Bitrix24Specialist:
+class Bitrix24Specialist(BaseSpecialist):
+    max_steps = 1
+    action_prefix = "bitrix"
+
     def __init__(
         self,
         manifest: AgentManifest,
@@ -34,13 +40,19 @@ class Bitrix24Specialist:
         retriever: HybridKnowledgeRetriever | None = None,
         tools: BitrixToolset | None = None,
         llm: BitrixAgentLLM | None = None,
+        scheduler: AgentScheduler | None = None,
+        store: AgentStore | None = None,
     ) -> None:
-        self.manifest = manifest
-        self.knowledge_base = knowledge_base or MarkdownKnowledgeBase()
-        self.skill_store = skill_store or SkillStore()
-        self.retriever = retriever or HybridKnowledgeRetriever(knowledge_base=self.knowledge_base)
-        self.tools = tools or BitrixToolset()
-        self.llm = llm or BitrixLLMService()
+        super().__init__(
+            manifest,
+            knowledge_base=knowledge_base,
+            skill_store=skill_store,
+            retriever=retriever,
+            tools=tools or BitrixToolset(),
+            llm=llm or BitrixLLMService(),
+            scheduler=scheduler,
+            store=store,
+        )
 
     @classmethod
     def build(
@@ -50,145 +62,10 @@ class Bitrix24Specialist:
         bitrix_tools: BitrixToolset | None = None,
         bitrix_retriever: HybridKnowledgeRetriever | None = None,
         bitrix_llm: BitrixAgentLLM | None = None,
+        scheduler: AgentScheduler | None = None,
         **_: object,
     ) -> Bitrix24Specialist:
-        return cls(manifest, retriever=bitrix_retriever, tools=bitrix_tools, llm=bitrix_llm)
-
-    async def handle(self, task: AgentTask) -> AgentResult:
-        available_skills = self.skill_store.list_skills(self.manifest)
-        permission_context = await self._load_permission_context(task)
-        task = task.model_copy(update={"context": {**task.context, **permission_context}})
-        retrieval_hits = self.retriever.search(self.manifest, task.request, limit=5)
-        actions_taken = [
-            ActionRecord(
-                name="load_bitrix_specialist_context",
-                status="completed",
-                details={
-                    "available_skills": [
-                        {"id": skill.id, "title": skill.title, "preview": skill.preview} for skill in available_skills
-                    ],
-                    "retrieval_topics": unique([hit.chunk.topic for hit in retrieval_hits]),
-                    "retrieval_hits": [
-                        {
-                            "topic": hit.chunk.topic,
-                            "section": hit.chunk.section,
-                            "score": hit.score,
-                            "keyword_score": hit.keyword_score,
-                            "vector_score": hit.vector_score,
-                            "embedding_provider": hit.embedding_provider,
-                        }
-                        for hit in retrieval_hits
-                    ],
-                    "bitrix_current_user_profile_status": _tool_context_status(
-                        permission_context.get("bitrix_current_user_profile")
-                    ),
-                    "permission_policy_topics": [
-                        item.get("topic")
-                        for item in permission_context.get("permission_policy_context", [])
-                        if isinstance(item, dict)
-                    ],
-                },
-            )
-        ]
-
-        try:
-            decision_result = await self.llm.decide(
-                manifest=self.manifest,
-                task=task,
-                retrieval_hits=retrieval_hits,
-                tool_definitions=self.tool_definitions(),
-                dialog_history=task.context.get("dialog_history"),
-            )
-        except Exception as exc:
-            failure = llm_failure_result(f"{type(exc).__name__}: {exc}", agent_id=self.manifest.id)
-            return AgentResult(
-                status="failed",
-                agent_id=self.manifest.id,
-                answer=failure.answer,
-                actions_taken=[
-                    *actions_taken,
-                    ActionRecord(
-                        name="bitrix_llm_decision",
-                        status="error",
-                        details={"error": f"{type(exc).__name__}: {exc}"},
-                    ),
-                ],
-                model_usage=[failure.model_usage],
-                confidence=0.0,
-                logs=_logs(),
-            )
-
-        decision = decision_result.decision
-        actions_taken.append(
-            ActionRecord(
-                name="bitrix_llm_decision",
-                status=decision.status,
-                details={
-                    "tool_calls": [
-                        {"name": call.name, "args": call.args, "summary": call.summary} for call in decision.tool_calls
-                    ],
-                    "confidence": decision.confidence,
-                },
-            )
-        )
-
-        tool_results: list[ToolResult] = []
-        approval_actions: list[ActionRecord] = []
-        for tool_call in decision.tool_calls:
-            result, action, approvals = await self._execute_tool_call(tool_call, task)
-            if result is not None:
-                tool_results.append(result)
-            if action is not None:
-                actions_taken.append(action)
-            approval_actions.extend(approvals)
-
-        try:
-            final_result = await self.llm.compose(
-                manifest=self.manifest,
-                task=task,
-                decision=decision,
-                tool_results=tool_results,
-                approval_actions=[action.model_dump() for action in approval_actions],
-            )
-        except Exception as exc:
-            failure = llm_failure_result(f"{type(exc).__name__}: {exc}", agent_id=self.manifest.id)
-            return AgentResult(
-                status="failed",
-                agent_id=self.manifest.id,
-                answer=failure.answer,
-                actions_taken=[
-                    *actions_taken,
-                    ActionRecord(
-                        name="bitrix_llm_final_answer",
-                        status="error",
-                        details={"error": f"{type(exc).__name__}: {exc}"},
-                    ),
-                ],
-                actions_requiring_approval=approval_actions,
-                model_usage=[decision_result.model_usage, failure.model_usage],
-                confidence=0.0,
-                logs=_logs(),
-            )
-
-        actions_taken.append(
-            ActionRecord(
-                name="bitrix_llm_final_answer",
-                status=final_result.status,
-                details={},
-            )
-        )
-        status = "needs_human" if approval_actions else final_result.status
-
-        return AgentResult(
-            status=status,
-            agent_id=self.manifest.id,
-            answer=final_result.answer,
-            actions_taken=actions_taken,
-            actions_requiring_approval=approval_actions,
-            model_usage=[decision_result.model_usage, final_result.model_usage],
-            confidence=decision.confidence,
-            logs=_logs(),
-        )
+        return cls(manifest, retriever=bitrix_retriever, tools=bitrix_tools, llm=bitrix_llm, scheduler=scheduler)
 
     def tool_definitions(self) -> list[dict]:
         return [
@@ -326,6 +203,21 @@ class Bitrix24Specialist:
         )
         return result, ActionRecord(name=tool_call.name, status=result.status, details=result.model_dump()), []
 
+    async def _load_extra_context(self, task: AgentTask) -> tuple[AgentTask, dict]:
+        permission_context = await self._load_permission_context(task)
+        merged_task = task.model_copy(update={"context": {**task.context, **permission_context}})
+        extra_details = {
+            "bitrix_current_user_profile_status": _tool_context_status(
+                permission_context.get("bitrix_current_user_profile")
+            ),
+            "permission_policy_topics": [
+                item.get("topic")
+                for item in permission_context.get("permission_policy_context", [])
+                if isinstance(item, dict)
+            ],
+        }
+        return merged_task, extra_details
+
     async def _load_permission_context(self, task: AgentTask) -> dict:
         profile_result = await self._current_user_profile_result(task)
         policy_hits = self.retriever.search(
@@ -416,6 +308,15 @@ class Bitrix24Specialist:
             group_note=group_note,
             notes=notes,
         )
+
+    def _llm_failure_result(self, message: str):
+        return llm_failure_result(message, agent_id=self.manifest.id)
+
+    def _logs(self) -> list[str]:
+        return [
+            "Bitrix24 specialist is an LLM subagent; backend tools only execute and validate selected tool calls.",
+            "Knowledge context is selected through hybrid retrieval over the agent package.",
+        ]
 
 
 def _format_ambiguous_note(prefix: str, candidates: object) -> str:
@@ -517,13 +418,6 @@ def _approval_actions_from_task_closure_draft(
                 "specialist_id": manifest.id,
             },
         )
-    ]
-
-
-def _logs() -> list[str]:
-    return [
-        "Bitrix24 specialist is an LLM subagent; backend tools only execute and validate selected tool calls.",
-        "Knowledge context is selected through hybrid retrieval over the agent package.",
     ]
 
 
