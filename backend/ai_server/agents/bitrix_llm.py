@@ -135,10 +135,11 @@ class BitrixLLMService:
         approval_actions: list[dict[str, Any]],
     ) -> BitrixLLMFinalResult:
         agent_id = manifest.id if manifest is not None else "bitrix24"
+        portal_base_url = get_settings().bitrix_portal_base_url
         completion = await self.client.complete(
             agent_id=agent_id,
             messages=[
-                {"role": "system", "content": _compose_system_prompt()},
+                {"role": "system", "content": _compose_system_prompt(portal_base_url)},
                 {
                     "role": "user",
                     "content": json.dumps(
@@ -148,6 +149,7 @@ class BitrixLLMService:
                             "initial_decision": _decision_dict(decision),
                             "tool_results": [_compact_tool_result(result) for result in tool_results],
                             "approval_actions": approval_actions,
+                            "portal_base_url": portal_base_url,
                         },
                         ensure_ascii=False,
                     ),
@@ -208,14 +210,15 @@ def _decision_system_prompt(instructions: str = "") -> str:
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
-        '"tool_calls":[{"name":"current_user_profile|task_search|task_create_draft|task_closure|portal_search|none","args":{},"summary":""}]}. '
+        '"tool_calls":[{"name":"current_user_profile|bitrix_api|task_create_draft|task_closure|portal_search|none","args":{},"summary":""}]}. '
         "Перед каждым tool_call сам проверь, хватает ли данных для его корректного вызова. "
         "Нельзя вызывать tool с надеждой, что backend или tool сам разберётся с недостающими данными. "
         'Если данных не хватает, не вызывай tool: верни status=needs_clarification, tool_calls=[{"name":"none"}], '
         "а в answer задай короткий уточняющий вопрос. "
         "Для проверки фактов о текущем пользователе можно использовать current_user_profile, но перед write-tool "
         "обычно уже есть permission_context.bitrix_current_user_profile. "
-        "Для поиска задач используй task_search. Для создания задачи используй task_create_draft. "
+        "Для поиска задач используй bitrix_api с tasks.task.list/tasks.task.get. "
+        "Для создания задачи используй task_create_draft. "
         "Для task_create_draft именно ты распознаёшь title, responsible_id/responsible_query/responsible_self, "
         "group_id/project_query, deadline_iso или no_deadline. "
         "Если пользователь сказал относительный срок, вычисли deadline_iso сам по current_datetime. "
@@ -231,11 +234,27 @@ def _decision_system_prompt(instructions: str = "") -> str:
     )
 
 
-def _compose_system_prompt() -> str:
+def _compose_system_prompt(portal_base_url: str = "") -> str:
+    links_rule = (
+        "Если в ответе перечисляешь сущности портала (сотрудников, проекты/рабочие группы, задачи, "
+        "лиды, сделки) — каждую сущность оформляй как markdown-ссылку на её страницу в портале, "
+        "используя поле portal_base_url из payload и ID сущности из tool_results:\n"
+        "- задача: {base}/company/personal/user/{RESPONSIBLE_ID}/tasks/task/view/{ID}/\n"
+        "- проект/рабочая группа: {base}/workgroups/group/{ID}/\n"
+        "- сотрудник: {base}/company/personal/user/{ID}/\n"
+        "- лид CRM: {base}/crm/lead/details/{ID}/\n"
+        "- сделка CRM: {base}/crm/deal/details/{ID}/\n"
+        "Текст ссылки — название/ФИО сущности (или название+ID, если имени нет). "
+        "Для файлов диска используй готовую ссылку из tool_results (DOWNLOAD_URL/поле ссылки), не строй её сам. "
+        "Если portal_base_url пустой или ID неизвестен, выводи обычный текст без ссылки."
+        if portal_base_url
+        else "Если portal_base_url не передан, не пытайся строить ссылки на портал — выводи обычный текст."
+    )
     return (
         "Ты тот же LLM-субагент Bitrix24. Сформируй итоговый ответ человеку по результатам tools. "
         "Не выдумывай данные, которых нет в tool_results. "
         "Если есть approval_actions, скажи, что действие подготовлено и требуется подтверждение. "
+        f"{links_rule} "
         "Верни только JSON-объект без markdown: "
         '{"status":"completed|needs_clarification|needs_human|failed","answer":"ответ человеку"}.'
     )
