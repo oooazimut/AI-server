@@ -14,6 +14,7 @@ from ai_server.agents.logistics_llm import LogisticsAgentLLM
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.models import AgentTask, UserContext
 from ai_server.registry import get_agent_manifest
+from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import Settings, get_settings
 from ai_server.tools.vehicle_usage import MOSCOW_TZ, VehicleUsageStore, VehicleUsageToolset, fetch_staff_roster
 from ai_server.utils import optional_int
@@ -261,6 +262,7 @@ async def run_vehicle_usage_once(
     now: datetime | None = None,
     store: VehicleUsageStore | None = None,
     logistics_llm: LogisticsAgentLLM | None = None,
+    retriever: HybridKnowledgeRetriever | None = None,
 ) -> dict[str, Any]:
     """Single-tick helper retained for unit tests. Not used in production."""
     settings = get_settings()
@@ -315,6 +317,7 @@ async def run_vehicle_usage_once(
                     "admin_user_ids": settings.resolved_vehicle_usage_admin_notify_user_ids,
                     "existing_request": existing,
                 },
+                retriever=retriever,
             )
             delivery = await _deliver_escalation(
                 bitrix,
@@ -356,6 +359,7 @@ async def run_vehicle_usage_once(
             "dialog_id": dialog_id,
             "existing_request": existing,
         },
+        retriever=retriever,
     )
     delivery = await _deliver_reminder(
         bitrix,
@@ -387,6 +391,7 @@ async def _run_logistics_event(
     dialog_id: str,
     request: str,
     context: dict[str, Any],
+    retriever: HybridKnowledgeRetriever | None = None,
 ) -> Any:
     manifest = get_agent_manifest("logistics")
     if manifest is None:
@@ -400,6 +405,7 @@ async def _run_logistics_event(
             dialog_id=dialog_id,
         ),
         llm=logistics_llm,
+        retriever=retriever,
     ).handle(
         AgentTask(
             task_id=str(uuid4()),

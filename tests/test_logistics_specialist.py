@@ -12,6 +12,8 @@ from ai_server.tools.vehicle_usage import VehicleUsageStore, VehicleUsageToolset
 from ai_server.workers.logistics.vehicle_usage import run_vehicle_usage_once
 from tests.fakes import FakeEmbeddingProvider, FakeLogisticsLLM
 
+_FAKE_RETRIEVER = HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider())
+
 
 def test_logistics_specialist_saves_llm_parsed_draft(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
@@ -142,6 +144,7 @@ def test_vehicle_usage_worker_delegates_due_reminder_to_logistics_llm(monkeypatc
             store=store,
             logistics_llm=fake_llm,
             now=datetime(2026, 6, 5, 8, 31, tzinfo=timezone(timedelta(hours=3))),
+            retriever=_FAKE_RETRIEVER,
         )
     )
 
@@ -192,6 +195,7 @@ def test_vehicle_usage_worker_delegates_escalation_to_logistics_llm(monkeypatch,
             store=store,
             logistics_llm=fake_llm,
             now=datetime(2026, 6, 5, 10, 1, tzinfo=timezone(timedelta(hours=3))),
+            retriever=_FAKE_RETRIEVER,
         )
     )
 
