@@ -164,6 +164,17 @@ class Settings:
         return bool(self.bitrix_oauth_client_id and self.bitrix_oauth_client_secret)
 
     @property
+    def bitrix_portal_base_url(self) -> str:
+        if self.bitrix_domain:
+            domain = self.bitrix_domain.strip().removeprefix("https://").removeprefix("http://").rstrip("/")
+            return f"https://{domain}"
+        if self.bitrix_rest_webhook_url:
+            netloc = urlsplit(self.bitrix_rest_webhook_url).netloc
+            if netloc:
+                return f"https://{netloc}"
+        return ""
+
+    @property
     def llm_configured(self) -> bool:
         return bool(self.llm_provider and self.llm_model and self.llm_api_key)
 

@@ -83,6 +83,36 @@ def test_bitrix_oauth_urls_are_resolved(monkeypatch):
     )
 
 
+def test_bitrix_portal_base_url_prefers_explicit_domain(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "portal.bitrix24.ru")
+    monkeypatch.setenv("BITRIX_REST_WEBHOOK_URL", "https://other.bitrix24.ru/rest/1/token/")
+
+    settings = get_settings()
+
+    assert settings.bitrix_portal_base_url == "https://portal.bitrix24.ru"
+
+
+def test_bitrix_portal_base_url_falls_back_to_webhook_domain(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.delenv("BITRIX_DOMAIN", raising=False)
+    monkeypatch.setenv("BITRIX_REST_WEBHOOK_URL", "https://asutp-expert.bitrix24.ru/rest/9/token/")
+
+    settings = get_settings()
+
+    assert settings.bitrix_portal_base_url == "https://asutp-expert.bitrix24.ru"
+
+
+def test_bitrix_portal_base_url_empty_when_unconfigured(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.delenv("BITRIX_DOMAIN", raising=False)
+    monkeypatch.delenv("BITRIX_REST_WEBHOOK_URL", raising=False)
+
+    settings = get_settings()
+
+    assert settings.bitrix_portal_base_url == ""
+
+
 def test_technical_footer_allowed_user_ids(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_TECH_FOOTER_ALLOWED_USER_IDS", "1,9")

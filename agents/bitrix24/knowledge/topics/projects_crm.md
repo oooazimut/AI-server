@@ -6,15 +6,16 @@
 
 В Bitrix проекты часто идут через social network / workgroups.
 
-`sonet_group.get` - читать проекты/рабочие группы.
+`sonet_group.get` - читать проекты/рабочие группы (`sonet_workgroup.list` не существует в Bitrix24
+REST API, не вызывай его). Без `params` возвращает все проекты; `FILTER: {"ID": N}` - конкретный
+проект по ID. Фильтр по `NAME`/`%NAME` Bitrix молча игнорирует, поэтому для поиска по названию
+получи весь список и сопоставь название сам:
 
 ```json
 {
   "action": "call",
   "method": "sonet_group.get",
-  "params": {
-    "FILTER": {"%NAME": "Транзит"}
-  }
+  "params": {}
 }
 ```
 
