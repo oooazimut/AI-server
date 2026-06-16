@@ -25,8 +25,23 @@ from ai_server.agents.pto_llm import (
     PtoLLMFinalResult,
     PtoLLMToolCall,
 )
+from ai_server.llm import LLMCompletion
 from ai_server.models import ModelUsageRecord
 from ai_server.orchestrators.internal_llm import InternalRouteDecision, InternalRouteResult, InternalSynthesisResult
+
+
+class RecordingLLMClient:
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.calls: list[dict] = []
+
+    async def complete(self, **kwargs):
+        self.calls.append(kwargs)
+        return LLMCompletion(
+            content=self.content,
+            model_usage=ModelUsageRecord(agent_id=kwargs["agent_id"], provider="fake", model="fake"),
+            raw={},
+        )
 
 
 @_dataclass

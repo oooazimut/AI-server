@@ -6,9 +6,17 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from ai_server.agents.specialist_llm_shared import (
+    DIALOG_HISTORY_PROMPT_FRAGMENT,
+    allowed_tool_definitions,
+    compact_tool_result,
+    decision_status,
+    load_instructions,
+    result_status,
+    retrieval_context,
+)
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
-from ai_server.registry import resolve_project_path
 from ai_server.retrieval import RetrievalHit
 from ai_server.utils import confidence
 
@@ -23,7 +31,6 @@ ALLOWED_TOOL_NAMES = {
     "document_draft_list",
     "none",
 }
-RESULT_STATUSES = {"completed", "needs_clarification", "needs_human", "failed"}
 
 
 class PtoAgentLLM(Protocol):
@@ -35,6 +42,7 @@ class PtoAgentLLM(Protocol):
         retrieval_hits: list[RetrievalHit],
         tool_definitions: list[dict[str, Any]],
         tool_results: list[ToolResult] | None = None,
+        dialog_history: list[dict[str, str]] | None = None,
     ) -> PtoLLMDecisionResult:
         pass
 
@@ -45,6 +53,7 @@ class PtoAgentLLM(Protocol):
         task: AgentTask,
         decision: PtoLLMDecision,
         tool_results: list[ToolResult],
+        approval_actions: list[dict[str, Any]] | None = None,
     ) -> PtoLLMFinalResult:
         pass
 
@@ -91,8 +100,9 @@ class PtoLLMService:
         retrieval_hits: list[RetrievalHit],
         tool_definitions: list[dict[str, Any]],
         tool_results: list[ToolResult] | None = None,
+        dialog_history: list[dict[str, str]] | None = None,
     ) -> PtoLLMDecisionResult:
-        instructions = _load_instructions(manifest)
+        instructions = load_instructions(manifest)
         completion = await self.client.complete(
             agent_id=manifest.id,
             messages=[
@@ -110,9 +120,10 @@ class PtoLLMService:
                             "user": task.user.model_dump(),
                             "files": task.files,
                             "current_datetime": datetime.now(UTC).astimezone().isoformat(),
-                            "retrieval_context": _retrieval_context(retrieval_hits),
-                            "tools": _allowed_tool_definitions(tool_definitions),
-                            "tool_results": [_compact_tool_result(result) for result in (tool_results or [])],
+                            "dialog_history": dialog_history or [],
+                            "retrieval_context": retrieval_context(retrieval_hits),
+                            "tools": allowed_tool_definitions(tool_definitions, ALLOWED_TOOL_NAMES),
+                            "tool_results": [compact_tool_result(result) for result in (tool_results or [])],
                         },
                         ensure_ascii=False,
                     ),
@@ -133,6 +144,7 @@ class PtoLLMService:
         task: AgentTask,
         decision: PtoLLMDecision,
         tool_results: list[ToolResult],
+        approval_actions: list[dict[str, Any]] | None = None,
     ) -> PtoLLMFinalResult:
         completion = await self.client.complete(
             agent_id=manifest.id,
@@ -144,7 +156,8 @@ class PtoLLMService:
                         {
                             "request": task.request,
                             "initial_decision": _decision_dict(decision),
-                            "tool_results": [_compact_tool_result(result) for result in tool_results],
+                            "tool_results": [compact_tool_result(result) for result in tool_results],
+                            "approval_actions": approval_actions or [],
                         },
                         ensure_ascii=False,
                     ),
@@ -154,7 +167,7 @@ class PtoLLMService:
         )
         parsed = completion.json_content()
         return PtoLLMFinalResult(
-            status=_result_status(parsed.get("status")),
+            status=result_status(parsed.get("status")),
             answer=str(parsed.get("answer") or "").strip() or "Готово.",
             model_usage=completion.model_usage,
             raw=completion.raw,
@@ -175,17 +188,6 @@ def pto_llm_failure_result(message: str, agent_id: str = "pto") -> PtoLLMFinalRe
     )
 
 
-def _load_instructions(manifest: AgentManifest) -> str:
-    if not manifest.instructions_file:
-        return ""
-    try:
-        path = resolve_project_path(manifest.instructions_file)
-        return path.read_text(encoding="utf-8").strip()
-    except Exception as exc:
-        logger.warning("Failed to load instructions from %s: %s", manifest.instructions_file, exc)
-        return ""
-
-
 def _decision_system_prompt(instructions: str = "") -> str:
     extra = f"\n\nДополнительные инструкции:\n{instructions}" if instructions else ""
     return (
@@ -196,6 +198,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "и применяет guardrails доступа. "
         "В tool_results могут прийти результаты твоих предыдущих tool_calls; используй их как наблюдения "
         "для следующего шага. "
+        f"{DIALOG_HISTORY_PROMPT_FRAGMENT}"
         "Если документ по смыслу бухгалтерский, складской, сетевой или программный, не притворяйся профильным специалистом: "
         "верни needs_human/needs_clarification и объясни, кому лучше передать. "
         "Перед каждым tool_call сам проверь, хватает ли данных. Если не хватает, не вызывай tool, задай уточняющий вопрос. "
@@ -246,37 +249,11 @@ def _parse_decision(data: dict[str, Any]) -> PtoLLMDecision:
     if not tool_calls:
         tool_calls = [PtoLLMToolCall(name="none")]
     return PtoLLMDecision(
-        status=_decision_status(data.get("status")),
+        status=decision_status(data.get("status")),
         answer=str(data.get("answer") or "").strip(),
         confidence=confidence(data.get("confidence")),
         tool_calls=tool_calls,
     )
-
-
-def _decision_status(value: object) -> str:
-    status = str(value or "completed").strip()
-    return status if status in {"completed", "needs_clarification", "needs_human"} else "completed"
-
-
-def _result_status(value: object) -> str:
-    status = str(value or "completed").strip()
-    return status if status in RESULT_STATUSES else "completed"
-
-
-def _retrieval_context(hits: list[RetrievalHit]) -> list[dict[str, Any]]:
-    return [
-        {
-            "topic": hit.chunk.topic,
-            "section": hit.chunk.section,
-            "score": hit.score,
-            "text": hit.chunk.text[:1200],
-        }
-        for hit in hits[:5]
-    ]
-
-
-def _allowed_tool_definitions(definitions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [definition for definition in definitions if definition.get("name") in ALLOWED_TOOL_NAMES]
 
 
 def _decision_dict(decision: PtoLLMDecision) -> dict[str, Any]:
@@ -285,13 +262,4 @@ def _decision_dict(decision: PtoLLMDecision) -> dict[str, Any]:
         "answer": decision.answer,
         "confidence": decision.confidence,
         "tool_calls": [{"name": call.name, "args": call.args, "summary": call.summary} for call in decision.tool_calls],
-    }
-
-
-def _compact_tool_result(result: ToolResult) -> dict[str, Any]:
-    return {
-        "status": result.status,
-        "tool": result.tool,
-        "data": result.data,
-        "error": result.error,
     }

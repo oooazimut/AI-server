@@ -6,9 +6,17 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from ai_server.agents.specialist_llm_shared import (
+    DIALOG_HISTORY_PROMPT_FRAGMENT,
+    allowed_tool_definitions,
+    compact_tool_result,
+    decision_status,
+    load_instructions,
+    result_status,
+    retrieval_context,
+)
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
-from ai_server.registry import resolve_project_path
 from ai_server.retrieval import RetrievalHit
 from ai_server.settings import get_settings
 from ai_server.utils import confidence, optional_int
@@ -23,7 +31,6 @@ ALLOWED_TOOL_NAMES = {
     "portal_search",
     "none",
 }
-RESULT_STATUSES = {"completed", "needs_clarification", "needs_human", "failed"}
 
 
 class BitrixAgentLLM(Protocol):
@@ -34,6 +41,7 @@ class BitrixAgentLLM(Protocol):
         task: AgentTask,
         retrieval_hits: list[RetrievalHit],
         tool_definitions: list[dict[str, Any]],
+        tool_results: list[ToolResult] | None = None,
         dialog_history: list[dict[str, str]] | None = None,
     ) -> BitrixLLMDecisionResult:
         pass
@@ -91,9 +99,10 @@ class BitrixLLMService:
         task: AgentTask,
         retrieval_hits: list[RetrievalHit],
         tool_definitions: list[dict[str, Any]],
+        tool_results: list[ToolResult] | None = None,
         dialog_history: list[dict[str, str]] | None = None,
     ) -> BitrixLLMDecisionResult:
-        instructions = _load_instructions(manifest)
+        instructions = load_instructions(manifest)
         completion = await self.client.complete(
             agent_id=manifest.id,
             messages=[
@@ -113,8 +122,9 @@ class BitrixLLMService:
                             "current_datetime": datetime.now(UTC).astimezone().isoformat(),
                             "dialog_history": dialog_history or [],
                             "permission_context": _permission_context(task),
-                            "retrieval_context": _retrieval_context(retrieval_hits),
-                            "tools": _allowed_tool_definitions(tool_definitions),
+                            "retrieval_context": retrieval_context(retrieval_hits),
+                            "tools": allowed_tool_definitions(tool_definitions, ALLOWED_TOOL_NAMES),
+                            "tool_results": [compact_tool_result(result) for result in (tool_results or [])],
                         },
                         ensure_ascii=False,
                     ),
@@ -150,7 +160,7 @@ class BitrixLLMService:
                             "request": task.request,
                             "user": task.user.model_dump(),
                             "initial_decision": _decision_dict(decision),
-                            "tool_results": [_compact_tool_result(result) for result in tool_results],
+                            "tool_results": [compact_tool_result(result) for result in tool_results],
                             "approval_actions": approval_actions,
                             "portal_base_url": portal_base_url,
                         },
@@ -162,7 +172,7 @@ class BitrixLLMService:
         )
         parsed = completion.json_content()
         return BitrixLLMFinalResult(
-            status=_result_status(parsed.get("status")),
+            status=result_status(parsed.get("status")),
             answer=str(parsed.get("answer") or "").strip() or "Готово.",
             model_usage=completion.model_usage,
             raw=completion.raw,
@@ -183,17 +193,6 @@ def llm_failure_result(message: str, agent_id: str = "bitrix24") -> BitrixLLMFin
     )
 
 
-def _load_instructions(manifest: AgentManifest) -> str:
-    if not manifest.instructions_file:
-        return ""
-    try:
-        path = resolve_project_path(manifest.instructions_file)
-        return path.read_text(encoding="utf-8").strip()
-    except Exception as exc:
-        logger.warning("Failed to load instructions from %s: %s", manifest.instructions_file, exc)
-        return ""
-
-
 def _decision_system_prompt(instructions: str = "") -> str:
     extra = f"\n\nДополнительные инструкции:\n{instructions}" if instructions else ""
     return (
@@ -205,11 +204,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "В payload есть permission_context: именно ты обязан прочитать его до write-tool "
         "и решить, имеет ли текущий пользователь право просить такое действие. "
         "permission_context содержит Bitrix-факты о текущем пользователе и RAG-выдержки из политики прав. "
-        "В payload есть dialog_history — последние сообщения этого диалога (роли user/assistant). "
-        "Текущий request может быть продолжением (уточнением имени, местоимением 'он/она/этот', "
-        "ответом на твой предыдущий уточняющий вопрос). Используй dialog_history, чтобы понять, "
-        "о какой сущности (сотрудник, задача, проект) идёт речь, и не задавай уточняющий вопрос повторно, "
-        "если ответ на него уже есть в dialog_history. "
+        f"{DIALOG_HISTORY_PROMPT_FRAGMENT}"
         "Если Bitrix-факты отсутствуют или противоречат политике, не угадывай права. "
         "Если permission_context не разрешает write-действие, не вызывай write-tool; "
         "верни needs_human или needs_clarification с коротким объяснением. "
@@ -289,35 +284,11 @@ def _parse_decision(data: dict[str, Any]) -> BitrixLLMDecision:
     if not tool_calls:
         tool_calls = [BitrixLLMToolCall(name="none")]
     return BitrixLLMDecision(
-        status=_decision_status(data.get("status")),
+        status=decision_status(data.get("status")),
         answer=str(data.get("answer") or "").strip(),
         confidence=confidence(data.get("confidence")),
         tool_calls=tool_calls,
     )
-
-
-def _decision_status(value: object) -> str:
-    status = str(value or "completed").strip()
-    return status if status in {"completed", "needs_clarification", "needs_human"} else "completed"
-
-
-def _result_status(value: object) -> str:
-    status = str(value or "completed").strip()
-    return status if status in RESULT_STATUSES else "completed"
-
-
-def _retrieval_context(hits: list[RetrievalHit]) -> list[dict[str, Any]]:
-    context = []
-    for hit in hits[:5]:
-        context.append(
-            {
-                "topic": hit.chunk.topic,
-                "section": hit.chunk.section,
-                "score": hit.score,
-                "text": hit.chunk.text[:1200],
-            }
-        )
-    return context
 
 
 def _permission_context(task: AgentTask) -> dict[str, Any]:
@@ -352,23 +323,10 @@ def _permission_context(task: AgentTask) -> dict[str, Any]:
     }
 
 
-def _allowed_tool_definitions(definitions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [definition for definition in definitions if definition.get("name") in ALLOWED_TOOL_NAMES]
-
-
 def _decision_dict(decision: BitrixLLMDecision) -> dict[str, Any]:
     return {
         "status": decision.status,
         "answer": decision.answer,
         "confidence": decision.confidence,
         "tool_calls": [{"name": call.name, "args": call.args, "summary": call.summary} for call in decision.tool_calls],
-    }
-
-
-def _compact_tool_result(result: ToolResult) -> dict[str, Any]:
-    return {
-        "status": result.status,
-        "tool": result.tool,
-        "data": result.data,
-        "error": result.error,
     }
