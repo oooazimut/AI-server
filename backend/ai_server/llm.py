@@ -58,11 +58,35 @@ class OpenAICompatibleLLMClient:
         settings = self._settings
         if not settings.llm_configured:
             raise LLMError("LLM is not configured")
+
+        max_tokens = settings.llm_max_tokens
+        data = await self._request(agent_id=agent_id, messages=messages, json_mode=json_mode, max_tokens=max_tokens)
+        if _is_length_truncated(data) and max_tokens > 0:
+            data = await self._request(
+                agent_id=agent_id,
+                messages=messages,
+                json_mode=json_mode,
+                max_tokens=max_tokens * 2,
+            )
+
+        content = _extract_content(data)
+        usage = _model_usage(agent_id=agent_id, data=data, settings=settings)
+        return LLMCompletion(content=content, model_usage=usage, raw=data)
+
+    async def _request(
+        self,
+        *,
+        agent_id: str,
+        messages: list[dict[str, str]],
+        json_mode: bool,
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        settings = self._settings
         url = _chat_completions_url(settings.llm_provider, settings.llm_base_url)
         payload: dict[str, Any] = {
             "model": settings.llm_model,
             "messages": messages,
-            "max_tokens": settings.llm_max_tokens,
+            "max_tokens": max_tokens,
         }
         if settings.llm_temperature is not None:
             payload["temperature"] = settings.llm_temperature
@@ -84,10 +108,7 @@ class OpenAICompatibleLLMClient:
             raise LLMError(_format_provider_error(data["error"]))
         if response.is_error:
             raise LLMError(f"LLM HTTP error {response.status_code}: {_response_text(response)}")
-
-        content = _extract_content(data)
-        usage = _model_usage(agent_id=agent_id, data=data, settings=settings)
-        return LLMCompletion(content=content, model_usage=usage, raw=data)
+        return data
 
 
 def build_llm_client(settings: Settings | None = None) -> OpenAICompatibleLLMClient:
@@ -129,6 +150,14 @@ def _model_usage(*, agent_id: str, data: dict[str, Any], settings: Settings) -> 
         input_tokens=optional_int(usage.get("prompt_tokens")),
         output_tokens=optional_int(usage.get("completion_tokens")),
     )
+
+
+def _is_length_truncated(data: dict[str, Any]) -> bool:
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return False
+    first = choices[0]
+    return isinstance(first, dict) and first.get("finish_reason") == "length"
 
 
 def _strip_json_fence(text: str) -> str:
