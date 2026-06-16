@@ -16,8 +16,8 @@ from ai_server.utils import confidence, optional_int
 logger = logging.getLogger(__name__)
 
 ALLOWED_TOOL_NAMES = {
+    "bitrix_api",
     "current_user_profile",
-    "task_search",
     "task_create_draft",
     "task_closure",
     "portal_search",

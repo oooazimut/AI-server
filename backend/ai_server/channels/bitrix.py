@@ -6,6 +6,7 @@ from dataclasses import asdict
 from typing import Any
 from uuid import uuid4
 
+from ai_server.agent_scheduler import AgentScheduler
 from ai_server.agents.bitrix_llm import BitrixAgentLLM
 from ai_server.agents.bitrix_task_closure import TaskClosureService
 from ai_server.attachments import AttachmentService, StoredAttachment
@@ -86,12 +87,14 @@ class BitrixWebhookProcessor:
         attachment_service: AttachmentService | None = None,
         transcriber: Any | None = None,
         learning_recorder: LearningEventRecorder | None = None,
+        scheduler: AgentScheduler | None = None,
     ) -> None:
         self._settings = settings or get_settings()
         self._manifests = manifests or load_agent_manifests()
         self.bitrix = bitrix or BitrixClient()
         self.portal_search = portal_search or PortalSearchIndex()
         self.bitrix_oauth = bitrix_oauth
+        self.scheduler = scheduler
         self.search_webhook_status = search_webhook_status if search_webhook_status is not None else {}
         self.quality_control_status = quality_control_status if quality_control_status is not None else {}
         self.orchestrator = orchestrator
@@ -161,6 +164,7 @@ class BitrixWebhookProcessor:
             specialists=build_specialist_registry(
                 manifests,
                 audience="employee",
+                scheduler=self.scheduler,
                 bitrix_retriever=self.bitrix_retriever,
                 bitrix_llm=self.bitrix_llm,
                 bitrix_tools=self.bitrix_tools
@@ -183,6 +187,7 @@ class BitrixWebhookProcessor:
                 ),
             ),
             orchestrator_llm=self.orchestrator_llm,
+            scheduler=self.scheduler,
         )
         task = AgentTask(
             task_id=str(uuid4()),

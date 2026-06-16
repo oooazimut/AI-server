@@ -34,7 +34,10 @@ class BitrixToolset:
         return [
             ToolDefinition(
                 name="bitrix_api",
-                description="Controlled Bitrix REST API access. Read methods can run immediately; writes return approval requests.",
+                description=(
+                    "Bitrix24 REST API access. Read methods (ending in .get/.list/.search) execute immediately. "
+                    "Write methods require user confirmation. Dangerous methods (user management, bots) are denied."
+                ),
                 parameters={
                     "type": "object",
                     "properties": {
@@ -48,7 +51,7 @@ class BitrixToolset:
             ),
             ToolDefinition(
                 name="portal_search",
-                description="Search the local Bitrix portal index from var/search_index.sqlite.",
+                description="Search the local Bitrix portal index (var/search_index.sqlite). Use for full-text search across tasks, projects, documents and disk files.",
                 parameters={
                     "type": "object",
                     "properties": {
@@ -57,46 +60,6 @@ class BitrixToolset:
                         "limit": {"type": "integer", "minimum": 1, "maximum": 30},
                     },
                     "required": ["query"],
-                },
-            ),
-            ToolDefinition(
-                name="resolve_user",
-                description="Read-only Bitrix user resolver. Returns one user only when the query is unambiguous.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 10},
-                    },
-                    "required": ["query"],
-                },
-            ),
-            ToolDefinition(
-                name="resolve_project",
-                description="Read-only Bitrix project/workgroup resolver. Returns one project only when the query is unambiguous.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 10},
-                    },
-                    "required": ["query"],
-                },
-            ),
-            ToolDefinition(
-                name="task_search",
-                description="Read-only Bitrix task search/get wrapper over tasks.task.list and tasks.task.get.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "mode": {"type": "string", "enum": ["list", "get"]},
-                        "task_id": {"type": "integer"},
-                        "filter": {"type": "object"},
-                        "select": {"type": "array", "items": {"type": "string"}},
-                        "order": {"type": "object"},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 10},
-                    },
-                    "required": ["mode"],
                 },
             ),
             ToolDefinition(
@@ -214,63 +177,6 @@ class BitrixToolset:
         candidates = [candidate for candidate in candidates if candidate is not None]
         return _resolution_result("resolve_project", query=query, candidates=candidates)
 
-    async def task_search(self, args: dict[str, Any]) -> ToolResult:
-        mode = str(args.get("mode") or "list").strip().lower()
-        select = args.get("select") if isinstance(args.get("select"), list) else None
-        if mode == "get":
-            task_id = optional_int(args.get("task_id"))
-            if task_id is None:
-                return ToolResult(status="invalid_tool_call", tool="task_search", error="task_id is required")
-            try:
-                payload: dict[str, Any] = {"taskId": task_id}
-                if select:
-                    payload["select"] = select
-                result = await self.client.result("tasks.task.get", payload)
-            except (BitrixApiError, BitrixConfigError) as exc:
-                return ToolResult(
-                    status="not_configured" if isinstance(exc, BitrixConfigError) else "error",
-                    tool="task_search",
-                    error=str(exc),
-                    data={"mode": mode, "task_id": task_id},
-                )
-            task = _extract_task(result)
-            if task is None:
-                return ToolResult(status="not_found", tool="task_search", data={"mode": mode, "task_id": task_id})
-            return ToolResult(status="ok", tool="task_search", data={"mode": mode, "task_id": task_id, "task": task})
-
-        if mode != "list":
-            return ToolResult(status="invalid_tool_call", tool="task_search", error=f"unknown mode: {mode}")
-
-        filter_ = args.get("filter") if isinstance(args.get("filter"), dict) else {}
-        order = args.get("order") if isinstance(args.get("order"), dict) else {"CHANGED_DATE": "desc"}
-        limit = max(1, min(optional_int(args.get("limit")) or 5, 10))
-        try:
-            tasks = await self.client.list_all_tasks(
-                filter_=filter_,
-                select=select,
-                order=order,
-                limit=limit,
-            )
-        except (BitrixApiError, BitrixConfigError) as exc:
-            return ToolResult(
-                status="not_configured" if isinstance(exc, BitrixConfigError) else "error",
-                tool="task_search",
-                error=str(exc),
-                data={"mode": mode, "filter": filter_, "order": order, "limit": limit},
-            )
-        return ToolResult(
-            status="ok",
-            tool="task_search",
-            data={
-                "mode": mode,
-                "filter": filter_,
-                "order": order,
-                "limit": limit,
-                "tasks": tasks,
-                "total": len(tasks),
-            },
-        )
-
     async def current_user_profile(self, args: dict[str, Any] | None = None) -> ToolResult:
         args = args or {}
         user_id = self.user_id if self.user_id is not None else optional_int(args.get("user_id"))
@@ -374,17 +280,6 @@ def _project_candidate(project: dict[str, Any]) -> dict[str, Any] | None:
         "label": name or f"Bitrix project #{project_id}",
         "raw": project,
     }
-
-
-def _extract_task(result: Any) -> dict[str, Any] | None:
-    if not isinstance(result, dict):
-        return None
-    task = result.get("task")
-    if isinstance(task, dict):
-        return task
-    if result.get("id") or result.get("ID"):
-        return result
-    return None
 
 
 def _compact_user_profile(user: dict[str, Any]) -> dict[str, Any]:

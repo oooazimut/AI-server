@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import uuid
 
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask
-from ai_server.orchestrators.internal_llm import InternalLLMRouter, InternalOrchestratorLLM
+from ai_server.orchestrators.internal_llm import InternalLLMRouter, InternalOrchestratorLLM, ScheduledTaskDecision
 from ai_server.specialists import Specialist, build_specialist_registry
+
+logger = logging.getLogger(__name__)
 
 
 class InternalOrchestrator:
@@ -14,10 +18,12 @@ class InternalOrchestrator:
         specialists: dict[str, Specialist] | None = None,
         *,
         orchestrator_llm: InternalOrchestratorLLM | None = None,
+        scheduler=None,
     ) -> None:
         self.manifests = manifests
         self.specialists = specialists or build_specialist_registry(manifests)
         self.orchestrator_llm = orchestrator_llm or InternalLLMRouter()
+        self.scheduler = scheduler
 
     async def handle(self, task: AgentTask) -> AgentResult:
         if task.context.get("pending_action"):
@@ -69,10 +75,15 @@ class InternalOrchestrator:
             )
 
         decision = route_result.decision
+        schedule_actions = _apply_scheduled_tasks(decision.scheduled_tasks, self.scheduler)
         route_action = ActionRecord(
             name="orchestrator_llm_route",
             status=decision.status,
-            details={"handoff_to": decision.handoff_to, "confidence": decision.confidence},
+            details={
+                "handoff_to": decision.handoff_to,
+                "scheduled_tasks": len(decision.scheduled_tasks),
+                "confidence": decision.confidence,
+            },
         )
 
         targets = [
@@ -86,7 +97,7 @@ class InternalOrchestrator:
                 status=decision.status,
                 agent_id="internal_orchestrator",
                 answer=decision.answer,
-                actions_taken=[route_action],
+                actions_taken=[route_action, *schedule_actions],
                 model_usage=[route_result.model_usage],
                 confidence=decision.confidence,
             )
@@ -130,7 +141,12 @@ class InternalOrchestrator:
                 confidence=0.0,
             )
 
-        all_actions = [route_action, *delegate_actions, *[a for _, sr in good for a in sr.actions_taken]]
+        all_actions = [
+            route_action,
+            *schedule_actions,
+            *delegate_actions,
+            *[a for _, sr in good for a in sr.actions_taken],
+        ]
         all_approvals = [a for _, sr in good for a in sr.actions_requiring_approval]
         all_artifacts = [art for _, sr in good for art in sr.artifacts]
         all_logs = [log for _, sr in good for log in sr.logs]
@@ -192,3 +208,50 @@ class InternalOrchestrator:
 def _merge_status(statuses: list[str]) -> str:
     priority = {"failed": 0, "needs_human": 1, "needs_clarification": 2, "completed": 3}
     return min(statuses, key=lambda s: priority.get(s, 2))
+
+
+def _apply_scheduled_tasks(
+    tasks: list[ScheduledTaskDecision],
+    scheduler,
+) -> list[ActionRecord]:
+    if not tasks or scheduler is None:
+        return []
+    from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.triggers.date import DateTrigger
+
+    from ai_server.utils import MOSCOW_TZ
+
+    actions: list[ActionRecord] = []
+    for task in tasks:
+        job_id = task.job_id or str(uuid.uuid4())[:8]
+        try:
+            trigger_data = task.trigger
+            trigger_type = str(trigger_data.get("type") or "date").strip()
+            if trigger_type == "date":
+                trigger = DateTrigger(run_date=trigger_data.get("run_date"), timezone=MOSCOW_TZ)
+            elif trigger_type == "cron":
+                kwargs = {k: v for k, v in trigger_data.items() if k != "type"}
+                trigger = CronTrigger(timezone=MOSCOW_TZ, **kwargs)
+            else:
+                raise ValueError(f"Unknown trigger type: {trigger_type!r}")
+
+            job = scheduler.schedule_task(task.agent_id, job_id, trigger, task.task_description)
+            next_run = job.next_run_time.isoformat() if job.next_run_time else None
+            actions.append(
+                ActionRecord(
+                    name="orchestrator_schedule_task",
+                    status="scheduled",
+                    details={"agent_id": task.agent_id, "job_id": f"{task.agent_id}:{job_id}", "next_run": next_run},
+                )
+            )
+            logger.info("Orchestrator scheduled task %s:%s next=%s", task.agent_id, job_id, next_run)
+        except Exception as exc:
+            logger.exception("Orchestrator failed to schedule task for %s", task.agent_id)
+            actions.append(
+                ActionRecord(
+                    name="orchestrator_schedule_task",
+                    status="error",
+                    details={"agent_id": task.agent_id, "job_id": job_id, "error": f"{type(exc).__name__}: {exc}"},
+                )
+            )
+    return actions

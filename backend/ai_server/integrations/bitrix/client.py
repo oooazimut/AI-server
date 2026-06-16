@@ -378,6 +378,20 @@ class BitrixClient:
             },
         )
 
+    async def list_all_users(
+        self,
+        *,
+        filter_: dict[str, Any] | None = None,
+        select: list[str] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        payload: dict[str, Any] = {}
+        if filter_:
+            payload["FILTER"] = filter_
+        if select:
+            payload["SELECT"] = select
+        return await self.collect_paged("user.get", payload, limit=limit)
+
     async def search_users(self, query: str, *, limit: int = 10) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {
             "FILTER": {"ACTIVE": True},

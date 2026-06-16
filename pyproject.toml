@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Corporate multi-agent AI server prototype"
 requires-python = ">=3.11"
 dependencies = [
+    "apscheduler>=3.10",
     "fastapi>=0.115.0",
     "httpx>=0.28.0",
     "pydantic>=2.8.0",

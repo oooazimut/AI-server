@@ -271,13 +271,6 @@ class Bitrix24Specialist:
     ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
         if tool_call.name == "none":
             return None, None, []
-        if tool_call.name == "task_search":
-            result = await self.tools.task_search(tool_call.args)
-            return (
-                result,
-                ActionRecord(name="bitrix_task_search", status=result.status, details=result.model_dump()),
-                [],
-            )
         if tool_call.name == "current_user_profile":
             profile_tool = getattr(self.tools, "current_user_profile", None)
             if profile_tool is None:

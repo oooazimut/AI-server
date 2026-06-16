@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
+from ai_server.agent_scheduler import AgentScheduler
 from ai_server.agents.logistics_llm import (
     LogisticsAgentLLM,
     LogisticsLLMService,
@@ -15,6 +17,8 @@ from ai_server.skills import SkillStore
 from ai_server.tools.vehicle_usage import VehicleUsageToolset
 from ai_server.utils import unique
 
+logger = logging.getLogger(__name__)
+
 
 class LogisticsSpecialist:
     def __init__(
@@ -26,6 +30,7 @@ class LogisticsSpecialist:
         retriever: HybridKnowledgeRetriever | None = None,
         tools: VehicleUsageToolset | None = None,
         llm: LogisticsAgentLLM | None = None,
+        scheduler: AgentScheduler | None = None,
     ) -> None:
         self.manifest = manifest
         self.knowledge_base = knowledge_base or MarkdownKnowledgeBase()
@@ -33,6 +38,7 @@ class LogisticsSpecialist:
         self.retriever = retriever or HybridKnowledgeRetriever(knowledge_base=self.knowledge_base)
         self.tools = tools or VehicleUsageToolset()
         self.llm = llm or LogisticsLLMService()
+        self.scheduler = scheduler
 
     @classmethod
     def build(
@@ -42,9 +48,16 @@ class LogisticsSpecialist:
         vehicle_usage_tools: VehicleUsageToolset | None = None,
         logistics_retriever: HybridKnowledgeRetriever | None = None,
         logistics_llm: LogisticsAgentLLM | None = None,
+        scheduler: AgentScheduler | None = None,
         **_: Any,
     ) -> LogisticsSpecialist:
-        return cls(manifest, retriever=logistics_retriever, tools=vehicle_usage_tools, llm=logistics_llm)
+        return cls(
+            manifest,
+            retriever=logistics_retriever,
+            tools=vehicle_usage_tools,
+            llm=logistics_llm,
+            scheduler=scheduler,
+        )
 
     async def handle(self, task: AgentTask) -> AgentResult:
         available_skills = self.skill_store.list_skills(self.manifest)
@@ -207,6 +220,14 @@ class LogisticsSpecialist:
             )
         if tool_call.name == "vehicle_usage_save_report":
             result = self.tools.vehicle_usage_save_report(tool_call.args)
+            if result.status == "ok" and self.scheduler is not None:
+                date_str = str((tool_call.args or {}).get("request_date") or "")
+                cancelled = self.scheduler.remove_jobs_by_prefix("logistics", "morning_")
+                cancelled += self.scheduler.remove_jobs_by_prefix("logistics", "escalation_")
+                if cancelled:
+                    logger.info(
+                        "LogisticsSpecialist: cancelled %d scheduled jobs after report saved %s", cancelled, date_str
+                    )
             return result, ActionRecord(
                 name="logistics_vehicle_usage_save_report", status=result.status, details=result.model_dump()
             )
