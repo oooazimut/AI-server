@@ -375,7 +375,7 @@ def get_settings() -> Settings:
         llm_base_url=_env("AI_SERVER_LLM_BASE_URL", _env("LLM_BASE_URL")),
         llm_api_key=_env("AI_SERVER_LLM_API_KEY", _env("LLM_API_KEY")),
         llm_temperature=_env_float("AI_SERVER_LLM_TEMPERATURE", _env_float("LLM_TEMPERATURE")),
-        llm_max_tokens=_env_int("AI_SERVER_LLM_MAX_TOKENS", _env_int("LLM_MAX_TOKENS", 3000)) or 3000,
+        llm_max_tokens=_env_int("AI_SERVER_LLM_MAX_TOKENS", _env_int("LLM_MAX_TOKENS", 10000)) or 10000,
         deepseek_api_key=_deepseek_api_key(),
         deepseek_balance_base_url=_env("AI_SERVER_DEEPSEEK_BALANCE_BASE_URL", "https://api.deepseek.com"),
         deepseek_balance_timeout_seconds=_env_float("AI_SERVER_DEEPSEEK_BALANCE_TIMEOUT_SECONDS", 10.0) or 10.0,
