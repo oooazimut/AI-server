@@ -43,6 +43,32 @@ def test_bitrix_specialist_loads_available_skills_and_rag_context():
     assert result.actions_taken[1].name == "bitrix_llm_decision"
 
 
+def test_bitrix_specialist_forwards_dialog_history_to_decide():
+    llm = FakeBitrixLLM()
+    history = [
+        {"role": "user", "content": "найди задачи Иванова"},
+        {"role": "assistant", "content": "Уточните, о ком из Ивановых речь?"},
+    ]
+
+    asyncio.run(
+        _bitrix_specialist(tools=FakeResolverTools(), llm=llm).handle(
+            AgentTask(task_id="t1", request="который Павел", context={"dialog_history": history})
+        )
+    )
+
+    assert llm.decide_calls[0]["dialog_history"] == history
+
+
+def test_bitrix_specialist_defaults_dialog_history_to_none_when_absent():
+    llm = FakeBitrixLLM()
+
+    asyncio.run(
+        _bitrix_specialist(tools=FakeResolverTools(), llm=llm).handle(AgentTask(task_id="t1", request="привет"))
+    )
+
+    assert llm.decide_calls[0]["dialog_history"] is None
+
+
 def test_bitrix_specialist_searches_task_by_id():
     result = asyncio.run(
         _bitrix_specialist(

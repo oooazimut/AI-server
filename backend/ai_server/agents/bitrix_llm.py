@@ -34,6 +34,7 @@ class BitrixAgentLLM(Protocol):
         task: AgentTask,
         retrieval_hits: list[RetrievalHit],
         tool_definitions: list[dict[str, Any]],
+        dialog_history: list[dict[str, str]] | None = None,
     ) -> BitrixLLMDecisionResult:
         pass
 
@@ -90,6 +91,7 @@ class BitrixLLMService:
         task: AgentTask,
         retrieval_hits: list[RetrievalHit],
         tool_definitions: list[dict[str, Any]],
+        dialog_history: list[dict[str, str]] | None = None,
     ) -> BitrixLLMDecisionResult:
         instructions = _load_instructions(manifest)
         completion = await self.client.complete(
@@ -109,6 +111,7 @@ class BitrixLLMService:
                             "user": task.user.model_dump(),
                             "files": task.files,
                             "current_datetime": datetime.now(UTC).astimezone().isoformat(),
+                            "dialog_history": dialog_history or [],
                             "permission_context": _permission_context(task),
                             "retrieval_context": _retrieval_context(retrieval_hits),
                             "tools": _allowed_tool_definitions(tool_definitions),
@@ -202,6 +205,11 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "В payload есть permission_context: именно ты обязан прочитать его до write-tool "
         "и решить, имеет ли текущий пользователь право просить такое действие. "
         "permission_context содержит Bitrix-факты о текущем пользователе и RAG-выдержки из политики прав. "
+        "В payload есть dialog_history — последние сообщения этого диалога (роли user/assistant). "
+        "Текущий request может быть продолжением (уточнением имени, местоимением 'он/она/этот', "
+        "ответом на твой предыдущий уточняющий вопрос). Используй dialog_history, чтобы понять, "
+        "о какой сущности (сотрудник, задача, проект) идёт речь, и не задавай уточняющий вопрос повторно, "
+        "если ответ на него уже есть в dialog_history. "
         "Если Bitrix-факты отсутствуют или противоречат политике, не угадывай права. "
         "Если permission_context не разрешает write-действие, не вызывай write-tool; "
         "верни needs_human или needs_clarification с коротким объяснением. "
