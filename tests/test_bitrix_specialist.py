@@ -2,11 +2,12 @@ import asyncio
 import json
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist
-from ai_server.agents.bitrix_llm import BitrixLLMService, BitrixLLMToolCall
+from ai_server.agents.bitrix_llm import BitrixLLMDecision, BitrixLLMService, BitrixLLMToolCall
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import AgentTask, ToolResult
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
+from ai_server.settings import get_settings
 from ai_server.skills import SkillStore
 from ai_server.tools.bitrix import BitrixToolset
 from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
@@ -524,6 +525,33 @@ def test_bitrix_llm_decision_payload_includes_permission_context(monkeypatch):
     assert permission["bitrix_current_user_profile"] == context["bitrix_current_user_profile"]
     assert permission["permission_policy_context"] == context["permission_policy_context"]
     assert any("read_only users should not prepare write-tools" in rule for rule in permission["rules"])
+
+
+def test_bitrix_llm_service_uses_injected_settings_not_global_at_call_time(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_REST_WEBHOOK_URL", "https://injected.bitrix24.ru/rest/1/token/")
+    injected_settings = get_settings()
+
+    # Change ambient env after capturing the snapshot to prove decide()/compose() use the
+    # injected Settings instance, not a fresh get_settings() call made from inside them.
+    monkeypatch.setenv("BITRIX_REST_WEBHOOK_URL", "https://different.bitrix24.ru/rest/1/token/")
+
+    client = RecordingLLMClient('{"status":"completed","answer":"ok","confidence":0.7,"tool_calls":[]}')
+    manifest = get_agent_manifest("bitrix24")
+    service = BitrixLLMService(client, settings=injected_settings)
+
+    asyncio.run(
+        service.compose(
+            manifest=manifest,
+            task=AgentTask(task_id="t1", request="x"),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[],
+            approval_actions=[],
+        )
+    )
+
+    payload = json.loads(client.calls[0]["messages"][1]["content"])
+    assert payload["portal_base_url"] == "https://injected.bitrix24.ru"
 
 
 def test_bitrix_policy():
