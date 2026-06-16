@@ -18,7 +18,7 @@ from ai_server.agents.specialist_llm_shared import (
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
 from ai_server.retrieval import RetrievalHit
-from ai_server.settings import get_settings
+from ai_server.settings import Settings, get_settings
 from ai_server.utils import confidence, optional_int
 
 logger = logging.getLogger(__name__)
@@ -89,8 +89,9 @@ class BitrixLLMFinalResult:
 
 
 class BitrixLLMService:
-    def __init__(self, client: LLMClient | None = None) -> None:
+    def __init__(self, client: LLMClient | None = None, settings: Settings | None = None) -> None:
         self.client = client or OpenAICompatibleLLMClient()
+        self.settings = settings or get_settings()
 
     async def decide(
         self,
@@ -121,7 +122,7 @@ class BitrixLLMService:
                             "files": task.files,
                             "current_datetime": datetime.now(UTC).astimezone().isoformat(),
                             "dialog_history": dialog_history or [],
-                            "permission_context": _permission_context(task),
+                            "permission_context": _permission_context(task, self.settings),
                             "retrieval_context": retrieval_context(retrieval_hits),
                             "tools": allowed_tool_definitions(tool_definitions, ALLOWED_TOOL_NAMES),
                             "tool_results": [compact_tool_result(result) for result in (tool_results or [])],
@@ -148,7 +149,7 @@ class BitrixLLMService:
         approval_actions: list[dict[str, Any]],
     ) -> BitrixLLMFinalResult:
         agent_id = manifest.id if manifest is not None else "bitrix24"
-        portal_base_url = get_settings().bitrix_portal_base_url
+        portal_base_url = self.settings.bitrix_portal_base_url
         completion = await self.client.complete(
             agent_id=agent_id,
             messages=[
@@ -291,8 +292,7 @@ def _parse_decision(data: dict[str, Any]) -> BitrixLLMDecision:
     )
 
 
-def _permission_context(task: AgentTask) -> dict[str, Any]:
-    settings = get_settings()
+def _permission_context(task: AgentTask, settings: Settings) -> dict[str, Any]:
     user_id = optional_int(task.user.id)
     full_write_user_ids = settings.resolved_agent_write_allowed_user_ids
     limited_user_ids = settings.resolved_agent_limited_task_create_user_ids
