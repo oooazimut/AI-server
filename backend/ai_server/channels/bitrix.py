@@ -7,8 +7,9 @@ from typing import Any
 from uuid import uuid4
 
 from ai_server.agent_scheduler import AgentScheduler
+from ai_server.agents.bitrix24 import Bitrix24Specialist
 from ai_server.agents.bitrix_llm import BitrixAgentLLM
-from ai_server.agents.bitrix_task_closure import TaskClosureService
+from ai_server.agents.bitrix_store import BitrixAgentStore
 from ai_server.attachments import AttachmentService, StoredAttachment
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.dialog_state import (
@@ -44,28 +45,6 @@ logger = logging.getLogger(__name__)
 _MARKETPLACE_PATH_RE = re.compile(r"(/marketplace/view/[A-Za-z0-9._-]+/?)")
 
 
-class _BitrixTaskClosureHandler:
-    def __init__(self, portal_search: PortalSearchIndex, llm: Any | None = None) -> None:
-        self._portal_search = portal_search
-        self._llm = llm
-
-    async def execute(
-        self,
-        params: dict[str, Any],
-        *,
-        current_user_id: int,
-        write_client: BitrixClient,
-        actor_client: BitrixClient,
-    ) -> dict[str, Any]:
-        service = TaskClosureService(
-            write_client,
-            self._portal_search,
-            actor_bitrix=actor_client,
-            llm=self._llm,
-        )
-        return await service.execute(params, current_user_id=current_user_id)
-
-
 class BitrixWebhookProcessor:
     def __init__(
         self,
@@ -88,6 +67,7 @@ class BitrixWebhookProcessor:
         transcriber: Any | None = None,
         learning_recorder: LearningEventRecorder | None = None,
         scheduler: AgentScheduler | None = None,
+        bitrix_store: BitrixAgentStore | None = None,
     ) -> None:
         self._settings = settings or get_settings()
         self._manifests = manifests or load_agent_manifests()
@@ -106,11 +86,11 @@ class BitrixWebhookProcessor:
         self.attachment_service = attachment_service or AttachmentService(self.bitrix)
         self.transcriber = transcriber or build_transcriber()
         self.learning_recorder = learning_recorder
+        self._bitrix_store = bitrix_store or BitrixAgentStore()
         self.pending_actions = pending_actions or BitrixPendingActionService(
             store=DialogStateStore(self._settings.dialog_state_path),
             bitrix=self.bitrix,
             bitrix_oauth=bitrix_oauth,
-            task_closure_handler=_BitrixTaskClosureHandler(self.portal_search),
             audit_log_path=self._settings.bitrix_write_audit_log_path,
             dry_run=self._settings.agent_dry_run,
         )
@@ -134,6 +114,7 @@ class BitrixWebhookProcessor:
                     quality_bitrix,
                     payload=payload,
                     status=self.quality_control_status,
+                    specialist=self._build_quality_control_specialist(quality_bitrix),
                 )
             return {
                 "handled": bool(search_result.get("handled")) or bool(quality_result.get("handled")),
@@ -167,6 +148,7 @@ class BitrixWebhookProcessor:
                 scheduler=self.scheduler,
                 bitrix_retriever=self.bitrix_retriever,
                 bitrix_llm=self.bitrix_llm,
+                bitrix_store=self._bitrix_store,
                 bitrix_tools=self.bitrix_tools
                 or BitrixToolset(
                     client=self.bitrix,
@@ -344,6 +326,26 @@ class BitrixWebhookProcessor:
             logger.exception("Failed to record Bitrix learning event")
             return {"recorded": False, "reason": "unexpected_error"}
 
+    def _build_quality_control_specialist(self, actor_bitrix: BitrixClient) -> Bitrix24Specialist | None:
+        bitrix24_manifest = next((m for m in self._manifests if m.id == "bitrix24"), None)
+        if bitrix24_manifest is None:
+            return None
+        deliver_fn = _make_quality_deliver_fn(self.bitrix, self._settings)
+        return Bitrix24Specialist(
+            bitrix24_manifest,
+            tools=BitrixToolset(
+                client=self.bitrix,
+                actor_client=actor_bitrix,
+                auto_execute=True,
+            ),
+            retriever=self.bitrix_retriever,
+            llm=self.bitrix_llm,
+            scheduler=self.scheduler,
+            bitrix_store=self._bitrix_store,
+            deliver_fn=deliver_fn,
+            settings=self._settings,
+        )
+
     async def _quality_control_bitrix_client(self) -> tuple[BitrixClient, dict[str, Any] | None]:
         settings = self._settings
         if not settings.quality_control_webhook_enabled:
@@ -393,7 +395,7 @@ def _pending_from_approval_action(
     *,
     user_id: int | None,
 ) -> PendingBitrixAction | None:
-    if action.name not in {"bitrix_api", "bitrix_task_closure"}:
+    if action.name != "bitrix_api":
         return None
     details = action.details
     method = str(details.get("method") or "").strip()
@@ -407,6 +409,17 @@ def _pending_from_approval_action(
         created_by=user_id,
         specialist_id=str(details.get("specialist_id") or "bitrix24"),
     )
+
+
+def _make_quality_deliver_fn(bitrix: BitrixClient, settings: Settings):
+    async def _deliver(user_id_str: str, message: str) -> None:
+        uid = int(user_id_str) if user_id_str.lstrip("-").isdigit() else None
+        if uid is not None:
+            await bitrix.notify_user(user_id=uid, message=message, tag="task_proposal")
+        else:
+            await bitrix.send_bot_message(user_id_str, message, bot_id=settings.bitrix_bot_id)
+
+    return _deliver
 
 
 def _record_quality_actor_error(status: dict[str, Any], error: dict[str, Any]) -> None:

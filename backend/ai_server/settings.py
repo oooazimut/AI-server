@@ -116,6 +116,7 @@ class Settings:
     vehicle_usage_max_reminders: int
     vehicle_usage_admin_notify_user_ids: str
     vehicle_usage_dry_run: bool
+    task_proposal_manager_bitrix_id: int | None
     attachment_max_bytes: int
     stt_provider: str
     transcription_max_bytes: int
@@ -459,6 +460,7 @@ def get_settings() -> Settings:
         vehicle_usage_max_reminders=_env_int("VEHICLE_USAGE_MAX_REMINDERS", 3) or 3,
         vehicle_usage_admin_notify_user_ids=_env("VEHICLE_USAGE_ADMIN_NOTIFY_USER_IDS"),
         vehicle_usage_dry_run=_env_bool("VEHICLE_USAGE_DRY_RUN", True),
+        task_proposal_manager_bitrix_id=_env_int("TASK_PROPOSAL_MANAGER_BITRIX_ID"),
         attachment_max_bytes=_env_int("ATTACHMENT_MAX_BYTES", 30 * 1024 * 1024) or (30 * 1024 * 1024),
         stt_provider=_env("STT_PROVIDER", "yandex_speechkit"),
         transcription_max_bytes=_env_int("TRANSCRIPTION_MAX_BYTES", 25 * 1024 * 1024) or (25 * 1024 * 1024),

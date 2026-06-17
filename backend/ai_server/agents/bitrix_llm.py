@@ -27,7 +27,8 @@ ALLOWED_TOOL_NAMES = {
     "bitrix_api",
     "current_user_profile",
     "task_create_draft",
-    "task_closure",
+    "save_incomplete_proposal",
+    "delete_incomplete_proposal",
     "portal_search",
     "none",
 }
@@ -214,7 +215,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
-        '"tool_calls":[{"name":"current_user_profile|bitrix_api|task_create_draft|task_closure|portal_search|none","args":{},"summary":""}]}. '
+        '"tool_calls":[{"name":"current_user_profile|bitrix_api|task_create_draft|save_incomplete_proposal|delete_incomplete_proposal|portal_search|none","args":{},"summary":""}]}. '
         "Перед каждым tool_call сам проверь, хватает ли данных для его корректного вызова. "
         "Нельзя вызывать tool с надеждой, что backend или tool сам разберётся с недостающими данными. "
         'Если данных не хватает, не вызывай tool: верни status=needs_clarification, tool_calls=[{"name":"none"}], '
@@ -229,10 +230,10 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Если срок не указан, применяй правила из retrieval_context; если правило неясно, спроси уточнение. "
         "Не вызывай task_create_draft без title, одного из responsible_id/responsible_query/responsible_self, "
         "и одного из deadline_iso/no_deadline=true. "
-        "Для закрытия/завершения задачи из чата используй task_closure, если пользователь сообщил результат работы. "
-        "Для task_closure именно ты выделяешь task_id или task_query и result_text. "
-        "В result_text передавай только результат выполнения, без команды закрыть задачу. "
-        "Не вызывай task_closure без result_text и одного из task_id/task_query. "
+        "Закрытие задачи исполнителем: вызови tasks.task.result.add (добавить результат) + tasks.task.complete "
+        "(завершить). Если TASK_CONTROL=Y, задача перейдёт в STATUS=4 (ждёт контроля). "
+        "Закрытие задачи постановщиком: вызови tasks.task.approve напрямую — STATUS=5, без проверки результата. "
+        "Все Bitrix-методы (approve/disapprove/complete/result.add/commentitem.add) вызывай через bitrix_api. "
         "Для поиска документов/файлов используй portal_search. Если данных не хватает, status=needs_clarification."
         f"{extra}"
     )
@@ -318,7 +319,7 @@ def _permission_context(task: AgentTask, settings: Settings) -> dict[str, Any]:
             "full_bitrix_write users may prepare Bitrix write-tools, still requiring chat confirmation.",
             "limited_task_create users may prepare task_create_draft only for the configured limited project.",
             "read_only users should not prepare write-tools; ask for an authorized user or human handoff.",
-            "task_closure should only be prepared when the user is acting on their own task result or has full write rights.",
+            "task closure via bitrix_api: responsible uses tasks.task.complete, creator uses tasks.task.approve.",
         ],
     }
 

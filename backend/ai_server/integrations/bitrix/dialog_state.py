@@ -6,7 +6,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixClient, BitrixConfigError
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
@@ -123,17 +123,6 @@ class DialogStateStore:
         return state
 
 
-class TaskClosureHandler(Protocol):
-    async def execute(
-        self,
-        params: dict[str, Any],
-        *,
-        current_user_id: int,
-        write_client: BitrixClient,
-        actor_client: BitrixClient,
-    ) -> dict[str, Any]: ...
-
-
 class BitrixPendingActionService:
     def __init__(
         self,
@@ -141,14 +130,12 @@ class BitrixPendingActionService:
         store: DialogStateStore | None = None,
         bitrix: BitrixClient | None = None,
         bitrix_oauth: BitrixOAuthService | None = None,
-        task_closure_handler: TaskClosureHandler | None = None,
         audit_log_path: Path | str | None = None,
         dry_run: bool = False,
     ) -> None:
         self.store = store or DialogStateStore()
         self.bitrix = bitrix or BitrixClient()
         self.bitrix_oauth = bitrix_oauth
-        self.task_closure_handler = task_closure_handler
         self.dry_run = dry_run
         self.audit_log_path = (
             Path(audit_log_path) if audit_log_path is not None else runtime_paths().bitrix_write_audit_log
@@ -198,9 +185,6 @@ class BitrixPendingActionService:
                 message="AGENT_DRY_RUN включён: действие не выполнено. Ожидающее действие оставлено без изменений.",
                 action=action,
             )
-
-        if action.method == "ai_server.task_closure":
-            return await self._confirm_task_closure(key, action=action, user_id=user_id)
 
         decision = decide_bitrix_method_policy(action.method)
         if decision.decision != "confirm":
@@ -285,80 +269,6 @@ class BitrixPendingActionService:
                     action=action,
                 )
             return self.bitrix
-
-    async def _confirm_task_closure(
-        self,
-        key: str,
-        *,
-        action: PendingBitrixAction,
-        user_id: int | None,
-    ) -> PendingActionResult:
-        if user_id is None:
-            self._audit("denied", key=key, action=action, data={"reason": "missing Bitrix user id"})
-            self.store.clear_pending(key)
-            return PendingActionResult(
-                status="denied",
-                message="Не выполнил действие: не вижу ID текущего пользователя Bitrix.",
-                action=action,
-            )
-
-        write_client = await self._write_client(user_id, action=action, key=key)
-        if isinstance(write_client, PendingActionResult):
-            return write_client
-        actor_client = await self._task_closure_actor_client(user_id, fallback=write_client)
-
-        if self.task_closure_handler is None:
-            self._audit("denied", key=key, action=action, data={"reason": "task_closure_handler not configured"})
-            self.store.clear_pending(key)
-            return PendingActionResult(
-                status="denied",
-                message="Обработчик закрытия задач не настроен.",
-                action=action,
-            )
-
-        try:
-            data = await self.task_closure_handler.execute(
-                action.params,
-                current_user_id=user_id,
-                write_client=write_client,
-                actor_client=actor_client,
-            )
-        except Exception as exc:
-            self._audit("error", key=key, action=action, data={"error": f"{type(exc).__name__}: {exc}"})
-            return PendingActionResult(
-                status="error",
-                message=f"Не смог закрыть задачу в Bitrix: {type(exc).__name__}: {exc}",
-                action=action,
-            )
-
-        status = str(data.get("status") or "executed")
-        if status != "error":
-            self.store.clear_pending(key)
-        audit_status = "executed" if status == "executed" else status
-        self._audit(audit_status, key=key, action=action, data=data)
-        return PendingActionResult(
-            status=status,
-            message=_task_closure_result_message(data),
-            action=action,
-            data=data,
-        )
-
-    async def _task_closure_actor_client(
-        self,
-        user_id: int,
-        *,
-        fallback: BitrixClient,
-    ) -> BitrixClient:
-        settings = get_settings()
-        actor_user_id = settings.quality_control_actor_user_id
-        if not actor_user_id or not settings.bitrix_oauth_enabled or self.bitrix_oauth is None:
-            return fallback
-        if actor_user_id == user_id:
-            return fallback
-        try:
-            return await self.bitrix_oauth.client_for_user(actor_user_id)
-        except (BitrixOAuthTokenMissing, BitrixApiError, BitrixConfigError):
-            return fallback
 
     def _audit(
         self,
@@ -493,32 +403,3 @@ def prepare_no_deadline_fields(fields: dict[str, Any]) -> None:
         if key in NO_DEADLINE_FIELD_NAMES or key.lower() == "deadline":
             fields.pop(key, None)
     fields["DEADLINE"] = ""
-
-
-def _task_closure_result_message(data: dict[str, Any]) -> str:
-    status = str(data.get("status") or "")
-    outcome = str(data.get("outcome") or "")
-    task = data.get("task") if isinstance(data.get("task"), dict) else {}
-    task_id = task.get("id") if isinstance(task, dict) else None
-    if status == "executed" and outcome == "closed":
-        return f"Готово, закрыл задачу #{task_id}." if task_id else "Готово, закрыл задачу."
-    if status == "executed" and outcome == "already_closed":
-        return f"Задача #{task_id} уже была закрыта." if task_id else "Задача уже была закрыта."
-    if status == "executed" and outcome == "needs_revision":
-        issues = data.get("issues") if isinstance(data.get("issues"), list) else []
-        issue_text = "; ".join(str(issue) for issue in issues[:3] if str(issue).strip())
-        base = (
-            f"Задачу #{task_id} не закрыл: результат нужно доработать."
-            if task_id
-            else "Задачу не закрыл: результат нужно доработать."
-        )
-        return f"{base} {issue_text}".strip()
-    if status == "ambiguous":
-        return str(data.get("message") or "Нашёл несколько похожих задач. Укажите номер нужной задачи.")
-    if status == "not_found":
-        return str(data.get("message") or "Не нашёл подходящую задачу.")
-    if status == "denied":
-        return str(data.get("reason") or "Не выполнил действие: недостаточно прав.")
-    if status == "contract_violation":
-        return str(data.get("error") or "Не выполнил действие: не хватает данных для закрытия задачи.")
-    return str(data.get("message") or "Действие обработано.")

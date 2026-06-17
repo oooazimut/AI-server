@@ -1,5 +1,3 @@
-from typing import Any
-
 from ai_server.integrations.bitrix.dialog_state import (
     BitrixDialogState,
     DialogStateStore,
@@ -226,23 +224,3 @@ def test_dialog_state_store_overwrite_on_conflict(tmp_path):
     store.save(BitrixDialogState(key="key:1", summary="Первый"))
     store.save(BitrixDialogState(key="key:1", summary="Второй"))
     assert store.load("key:1").summary == "Второй"
-
-
-# TaskClosureHandler Protocol — duck-type conformance
-def test_task_closure_handler_protocol_conformance():
-    """A class with the correct execute() signature satisfies the Protocol."""
-    from ai_server.integrations.bitrix.dialog_state import TaskClosureHandler
-
-    class FakeHandler:
-        async def execute(
-            self,
-            params: dict[str, Any],
-            *,
-            current_user_id: int,
-            write_client: Any,
-            actor_client: Any,
-        ) -> dict[str, Any]:
-            return {"status": "executed"}
-
-    handler: TaskClosureHandler = FakeHandler()
-    assert handler is not None
