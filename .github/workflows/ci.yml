@@ -70,5 +70,4 @@ jobs:
             cd /opt/ai-server
             git pull origin main
             /home/azimut/.local/bin/uv sync --extra retrieval
-            sudo systemctl daemon-reload
             sudo systemctl restart ai-server
