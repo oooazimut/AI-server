@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from .agent_scheduler import AgentScheduler
+from .agents.logistics import LogisticsSpecialist
 from .channels.bitrix import BitrixWebhookProcessor
 from .integrations.bitrix.client import BitrixClient
 from .integrations.bitrix.oauth import BitrixOAuthService
@@ -14,11 +15,13 @@ from .learning import LearningEventRecorder
 from .registry import load_agent_manifests
 from .runtime import ensure_runtime_dirs
 from .settings import get_settings
+from .specialists import manifest_by_id
+from .tools.vehicle_usage import VehicleUsageStore, VehicleUsageToolset
 from .workers.bitrix.reconciler import run_reconciler
 from .workers.bitrix.search_indexer import PortalSearchIndexerWorker
 from .workers.bitrix.supervisor import run_task_supervisor
 from .workers.bitrix.webhook_event_queue import WebhookEventQueue, run_webhook_event_worker
-from .workers.logistics.vehicle_usage import VehicleUsageWorker
+from .workers.logistics.staff_sync import run_staff_sync
 
 
 @asynccontextmanager
@@ -126,21 +129,13 @@ async def lifespan(app: FastAPI):
     }
     app.state.vehicle_usage_status = {
         "enabled": settings.vehicle_usage_enabled,
-        "running": False,
         "dry_run": settings.vehicle_usage_dry_run,
-        "interval_seconds": settings.vehicle_usage_interval_seconds,
         "dialog_id": settings.vehicle_usage_dialog_id,
         "manager_user_id": settings.vehicle_usage_manager_user_id,
         "admin_notify_user_ids": settings.resolved_vehicle_usage_admin_notify_user_ids,
         "request_time": settings.vehicle_usage_request_time,
-        "request_times": settings.vehicle_usage_request_times,
-        "escalation_time": settings.vehicle_usage_escalation_time,
-        "last_check_at": None,
-        "last_sent_at": None,
-        "last_escalated_at": None,
-        "last_error": None,
-        "runs": 0,
-        "errors": 0,
+        "reminder_interval_minutes": settings.vehicle_usage_reminder_interval_minutes,
+        "max_reminders": settings.vehicle_usage_max_reminders,
     }
 
     scheduler = AgentScheduler()
@@ -151,6 +146,8 @@ async def lifespan(app: FastAPI):
     search_indexer_task: asyncio.Task | None = None
     supervisor_task: asyncio.Task | None = None
     reconciler_task: asyncio.Task | None = None
+    staff_sync_task: asyncio.Task | None = None
+    logistics_specialist: LogisticsSpecialist | None = None
 
     if settings.webhook_event_queue_enabled and settings.webhook_event_worker_enabled:
         processor = BitrixWebhookProcessor(
@@ -185,10 +182,33 @@ async def lifespan(app: FastAPI):
             )
         )
     if settings.vehicle_usage_enabled:
-        vehicle_usage_worker = VehicleUsageWorker(scheduler, bitrix, settings=settings)
-        vehicle_usage_worker.setup_today()
-        vehicle_usage_worker.setup_midnight_cron()
-        app.state.vehicle_usage_worker = vehicle_usage_worker
+        vehicle_usage_store = VehicleUsageStore()
+        vehicle_usage_store.bootstrap_reference_data()
+
+        async def _vehicle_deliver(dialog_id: str, message: str) -> None:
+            await bitrix.send_bot_message(dialog_id, message)
+
+        async def _vehicle_notify(user_id: int, message: str) -> None:
+            await bitrix.notify_user(user_id=user_id, message=message, tag="vehicle_usage_escalation")
+
+        logistics_manifest = manifest_by_id(manifests, "logistics")
+        if logistics_manifest is not None:
+            logistics_specialist = LogisticsSpecialist(
+                logistics_manifest,
+                scheduler=scheduler,
+                deliver_fn=_vehicle_deliver,
+                notify_fn=_vehicle_notify,
+                settings=settings,
+                tools=VehicleUsageToolset(
+                    store=vehicle_usage_store,
+                    user_id=settings.vehicle_usage_manager_user_id,
+                    dialog_id=settings.vehicle_usage_dialog_id,
+                ),
+            )
+            logistics_specialist.start()
+            app.state.logistics_specialist = logistics_specialist
+
+        staff_sync_task = asyncio.create_task(run_staff_sync(bitrix, vehicle_usage_store))
 
     try:
         yield
@@ -221,4 +241,12 @@ async def lifespan(app: FastAPI):
                 await reconciler_task
             except asyncio.CancelledError:
                 pass
+        if staff_sync_task:
+            staff_sync_task.cancel()
+            try:
+                await staff_sync_task
+            except asyncio.CancelledError:
+                pass
+        if logistics_specialist is not None:
+            logistics_specialist.stop()
         scheduler.stop()

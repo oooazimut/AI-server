@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import logging
+import uuid
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta
 from typing import Any
+
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 
 from ai_server.agent_scheduler import AgentScheduler
 from ai_server.agent_store import AgentStore
@@ -13,10 +19,12 @@ from ai_server.agents.logistics_llm import (
     logistics_llm_failure_result,
 )
 from ai_server.knowledge import MarkdownKnowledgeBase
-from ai_server.models import ActionRecord, AgentManifest, AgentTask, ToolResult
+from ai_server.models import ActionRecord, AgentManifest, AgentTask, ToolResult, UserContext
 from ai_server.retrieval import HybridKnowledgeRetriever
+from ai_server.settings import Settings, get_settings
 from ai_server.skills import SkillStore
 from ai_server.tools.vehicle_usage import VehicleUsageToolset
+from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)
 
@@ -36,13 +44,23 @@ class LogisticsSpecialist(BaseSpecialist):
         llm: LogisticsAgentLLM | None = None,
         scheduler: AgentScheduler | None = None,
         store: AgentStore | None = None,
+        deliver_fn: Callable[[str, str], Awaitable[None]] | None = None,
+        notify_fn: Callable[[int, str], Awaitable[None]] | None = None,
+        settings: Settings | None = None,
     ) -> None:
+        self._settings = settings or get_settings()
+        self._deliver_fn = deliver_fn
+        self._notify_fn = notify_fn
+        _tools = tools or VehicleUsageToolset(
+            user_id=self._settings.vehicle_usage_manager_user_id,
+            dialog_id=self._settings.vehicle_usage_dialog_id,
+        )
         super().__init__(
             manifest,
             knowledge_base=knowledge_base,
             skill_store=skill_store,
             retriever=retriever,
-            tools=tools or VehicleUsageToolset(),
+            tools=_tools,
             llm=llm or LogisticsLLMService(),
             scheduler=scheduler,
             store=store,
@@ -66,6 +84,136 @@ class LogisticsSpecialist(BaseSpecialist):
             llm=logistics_llm,
             scheduler=scheduler,
         )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        if self._deliver_fn and self._settings.vehicle_usage_enabled:
+            self._setup_morning_cron()
+
+    # ------------------------------------------------------------------
+    # Scheduling
+    # ------------------------------------------------------------------
+
+    def _setup_morning_cron(self) -> None:
+        hour, minute = _parse_hhmm(self._settings.vehicle_usage_request_time)
+        self.schedule_job(
+            "morning_report",
+            self._morning_handler,
+            CronTrigger(hour=hour, minute=minute, timezone=MOSCOW_TZ),
+            replace_existing=False,
+        )
+        logger.info(
+            "LogisticsSpecialist: morning_report cron scheduled at %s МСК", self._settings.vehicle_usage_request_time
+        )
+
+    async def _morning_handler(self) -> None:
+        await self._run_and_deliver(reminder_count=0)
+
+    def _make_reminder_handler(self, count: int) -> Callable[[], Awaitable[None]]:
+        async def _handler() -> None:
+            await self._run_and_deliver(reminder_count=count)
+
+        return _handler
+
+    async def _run_and_deliver(self, reminder_count: int) -> None:
+        settings = self._settings
+        dialog_id = settings.vehicle_usage_dialog_id
+        manager_user_id = settings.vehicle_usage_manager_user_id
+        max_reminders = settings.vehicle_usage_max_reminders
+
+        if reminder_count >= max_reminders:
+            await self._escalate()
+            return
+
+        if not dialog_id:
+            logger.warning("LogisticsSpecialist: VEHICLE_USAGE_DIALOG_ID not set, skipping")
+            return
+
+        task = AgentTask(
+            task_id=f"vehicle_usage_{uuid.uuid4().hex[:8]}",
+            request="Нужен утренний отчёт по использованию служебных автомобилей.",
+            user=UserContext(id=str(manager_user_id) if manager_user_id else ""),
+            context={
+                "event": "vehicle_usage_morning_due",
+                "dialog_id": dialog_id,
+                "manager_user_id": manager_user_id,
+                "reminder_count": reminder_count,
+            },
+        )
+
+        try:
+            result = await self.handle(task)
+        except Exception:
+            logger.exception("LogisticsSpecialist: morning handler LLM failed")
+            return
+
+        if result.answer and self._deliver_fn:
+            if not settings.vehicle_usage_dry_run:
+                await self._deliver_fn(dialog_id, result.answer)
+                self.tools.store.create_sent_request(
+                    request_date=datetime.now(MOSCOW_TZ).date().isoformat(),
+                    user_id=manager_user_id,
+                    dialog_id=dialog_id,
+                    message=result.answer,
+                    sent_at=datetime.now(MOSCOW_TZ).isoformat(),
+                    reminder_count=reminder_count + 1,
+                )
+            else:
+                logger.info("LogisticsSpecialist: dry_run, would send: %s", result.answer[:120])
+
+        next_count = reminder_count + 1
+        interval = settings.vehicle_usage_reminder_interval_minutes
+        run_date = datetime.now(MOSCOW_TZ) + timedelta(minutes=interval)
+        self.schedule_job(
+            f"reminder_{next_count}",
+            self._make_reminder_handler(next_count),
+            DateTrigger(run_date=run_date),
+        )
+        logger.info("LogisticsSpecialist: scheduled reminder_%d at %s", next_count, run_date.isoformat())
+
+    async def _escalate(self) -> None:
+        settings = self._settings
+        admin_ids = settings.resolved_vehicle_usage_admin_notify_user_ids
+        if not admin_ids:
+            logger.warning("LogisticsSpecialist: VEHICLE_USAGE_ADMIN_NOTIFY_USER_IDS not set, skipping escalation")
+            return
+
+        task = AgentTask(
+            task_id=f"vehicle_usage_esc_{uuid.uuid4().hex[:8]}",
+            request="Сформируй уведомление об отсутствии утреннего отчёта по служебным автомобилям.",
+            context={"event": "vehicle_usage_escalation_due"},
+        )
+        try:
+            result = await self.handle(task)
+            message = result.answer or "Утренний отчёт по служебным автомобилям не получен."
+        except Exception:
+            message = "Утренний отчёт по служебным автомобилям не получен."
+            logger.exception("LogisticsSpecialist: escalation LLM failed, using fallback message")
+
+        if settings.vehicle_usage_dry_run:
+            logger.info("LogisticsSpecialist: dry_run, escalation would notify %s", admin_ids)
+            return
+
+        for user_id in admin_ids:
+            if self._notify_fn:
+                try:
+                    await self._notify_fn(user_id, message)
+                except Exception:
+                    logger.exception("LogisticsSpecialist: escalation notify failed for user_id=%d", user_id)
+
+        self.tools.store.mark_escalated(
+            request_date=datetime.now(MOSCOW_TZ).date().isoformat(),
+            user_id=settings.vehicle_usage_manager_user_id,
+            escalated_at=datetime.now(MOSCOW_TZ).isoformat(),
+        )
+        logger.info("LogisticsSpecialist: escalation sent to %s", admin_ids)
+
+    # ------------------------------------------------------------------
+    # BaseSpecialist hooks
+    # ------------------------------------------------------------------
 
     def tool_definitions(self) -> list[dict]:
         return [definition.model_dump() for definition in self.tools.definitions()]
@@ -96,13 +244,9 @@ class LogisticsSpecialist(BaseSpecialist):
         if tool_call.name == "vehicle_usage_save_report":
             result = self.tools.vehicle_usage_save_report(tool_call.args)
             if result.status == "ok":
-                date_str = str((tool_call.args or {}).get("request_date") or "")
-                cancelled = self.cancel_self_jobs_by_prefix("morning_")
-                cancelled += self.cancel_self_jobs_by_prefix("escalation_")
+                cancelled = self.cancel_jobs_by_prefix("reminder_")
                 if cancelled:
-                    logger.info(
-                        "LogisticsSpecialist: cancelled %d scheduled jobs after report saved %s", cancelled, date_str
-                    )
+                    logger.info("LogisticsSpecialist: cancelled %d reminder jobs after report saved", cancelled)
             return (
                 result,
                 ActionRecord(
@@ -127,3 +271,14 @@ class LogisticsSpecialist(BaseSpecialist):
             "User-facing delivery belongs to the Negotiator/channel runtime.",
             "Bitrix remains the channel/source layer; Logistics owns vehicle usage interpretation.",
         ]
+
+
+def _parse_hhmm(value: str) -> tuple[int, int]:
+    parts = value.strip().split(":")
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1]) if len(parts) > 1 else 0
+    except (ValueError, IndexError):
+        logger.warning("LogisticsSpecialist: invalid vehicle_usage_request_time %r, defaulting to 08:00", value)
+        return 8, 0
+    return hour, minute
