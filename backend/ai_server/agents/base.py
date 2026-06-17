@@ -41,7 +41,7 @@ class BaseSpecialist:
         self.retriever = retriever or HybridKnowledgeRetriever(knowledge_base=self.knowledge_base)
         self.tools = tools
         self.llm = llm
-        self.scheduler = scheduler
+        self._scheduler = scheduler
         self.store = store or AgentStore(self.manifest.id)
 
     # ------------------------------------------------------------------
@@ -73,23 +73,33 @@ class BaseSpecialist:
         raise NotImplementedError
 
     # ------------------------------------------------------------------
-    # Scheduler helpers (available to any specialist, scheduler may be None)
+    # Lifecycle hooks (subclasses override as needed)
     # ------------------------------------------------------------------
 
-    def schedule_self_job(self, job_id: str, func: Any, trigger: Any, **kwargs: Any) -> Any:
-        if self.scheduler is None:
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    # ------------------------------------------------------------------
+    # Scheduler helpers (scheduler may be None — all methods are safe)
+    # ------------------------------------------------------------------
+
+    def schedule_job(self, job_id: str, func: Any, trigger: Any, **kwargs: Any) -> Any:
+        if self._scheduler is None:
             return None
-        return self.scheduler.add_job(self.manifest.id, job_id, func, trigger, **kwargs)
+        return self._scheduler.add_job(self.manifest.id, job_id, func, trigger, **kwargs)
 
-    def cancel_self_jobs_by_prefix(self, prefix: str) -> int:
-        if self.scheduler is None:
+    def cancel_jobs_by_prefix(self, prefix: str) -> int:
+        if self._scheduler is None:
             return 0
-        return self.scheduler.remove_jobs_by_prefix(self.manifest.id, prefix)
+        return self._scheduler.remove_jobs_by_prefix(self.manifest.id, prefix)
 
-    def list_self_jobs(self) -> list[dict[str, Any]]:
-        if self.scheduler is None:
+    def list_jobs(self) -> list[dict[str, Any]]:
+        if self._scheduler is None:
             return []
-        return self.scheduler.list_jobs(self.manifest.id)
+        return self._scheduler.list_jobs(self.manifest.id)
 
     # ------------------------------------------------------------------
     # Unified control flow

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -13,15 +14,7 @@ from ai_server.models import ToolDefinition, ToolResult
 from ai_server.settings import get_settings
 from ai_server.utils import MOSCOW_TZ, optional_int
 
-
-@dataclass(frozen=True)
-class ServiceVehicle:
-    id: int
-    name: str
-    plate: str
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"id": self.id, "name": self.name, "plate": self.plate}
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -32,16 +25,6 @@ class StaffMember:
 
     def as_dict(self) -> dict[str, Any]:
         return {"display_order": self.order, "full_name": self.name, "user_id": self.user_id}
-
-
-SERVICE_VEHICLES: tuple[ServiceVehicle, ...] = (
-    ServiceVehicle(1, "Лада Ларгус", "В490СР161"),
-    ServiceVehicle(2, "Лада Ларгус", "У316ТО161"),
-    ServiceVehicle(3, "Лада Ларгус", "В735ХА161"),
-    ServiceVehicle(4, "Nissan Almera Classic", "М845КН761"),
-    ServiceVehicle(5, "Nissan Almera Classic", "М017УН61"),
-    ServiceVehicle(6, "Renault Logan", "О248АМ761"),
-)
 
 
 class VehicleUsageStore(AgentStore):
@@ -117,9 +100,15 @@ class VehicleUsageStore(AgentStore):
                 """
             )
 
-    def bootstrap_reference_data(self, roster: list[StaffMember] | None = None) -> None:
+    def bootstrap_reference_data(self) -> None:
         self.ensure_schema()
-        members = roster if roster is not None else _staff_roster_from_settings()
+        with self._connection() as db:
+            count = db.execute("SELECT COUNT(*) FROM vehicles").fetchone()[0]
+        if count == 0:
+            logger.warning("VehicleUsageStore: vehicles table is empty — add vehicle records directly to the DB")
+
+    def upsert_employees(self, members: list[StaffMember]) -> None:
+        self.ensure_schema()
         with self._connection() as db:
             for member in members:
                 db.execute(
@@ -132,26 +121,22 @@ class VehicleUsageStore(AgentStore):
                     """,
                     (member.order, member.user_id, member.name),
                 )
-            for vehicle in SERVICE_VEHICLES:
-                db.execute(
-                    """
-                    INSERT INTO vehicles (id, brand_model, registration_number)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        brand_model = excluded.brand_model,
-                        registration_number = excluded.registration_number
-                    """,
-                    (vehicle.id, vehicle.name, vehicle.plate),
-                )
 
     def context(self, *, request_date: str, user_id: int | None, dialog_id: str) -> dict[str, Any]:
         self.bootstrap_reference_data()
         return {
             "request_date": request_date,
             "staff_roster": self.staff_roster(),
-            "vehicles": [vehicle.as_dict() for vehicle in SERVICE_VEHICLES],
+            "vehicles": self._vehicles(),
             "latest_request": self.latest_request(user_id=user_id, dialog_id=dialog_id),
         }
+
+    def _vehicles(self) -> list[dict[str, Any]]:
+        with self._connection() as db:
+            rows = db.execute(
+                "SELECT id, brand_model, registration_number, debit_card_number, ppr_card_number FROM vehicles ORDER BY id ASC"
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def staff_roster(self) -> list[dict[str, Any]]:
         with self._connection() as db:
@@ -507,30 +492,6 @@ async def fetch_staff_roster(
         candidates.append((last.casefold() or first.casefold(), user_id, name))
     candidates.sort(key=lambda x: x[0])
     return [StaffMember(order=i + 1, user_id=uid, name=name) for i, (_, uid, name) in enumerate(candidates)]
-
-
-def _staff_roster_from_settings() -> list[StaffMember]:
-    roster: list[StaffMember] = []
-    for raw_item in get_settings().vehicle_usage_staff_roster.replace(";", "\n").splitlines():
-        item = raw_item.strip()
-        if not item:
-            continue
-        parts = [part.strip() for part in item.split("|")]
-        if len(parts) == 3:
-            order = optional_int(parts[0])
-            user_id = optional_int(parts[1])
-            name = parts[2]
-        elif len(parts) == 2:
-            order = optional_int(parts[0])
-            user_id = None
-            name = parts[1]
-        else:
-            order = len(roster) + 1
-            user_id = None
-            name = item
-        if order is not None and name:
-            roster.append(StaffMember(order=order, user_id=user_id, name=name))
-    return sorted(roster, key=lambda item: item.order)
 
 
 def _request_row_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:

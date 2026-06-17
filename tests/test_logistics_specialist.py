@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timedelta, timezone
 
 from ai_server.agents.logistics import LogisticsSpecialist
 from ai_server.agents.logistics_llm import LogisticsLLMService, LogisticsLLMToolCall
 from ai_server.models import AgentTask, UserContext
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
-from ai_server.tools.vehicle_usage import VehicleUsageStore, VehicleUsageToolset
-from ai_server.workers.logistics.vehicle_usage import run_vehicle_usage_once
+from ai_server.tools.vehicle_usage import StaffMember, VehicleUsageStore, VehicleUsageToolset
 from tests.fakes import FakeEmbeddingProvider, FakeLogisticsLLM, RecordingLLMClient
 
 _FAKE_RETRIEVER = HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider())
@@ -73,10 +71,12 @@ def test_logistics_llm_decide_payload_includes_dialog_history_and_raw_context():
 
 def test_logistics_specialist_saves_llm_parsed_draft(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
-    monkeypatch.setenv("VEHICLE_USAGE_STAFF_ROSTER", "1|15|Иван Петров;2|16|Олег Сидоров")
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
     store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
+    store.upsert_employees(
+        [StaffMember(order=1, user_id=15, name="Иван Петров"), StaffMember(order=2, user_id=16, name="Олег Сидоров")]
+    )
     fake_llm = FakeLogisticsLLM(
         tool_call_steps=[
             [LogisticsLLMToolCall(name="vehicle_usage_context", args={"request_date": "2026-06-05"})],
@@ -129,10 +129,10 @@ def test_logistics_specialist_saves_llm_parsed_draft(monkeypatch, tmp_path):
 
 def test_logistics_specialist_saves_confirmed_report(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
-    monkeypatch.setenv("VEHICLE_USAGE_STAFF_ROSTER", "1|15|Иван Петров")
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
     store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
+    store.upsert_employees([StaffMember(order=1, user_id=15, name="Иван Петров")])
     fake_llm = FakeLogisticsLLM(
         tool_call_steps=[
             [LogisticsLLMToolCall(name="vehicle_usage_context", args={"request_date": "2026-06-05"})],
@@ -173,16 +173,17 @@ def test_logistics_specialist_saves_confirmed_report(monkeypatch, tmp_path):
     assert assignment == (1, 1)
 
 
-def test_vehicle_usage_worker_delegates_due_reminder_to_logistics_llm(monkeypatch, tmp_path):
+def test_logistics_morning_handler_delivers_and_records_request(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     monkeypatch.setenv("VEHICLE_USAGE_ENABLED", "true")
     monkeypatch.setenv("VEHICLE_USAGE_DRY_RUN", "false")
     monkeypatch.setenv("VEHICLE_USAGE_MANAGER_USER_ID", "9")
     monkeypatch.setenv("VEHICLE_USAGE_DIALOG_ID", "chat9")
-    monkeypatch.setenv("VEHICLE_USAGE_REQUEST_TIMES", "08:30,09:00")
-    monkeypatch.setenv("VEHICLE_USAGE_ESCALATION_TIME", "10:00")
-    monkeypatch.setenv("VEHICLE_USAGE_STAFF_ROSTER", "1|15|Иван Петров")
+    monkeypatch.setenv("VEHICLE_USAGE_REMINDER_INTERVAL_MINUTES", "30")
+    monkeypatch.setenv("VEHICLE_USAGE_MAX_REMINDERS", "3")
+    from ai_server.settings import get_settings
+
     store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
     fake_llm = FakeLogisticsLLM(
         tool_call_steps=[
@@ -191,31 +192,31 @@ def test_vehicle_usage_worker_delegates_due_reminder_to_logistics_llm(monkeypatc
         ],
         final_answer="Нужен утренний отчет.",
     )
-    bitrix = FakeVehicleBitrix()
+    delivered = []
 
-    result = anyio_run(
-        run_vehicle_usage_once(
-            bitrix,
-            status={},
-            store=store,
-            logistics_llm=fake_llm,
-            now=datetime(2026, 6, 5, 8, 31, tzinfo=timezone(timedelta(hours=3))),
-            retriever=_FAKE_RETRIEVER,
-        )
+    async def _deliver(dialog_id: str, message: str) -> None:
+        delivered.append((dialog_id, message))
+
+    manifest = get_agent_manifest("logistics")
+    assert manifest is not None
+    # No real scheduler — schedule_job is a safe no-op when _scheduler is None
+    specialist = LogisticsSpecialist(
+        manifest,
+        retriever=_FAKE_RETRIEVER,
+        tools=VehicleUsageToolset(store=store, user_id=9, dialog_id="chat9"),
+        llm=fake_llm,
+        deliver_fn=_deliver,
+        settings=get_settings(),
     )
+    anyio_run(specialist._run_and_deliver(reminder_count=0))
 
-    assert result["handled"] is True
-    assert result["action"] == "reminder"
-    assert bitrix.messages == [
-        {"dialog_id": "chat9", "message": "Нужен утренний отчет.", "bot_id": None, "keyboard": None}
-    ]
-    assert result["delivery"]["speaker"] == "negotiator_channel"
+    assert delivered == [("chat9", "Нужен утренний отчет.")]
     with sqlite3.connect(store.path) as db:
         row = db.execute("SELECT status, reminder_count, message FROM vehicle_usage_requests").fetchone()
     assert row == ("sent", 1, "Нужен утренний отчет.")
 
 
-def test_vehicle_usage_worker_delegates_escalation_to_logistics_llm(monkeypatch, tmp_path):
+def test_logistics_escalates_after_max_reminders(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     monkeypatch.setenv("VEHICLE_USAGE_ENABLED", "true")
@@ -223,17 +224,21 @@ def test_vehicle_usage_worker_delegates_escalation_to_logistics_llm(monkeypatch,
     monkeypatch.setenv("VEHICLE_USAGE_MANAGER_USER_ID", "9")
     monkeypatch.setenv("VEHICLE_USAGE_DIALOG_ID", "chat9")
     monkeypatch.setenv("VEHICLE_USAGE_ADMIN_NOTIFY_USER_IDS", "1,9")
-    monkeypatch.setenv("VEHICLE_USAGE_REQUEST_TIMES", "08:30")
-    monkeypatch.setenv("VEHICLE_USAGE_ESCALATION_TIME", "10:00")
-    monkeypatch.setenv("VEHICLE_USAGE_STAFF_ROSTER", "1|15|Иван Петров")
+    monkeypatch.setenv("VEHICLE_USAGE_MAX_REMINDERS", "3")
+    from datetime import datetime
+
+    from ai_server.settings import get_settings
+    from ai_server.utils import MOSCOW_TZ
+
+    today = datetime.now(MOSCOW_TZ).date().isoformat()
     store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
     store.create_sent_request(
-        request_date="2026-06-05",
+        request_date=today,
         user_id=9,
         dialog_id="chat9",
         message="Нужен отчет.",
-        sent_at="2026-06-05T08:30:00+03:00",
-        reminder_count=1,
+        sent_at=f"{today}T08:00:00+03:00",
+        reminder_count=3,
     )
     fake_llm = FakeLogisticsLLM(
         tool_call_steps=[
@@ -242,23 +247,24 @@ def test_vehicle_usage_worker_delegates_escalation_to_logistics_llm(monkeypatch,
         ],
         final_answer="Отчет по машинам не получен.",
     )
-    bitrix = FakeVehicleBitrix()
+    notified: list[int] = []
 
-    result = anyio_run(
-        run_vehicle_usage_once(
-            bitrix,
-            status={},
-            store=store,
-            logistics_llm=fake_llm,
-            now=datetime(2026, 6, 5, 10, 1, tzinfo=timezone(timedelta(hours=3))),
-            retriever=_FAKE_RETRIEVER,
-        )
+    async def _notify(user_id: int, message: str) -> None:
+        notified.append(user_id)
+
+    manifest = get_agent_manifest("logistics")
+    assert manifest is not None
+    specialist = LogisticsSpecialist(
+        manifest,
+        retriever=_FAKE_RETRIEVER,
+        tools=VehicleUsageToolset(store=store, user_id=9, dialog_id="chat9"),
+        llm=fake_llm,
+        notify_fn=_notify,
+        settings=get_settings(),
     )
+    anyio_run(specialist._run_and_deliver(reminder_count=3))
 
-    assert result["handled"] is True
-    assert result["action"] == "escalation"
-    assert [item["user_id"] for item in bitrix.notifications] == [1, 9]
-    assert result["delivery"]["speaker"] == "negotiator_channel"
+    assert notified == [1, 9]
     with sqlite3.connect(store.path) as db:
         row = db.execute("SELECT escalated_at FROM vehicle_usage_requests").fetchone()
     assert row[0]

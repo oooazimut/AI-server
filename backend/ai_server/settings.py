@@ -112,12 +112,9 @@ class Settings:
     vehicle_usage_manager_user_id: int | None
     vehicle_usage_dialog_id: str
     vehicle_usage_request_time: str
-    vehicle_usage_request_times: str
-    vehicle_usage_escalation_time: str
-    vehicle_usage_interval_seconds: int
-    vehicle_usage_request_grace_minutes: int
+    vehicle_usage_reminder_interval_minutes: int
+    vehicle_usage_max_reminders: int
     vehicle_usage_admin_notify_user_ids: str
-    vehicle_usage_staff_roster: str
     vehicle_usage_dry_run: bool
     attachment_max_bytes: int
     stt_provider: str
@@ -457,13 +454,10 @@ def get_settings() -> Settings:
         vehicle_usage_enabled=_env_bool("VEHICLE_USAGE_ENABLED", False),
         vehicle_usage_manager_user_id=_env_int("VEHICLE_USAGE_MANAGER_USER_ID"),
         vehicle_usage_dialog_id=_env("VEHICLE_USAGE_DIALOG_ID"),
-        vehicle_usage_request_time=_env("VEHICLE_USAGE_REQUEST_TIME", "08:30"),
-        vehicle_usage_request_times=_env("VEHICLE_USAGE_REQUEST_TIMES", "08:30,09:00,09:30"),
-        vehicle_usage_escalation_time=_env("VEHICLE_USAGE_ESCALATION_TIME", "10:00"),
-        vehicle_usage_interval_seconds=_env_int("VEHICLE_USAGE_INTERVAL_SECONDS", 60) or 60,
-        vehicle_usage_request_grace_minutes=_env_int("VEHICLE_USAGE_REQUEST_GRACE_MINUTES", 15) or 15,
+        vehicle_usage_request_time=_env("VEHICLE_USAGE_REQUEST_TIME", "08:00"),
+        vehicle_usage_reminder_interval_minutes=_env_int("VEHICLE_USAGE_REMINDER_INTERVAL_MINUTES", 30) or 30,
+        vehicle_usage_max_reminders=_env_int("VEHICLE_USAGE_MAX_REMINDERS", 3) or 3,
         vehicle_usage_admin_notify_user_ids=_env("VEHICLE_USAGE_ADMIN_NOTIFY_USER_IDS"),
-        vehicle_usage_staff_roster=_env("VEHICLE_USAGE_STAFF_ROSTER"),
         vehicle_usage_dry_run=_env_bool("VEHICLE_USAGE_DRY_RUN", True),
         attachment_max_bytes=_env_int("ATTACHMENT_MAX_BYTES", 30 * 1024 * 1024) or (30 * 1024 * 1024),
         stt_provider=_env("STT_PROVIDER", "yandex_speechkit"),
