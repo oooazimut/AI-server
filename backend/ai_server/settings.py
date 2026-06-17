@@ -81,17 +81,9 @@ class Settings:
     search_webhook_indexer_enabled: bool
     search_webhook_content_enabled: bool
     quality_control_webhook_enabled: bool
-    quality_control_webhook_auto_managed_only: bool
     quality_control_dry_run: bool
-    quality_control_notify_only: bool
-    quality_control_director_user_id: int | None
-    quality_control_additional_notify_user_ids: str
-    quality_control_notify_responsible: bool
-    quality_control_notify_director: bool
     quality_control_actor_user_id: int | None
-    quality_control_smart_enabled: bool
     quality_control_exempt_responsible_user_ids: str
-    quality_control_auto_manage_project_id: int | None
     supervisor_enabled: bool
     supervisor_dry_run: bool
     supervisor_interval_seconds: int
@@ -296,14 +288,6 @@ class Settings:
         return _id_list(self.tech_footer_allowed_user_ids)
 
     @property
-    def resolved_quality_control_director_user_ids(self) -> list[int]:
-        ids: list[int] = []
-        if self.quality_control_director_user_id:
-            ids.append(self.quality_control_director_user_id)
-        ids.extend(_id_list(self.quality_control_additional_notify_user_ids))
-        return _unique_ints(ids)
-
-    @property
     def resolved_quality_control_exempt_responsible_user_ids(self) -> list[int]:
         return _id_list(self.quality_control_exempt_responsible_user_ids)
 
@@ -425,17 +409,9 @@ def get_settings() -> Settings:
         search_webhook_indexer_enabled=_env_bool("SEARCH_WEBHOOK_INDEXER_ENABLED", False),
         search_webhook_content_enabled=_env_bool("SEARCH_WEBHOOK_CONTENT_ENABLED", True),
         quality_control_webhook_enabled=_env_bool("QUALITY_CONTROL_WEBHOOK_ENABLED", False),
-        quality_control_webhook_auto_managed_only=_env_bool("QUALITY_CONTROL_WEBHOOK_AUTO_MANAGED_ONLY", True),
         quality_control_dry_run=_env_bool("QUALITY_CONTROL_DRY_RUN", True),
-        quality_control_notify_only=_env_bool("QUALITY_CONTROL_NOTIFY_ONLY", False),
-        quality_control_director_user_id=_env_int("QUALITY_CONTROL_DIRECTOR_USER_ID"),
-        quality_control_additional_notify_user_ids=_env("QUALITY_CONTROL_ADDITIONAL_NOTIFY_USER_IDS"),
-        quality_control_notify_responsible=_env_bool("QUALITY_CONTROL_NOTIFY_RESPONSIBLE", True),
-        quality_control_notify_director=_env_bool("QUALITY_CONTROL_NOTIFY_DIRECTOR", True),
         quality_control_actor_user_id=_env_int("QUALITY_CONTROL_ACTOR_USER_ID"),
-        quality_control_smart_enabled=_env_bool("QUALITY_CONTROL_SMART_ENABLED", True),
         quality_control_exempt_responsible_user_ids=_env("QUALITY_CONTROL_EXEMPT_RESPONSIBLE_USER_IDS"),
-        quality_control_auto_manage_project_id=_env_int("QUALITY_CONTROL_AUTO_MANAGE_PROJECT_ID"),
         supervisor_enabled=_env_bool("SUPERVISOR_ENABLED", False),
         supervisor_dry_run=_env_bool("SUPERVISOR_DRY_RUN", True),
         supervisor_interval_seconds=_env_int("SUPERVISOR_INTERVAL_SECONDS", 60 * 60) or (60 * 60),
