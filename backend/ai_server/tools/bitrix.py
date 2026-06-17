@@ -23,12 +23,16 @@ class BitrixToolset:
         pending_actions: BitrixPendingActionService | None = None,
         dialog_key: str | None = None,
         user_id: int | None = None,
+        actor_client: BitrixClient | None = None,
+        auto_execute: bool = False,
     ) -> None:
         self.client = client or BitrixClient()
         self.portal_search = portal_search or PortalSearchIndex()
         self.pending_actions = pending_actions
         self.dialog_key = dialog_key
         self.user_id = user_id
+        self._actor_client = actor_client
+        self._auto_execute = auto_execute
 
     def definitions(self) -> list[ToolDefinition]:
         return [
@@ -109,6 +113,20 @@ class BitrixToolset:
                 data={"method": method, "policy_reason": decision.reason},
             )
         if decision.decision == "confirm":
+            if self._auto_execute:
+                execute_client = self._actor_client or self.client
+                try:
+                    result = await execute_client.result(method, params)
+                except (BitrixApiError, BitrixConfigError) as exc:
+                    return ToolResult(
+                        status="not_configured" if isinstance(exc, BitrixConfigError) else "error",
+                        tool="bitrix_api",
+                        error=str(exc),
+                        data={"method": method, "params": params},
+                    )
+                return ToolResult(
+                    status="ok", tool="bitrix_api", data={"method": method, "params": params, "result": result}
+                )
             if not params:
                 return ToolResult(
                     status="invalid_tool_call",

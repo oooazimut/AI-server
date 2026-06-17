@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+import logging
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta
+from typing import Any
+
+from apscheduler.triggers.date import DateTrigger
+
 from ai_server.agent_scheduler import AgentScheduler
 from ai_server.agent_store import AgentStore
 from ai_server.agents.base import BaseSpecialist
@@ -9,11 +16,6 @@ from ai_server.agents.bitrix_llm import (
     BitrixLLMToolCall,
     llm_failure_result,
 )
-from ai_server.agents.bitrix_task_closure import (
-    TASK_CLOSURE_PENDING_METHOD,
-    BitrixTaskClosureDraft,
-    build_task_closure_draft_from_args,
-)
 from ai_server.agents.bitrix_task_create import (
     BitrixTaskCreateDraft,
     BitrixTaskCreateResolution,
@@ -22,13 +24,16 @@ from ai_server.agents.bitrix_task_create import (
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentTask, ToolResult
 from ai_server.retrieval import HybridKnowledgeRetriever
+from ai_server.settings import Settings, get_settings
 from ai_server.skills import SkillStore
 from ai_server.tools.bitrix import BitrixToolset
-from ai_server.utils import optional_int
+from ai_server.utils import MOSCOW_TZ, optional_int
+
+logger = logging.getLogger(__name__)
 
 
 class Bitrix24Specialist(BaseSpecialist):
-    max_steps = 1
+    max_steps = 7
     action_prefix = "bitrix"
 
     def __init__(
@@ -42,7 +47,13 @@ class Bitrix24Specialist(BaseSpecialist):
         llm: BitrixAgentLLM | None = None,
         scheduler: AgentScheduler | None = None,
         store: AgentStore | None = None,
+        bitrix_store: Any | None = None,
+        deliver_fn: Callable[[str, str], Awaitable[None]] | None = None,
+        settings: Settings | None = None,
     ) -> None:
+        self._bitrix_store = bitrix_store
+        self._deliver_fn = deliver_fn
+        self._settings = settings or get_settings()
         super().__init__(
             manifest,
             knowledge_base=knowledge_base,
@@ -63,9 +74,17 @@ class Bitrix24Specialist(BaseSpecialist):
         bitrix_retriever: HybridKnowledgeRetriever | None = None,
         bitrix_llm: BitrixAgentLLM | None = None,
         scheduler: AgentScheduler | None = None,
+        bitrix_store: Any | None = None,
         **_: object,
     ) -> Bitrix24Specialist:
-        return cls(manifest, retriever=bitrix_retriever, tools=bitrix_tools, llm=bitrix_llm, scheduler=scheduler)
+        return cls(
+            manifest,
+            retriever=bitrix_retriever,
+            tools=bitrix_tools,
+            llm=bitrix_llm,
+            scheduler=scheduler,
+            bitrix_store=bitrix_store,
+        )
 
     def tool_definitions(self) -> list[dict]:
         return [
@@ -110,24 +129,37 @@ class Bitrix24Specialist(BaseSpecialist):
                 },
             },
             {
-                "name": "task_closure",
+                "name": "save_incomplete_proposal",
                 "description": (
-                    "Prepare a Bitrix task closure action from fields already understood by the LLM. "
-                    "The LLM must call this only after it has checked that result_text and task_id/task_query are present. "
-                    "Execution is delayed until the chat user confirms the pending write action."
+                    "Save partial completion data for a task to the agent's internal DB "
+                    "and schedule a morning proposal to the manager at 08:30 МСК. "
+                    "Call this after approving a partially-complete task when some items from the "
+                    "task description were not covered by the result."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "task_id": {"type": "integer"},
-                        "task_query": {"type": "string"},
-                        "result_text": {"type": "string"},
+                        "task_title": {"type": "string"},
+                        "missing_parts": {"type": "string", "description": "What was not done — from task description"},
+                        "responsible_id": {"type": "integer"},
+                        "responsible_dialog_id": {"type": "string"},
                     },
-                    "required": ["result_text"],
-                    "anyOf": [
-                        {"required": ["task_id"]},
-                        {"required": ["task_query"]},
-                    ],
+                    "required": ["task_id", "missing_parts"],
+                },
+            },
+            {
+                "name": "delete_incomplete_proposal",
+                "description": (
+                    "Delete a saved incomplete proposal from the agent's internal DB "
+                    "after the manager agreed to create a new task from it."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "proposal_id": {"type": "integer"},
+                    },
+                    "required": ["proposal_id"],
                 },
             },
         ]
@@ -138,9 +170,6 @@ class Bitrix24Specialist(BaseSpecialist):
         if resolution is None:
             return draft
         return build_task_create_draft_from_args(task, args, resolution=resolution)
-
-    async def _task_closure_draft(self, task: AgentTask, args: dict) -> BitrixTaskClosureDraft:
-        return build_task_closure_draft_from_args(task, args)
 
     async def _execute_tool_call(
         self,
@@ -180,15 +209,22 @@ class Bitrix24Specialist(BaseSpecialist):
                 details=draft.as_action_details(),
             )
             return result, action, _approval_actions_from_task_create_draft(draft, self.manifest)
-        if tool_call.name == "task_closure":
-            draft = await self._task_closure_draft(task, tool_call.args)
-            result = _tool_result_from_task_closure_draft(draft)
-            action = ActionRecord(
-                name="bitrix_task_closure_draft",
-                status=result.status,
-                details=draft.as_action_details(),
+        if tool_call.name == "save_incomplete_proposal":
+            result = self._save_incomplete_proposal(tool_call.args)
+            return (
+                result,
+                ActionRecord(name="bitrix_save_incomplete_proposal", status=result.status, details=result.model_dump()),
+                [],
             )
-            return result, action, _approval_actions_from_task_closure_draft(draft, self.manifest)
+        if tool_call.name == "delete_incomplete_proposal":
+            result = self._delete_incomplete_proposal(tool_call.args)
+            return (
+                result,
+                ActionRecord(
+                    name="bitrix_delete_incomplete_proposal", status=result.status, details=result.model_dump()
+                ),
+                [],
+            )
         if tool_call.name == "bitrix_api":
             result = await self.tools.bitrix_api(tool_call.args)
             return (
@@ -203,9 +239,81 @@ class Bitrix24Specialist(BaseSpecialist):
         )
         return result, ActionRecord(name=tool_call.name, status=result.status, details=result.model_dump()), []
 
+    def _save_incomplete_proposal(self, args: dict[str, Any]) -> ToolResult:
+        if self._bitrix_store is None:
+            return ToolResult(
+                status="not_configured",
+                tool="save_incomplete_proposal",
+                error="bitrix_store is not configured",
+            )
+        task_id = optional_int(args.get("task_id"))
+        if task_id is None:
+            return ToolResult(
+                status="invalid_tool_call",
+                tool="save_incomplete_proposal",
+                error="task_id is required",
+            )
+        run_date = _next_morning_830()
+        proposal_id = self._bitrix_store.save_proposal(
+            task_id=task_id,
+            task_title=str(args.get("task_title") or ""),
+            missing_parts=str(args.get("missing_parts") or ""),
+            responsible_id=optional_int(args.get("responsible_id")),
+            responsible_dialog_id=str(args.get("responsible_dialog_id") or ""),
+            scheduled_for=run_date.isoformat(),
+        )
+        self._schedule_proposal_job(proposal_id, run_date)
+        return ToolResult(
+            status="ok",
+            tool="save_incomplete_proposal",
+            data={"proposal_id": proposal_id, "scheduled_for": run_date.isoformat()},
+        )
+
+    def _delete_incomplete_proposal(self, args: dict[str, Any]) -> ToolResult:
+        if self._bitrix_store is None:
+            return ToolResult(
+                status="not_configured",
+                tool="delete_incomplete_proposal",
+                error="bitrix_store is not configured",
+            )
+        proposal_id = optional_int(args.get("proposal_id"))
+        if proposal_id is None:
+            return ToolResult(
+                status="invalid_tool_call",
+                tool="delete_incomplete_proposal",
+                error="proposal_id is required",
+            )
+        self._bitrix_store.delete_proposal(proposal_id)
+        return ToolResult(status="ok", tool="delete_incomplete_proposal", data={"proposal_id": proposal_id})
+
+    def _schedule_proposal_job(self, proposal_id: int, run_date: datetime) -> None:
+        if self._deliver_fn is None or self._bitrix_store is None:
+            return
+        handler = _make_proposal_deliver_handler(
+            proposal_id,
+            bitrix_store=self._bitrix_store,
+            deliver_fn=self._deliver_fn,
+            settings=self._settings,
+        )
+        self.schedule_job(f"proposal_{proposal_id}", handler, DateTrigger(run_date=run_date))
+        logger.info("Bitrix24Specialist: scheduled morning proposal job %d at %s", proposal_id, run_date.isoformat())
+
     async def _load_extra_context(self, task: AgentTask) -> tuple[AgentTask, dict]:
         permission_context = await self._load_permission_context(task)
-        merged_task = task.model_copy(update={"context": {**task.context, **permission_context}})
+        proposal_context: dict[str, Any] = {}
+        if self._bitrix_store is not None:
+            user_id_int = optional_int(task.user.id)
+            manager_id = self._settings.task_proposal_manager_bitrix_id
+            if manager_id and user_id_int == manager_id:
+                proposed = [p for p in self._bitrix_store.get_proposals_for_manager() if p.get("status") == "proposed"]
+                if proposed:
+                    proposal_context["pending_manager_proposals"] = proposed
+            elif user_id_int:
+                pending = self._bitrix_store.get_pending_for_responsible(user_id_int)
+                if pending:
+                    proposal_context["pending_responsible_question"] = pending
+
+        merged_task = task.model_copy(update={"context": {**task.context, **permission_context, **proposal_context}})
         extra_details = {
             "bitrix_current_user_profile_status": _tool_context_status(
                 permission_context.get("bitrix_current_user_profile")
@@ -319,6 +427,58 @@ class Bitrix24Specialist(BaseSpecialist):
         ]
 
 
+def _make_proposal_deliver_handler(
+    proposal_id: int,
+    *,
+    bitrix_store: Any,
+    deliver_fn: Callable[[str, str], Awaitable[None]],
+    settings: Settings,
+) -> Callable[[], Awaitable[None]]:
+    async def _handler() -> None:
+        proposal = bitrix_store.get_proposal_by_id(proposal_id)
+        if proposal is None:
+            logger.info("Bitrix24Specialist: proposal %d not found, skipping morning delivery", proposal_id)
+            return
+        if proposal.get("status") not in ("awaiting_response", "proposed"):
+            return
+        manager_id = settings.task_proposal_manager_bitrix_id
+        if manager_id is None:
+            logger.warning("Bitrix24Specialist: TASK_PROPOSAL_MANAGER_BITRIX_ID not set, skipping proposal delivery")
+            return
+        message = _format_proposal_message(proposal)
+        try:
+            await deliver_fn(str(manager_id), message)
+            bitrix_store.mark_status(proposal_id, "proposed")
+            logger.info("Bitrix24Specialist: delivered morning proposal %d to manager %d", proposal_id, manager_id)
+        except Exception:
+            logger.exception("Bitrix24Specialist: failed to deliver morning proposal %d", proposal_id)
+
+    return _handler
+
+
+def _format_proposal_message(proposal: dict[str, Any]) -> str:
+    task_id = proposal.get("task_id")
+    task_title = proposal.get("task_title") or f"задача #{task_id}"
+    missing_parts = proposal.get("missing_parts") or ""
+    responsible_response = proposal.get("responsible_response") or ""
+    parts = [
+        f"Задача [{task_title}] (#{task_id}) была выполнена частично.",
+        f"Что не сделано: {missing_parts}",
+    ]
+    if responsible_response:
+        parts.append(f"Пояснение исполнителя: {responsible_response}")
+    parts.append("Предлагаю создать задачу на оставшиеся работы. Если согласны — сообщите, я подготовлю черновик.")
+    return "\n\n".join(parts)
+
+
+def _next_morning_830() -> datetime:
+    now = datetime.now(MOSCOW_TZ)
+    target = now.replace(hour=8, minute=30, second=0, microsecond=0)
+    if now >= target:
+        target += timedelta(days=1)
+    return target
+
+
 def _format_ambiguous_note(prefix: str, candidates: object) -> str:
     if not isinstance(candidates, list):
         return prefix + "; нужно уточнение."
@@ -376,39 +536,6 @@ def _approval_actions_from_task_create_draft(
             status="approval_required" if needs_approval else "allow",
             details={
                 "method": draft.method,
-                "params": draft.params,
-                "policy": {
-                    "decision": "confirm" if needs_approval else "allow",
-                    "reason": "manifest.approval_required",
-                },
-                "summary": draft.summary,
-                "specialist_id": manifest.id,
-            },
-        )
-    ]
-
-
-def _tool_result_from_task_closure_draft(draft: BitrixTaskClosureDraft) -> ToolResult:
-    return ToolResult(
-        status="ready" if draft.is_ready else "contract_violation",
-        tool="task_closure",
-        data=draft.as_action_details(),
-        error=None if draft.is_ready else "LLM called task_closure with arguments outside the tool contract.",
-    )
-
-
-def _approval_actions_from_task_closure_draft(
-    draft: BitrixTaskClosureDraft, manifest: AgentManifest
-) -> list[ActionRecord]:
-    if not draft.is_ready:
-        return []
-    needs_approval = "close_task" in manifest.approval_required
-    return [
-        ActionRecord(
-            name="bitrix_task_closure",
-            status="approval_required" if needs_approval else "allow",
-            details={
-                "method": TASK_CLOSURE_PENDING_METHOD,
                 "params": draft.params,
                 "policy": {
                     "decision": "confirm" if needs_approval else "allow",

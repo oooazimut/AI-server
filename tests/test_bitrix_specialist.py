@@ -244,50 +244,6 @@ def test_bitrix_specialist_marks_write_for_approval():
     assert action.details["params"]["fields"]["DEADLINE"]
 
 
-def test_bitrix_specialist_prepares_task_closure_for_approval():
-    result = asyncio.run(
-        _bitrix_specialist(
-            llm=FakeBitrixLLM(
-                tool_calls=[
-                    BitrixLLMToolCall(
-                        name="task_closure",
-                        args={"task_id": 8413, "result_text": "Камера перезагружена, изображение восстановлено."},
-                    )
-                ],
-                final_status="needs_human",
-                final_answer="Подготовил закрытие задачи, нужно подтверждение.",
-            )
-        ).handle(AgentTask(task_id="t1", request="Закрой задачу #8413, камера перезагружена", user={"id": "9"}))
-    )
-
-    assert result.status == "needs_human"
-    assert result.actions_requiring_approval
-    action = result.actions_requiring_approval[0]
-    assert action.name == "bitrix_task_closure"
-    assert action.details["method"] == "ai_server.task_closure"
-    assert action.details["params"]["task_id"] == 8413
-    assert action.details["params"]["result_text"] == "Камера перезагружена, изображение восстановлено."
-
-
-def test_bitrix_specialist_rejects_incomplete_task_closure_tool_call():
-    result = asyncio.run(
-        _bitrix_specialist(
-            llm=FakeBitrixLLM(
-                tool_calls=[BitrixLLMToolCall(name="task_closure", args={"task_id": 8413})],
-                final_status="failed",
-                final_answer="LLM-субагент вызвал task_closure с неполным контрактом.",
-            )
-        ).handle(AgentTask(task_id="t1", request="Закрой задачу #8413"))
-    )
-
-    assert result.status == "failed"
-    assert result.actions_requiring_approval == []
-    action = result.actions_taken[2]
-    assert action.name == "bitrix_task_closure_draft"
-    assert action.status == "contract_violation"
-    assert action.details["contract_errors"] == ["task_closure.result_text is required"]
-
-
 def test_bitrix_specialist_asks_for_responsible_before_task_create():
     result = asyncio.run(
         _bitrix_specialist(
