@@ -118,21 +118,6 @@ async def _handle_quality_control_webhook_task(
             "task_id": task_id,
         }
 
-    # Policy: auto-managed project filter
-    group_id = _to_int(_first(task_detail, "groupId", "GROUP_ID"))
-    if (
-        settings.quality_control_webhook_auto_managed_only
-        and settings.quality_control_auto_manage_project_id is not None
-        and group_id != settings.quality_control_auto_manage_project_id
-    ):
-        return {
-            "handled": False,
-            "reason": "outside_auto_managed_project",
-            "event": event_type,
-            "task_id": task_id,
-            "group_id": group_id,
-        }
-
     # Exempt responsible check
     responsible_id = _to_int(_first(task_detail, "responsibleId", "RESPONSIBLE_ID"))
     if is_quality_exempt_responsible(responsible_id):

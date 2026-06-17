@@ -87,8 +87,6 @@ async def lifespan(app: FastAPI):
     }
     app.state.quality_control_webhook_status = {
         "enabled": settings.quality_control_webhook_enabled,
-        "auto_managed_only": settings.quality_control_webhook_auto_managed_only,
-        "auto_manage_project_id": settings.quality_control_auto_manage_project_id,
         "dry_run": settings.quality_control_dry_run,
         "actor_user_id": settings.quality_control_actor_user_id,
         "last_received_at": None,
