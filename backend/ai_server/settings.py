@@ -123,9 +123,6 @@ class Settings:
     yandex_speechkit_max_bytes: int
     yandex_speechkit_convert_to_ogg: bool
     ffmpeg_path: str
-    agent_write_allowed_user_ids: str
-    agent_limited_task_create_project_id: int | None
-    agent_limited_task_create_user_ids: str
     agent_private_disk_path_markers: str
     agent_private_disk_restricted_user_ids: str
     agent_working_dates: str
@@ -264,14 +261,6 @@ class Settings:
     @property
     def resolved_supervisor_admin_user_ids(self) -> list[int]:
         return _id_list(self.supervisor_admin_user_ids)
-
-    @property
-    def resolved_agent_write_allowed_user_ids(self) -> list[int]:
-        return _id_list(self.agent_write_allowed_user_ids)
-
-    @property
-    def resolved_agent_limited_task_create_user_ids(self) -> list[int]:
-        return _id_list(self.agent_limited_task_create_user_ids)
 
     @property
     def resolved_agent_private_disk_path_markers(self) -> list[str]:
@@ -451,9 +440,6 @@ def get_settings() -> Settings:
         yandex_speechkit_max_bytes=_env_int("YANDEX_SPEECHKIT_MAX_BYTES", 1024 * 1024) or (1024 * 1024),
         yandex_speechkit_convert_to_ogg=_env_bool("YANDEX_SPEECHKIT_CONVERT_TO_OGG", True),
         ffmpeg_path=_env("FFMPEG_PATH", "ffmpeg"),
-        agent_write_allowed_user_ids=_env("AGENT_WRITE_ALLOWED_USER_IDS"),
-        agent_limited_task_create_project_id=_env_int("AGENT_LIMITED_TASK_CREATE_PROJECT_ID"),
-        agent_limited_task_create_user_ids=_env("AGENT_LIMITED_TASK_CREATE_USER_IDS"),
         agent_private_disk_path_markers=_env("AGENT_PRIVATE_DISK_PATH_MARKERS", "Приватный доступ"),
         agent_private_disk_restricted_user_ids=_env("AGENT_PRIVATE_DISK_RESTRICTED_USER_IDS"),
         agent_working_dates=_env("AGENT_WORKING_DATES"),

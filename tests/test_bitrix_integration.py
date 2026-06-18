@@ -311,7 +311,6 @@ def test_bitrix_webhook_processor_saves_pending_action_from_specialist(monkeypat
 def test_bitrix_pending_action_confirm_executes_and_clears_state(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AGENT_DRY_RUN", "true")
-    monkeypatch.setenv("AGENT_WRITE_ALLOWED_USER_IDS", "9")
     monkeypatch.setenv("BITRIX_OAUTH_REQUIRED_FOR_WRITES", "false")
     store = DialogStateStore(tmp_path / "dialog_state.sqlite")
     fake_bitrix = FakeBitrixClient()
@@ -475,8 +474,7 @@ def test_quality_control_live_webhook_requires_actor(monkeypatch):
     assert fake_bitrix.calls == []
 
 
-def test_task_add_write_policy_translates_internal_no_deadline_marker(monkeypatch):
-    monkeypatch.delenv("AGENT_LIMITED_TASK_CREATE_PROJECT_ID", raising=False)
+def test_task_add_write_policy_translates_internal_no_deadline_marker():
     params = {
         "fields": {
             "TITLE": "Тестовая задача",
@@ -486,7 +484,7 @@ def test_task_add_write_policy_translates_internal_no_deadline_marker(monkeypatc
         }
     }
 
-    result = apply_write_policy("tasks.task.add", params, user_id=9)
+    result = apply_write_policy("tasks.task.add", params)
 
     assert result["fields"] == {"TITLE": "Тестовая задача", "RESPONSIBLE_ID": 9, "DEADLINE": ""}
 
@@ -542,7 +540,6 @@ def test_create_bitrix_dev_chat_helpers_extract_reference_and_redact_tokens():
 def test_bitrix_task_create_chat_flow_saves_and_confirms_pending_action(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AGENT_DRY_RUN", "true")
-    monkeypatch.setenv("AGENT_WRITE_ALLOWED_USER_IDS", "9")
     monkeypatch.setenv("BITRIX_OAUTH_REQUIRED_FOR_WRITES", "false")
     store = DialogStateStore(tmp_path / "dialog_state.sqlite")
     fake_bitrix = FakeBitrixClient()
@@ -754,6 +751,18 @@ class FakeBitrixClient:
             payload["FIELDS"]["AUTHOR_ID"] = author_id
         self.calls.append(("task.commentitem.add", payload))
         return 1
+
+    async def get_user(self, user_id: int):
+        return {
+            "ID": str(user_id),
+            "WORK_POSITION": "Руководитель",
+            "IS_ADMIN": "N",
+            "ACTIVE": "Y",
+            "NAME": "Test",
+            "LAST_NAME": "User",
+            "USER_TYPE": "employee",
+            "UF_DEPARTMENT": [],
+        }
 
     async def notify_user(self, *, user_id, message, tag="ai_server", sub_tag=""):
         self.calls.append(

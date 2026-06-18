@@ -295,33 +295,53 @@ def _parse_decision(data: dict[str, Any]) -> BitrixLLMDecision:
 
 def _permission_context(task: AgentTask, settings: Settings) -> dict[str, Any]:
     user_id = optional_int(task.user.id)
-    full_write_user_ids = settings.resolved_agent_write_allowed_user_ids
-    limited_user_ids = settings.resolved_agent_limited_task_create_user_ids
-    limited_project_id = settings.agent_limited_task_create_project_id
-    full_write = user_id is not None and user_id in full_write_user_ids
-    limited_task_create = user_id is not None and limited_project_id is not None and user_id in limited_user_ids
-    if full_write:
-        profile = "full_bitrix_write"
-    elif limited_task_create:
-        profile = "limited_task_create"
-    else:
-        profile = "read_only"
+    profile_result = task.context.get("bitrix_current_user_profile")
+    write_profile = _write_profile_from_bitrix_profile(profile_result)
     return {
         "current_user_id": user_id,
-        "current_user_write_profile": profile,
-        "full_write_user_ids": full_write_user_ids,
-        "limited_task_create_user_ids": limited_user_ids,
-        "limited_task_create_project_id": limited_project_id,
+        "current_user_write_profile": write_profile,
         "oauth_required_for_writes": settings.bitrix_oauth_required_for_writes,
-        "bitrix_current_user_profile": task.context.get("bitrix_current_user_profile"),
+        "bitrix_current_user_profile": profile_result,
         "permission_policy_context": task.context.get("permission_policy_context", []),
         "rules": [
-            "full_bitrix_write users may prepare Bitrix write-tools, still requiring chat confirmation.",
-            "limited_task_create users may prepare task_create_draft only for the configured limited project.",
+            "full_bitrix_write users may prepare any Bitrix write-tools, still requiring chat confirmation.",
+            (
+                "member_write users may prepare task write-tools (tasks.task.add/update/delete) only for projects"
+                " where they hold manager or owner role (ROLE=A or ROLE=E) —"
+                " verify with sonet_group.user.get before preparing a write."
+            ),
+            (
+                "member_write users may prepare disk write-tools only on their personal storage"
+                " (entity_type=user, entity_id={current_user_id}) —"
+                " call disk.storage.getlist to identify personal storage if needed."
+            ),
             "read_only users should not prepare write-tools; ask for an authorized user or human handoff.",
             "task closure via bitrix_api: responsible uses tasks.task.complete, creator uses tasks.task.approve.",
         ],
     }
+
+
+_MANAGER_POSITION_KEYWORDS = ("руковод", "начальник", "директор", "президент", "chairman")
+
+
+def _write_profile_from_bitrix_profile(profile_result: object) -> str:
+    if not isinstance(profile_result, dict) or profile_result.get("status") != "ok":
+        return "read_only"
+    profile = (profile_result.get("data") or {}).get("profile") or {}
+    if not isinstance(profile, dict):
+        return "read_only"
+    if not profile.get("active", True):
+        return "read_only"
+    if profile.get("is_admin"):
+        return "full_bitrix_write"
+    position = str(profile.get("work_position") or "").lower()
+    if any(kw in position for kw in _MANAGER_POSITION_KEYWORDS):
+        return "full_bitrix_write"
+    # External/extranet users get read-only; all internal employees get member_write
+    user_type = str(profile.get("user_type") or "").lower()
+    if user_type in ("", "employee"):
+        return "member_write"
+    return "read_only"
 
 
 def _decision_dict(decision: BitrixLLMDecision) -> dict[str, Any]:
