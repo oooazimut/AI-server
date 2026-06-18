@@ -25,14 +25,15 @@
 1. `catalog.store.list` → найти нужный склад по названию, взять `id`
 2. `catalog.storeproduct.list` с `filter[storeId]=<id>` → список `{ productId, amount }`
    **`storeId` — camelCase, не `STORE_ID`**: при `STORE_ID` фильтр молча игнорируется, API возвращает все 1600+ записей подряд.
-3. Для каждого `productId`: `catalog.product.get id=<X>` → `name`, `iblockId` (iblockId в запросе не нужен)
+3. `batch` с набором `catalog.product.get?id=<X>` на каждый productId → все имена за один HTTP-вызов. `iblockId` в запросе не нужен — product.get возвращает его сам.
 4. Собрать: название + количество + ссылка `/shop/documents-catalog/{iblockId}/product/{id}/`
 5. **Не искать склад через portal_search** — portal_search может вернуть CRM-сделки или задачи с похожим именем.
 
 ### Важные детали API
 - `catalog.product.list` требует `iblockId` в массиве `select`, иначе HTTP 400.
-- `filter[ID]=[список]` в `catalog.product.list` игнорируется — получить несколько товаров можно только через цикл `catalog.product.get`.
-- `filter[storeId]` и `filter[productId]` в `catalog.storeproduct.list` — camelCase.
+- `filter[ID]=[список]` в `catalog.product.list` молча игнорируется — имена брать через `batch` + `catalog.product.get`.
+- `filter[storeId]` и `filter[productId]` в `catalog.storeproduct.list` — camelCase, верхний регистр молча игнорируется.
+- `batch` принимает `cmd` — словарь `{ "ключ": "метод?param=val" }`. Результаты в `result.result`.
 
 ### Список всех складов
 `catalog.store.list`.
