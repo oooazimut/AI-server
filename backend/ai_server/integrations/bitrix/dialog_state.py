@@ -202,7 +202,8 @@ class BitrixPendingActionService:
                 data={"policy": decision.model_dump()},
             )
 
-        if not can_prepare_write_action(action.method, action.params, user_id):
+        can_write = await _user_can_write(user_id, self.bitrix)
+        if not can_write:
             self._audit(
                 "denied",
                 key=key,
@@ -215,7 +216,7 @@ class BitrixPendingActionService:
                 action=action,
             )
 
-        params = apply_write_policy(action.method, deepcopy(action.params), user_id)
+        params = apply_write_policy(action.method, deepcopy(action.params))
         write_client = await self._write_client(user_id, action=action, key=key)
         if isinstance(write_client, PendingActionResult):
             return write_client
@@ -331,22 +332,25 @@ def pending_bitrix_from_dict(data: object) -> PendingBitrixAction | None:
     )
 
 
-def can_prepare_write_action(method: str, params: dict[str, Any], user_id: int | None) -> bool:
-    settings = get_settings()
-    if user_id in settings.resolved_agent_write_allowed_user_ids:
-        return True
-    normalized = method.strip().lower()
-    if normalized != "tasks.task.add":
+async def _user_can_write(user_id: int | None, bitrix: BitrixClient) -> bool:
+    if user_id is None:
         return False
-    allowed_project_id = settings.agent_limited_task_create_project_id
-    if allowed_project_id is None or user_id not in settings.resolved_agent_limited_task_create_user_ids:
+    try:
+        user = await bitrix.get_user(user_id)
+    except Exception:
         return False
-    requested_group_id = task_add_group_id(params)
-    return requested_group_id is None or requested_group_id == allowed_project_id
+    if user is None:
+        return False
+    from ai_server.tools.bitrix import _compact_user_profile
+
+    profile = _compact_user_profile(user)
+    if not profile.get("active", True):
+        return False
+    user_type = str(profile.get("user_type") or "").lower()
+    return user_type in ("", "employee")
 
 
-def apply_write_policy(method: str, params: dict[str, Any], user_id: int | None) -> dict[str, Any]:
-    settings = get_settings()
+def apply_write_policy(method: str, params: dict[str, Any]) -> dict[str, Any]:
     normalized = method.strip().lower()
     if normalized != "tasks.task.add":
         return params
@@ -355,25 +359,7 @@ def apply_write_policy(method: str, params: dict[str, Any], user_id: int | None)
         return params
     if no_deadline_requested(fields):
         prepare_no_deadline_fields(fields)
-    allowed_project_id = settings.agent_limited_task_create_project_id
-    if allowed_project_id is None or user_id not in settings.resolved_agent_limited_task_create_user_ids:
-        return params
-    if task_add_group_id(params) is None:
-        fields["GROUP_ID"] = allowed_project_id
     return params
-
-
-def task_add_group_id(params: dict[str, Any]) -> int | None:
-    fields = params.get("fields")
-    if not isinstance(fields, dict):
-        return None
-    for key in ("GROUP_ID", "groupId", "group_id"):
-        value = fields.get(key)
-        try:
-            return int(str(value).strip()) if value not in (None, "") else None
-        except (TypeError, ValueError):
-            return None
-    return None
 
 
 def no_deadline_requested(fields: dict[str, Any]) -> bool:

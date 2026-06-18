@@ -444,9 +444,6 @@ def test_bitrix_specialist_asks_when_responsible_name_is_ambiguous():
 
 def test_bitrix_llm_decision_payload_includes_permission_context(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    monkeypatch.setenv("AGENT_WRITE_ALLOWED_USER_IDS", "1,9")
-    monkeypatch.setenv("AGENT_LIMITED_TASK_CREATE_PROJECT_ID", "44")
-    monkeypatch.setenv("AGENT_LIMITED_TASK_CREATE_USER_IDS", "15")
     client = RecordingLLMClient(
         '{"status":"completed","answer":"","confidence":0.7,"tool_calls":[{"name":"none","args":{},"summary":""}]}'
     )
@@ -474,10 +471,7 @@ def test_bitrix_llm_decision_payload_includes_permission_context(monkeypatch):
     payload = json.loads(client.calls[0]["messages"][1]["content"])
     permission = payload["permission_context"]
     assert permission["current_user_id"] == 15
-    assert permission["current_user_write_profile"] == "limited_task_create"
-    assert permission["full_write_user_ids"] == [1, 9]
-    assert permission["limited_task_create_user_ids"] == [15]
-    assert permission["limited_task_create_project_id"] == 44
+    assert permission["current_user_write_profile"] == "member_write"
     assert permission["bitrix_current_user_profile"] == context["bitrix_current_user_profile"]
     assert permission["permission_policy_context"] == context["permission_policy_context"]
     assert any("read_only users should not prepare write-tools" in rule for rule in permission["rules"])
