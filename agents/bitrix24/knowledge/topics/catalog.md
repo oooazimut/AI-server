@@ -17,16 +17,22 @@
 
 ### Узнать остатки конкретного товара
 1. Найти `id` товара через `catalog.product.list`
-2. Вызвать `catalog.storeproduct.list` с `filter[PRODUCT_ID]=<id>`
+2. Вызвать `catalog.storeproduct.list` с `filter[productId]=<id>` (camelCase — не PRODUCT_ID)
 3. Результат содержит `storeId` и `amount` по каждому складу
 4. Для названий складов — `catalog.store.list`
 
 ### Узнать все товары на конкретном складе
 1. `catalog.store.list` → найти нужный склад по названию, взять `id`
-2. `catalog.storeproduct.list` с `filter[STORE_ID]=<id>` → список `{ productId, amount }`
-3. `catalog.catalog.list` → получить `iblockId`
-4. `catalog.product.list` с `filter[iblockId]=X`, `filter[ID]=[список productId]` → имена товаров
+2. `catalog.storeproduct.list` с `filter[storeId]=<id>` → список `{ productId, amount }`
+   **`storeId` — camelCase, не `STORE_ID`**: при `STORE_ID` фильтр молча игнорируется, API возвращает все 1600+ записей подряд.
+3. Для каждого `productId`: `catalog.product.get id=<X>` → `name`, `iblockId` (iblockId в запросе не нужен)
+4. Собрать: название + количество + ссылка `/shop/documents-catalog/{iblockId}/product/{id}/`
 5. **Не искать склад через portal_search** — portal_search может вернуть CRM-сделки или задачи с похожим именем.
+
+### Важные детали API
+- `catalog.product.list` требует `iblockId` в массиве `select`, иначе HTTP 400.
+- `filter[ID]=[список]` в `catalog.product.list` игнорируется — получить несколько товаров можно только через цикл `catalog.product.get`.
+- `filter[storeId]` и `filter[productId]` в `catalog.storeproduct.list` — camelCase.
 
 ### Список всех складов
 `catalog.store.list`.
