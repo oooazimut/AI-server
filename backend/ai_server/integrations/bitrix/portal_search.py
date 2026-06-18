@@ -1912,8 +1912,8 @@ def _project_url(project_id: object) -> str:
 def _catalog_product_url(iblock_id: object, product_id: object) -> str:
     domain = _portal_domain()
     if not domain:
-        return f"/crm/catalog/{iblock_id}/product/{product_id}/"
-    return f"https://{domain}/crm/catalog/{iblock_id}/product/{product_id}/"
+        return f"/shop/documents-catalog/{iblock_id}/product/{product_id}/"
+    return f"https://{domain}/shop/documents-catalog/{iblock_id}/product/{product_id}/"
 
 
 def _catalog_store_url(store_id: object) -> str:
