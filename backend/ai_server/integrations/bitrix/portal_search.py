@@ -37,6 +37,8 @@ class PortalSyncStats:
     disk_items: int = 0
     storages: int = 0
     task_attachments: int = 0
+    catalog_products: int = 0
+    catalog_stores: int = 0
     stale_deleted: int = 0
     prune_skipped: list[str] | None = None
     content: PortalContentSyncStats | None = None
@@ -44,7 +46,7 @@ class PortalSyncStats:
 
     @property
     def total(self) -> int:
-        return self.tasks + self.projects + self.disk_items + self.task_attachments
+        return self.tasks + self.projects + self.disk_items + self.task_attachments + self.catalog_products
 
 
 @dataclass
@@ -652,6 +654,21 @@ async def sync_portal_index(
             seen_before=sync_started_at,
         )
 
+    if settings.search_index_include_catalog:
+        try:
+            catalog_stats = await _sync_catalog(bitrix, index)
+            stats.catalog_products = catalog_stats["products"]
+            stats.catalog_stores = catalog_stats["stores"]
+            if stats.catalog_products < settings.search_index_max_catalog_products:
+                stats.stale_deleted += index.delete_stale_items(
+                    entity_types={"catalog_product", "catalog_store"},
+                    seen_before=sync_started_at,
+                )
+            else:
+                stats.prune_skipped = (stats.prune_skipped or []) + ["catalog: reached configured limit"]
+        except Exception as exc:
+            stats.errors = (stats.errors or []) + [f"catalog: {type(exc).__name__}: {exc}"]
+
     if settings.search_index_include_disk:
         try:
             disk_stats = await _sync_disk(bitrix, index)
@@ -1156,6 +1173,71 @@ def entity_types_for_scope(scope: str) -> set[str] | None:
         "tasks": {"task", "task_attachment"},
         "projects": {"project"},
     }.get(normalized)
+
+
+async def _sync_catalog(bitrix: BitrixClient, index: PortalSearchIndex) -> dict[str, int]:
+    settings = get_settings()
+    products_count = 0
+    stores_count = 0
+
+    try:
+        catalogs = await bitrix.list_catalogs()
+    except Exception:
+        catalogs = []
+
+    for catalog in catalogs:
+        iblock_id = _first(catalog, "iblockId", "IBLOCK_ID")
+        if iblock_id is None:
+            continue
+        try:
+            products = await bitrix.list_catalog_products(
+                int(iblock_id), limit=settings.search_index_max_catalog_products
+            )
+        except Exception:
+            continue
+        for product in products:
+            product_id = _first(product, "id", "ID")
+            if product_id is None:
+                continue
+            name = str(_first(product, "name", "NAME") or f"Товар #{product_id}")
+            body_parts = [
+                str(_first(product, "previewText", "PREVIEW_TEXT") or ""),
+                str(_first(product, "detailText", "DETAIL_TEXT") or ""),
+                f"Каталог iblockId:{iblock_id}",
+            ]
+            index.upsert_item(
+                entity_type="catalog_product",
+                entity_id=product_id,
+                title=name,
+                body="\n".join(p for p in body_parts if p.strip()),
+                url=_catalog_product_url(iblock_id, product_id),
+                metadata={"iblock_id": iblock_id},
+            )
+            products_count += 1
+
+    try:
+        stores = await bitrix.list_catalog_stores()
+    except Exception:
+        stores = []
+
+    for store in stores:
+        store_id = _first(store, "id", "ID")
+        if store_id is None:
+            continue
+        title = str(_first(store, "title", "TITLE") or f"Склад #{store_id}")
+        address = str(_first(store, "address", "ADDRESS") or "")
+        description = str(_first(store, "description", "DESCRIPTION") or "")
+        index.upsert_item(
+            entity_type="catalog_store",
+            entity_id=store_id,
+            title=title,
+            body="\n".join(p for p in [address, description] if p.strip()),
+            url=_catalog_store_url(store_id),
+            metadata={"active": _first(store, "active", "ACTIVE"), "is_default": _first(store, "isDefault", "IS_DEFAULT")},
+        )
+        stores_count += 1
+
+    return {"products": products_count, "stores": stores_count}
 
 
 async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex) -> dict[str, object]:
@@ -1822,6 +1904,20 @@ def _project_url(project_id: object) -> str:
     if not domain:
         return f"/workgroups/group/{project_id}/"
     return f"https://{domain}/workgroups/group/{project_id}/"
+
+
+def _catalog_product_url(iblock_id: object, product_id: object) -> str:
+    domain = _portal_domain()
+    if not domain:
+        return f"/crm/catalog/{iblock_id}/product/{product_id}/"
+    return f"https://{domain}/crm/catalog/{iblock_id}/product/{product_id}/"
+
+
+def _catalog_store_url(store_id: object) -> str:
+    domain = _portal_domain()
+    if not domain:
+        return f"/crm/store/detail/{store_id}/"
+    return f"https://{domain}/crm/store/detail/{store_id}/"
 
 
 def _disk_object_url(object_id: object) -> str:
