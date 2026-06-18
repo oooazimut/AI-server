@@ -157,7 +157,7 @@ class BitrixClient:
             "dialogId": dialog_id,
             "fields": {"message": message},
         }
-        if not self.access_token:
+        if settings.bitrix_bot_token:
             payload["botToken"] = settings.bitrix_bot_token
         if keyboard:
             payload["fields"]["keyboard"] = keyboard
