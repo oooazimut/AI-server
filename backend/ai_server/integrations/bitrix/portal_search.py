@@ -1232,7 +1232,7 @@ async def _sync_catalog(bitrix: BitrixClient, index: PortalSearchIndex) -> dict[
             entity_id=store_id,
             title=title,
             body="\n".join(p for p in [address, description] if p.strip()),
-            url=_catalog_store_url(store_id),
+            url="",
             metadata={
                 "active": _first(store, "active", "ACTIVE"),
                 "is_default": _first(store, "isDefault", "IS_DEFAULT"),
@@ -1912,8 +1912,8 @@ def _project_url(project_id: object) -> str:
 def _catalog_product_url(iblock_id: object, product_id: object) -> str:
     domain = _portal_domain()
     if not domain:
-        return f"/crm/catalog/{iblock_id}/product/{product_id}/"
-    return f"https://{domain}/crm/catalog/{iblock_id}/product/{product_id}/"
+        return f"/shop/documents-catalog/{iblock_id}/product/{product_id}/"
+    return f"https://{domain}/shop/documents-catalog/{iblock_id}/product/{product_id}/"
 
 
 def _catalog_store_url(store_id: object) -> str:
