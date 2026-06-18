@@ -1233,7 +1233,10 @@ async def _sync_catalog(bitrix: BitrixClient, index: PortalSearchIndex) -> dict[
             title=title,
             body="\n".join(p for p in [address, description] if p.strip()),
             url=_catalog_store_url(store_id),
-            metadata={"active": _first(store, "active", "ACTIVE"), "is_default": _first(store, "isDefault", "IS_DEFAULT")},
+            metadata={
+                "active": _first(store, "active", "ACTIVE"),
+                "is_default": _first(store, "isDefault", "IS_DEFAULT"),
+            },
         )
         stores_count += 1
 
