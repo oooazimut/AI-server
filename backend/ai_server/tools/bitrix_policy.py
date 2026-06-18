@@ -1,6 +1,7 @@
 from ai_server.models import PolicyDecision
 
 READ_METHODS = {
+    "batch",
     "app.info",
     "profile",
     "user.current",
