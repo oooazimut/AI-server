@@ -13,19 +13,23 @@
 ## Типичные сценарии
 
 ### Найти товары по названию
-Поиск по индексу портала (`portal_search`) уже содержит товары с entity_type=`catalog_product`. Если не найдено — вызвать `catalog.product.list` с нужным `iblockId`.
+Для поиска товаров использовать `catalog.product.list` с `filter[%NAME]`. Portal_search можно использовать для товаров (entity_type=`catalog_product`), но **никогда** не для остатков и складов.
 
 ### Узнать остатки конкретного товара
-1. Найти `id` товара через поиск или `catalog.product.list`
-2. Вызвать `catalog.storeproduct.list` с `filter[PRODUCT_ID]=<id>`
+1. Найти `id` товара через `catalog.product.list`
+2. Вызвать `catalog.storeproduct.list` с `filter[PRODUCT_ID]=<id>`, `filter[>AMOUNT]=0`
 3. Результат содержит `storeId` и `amount` по каждому складу
-4. Для названий складов — `catalog.store.list` или уже есть в индексе (entity_type=`catalog_store`)
+4. Для названий складов — `catalog.store.list`
 
-### Узнать все остатки на конкретном складе
-`catalog.storeproduct.list` с `filter[STORE_ID]=<id>` — вернёт все товары с количеством.
+### Узнать все товары на конкретном складе
+1. `catalog.store.list` → найти нужный склад по названию, взять `id`
+2. `catalog.storeproduct.list` с `filter[STORE_ID]=<id>`, `filter[>AMOUNT]=0` → список `{ productId, amount }`
+3. `catalog.catalog.list` → получить `iblockId`
+4. `catalog.product.list` с `filter[iblockId]=X`, `filter[ID]=[список productId]` → имена товаров
+5. **Не искать склад через portal_search** — portal_search может вернуть CRM-сделки или задачи с похожим именем.
 
 ### Список всех складов
-`catalog.store.list` — или поиск по индексу портала с entity_type=`catalog_store`.
+`catalog.store.list`.
 
 ### Получить iblockId каталога
 `catalog.catalog.list` — первый элемент обычно и есть основной каталог товаров. Поле `iblockId`.
