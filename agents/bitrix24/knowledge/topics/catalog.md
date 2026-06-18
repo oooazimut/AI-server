@@ -17,13 +17,13 @@
 
 ### Узнать остатки конкретного товара
 1. Найти `id` товара через `catalog.product.list`
-2. Вызвать `catalog.storeproduct.list` с `filter[PRODUCT_ID]=<id>`, `filter[>AMOUNT]=0`
+2. Вызвать `catalog.storeproduct.list` с `filter[PRODUCT_ID]=<id>`
 3. Результат содержит `storeId` и `amount` по каждому складу
 4. Для названий складов — `catalog.store.list`
 
 ### Узнать все товары на конкретном складе
 1. `catalog.store.list` → найти нужный склад по названию, взять `id`
-2. `catalog.storeproduct.list` с `filter[STORE_ID]=<id>`, `filter[>AMOUNT]=0` → список `{ productId, amount }`
+2. `catalog.storeproduct.list` с `filter[STORE_ID]=<id>` → список `{ productId, amount }`
 3. `catalog.catalog.list` → получить `iblockId`
 4. `catalog.product.list` с `filter[iblockId]=X`, `filter[ID]=[список productId]` → имена товаров
 5. **Не искать склад через portal_search** — portal_search может вернуть CRM-сделки или задачи с похожим именем.
