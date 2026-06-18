@@ -24,6 +24,18 @@ READ_METHODS = {
     "crm.deal.get",
     "crm.deal.list",
     "crm.status.list",
+    "catalog.catalog.list",
+    "catalog.catalog.get",
+    "catalog.product.list",
+    "catalog.product.get",
+    "catalog.section.list",
+    "catalog.section.get",
+    "catalog.store.list",
+    "catalog.store.get",
+    "catalog.storeproduct.list",
+    "catalog.measure.list",
+    "catalog.price.list",
+    "catalog.pricetype.list",
 }
 READ_SUFFIXES = (".get", ".list", ".search")
 WRITE_SUFFIXES = (
@@ -40,7 +52,7 @@ WRITE_SUFFIXES = (
     ".pause",
     ".delegate",
 )
-WRITE_PREFIXES_WITH_CONFIRMATION = ("tasks.", "task.", "sonet_group.", "crm.", "disk.", "calendar.")
+WRITE_PREFIXES_WITH_CONFIRMATION = ("tasks.", "task.", "sonet_group.", "crm.", "disk.", "calendar.", "catalog.")
 WRITE_METHODS_WITH_CONFIRMATION = {
     "disk.storage.addfolder",
     "disk.storage.uploadfile",

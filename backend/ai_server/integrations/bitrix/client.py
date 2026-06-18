@@ -496,6 +496,30 @@ class BitrixClient:
             limit=limit,
         )
 
+    async def list_catalogs(self) -> list[dict[str, Any]]:
+        return await self.collect_paged("catalog.catalog.list", {})
+
+    async def list_catalog_products(
+        self,
+        iblock_id: int,
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return await self.collect_paged(
+            "catalog.product.list",
+            {"filter": {"iblockId": iblock_id}, "select": ["id", "iblockId", "name", "previewText", "detailText"]},
+            limit=limit,
+        )
+
+    async def list_catalog_stores(self, *, limit: int | None = None) -> list[dict[str, Any]]:
+        return await self.collect_paged("catalog.store.list", {}, limit=limit)
+
+    async def list_catalog_sections(self, iblock_id: int) -> list[dict[str, Any]]:
+        return await self.collect_paged(
+            "catalog.section.list",
+            {"filter": {"iblockId": iblock_id}, "select": ["id", "iblockId", "name", "description"]},
+        )
+
     async def download_file_from_url(
         self,
         url: str,
