@@ -109,8 +109,6 @@ class VehicleUsageStatus(TypedDict):
     manager_user_id: int | None
     admin_notify_user_ids: list[int]
     request_time: str
-    request_times: str
-    escalation_time: str
     db_path: str
     last_check_at: str | None
     last_sent_at: str | None
