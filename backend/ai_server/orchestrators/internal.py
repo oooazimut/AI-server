@@ -4,7 +4,7 @@ import asyncio
 import logging
 import uuid
 
-from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask
+from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentResultStatus, AgentTask
 from ai_server.orchestrators.internal_llm import InternalLLMRouter, InternalOrchestratorLLM, ScheduledTaskDecision
 from ai_server.specialists import Specialist, build_specialist_registry
 
@@ -205,9 +205,16 @@ class InternalOrchestrator:
         )
 
 
-def _merge_status(statuses: list[str]) -> str:
-    priority = {"failed": 0, "needs_human": 1, "needs_clarification": 2, "completed": 3}
-    return min(statuses, key=lambda s: priority.get(s, 2))
+_STATUS_PRIORITY: dict[AgentResultStatus, int] = {
+    "failed": 0,
+    "needs_human": 1,
+    "needs_clarification": 2,
+    "completed": 3,
+}
+
+
+def _merge_status(statuses: list[AgentResultStatus]) -> AgentResultStatus:
+    return min(statuses, key=lambda s: _STATUS_PRIORITY.get(s, 2))
 
 
 def _apply_scheduled_tasks(

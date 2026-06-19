@@ -2,13 +2,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from ai_server.agent_scheduler import AgentScheduler
+from ai_server.agent_scheduler import SchedulerPort
 from ai_server.agent_store import AgentStore
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
 from ai_server.utils import unique
+
+_NOT_CONFIGURED_ANSWER = "Специалист временно недоступен: LLM не сконфигурирован."
 
 
 class BaseSpecialist:
@@ -32,17 +34,17 @@ class BaseSpecialist:
         retriever: HybridKnowledgeRetriever | None = None,
         tools: Any = None,
         llm: Any = None,
-        scheduler: AgentScheduler | None = None,
+        scheduler: SchedulerPort | None = None,
         store: AgentStore | None = None,
     ) -> None:
         self.manifest = manifest
-        self.knowledge_base = knowledge_base or MarkdownKnowledgeBase()
-        self.skill_store = skill_store or SkillStore()
-        self.retriever = retriever or HybridKnowledgeRetriever(knowledge_base=self.knowledge_base)
+        self.knowledge_base = knowledge_base
+        self.skill_store = skill_store
+        self.retriever = retriever
         self.tools = tools
         self.llm = llm
         self._scheduler = scheduler
-        self.store = store or AgentStore(self.manifest.id)
+        self.store = store
 
     # ------------------------------------------------------------------
     # Hooks subclasses implement/override
@@ -106,9 +108,23 @@ class BaseSpecialist:
     # ------------------------------------------------------------------
 
     async def handle(self, task: AgentTask) -> AgentResult:
-        available_skills = self.skill_store.list_skills(self.manifest)
+        if self.llm is None:
+            failure = self._llm_failure_result(_NOT_CONFIGURED_ANSWER)
+            return AgentResult(
+                status="failed",
+                agent_id=self.manifest.id,
+                answer=failure.answer,
+                actions_taken=[],
+                actions_requiring_approval=[],
+                model_usage=[failure.model_usage],
+                confidence=0.0,
+                logs=self._logs(),
+            )
+        available_skills = self.skill_store.list_skills(self.manifest) if self.skill_store is not None else []
         task, extra_context_details = await self._load_extra_context(task)
-        retrieval_hits = self.retriever.search(self.manifest, task.request, limit=5)
+        retrieval_hits = (
+            self.retriever.search(self.manifest, task.request, limit=5) if self.retriever is not None else []
+        )
         actions_taken = [
             ActionRecord(
                 name=f"load_{self.action_prefix}_specialist_context",

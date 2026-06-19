@@ -6,10 +6,12 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixClient, BitrixConfigError
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
+from ai_server.integrations.bitrix.ports import BitrixUserPort
+from ai_server.integrations.bitrix.profile import compact_user_profile
 from ai_server.runtime import runtime_paths
 from ai_server.settings import get_settings
 from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
@@ -122,19 +124,26 @@ class DialogStateStore:
         self.save(state)
         return state
 
+    def append_turn(self, key: str, user_text: str, agent_response: str) -> None:
+        state = self.load(key)
+        state.turns.append({"role": "user", "content": user_text})
+        state.turns.append({"role": "assistant", "content": agent_response})
+        state.turns = state.turns[-20:]
+        self.save(state)
+
 
 class BitrixPendingActionService:
     def __init__(
         self,
         *,
-        store: DialogStateStore | None = None,
-        bitrix: BitrixClient | None = None,
+        store: DialogStateStore,
+        bitrix: BitrixClient,
         bitrix_oauth: BitrixOAuthService | None = None,
         audit_log_path: Path | str | None = None,
         dry_run: bool = False,
     ) -> None:
-        self.store = store or DialogStateStore()
-        self.bitrix = bitrix or BitrixClient()
+        self.store = store
+        self.bitrix = bitrix
         self.bitrix_oauth = bitrix_oauth
         self.dry_run = dry_run
         self.audit_log_path = (
@@ -143,13 +152,6 @@ class BitrixPendingActionService:
 
     def pending_for(self, key: str) -> PendingBitrixAction | None:
         return self.store.load(key).pending_action
-
-    def append_turn(self, key: str, user_text: str, agent_response: str) -> None:
-        state = self.store.load(key)
-        state.turns.append({"role": "user", "content": user_text})
-        state.turns.append({"role": "assistant", "content": agent_response})
-        state.turns = state.turns[-20:]
-        self.store.save(state)
 
     def save_pending(self, key: str, action: PendingBitrixAction) -> None:
         self.store.set_pending(key, action)
@@ -166,18 +168,24 @@ class BitrixPendingActionService:
             action=action,
         )
 
-    async def confirm(self, key: str, *, user_id: int | None = None) -> PendingActionResult:
-        action = self.pending_for(key)
-        if not action:
-            return PendingActionResult(
-                status="nothing_to_confirm", message="Нет ожидающего действия для подтверждения."
-            )
+    def _validate_ownership(self, action: PendingBitrixAction, user_id: int | None) -> PendingActionResult | None:
         if action.created_by and user_id and action.created_by != user_id:
             return PendingActionResult(
                 status="denied",
                 message="Подтвердить действие может только пользователь, который его запросил.",
                 action=action,
             )
+        return None
+
+    async def confirm(self, key: str, *, user_id: int | None = None) -> PendingActionResult:
+        action = self.pending_for(key)
+        if not action:
+            return PendingActionResult(
+                status="nothing_to_confirm", message="Нет ожидающего действия для подтверждения."
+            )
+        ownership_error = self._validate_ownership(action, user_id)
+        if ownership_error:
+            return ownership_error
 
         if self.dry_run:
             return PendingActionResult(
@@ -332,7 +340,7 @@ def pending_bitrix_from_dict(data: object) -> PendingBitrixAction | None:
     )
 
 
-async def _user_can_write(user_id: int | None, bitrix: BitrixClient) -> bool:
+async def _user_can_write(user_id: int | None, bitrix: BitrixUserPort) -> bool:
     if user_id is None:
         return False
     try:
@@ -341,25 +349,33 @@ async def _user_can_write(user_id: int | None, bitrix: BitrixClient) -> bool:
         return False
     if user is None:
         return False
-    from ai_server.tools.bitrix import _compact_user_profile
-
-    profile = _compact_user_profile(user)
+    profile = compact_user_profile(user)
     if not profile.get("active", True):
         return False
     user_type = str(profile.get("user_type") or "").lower()
     return user_type in ("", "employee")
 
 
+class _WritePolicy(Protocol):
+    def apply(self, params: dict[str, Any]) -> dict[str, Any]: ...
+
+
+class _NoDeadlinePolicy:
+    def apply(self, params: dict[str, Any]) -> dict[str, Any]:
+        fields = params.get("fields")
+        if isinstance(fields, dict) and no_deadline_requested(fields):
+            prepare_no_deadline_fields(fields)
+        return params
+
+
+_WRITE_POLICY_REGISTRY: dict[str, _WritePolicy] = {
+    "tasks.task.add": _NoDeadlinePolicy(),
+}
+
+
 def apply_write_policy(method: str, params: dict[str, Any]) -> dict[str, Any]:
-    normalized = method.strip().lower()
-    if normalized != "tasks.task.add":
-        return params
-    fields = params.get("fields")
-    if not isinstance(fields, dict):
-        return params
-    if no_deadline_requested(fields):
-        prepare_no_deadline_fields(fields)
-    return params
+    policy = _WRITE_POLICY_REGISTRY.get(method.strip().lower())
+    return policy.apply(params) if policy else params
 
 
 def no_deadline_requested(fields: dict[str, Any]) -> bool:

@@ -5,9 +5,9 @@ from typing import Any
 from ai_server.agent_scheduler import AgentScheduler
 from ai_server.agent_store import AgentStore
 from ai_server.agents.base import BaseSpecialist
-from ai_server.agents.pto_llm import PtoAgentLLM, PtoLLMService, PtoLLMToolCall, pto_llm_failure_result
+from ai_server.agents.pto_llm import PtoAgentLLM, PtoLLMToolCall, pto_llm_failure_result
 from ai_server.knowledge import MarkdownKnowledgeBase
-from ai_server.models import ActionRecord, AgentManifest, AgentTask, ToolResult
+from ai_server.models import ActionRecord, AgentManifest, AgentTask, ToolResult, ToolStatus
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
 from ai_server.tools.document_access import DocumentToolset
@@ -34,8 +34,8 @@ class PtoSpecialist(BaseSpecialist):
             knowledge_base=knowledge_base,
             skill_store=skill_store,
             retriever=retriever,
-            tools=tools or DocumentToolset(),
-            llm=llm or PtoLLMService(),
+            tools=tools,
+            llm=llm,
             scheduler=scheduler,
             store=store,
         )
@@ -54,6 +54,8 @@ class PtoSpecialist(BaseSpecialist):
         return cls(manifest, retriever=pto_retriever, tools=document_tools, llm=pto_llm, scheduler=scheduler)
 
     def tool_definitions(self) -> list[dict]:
+        if self.tools is None:
+            return []
         return [definition.model_dump() for definition in self.tools.definitions()]
 
     async def _execute_tool_call(
@@ -107,7 +109,7 @@ class PtoSpecialist(BaseSpecialist):
             )
 
         result = ToolResult(
-            status="invalid_tool_call",
+            status=ToolStatus.INVALID_TOOL_CALL,
             tool=tool_call.name,
             error=f"unknown PTO tool call: {tool_call.name}",
         )

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from ai_server.integrations.bitrix.client import BitrixClient
+from ai_server.integrations.bitrix.ports import BitrixTaskPort
 from ai_server.settings import get_settings
 from ai_server.utils import MOSCOW_TZ, optional_int
 from ai_server.workers.bitrix.search_indexer import PortalSearchIndexerWorker
@@ -14,8 +15,15 @@ from ai_server.workers.bitrix.webhook_event_queue import WebhookEventQueue
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class ReconcileResult:
+    checked_at: str
+    tasks: dict[str, Any]
+    disk_delta: dict[str, Any]
+
+
 async def run_reconciler(
-    bitrix: BitrixClient,
+    bitrix: BitrixTaskPort,
     queue: WebhookEventQueue,
     search_indexer: PortalSearchIndexerWorker,
     *,
@@ -45,7 +53,7 @@ async def run_reconciler(
             status["last_success_at"] = _now().isoformat()
             status["last_error"] = None
             status["runs"] = int(status.get("runs") or 0) + 1
-            status["last_result"] = result
+            status["last_result"] = asdict(result)
             await _sleep_until_next(status, get_settings().reconcile_interval_seconds)
         except asyncio.CancelledError:
             status["running"] = False
@@ -58,33 +66,30 @@ async def run_reconciler(
 
 
 async def reconcile_once(
-    bitrix: BitrixClient,
+    bitrix: BitrixTaskPort,
     queue: WebhookEventQueue,
     search_indexer: PortalSearchIndexerWorker,
     *,
     status: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+) -> ReconcileResult:
     settings = get_settings()
     now = _now()
     if status is not None:
         status["last_check_at"] = now.isoformat()
 
-    result: dict[str, Any] = {
-        "checked_at": now.isoformat(),
-        "tasks": {"enabled": settings.reconcile_tasks_enabled},
-        "disk_delta": {"enabled": settings.reconcile_disk_delta_enabled},
-    }
+    tasks: dict[str, Any] = {"enabled": settings.reconcile_tasks_enabled}
+    disk_delta: dict[str, Any] = {"enabled": settings.reconcile_disk_delta_enabled}
     if settings.reconcile_tasks_enabled:
-        result["tasks"] = await _reconcile_tasks(bitrix, queue, now=now)
+        tasks = await _reconcile_tasks(bitrix, queue, now=now)
     if settings.reconcile_disk_delta_enabled and settings.search_delta_indexer_enabled:
-        result["disk_delta"] = await _reconcile_disk_delta(search_indexer)
+        disk_delta = await _reconcile_disk_delta(search_indexer)
     elif settings.reconcile_disk_delta_enabled:
-        result["disk_delta"] = {"enabled": False, "reason": "search_delta_indexer_disabled"}
-    return result
+        disk_delta = {"enabled": False, "reason": "search_delta_indexer_disabled"}
+    return ReconcileResult(checked_at=now.isoformat(), tasks=tasks, disk_delta=disk_delta)
 
 
 async def _reconcile_tasks(
-    bitrix: BitrixClient,
+    bitrix: BitrixTaskPort,
     queue: WebhookEventQueue,
     *,
     now: datetime,

@@ -4,12 +4,12 @@ import asyncio
 import json
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from ai_server.integrations.bitrix.client import BitrixClient
+from ai_server.integrations.bitrix.ports import BitrixSupervisorPort
 from ai_server.settings import get_settings
 from ai_server.utils import MOSCOW_TZ, optional_int
 
@@ -40,6 +40,15 @@ class OverdueReport:
 
 
 @dataclass(frozen=True)
+class SupervisorRunResult:
+    checked_at: str
+    overdue_tasks_seen: int
+    notifications_sent: int
+    notifications_planned: int
+    notifications: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
 class SupervisorNotification:
     recipient_id: int
     dry_run: bool
@@ -47,18 +56,9 @@ class SupervisorNotification:
     task_count: int
     reason: str = ""
 
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "recipient_id": self.recipient_id,
-            "dry_run": self.dry_run,
-            "sent": self.sent,
-            "task_count": self.task_count,
-            "reason": self.reason,
-        }
-
 
 async def run_task_supervisor(
-    bitrix: BitrixClient,
+    bitrix: BitrixSupervisorPort,
     *,
     status: dict[str, Any],
 ) -> None:
@@ -86,7 +86,7 @@ async def run_task_supervisor(
             status["last_success_at"] = _now().isoformat()
             status["last_error"] = None
             status["runs"] = int(status.get("runs") or 0) + 1
-            status["last_result"] = result
+            status["last_result"] = asdict(result)
             await _sleep_until_next(status, get_settings().supervisor_interval_seconds)
         except asyncio.CancelledError:
             status["running"] = False
@@ -99,25 +99,25 @@ async def run_task_supervisor(
 
 
 async def run_task_supervisor_once(
-    bitrix: BitrixClient,
+    bitrix: BitrixSupervisorPort,
     *,
     status: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+) -> SupervisorRunResult:
     report = await build_overdue_report(bitrix, limit=get_settings().supervisor_max_tasks)
     notifications = await send_overdue_notifications(bitrix, report)
-    result = {
-        "checked_at": report.checked_at.isoformat(),
-        "overdue_tasks_seen": len(report.tasks),
-        "notifications_sent": sum(1 for item in notifications if item.sent),
-        "notifications_planned": len(notifications),
-        "notifications": [item.as_dict() for item in notifications],
-    }
+    result = SupervisorRunResult(
+        checked_at=report.checked_at.isoformat(),
+        overdue_tasks_seen=len(report.tasks),
+        notifications_sent=sum(1 for item in notifications if item.sent),
+        notifications_planned=len(notifications),
+        notifications=[asdict(item) for item in notifications],
+    )
     if status is not None:
-        status.update(result)
+        status.update(asdict(result))
     return result
 
 
-async def build_overdue_report(bitrix: BitrixClient, *, limit: int = 50) -> OverdueReport:
+async def build_overdue_report(bitrix: BitrixSupervisorPort, *, limit: int = 50) -> OverdueReport:
     tasks = [
         task
         for task in _parse_overdue_tasks(
@@ -179,7 +179,7 @@ def format_overdue_report(
 
 
 async def send_overdue_notifications(
-    bitrix: BitrixClient,
+    bitrix: BitrixSupervisorPort,
     report: OverdueReport,
 ) -> list[SupervisorNotification]:
     settings = get_settings()
@@ -233,7 +233,7 @@ async def send_overdue_notifications(
 
 
 async def _send_notification_with_cooldown(
-    bitrix: BitrixClient,
+    bitrix: BitrixSupervisorPort,
     state: dict[str, Any],
     *,
     recipient_id: int,
@@ -280,7 +280,7 @@ def _parse_overdue_tasks(raw_tasks: object) -> list[OverdueTask]:
     return tasks
 
 
-async def _resolve_user_names(bitrix: BitrixClient, user_ids: list[int]) -> dict[int, str]:
+async def _resolve_user_names(bitrix: BitrixSupervisorPort, user_ids: list[int]) -> dict[int, str]:
     names: dict[int, str] = {}
     for user_id in user_ids:
         try:

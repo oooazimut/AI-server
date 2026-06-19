@@ -7,6 +7,7 @@ from fastapi import FastAPI
 
 from .agent_scheduler import AgentScheduler
 from .agents.logistics import LogisticsSpecialist
+from .agents.logistics_llm import LogisticsLLMService
 from .channels.bitrix import BitrixWebhookProcessor
 from .integrations.bitrix.client import BitrixClient
 from .integrations.bitrix.oauth import BitrixOAuthService
@@ -29,8 +30,8 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     ensure_runtime_dirs()
     manifests = load_agent_manifests()
-    bitrix = BitrixClient()
     bitrix_oauth = BitrixOAuthService()
+    bitrix = BitrixClient(settings=settings, oauth_service=bitrix_oauth)
     bitrix_oauth.ensure_schema()
     portal_search = PortalSearchIndex()
     portal_search.ensure_schema()
@@ -193,6 +194,7 @@ async def lifespan(app: FastAPI):
         if logistics_manifest is not None:
             logistics_specialist = LogisticsSpecialist(
                 logistics_manifest,
+                llm=LogisticsLLMService(),
                 scheduler=scheduler,
                 deliver_fn=_vehicle_deliver,
                 notify_fn=_vehicle_notify,

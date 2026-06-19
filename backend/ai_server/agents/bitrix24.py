@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -12,7 +13,6 @@ from ai_server.agent_store import AgentStore
 from ai_server.agents.base import BaseSpecialist
 from ai_server.agents.bitrix_llm import (
     BitrixAgentLLM,
-    BitrixLLMService,
     BitrixLLMToolCall,
     llm_failure_result,
 )
@@ -22,7 +22,7 @@ from ai_server.agents.bitrix_task_create import (
     build_task_create_draft_from_args,
 )
 from ai_server.knowledge import MarkdownKnowledgeBase
-from ai_server.models import ActionRecord, AgentManifest, AgentTask, ToolResult
+from ai_server.models import ActionRecord, AgentManifest, AgentTask, ToolResult, ToolStatus
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import Settings, get_settings
 from ai_server.skills import SkillStore
@@ -30,6 +30,15 @@ from ai_server.tools.bitrix import BitrixToolset
 from ai_server.utils import MOSCOW_TZ, optional_int
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class IncompleteProposal:
+    task_id: int
+    missing_parts: str
+    task_title: str = ""
+    responsible_id: int | None = None
+    responsible_dialog_id: str = ""
 
 
 class Bitrix24Specialist(BaseSpecialist):
@@ -59,8 +68,8 @@ class Bitrix24Specialist(BaseSpecialist):
             knowledge_base=knowledge_base,
             skill_store=skill_store,
             retriever=retriever,
-            tools=tools or BitrixToolset(),
-            llm=llm or BitrixLLMService(),
+            tools=tools,
+            llm=llm,
             scheduler=scheduler,
             store=store,
         )
@@ -75,6 +84,7 @@ class Bitrix24Specialist(BaseSpecialist):
         bitrix_llm: BitrixAgentLLM | None = None,
         scheduler: AgentScheduler | None = None,
         bitrix_store: Any | None = None,
+        bitrix_deliver_fn: Callable[[str, str], Awaitable[None]] | None = None,
         **_: object,
     ) -> Bitrix24Specialist:
         return cls(
@@ -84,11 +94,13 @@ class Bitrix24Specialist(BaseSpecialist):
             llm=bitrix_llm,
             scheduler=scheduler,
             bitrix_store=bitrix_store,
+            deliver_fn=bitrix_deliver_fn,
         )
 
     def tool_definitions(self) -> list[dict]:
+        toolset_defs = [definition.model_dump() for definition in self.tools.definitions()] if self.tools else []
         return [
-            *[definition.model_dump() for definition in self.tools.definitions()],
+            *toolset_defs,
             {
                 "name": "task_create_draft",
                 "description": (
@@ -162,6 +174,22 @@ class Bitrix24Specialist(BaseSpecialist):
                     "required": ["proposal_id"],
                 },
             },
+            {
+                "name": "save_responsible_response",
+                "description": (
+                    "Save the responsible person's explanation for a pending incomplete proposal. "
+                    "Call this when the responsible replies to a pending_responsible_question "
+                    "to store their answer so it appears in the morning proposal to the manager."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "proposal_id": {"type": "integer"},
+                        "response_text": {"type": "string", "description": "Responsible's explanation text"},
+                    },
+                    "required": ["proposal_id", "response_text"],
+                },
+            },
         ]
 
     async def _task_create_draft(self, task: AgentTask, args: dict) -> BitrixTaskCreateDraft:
@@ -182,7 +210,7 @@ class Bitrix24Specialist(BaseSpecialist):
             profile_tool = getattr(self.tools, "current_user_profile", None)
             if profile_tool is None:
                 result = ToolResult(
-                    status="not_configured",
+                    status=ToolStatus.NOT_CONFIGURED,
                     tool="current_user_profile",
                     error="current_user_profile tool is not bound",
                 )
@@ -210,7 +238,42 @@ class Bitrix24Specialist(BaseSpecialist):
             )
             return result, action, _approval_actions_from_task_create_draft(draft, self.manifest)
         if tool_call.name == "save_incomplete_proposal":
-            result = self._save_incomplete_proposal(tool_call.args)
+            task_id = optional_int(tool_call.args.get("task_id"))
+            if task_id is None:
+                result = ToolResult(
+                    status=ToolStatus.INVALID_TOOL_CALL,
+                    tool="save_incomplete_proposal",
+                    error="task_id is required",
+                )
+                return (
+                    result,
+                    ActionRecord(
+                        name="bitrix_save_incomplete_proposal", status=result.status, details=result.model_dump()
+                    ),
+                    [],
+                )
+            missing_parts = str(tool_call.args.get("missing_parts") or "").strip()
+            if not missing_parts:
+                result = ToolResult(
+                    status=ToolStatus.INVALID_TOOL_CALL,
+                    tool="save_incomplete_proposal",
+                    error="missing_parts is required and must not be empty",
+                )
+                return (
+                    result,
+                    ActionRecord(
+                        name="bitrix_save_incomplete_proposal", status=result.status, details=result.model_dump()
+                    ),
+                    [],
+                )
+            proposal = IncompleteProposal(
+                task_id=task_id,
+                task_title=str(tool_call.args.get("task_title") or ""),
+                missing_parts=missing_parts,
+                responsible_id=optional_int(tool_call.args.get("responsible_id")),
+                responsible_dialog_id=str(tool_call.args.get("responsible_dialog_id") or ""),
+            )
+            result = self._save_incomplete_proposal(proposal)
             return (
                 result,
                 ActionRecord(name="bitrix_save_incomplete_proposal", status=result.status, details=result.model_dump()),
@@ -225,6 +288,15 @@ class Bitrix24Specialist(BaseSpecialist):
                 ),
                 [],
             )
+        if tool_call.name == "save_responsible_response":
+            result = self._save_responsible_response(tool_call.args)
+            return (
+                result,
+                ActionRecord(
+                    name="bitrix_save_responsible_response", status=result.status, details=result.model_dump()
+                ),
+                [],
+            )
         if tool_call.name == "bitrix_api":
             result = await self.tools.bitrix_api(tool_call.args)
             return (
@@ -233,38 +305,37 @@ class Bitrix24Specialist(BaseSpecialist):
                 [],
             )
         result = ToolResult(
-            status="invalid_tool_call",
+            status=ToolStatus.INVALID_TOOL_CALL,
             tool=tool_call.name,
             error=f"unknown Bitrix LLM tool call: {tool_call.name}",
         )
         return result, ActionRecord(name=tool_call.name, status=result.status, details=result.model_dump()), []
 
-    def _save_incomplete_proposal(self, args: dict[str, Any]) -> ToolResult:
+    def _save_incomplete_proposal(self, proposal: IncompleteProposal) -> ToolResult:
         if self._bitrix_store is None:
             return ToolResult(
-                status="not_configured",
+                status=ToolStatus.NOT_CONFIGURED,
                 tool="save_incomplete_proposal",
                 error="bitrix_store is not configured",
             )
-        task_id = optional_int(args.get("task_id"))
-        if task_id is None:
+        if self._scheduler is None:
             return ToolResult(
-                status="invalid_tool_call",
+                status=ToolStatus.NOT_CONFIGURED,
                 tool="save_incomplete_proposal",
-                error="task_id is required",
+                error="scheduler is not configured — cannot schedule morning delivery",
             )
         run_date = _next_morning_830()
         proposal_id = self._bitrix_store.save_proposal(
-            task_id=task_id,
-            task_title=str(args.get("task_title") or ""),
-            missing_parts=str(args.get("missing_parts") or ""),
-            responsible_id=optional_int(args.get("responsible_id")),
-            responsible_dialog_id=str(args.get("responsible_dialog_id") or ""),
+            task_id=proposal.task_id,
+            task_title=proposal.task_title,
+            missing_parts=proposal.missing_parts,
+            responsible_id=proposal.responsible_id,
+            responsible_dialog_id=proposal.responsible_dialog_id,
             scheduled_for=run_date.isoformat(),
         )
         self._schedule_proposal_job(proposal_id, run_date)
         return ToolResult(
-            status="ok",
+            status=ToolStatus.OK,
             tool="save_incomplete_proposal",
             data={"proposal_id": proposal_id, "scheduled_for": run_date.isoformat()},
         )
@@ -272,19 +343,47 @@ class Bitrix24Specialist(BaseSpecialist):
     def _delete_incomplete_proposal(self, args: dict[str, Any]) -> ToolResult:
         if self._bitrix_store is None:
             return ToolResult(
-                status="not_configured",
+                status=ToolStatus.NOT_CONFIGURED,
                 tool="delete_incomplete_proposal",
                 error="bitrix_store is not configured",
             )
         proposal_id = optional_int(args.get("proposal_id"))
         if proposal_id is None:
             return ToolResult(
-                status="invalid_tool_call",
+                status=ToolStatus.INVALID_TOOL_CALL,
                 tool="delete_incomplete_proposal",
                 error="proposal_id is required",
             )
         self._bitrix_store.delete_proposal(proposal_id)
-        return ToolResult(status="ok", tool="delete_incomplete_proposal", data={"proposal_id": proposal_id})
+        return ToolResult(status=ToolStatus.OK, tool="delete_incomplete_proposal", data={"proposal_id": proposal_id})
+
+    def _save_responsible_response(self, args: dict[str, Any]) -> ToolResult:
+        if self._bitrix_store is None:
+            return ToolResult(
+                status=ToolStatus.NOT_CONFIGURED,
+                tool="save_responsible_response",
+                error="bitrix_store is not configured",
+            )
+        proposal_id = optional_int(args.get("proposal_id"))
+        if proposal_id is None:
+            return ToolResult(
+                status=ToolStatus.INVALID_TOOL_CALL,
+                tool="save_responsible_response",
+                error="proposal_id is required",
+            )
+        response_text = str(args.get("response_text") or "").strip()
+        if not response_text:
+            return ToolResult(
+                status=ToolStatus.INVALID_TOOL_CALL,
+                tool="save_responsible_response",
+                error="response_text is required and must not be empty",
+            )
+        self._bitrix_store.update_responsible_response(proposal_id, response_text)
+        return ToolResult(
+            status=ToolStatus.OK,
+            tool="save_responsible_response",
+            data={"proposal_id": proposal_id},
+        )
 
     def _schedule_proposal_job(self, proposal_id: int, run_date: datetime) -> None:
         if self._deliver_fn is None or self._bitrix_store is None:
@@ -352,7 +451,7 @@ class Bitrix24Specialist(BaseSpecialist):
         tool = getattr(self.tools, "current_user_profile", None)
         if user_id is None or tool is None:
             return ToolResult(
-                status="not_available",
+                status=ToolStatus.NOT_AVAILABLE,
                 tool="current_user_profile",
                 error="current Bitrix user id is not available",
             )
@@ -360,53 +459,56 @@ class Bitrix24Specialist(BaseSpecialist):
             return await tool({"user_id": user_id})
         except Exception as exc:
             return ToolResult(
-                status="error",
+                status=ToolStatus.ERROR,
                 tool="current_user_profile",
                 error=f"{type(exc).__name__}: {exc}",
                 data={"user_id": user_id},
             )
 
+    async def _resolve_user_field(self, query: str, fields: dict[str, Any]) -> tuple[int | None, str, list[str]]:
+        if not query or "RESPONSIBLE_ID" in fields:
+            return None, "", []
+        result = await self.tools.resolve_user(query)
+        if result.status == "ok":
+            candidate = result.data.get("candidate") if isinstance(result.data, dict) else None
+            if isinstance(candidate, dict):
+                return (
+                    optional_int(candidate.get("id")),
+                    f"Ответственный найден в Bitrix: {candidate.get('label') or query}.",
+                    [],
+                )
+        if result.status == "ambiguous":
+            return None, "", [_format_ambiguous_note("Найдено несколько сотрудников", result.data.get("candidates"))]
+        if result.status == "not_found":
+            return None, "", [f"Не нашёл сотрудника в Bitrix по запросу `{query}`."]
+        return None, "", [f"Не смог проверить сотрудника через Bitrix: {result.status}."]
+
+    async def _resolve_project_field(self, query: str, fields: dict[str, Any]) -> tuple[int | None, str, list[str]]:
+        if not query or "GROUP_ID" in fields:
+            return None, "", []
+        result = await self.tools.resolve_project(query)
+        if result.status == "ok":
+            candidate = result.data.get("candidate") if isinstance(result.data, dict) else None
+            if isinstance(candidate, dict):
+                return (
+                    optional_int(candidate.get("id")),
+                    f"Проект найден в Bitrix: {candidate.get('label') or query}.",
+                    [],
+                )
+        if result.status == "ambiguous":
+            return None, "", [_format_ambiguous_note("Найдено несколько проектов", result.data.get("candidates"))]
+        if result.status == "not_found":
+            return None, "", [f"Не нашёл проект в Bitrix по запросу `{query}`."]
+        return None, "", [f"Не смог проверить проект через Bitrix: {result.status}."]
+
     async def _resolve_task_create_draft(
         self,
         draft: BitrixTaskCreateDraft,
     ) -> BitrixTaskCreateResolution | None:
-        responsible_id = None
-        responsible_note = ""
-        group_id = None
-        group_note = ""
-        notes: list[str] = []
-
         fields = _draft_fields(draft)
-        if draft.responsible_query and "RESPONSIBLE_ID" not in fields:
-            result = await self.tools.resolve_user(draft.responsible_query)
-            if result.status == "ok":
-                candidate = result.data.get("candidate") if isinstance(result.data, dict) else None
-                if isinstance(candidate, dict):
-                    responsible_id = optional_int(candidate.get("id"))
-                    responsible_note = (
-                        f"Ответственный найден в Bitrix: {candidate.get('label') or draft.responsible_query}."
-                    )
-            elif result.status == "ambiguous":
-                notes.append(_format_ambiguous_note("Найдено несколько сотрудников", result.data.get("candidates")))
-            elif result.status == "not_found":
-                notes.append(f"Не нашёл сотрудника в Bitrix по запросу `{draft.responsible_query}`.")
-            else:
-                notes.append(f"Не смог проверить сотрудника через Bitrix: {result.status}.")
-
-        if draft.project_query and "GROUP_ID" not in fields:
-            result = await self.tools.resolve_project(draft.project_query)
-            if result.status == "ok":
-                candidate = result.data.get("candidate") if isinstance(result.data, dict) else None
-                if isinstance(candidate, dict):
-                    group_id = optional_int(candidate.get("id"))
-                    group_note = f"Проект найден в Bitrix: {candidate.get('label') or draft.project_query}."
-            elif result.status == "ambiguous":
-                notes.append(_format_ambiguous_note("Найдено несколько проектов", result.data.get("candidates")))
-            elif result.status == "not_found":
-                notes.append(f"Не нашёл проект в Bitrix по запросу `{draft.project_query}`.")
-            else:
-                notes.append(f"Не смог проверить проект через Bitrix: {result.status}.")
-
+        responsible_id, responsible_note, user_notes = await self._resolve_user_field(draft.responsible_query, fields)
+        group_id, group_note, project_notes = await self._resolve_project_field(draft.project_query, fields)
+        notes = user_notes + project_notes
         if responsible_id is None and group_id is None and not notes:
             return None
         return BitrixTaskCreateResolution(
@@ -517,7 +619,7 @@ def _tool_context_status(value: object) -> str:
 
 def _tool_result_from_task_create_draft(draft: BitrixTaskCreateDraft) -> ToolResult:
     return ToolResult(
-        status="ready" if draft.is_ready else "contract_violation",
+        status=ToolStatus.READY if draft.is_ready else ToolStatus.CONTRACT_VIOLATION,
         tool="task_create_draft",
         data=draft.as_action_details(),
         error=None if draft.is_ready else "LLM called task_create_draft with arguments outside the tool contract.",

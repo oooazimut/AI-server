@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol
 
 from apscheduler.job import Job
 from apscheduler.jobstores.base import JobLookupError
@@ -12,6 +12,14 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)
+
+
+class SchedulerPort(Protocol):
+    def add_job(self, agent_id: str, job_id: str, func: Any, trigger: Any, **kwargs: Any) -> Any: ...
+
+    def remove_jobs_by_prefix(self, agent_id: str, prefix: str) -> int: ...
+
+    def list_jobs(self, agent_id: str) -> list[dict[str, Any]]: ...
 
 
 class AgentScheduler:

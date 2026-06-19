@@ -8,8 +8,10 @@ from uuid import uuid4
 
 from ai_server.agent_scheduler import AgentScheduler
 from ai_server.agents.bitrix24 import Bitrix24Specialist
-from ai_server.agents.bitrix_llm import BitrixAgentLLM
+from ai_server.agents.bitrix_llm import BitrixAgentLLM, BitrixLLMService
 from ai_server.agents.bitrix_store import BitrixAgentStore
+from ai_server.agents.logistics_llm import LogisticsLLMService
+from ai_server.agents.pto_llm import PtoLLMService
 from ai_server.attachments import AttachmentService, StoredAttachment
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.dialog_state import (
@@ -24,7 +26,7 @@ from ai_server.integrations.bitrix.portal_search import PortalSearchIndex
 from ai_server.learning import LearningEventRecorder
 from ai_server.models import ActionRecord, AgentManifest, AgentTask, UserContext
 from ai_server.orchestrators.internal import InternalOrchestrator
-from ai_server.orchestrators.internal_llm import InternalOrchestratorLLM
+from ai_server.orchestrators.internal_llm import InternalLLMRouter, InternalOrchestratorLLM
 from ai_server.registry import load_agent_manifests
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import Settings, get_settings
@@ -71,7 +73,7 @@ class BitrixWebhookProcessor:
     ) -> None:
         self._settings = settings or get_settings()
         self._manifests = manifests or load_agent_manifests()
-        self.bitrix = bitrix or BitrixClient()
+        self.bitrix = bitrix or BitrixClient(settings=self._settings)
         self.portal_search = portal_search or PortalSearchIndex()
         self.bitrix_oauth = bitrix_oauth
         self.scheduler = scheduler
@@ -80,8 +82,10 @@ class BitrixWebhookProcessor:
         self.orchestrator = orchestrator
         self.bitrix_tools = bitrix_tools
         self.bitrix_retriever = bitrix_retriever
-        self.bitrix_llm = bitrix_llm
-        self.orchestrator_llm = orchestrator_llm
+        self.bitrix_llm = bitrix_llm or BitrixLLMService()
+        self.orchestrator_llm = orchestrator_llm or InternalLLMRouter()
+        self._pto_llm = PtoLLMService()
+        self._logistics_llm = LogisticsLLMService()
         self.technical_footer = technical_footer or TechnicalFooterService()
         self.attachment_service = attachment_service or AttachmentService(self.bitrix)
         self.transcriber = transcriber or build_transcriber()
@@ -148,7 +152,10 @@ class BitrixWebhookProcessor:
                 scheduler=self.scheduler,
                 bitrix_retriever=self.bitrix_retriever,
                 bitrix_llm=self.bitrix_llm,
+                pto_llm=self._pto_llm,
+                logistics_llm=self._logistics_llm,
                 bitrix_store=self._bitrix_store,
+                bitrix_deliver_fn=_make_quality_deliver_fn(self.bitrix, self._settings),
                 bitrix_tools=self.bitrix_tools
                 or BitrixToolset(
                     client=self.bitrix,
@@ -201,7 +208,7 @@ class BitrixWebhookProcessor:
         result = await orchestrator.handle(task)
 
         if incoming.text and result.answer:
-            self.pending_actions.append_turn(dialog_key, incoming.text, result.answer)
+            self.pending_actions.store.append_turn(dialog_key, incoming.text, result.answer)
 
         pending_action = self._save_first_pending_action(
             dialog_key,
@@ -336,7 +343,7 @@ class BitrixWebhookProcessor:
             tools=BitrixToolset(
                 client=self.bitrix,
                 actor_client=actor_bitrix,
-                auto_execute=True,
+                auto_execute=not self._settings.quality_control_dry_run,
             ),
             retriever=self.bitrix_retriever,
             llm=self.bitrix_llm,
