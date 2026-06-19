@@ -79,7 +79,6 @@ class BitrixWebhookProcessor:
         self.scheduler = scheduler
         self.search_webhook_status = search_webhook_status if search_webhook_status is not None else {}
         self.quality_control_status = quality_control_status if quality_control_status is not None else {}
-        self.orchestrator = orchestrator
         self.bitrix_tools = bitrix_tools
         self.bitrix_retriever = bitrix_retriever
         self.bitrix_llm = bitrix_llm or BitrixLLMService()
@@ -98,56 +97,10 @@ class BitrixWebhookProcessor:
             audit_log_path=self._settings.bitrix_write_audit_log_path,
             dry_run=self._settings.agent_dry_run,
         )
-
-    async def process(self, payload: dict[str, Any]) -> dict[str, Any]:
-        event_type = payload_event_type(payload)
-        if event_type not in MESSAGE_EVENTS:
-            search_job, search_result = prepare_search_webhook_job(payload)
-            if search_job:
-                search_result = await process_search_webhook_job(
-                    self.bitrix,
-                    self.portal_search,
-                    search_job,
-                    status=self.search_webhook_status,
-                )
-            quality_bitrix, quality_actor_error = await self._quality_control_bitrix_client()
-            if quality_actor_error:
-                quality_result = quality_actor_error
-            else:
-                quality_result = await handle_quality_control_webhook_event(
-                    quality_bitrix,
-                    payload=payload,
-                    status=self.quality_control_status,
-                    specialist=self._build_quality_control_specialist(quality_bitrix),
-                )
-            return {
-                "handled": bool(search_result.get("handled")) or bool(quality_result.get("handled")),
-                "event": event_type,
-                "search_index": search_result,
-                "quality_control": quality_result,
-            }
-
-        incoming = parse_incoming_message(payload)
-        attachment_context = await self._prepare_attachments(incoming)
-        if attachment_context["transcription_text"]:
-            incoming = incoming.model_copy(
-                update={"text": _merge_text_and_transcription(incoming.text, attachment_context["transcription_text"])}
-            )
-        settings = self._settings
-        dialog_key = make_dialog_key(
-            chat_id=incoming.chat_id,
-            dialog_id=incoming.dialog_id,
-            user_id=incoming.user_id,
-        )
-        dialog_state = self.pending_actions.store.load(dialog_key)
-        pending_action = dialog_state.pending_action
-        recent_turns = dialog_state.turns[-8:]
-
-        manifests = self._manifests
-        orchestrator = self.orchestrator or InternalOrchestrator(
-            manifests,
+        self._orchestrator: InternalOrchestrator = orchestrator or InternalOrchestrator(
+            self._manifests,
             specialists=build_specialist_registry(
-                manifests,
+                self._manifests,
                 audience="employee",
                 scheduler=self.scheduler,
                 bitrix_retriever=self.bitrix_retriever,
@@ -156,29 +109,89 @@ class BitrixWebhookProcessor:
                 logistics_llm=self._logistics_llm,
                 bitrix_store=self._bitrix_store,
                 bitrix_deliver_fn=_make_quality_deliver_fn(self.bitrix, self._settings),
-                bitrix_tools=self.bitrix_tools
+                bitrix_tools=bitrix_tools
                 or BitrixToolset(
                     client=self.bitrix,
                     portal_search=self.portal_search,
                     pending_actions=self.pending_actions,
-                    dialog_key=dialog_key,
-                    user_id=incoming.user_id,
                 ),
                 document_tools=DocumentToolset(
                     client=self.bitrix,
                     portal_search=self.portal_search,
-                    user_id=incoming.user_id,
                 ),
                 vehicle_usage_tools=VehicleUsageToolset(
                     client=self.bitrix,
-                    user_id=incoming.user_id,
-                    dialog_id=incoming.dialog_id,
                 ),
             ),
             orchestrator_llm=self.orchestrator_llm,
             scheduler=self.scheduler,
         )
-        task = AgentTask(
+
+    async def process(self, payload: dict[str, Any]) -> dict[str, Any]:
+        event_type = payload_event_type(payload)
+        if event_type not in MESSAGE_EVENTS:
+            return await self._handle_background_events(payload, event_type)
+        return await self._handle_message_event(payload, event_type)
+
+    # ------------------------------------------------------------------
+    # Background event handlers (search index, quality control)
+    # ------------------------------------------------------------------
+
+    async def _handle_background_events(self, payload: dict[str, Any], event_type: str) -> dict[str, Any]:
+        search_result = await self._handle_search_webhook(payload)
+        quality_result = await self._handle_quality_control_webhook(payload)
+        return {
+            "handled": bool(search_result.get("handled")) or bool(quality_result.get("handled")),
+            "event": event_type,
+            "search_index": search_result,
+            "quality_control": quality_result,
+        }
+
+    async def _handle_search_webhook(self, payload: dict[str, Any]) -> dict[str, Any]:
+        search_job, result = prepare_search_webhook_job(payload)
+        if search_job:
+            result = await process_search_webhook_job(
+                self.bitrix, self.portal_search, search_job, status=self.search_webhook_status
+            )
+        return result
+
+    async def _handle_quality_control_webhook(self, payload: dict[str, Any]) -> dict[str, Any]:
+        quality_bitrix, actor_error = await self._quality_control_bitrix_client()
+        if actor_error:
+            return actor_error
+        return await handle_quality_control_webhook_event(
+            quality_bitrix,
+            payload=payload,
+            status=self.quality_control_status,
+            specialist=self._build_quality_control_specialist(quality_bitrix),
+        )
+
+    # ------------------------------------------------------------------
+    # Chat message handler
+    # ------------------------------------------------------------------
+
+    async def _handle_message_event(self, payload: dict[str, Any], event_type: str) -> dict[str, Any]:
+        incoming = parse_incoming_message(payload)
+        attachment_context = await self._prepare_attachments(incoming)
+        if attachment_context["transcription_text"]:
+            incoming = incoming.model_copy(
+                update={"text": _merge_text_and_transcription(incoming.text, attachment_context["transcription_text"])}
+            )
+        dialog_key = make_dialog_key(
+            chat_id=incoming.chat_id,
+            dialog_id=incoming.dialog_id,
+            user_id=incoming.user_id,
+        )
+        dialog_state = self.pending_actions.store.load(dialog_key)
+        task = self._build_task(incoming, attachment_context, dialog_state, dialog_key)
+        result = await self._orchestrator.handle(task)
+        return await self._finalize_message(incoming, task, result, dialog_key, event_type, attachment_context)
+
+    def _build_task(
+        self, incoming: Any, attachment_context: dict[str, Any], dialog_state: Any, dialog_key: str
+    ) -> AgentTask:
+        pending_action = dialog_state.pending_action
+        return AgentTask(
             task_id=str(uuid4()),
             source="bitrix24_chat",
             user=UserContext(
@@ -202,30 +215,52 @@ class BitrixWebhookProcessor:
                 "attachment_errors": attachment_context["errors"],
                 "dialog_key": dialog_key,
                 "pending_action": asdict(pending_action) if pending_action is not None else None,
-                "dialog_history": recent_turns,
+                "dialog_history": dialog_state.turns[-8:],
+                "_bitrix_tools": self.bitrix_tools
+                or BitrixToolset(
+                    client=self.bitrix,
+                    portal_search=self.portal_search,
+                    pending_actions=self.pending_actions,
+                    dialog_key=dialog_key,
+                    user_id=incoming.user_id,
+                ),
+                "_pto_tools": DocumentToolset(
+                    client=self.bitrix,
+                    portal_search=self.portal_search,
+                    user_id=incoming.user_id,
+                ),
+                "_vehicle_tools": VehicleUsageToolset(
+                    client=self.bitrix,
+                    user_id=incoming.user_id,
+                    dialog_id=incoming.dialog_id,
+                ),
             },
         )
-        result = await orchestrator.handle(task)
 
+    async def _finalize_message(
+        self,
+        incoming: Any,
+        task: AgentTask,
+        result: Any,
+        dialog_key: str,
+        event_type: str,
+        attachment_context: dict[str, Any],
+    ) -> dict[str, Any]:
         if incoming.text and result.answer:
             self.pending_actions.store.append_turn(dialog_key, incoming.text, result.answer)
-
         pending_action = self._save_first_pending_action(
-            dialog_key,
-            result.actions_requiring_approval,
-            user_id=incoming.user_id,
+            dialog_key, result.actions_requiring_approval, user_id=incoming.user_id
         )
-        reply_text = result.answer
-        footer = await self.technical_footer.build_for_agent_result(
-            result,
-            user_id=incoming.user_id,
-            channel="bitrix24_chat",
+        reply_text = append_footer(
+            result.answer,
+            await self.technical_footer.build_for_agent_result(
+                result, user_id=incoming.user_id, channel="bitrix24_chat"
+            ),
         )
-        reply_text = append_footer(reply_text, footer)
         reply_sent, send_error = await self._send_reply(
             incoming.dialog_id,
             reply_text,
-            bot_id=incoming.bot_id or settings.bitrix_bot_id,
+            bot_id=incoming.bot_id or self._settings.bitrix_bot_id,
         )
         learning_event = self._record_agent_result(
             task,
@@ -237,7 +272,6 @@ class BitrixWebhookProcessor:
                 "send_error": send_error,
             },
         )
-
         return {
             "handled": True,
             "event": event_type,

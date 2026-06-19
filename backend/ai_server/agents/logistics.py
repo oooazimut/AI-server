@@ -225,17 +225,18 @@ class LogisticsSpecialist(BaseSpecialist):
         tool_call: LogisticsLLMToolCall,
         task: AgentTask,
     ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
+        tools: VehicleUsageToolset | None = task.context.get("_vehicle_tools") or self.tools
         if tool_call.name == "none":
             return None, None, []
         if tool_call.name == "vehicle_usage_context":
-            result = self.tools.vehicle_usage_context(tool_call.args)
+            result = tools.vehicle_usage_context(tool_call.args)
             return (
                 result,
                 ActionRecord(name="logistics_vehicle_usage_context", status=result.status, details=result.model_dump()),
                 [],
             )
         if tool_call.name == "vehicle_usage_save_draft":
-            result = self.tools.vehicle_usage_save_draft(tool_call.args)
+            result = tools.vehicle_usage_save_draft(tool_call.args)
             return (
                 result,
                 ActionRecord(
@@ -244,7 +245,7 @@ class LogisticsSpecialist(BaseSpecialist):
                 [],
             )
         if tool_call.name == "vehicle_usage_save_report":
-            result = self.tools.vehicle_usage_save_report(tool_call.args)
+            result = tools.vehicle_usage_save_report(tool_call.args)
             if result.status == "ok":
                 cancelled = self.cancel_jobs_by_prefix("reminder_")
                 if cancelled:

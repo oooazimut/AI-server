@@ -63,45 +63,46 @@ class PtoSpecialist(BaseSpecialist):
         tool_call: PtoLLMToolCall,
         task: AgentTask,
     ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
+        tools: DocumentToolset | None = task.context.get("_pto_tools") or self.tools
         if tool_call.name == "none":
             return None, None, []
         if tool_call.name == "portal_document_search":
-            result = self.tools.portal_document_search(tool_call.args)
+            result = tools.portal_document_search(tool_call.args)
             return (
                 result,
                 ActionRecord(name="pto_portal_document_search", status=result.status, details=result.model_dump()),
                 [],
             )
         if tool_call.name == "document_read":
-            result = await self.tools.document_read(tool_call.args)
+            result = await tools.document_read(tool_call.args)
             return (
                 result,
                 ActionRecord(name="pto_document_read", status=result.status, details=result.model_dump()),
                 [],
             )
         if tool_call.name == "spreadsheet_preview":
-            result = await self.tools.spreadsheet_preview(tool_call.args)
+            result = await tools.spreadsheet_preview(tool_call.args)
             return (
                 result,
                 ActionRecord(name="pto_spreadsheet_preview", status=result.status, details=result.model_dump()),
                 [],
             )
         if tool_call.name == "spreadsheet_compare":
-            result = await self.tools.spreadsheet_compare(tool_call.args)
+            result = await tools.spreadsheet_compare(tool_call.args)
             return (
                 result,
                 ActionRecord(name="pto_spreadsheet_compare", status=result.status, details=result.model_dump()),
                 [],
             )
         if tool_call.name == "document_draft_create":
-            result = self.tools.document_draft_create(tool_call.args)
+            result = tools.document_draft_create(tool_call.args)
             return (
                 result,
                 ActionRecord(name="pto_document_draft_create", status=result.status, details=result.model_dump()),
                 [],
             )
         if tool_call.name == "document_draft_list":
-            result = self.tools.document_draft_list(tool_call.args)
+            result = tools.document_draft_list(tool_call.args)
             return (
                 result,
                 ActionRecord(name="pto_document_draft_list", status=result.status, details=result.model_dump()),

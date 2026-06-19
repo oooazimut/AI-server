@@ -192,9 +192,11 @@ class Bitrix24Specialist(BaseSpecialist):
             },
         ]
 
-    async def _task_create_draft(self, task: AgentTask, args: dict) -> BitrixTaskCreateDraft:
+    async def _task_create_draft(
+        self, task: AgentTask, args: dict, tools: BitrixToolset | None
+    ) -> BitrixTaskCreateDraft:
         draft = build_task_create_draft_from_args(task, args)
-        resolution = await self._resolve_task_create_draft(draft)
+        resolution = await self._resolve_task_create_draft(draft, tools)
         if resolution is None:
             return draft
         return build_task_create_draft_from_args(task, args, resolution=resolution)
@@ -204,10 +206,11 @@ class Bitrix24Specialist(BaseSpecialist):
         tool_call: BitrixLLMToolCall,
         task: AgentTask,
     ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
+        tools = self._tools_for(task)
         if tool_call.name == "none":
             return None, None, []
         if tool_call.name == "current_user_profile":
-            profile_tool = getattr(self.tools, "current_user_profile", None)
+            profile_tool = getattr(tools, "current_user_profile", None)
             if profile_tool is None:
                 result = ToolResult(
                     status=ToolStatus.NOT_CONFIGURED,
@@ -222,14 +225,14 @@ class Bitrix24Specialist(BaseSpecialist):
                 [],
             )
         if tool_call.name == "portal_search":
-            result = self.tools.portal_search_contract(tool_call.args)
+            result = tools.portal_search_contract(tool_call.args)
             return (
                 result,
                 ActionRecord(name="portal_search", status=result.status, details=result.model_dump()),
                 [],
             )
         if tool_call.name == "task_create_draft":
-            draft = await self._task_create_draft(task, tool_call.args)
+            draft = await self._task_create_draft(task, tool_call.args, tools)
             result = _tool_result_from_task_create_draft(draft)
             action = ActionRecord(
                 name="bitrix_task_create_draft",
@@ -298,7 +301,7 @@ class Bitrix24Specialist(BaseSpecialist):
                 [],
             )
         if tool_call.name == "bitrix_api":
-            result = await self.tools.bitrix_api(tool_call.args)
+            result = await tools.bitrix_api(tool_call.args)
             return (
                 result,
                 ActionRecord(name="bitrix_api", status=result.status, details=result.model_dump()),
@@ -448,7 +451,7 @@ class Bitrix24Specialist(BaseSpecialist):
 
     async def _current_user_profile_result(self, task: AgentTask) -> ToolResult:
         user_id = optional_int(task.user.id)
-        tool = getattr(self.tools, "current_user_profile", None)
+        tool = getattr(self._tools_for(task), "current_user_profile", None)
         if user_id is None or tool is None:
             return ToolResult(
                 status=ToolStatus.NOT_AVAILABLE,
@@ -465,10 +468,14 @@ class Bitrix24Specialist(BaseSpecialist):
                 data={"user_id": user_id},
             )
 
-    async def _resolve_user_field(self, query: str, fields: dict[str, Any]) -> tuple[int | None, str, list[str]]:
+    async def _resolve_user_field(
+        self, query: str, fields: dict[str, Any], tools: BitrixToolset | None
+    ) -> tuple[int | None, str, list[str]]:
         if not query or "RESPONSIBLE_ID" in fields:
             return None, "", []
-        result = await self.tools.resolve_user(query)
+        if tools is None:
+            return None, "", ["Bitrix API недоступен для поиска сотрудника."]
+        result = await tools.resolve_user(query)
         if result.status == "ok":
             candidate = result.data.get("candidate") if isinstance(result.data, dict) else None
             if isinstance(candidate, dict):
@@ -483,10 +490,14 @@ class Bitrix24Specialist(BaseSpecialist):
             return None, "", [f"Не нашёл сотрудника в Bitrix по запросу `{query}`."]
         return None, "", [f"Не смог проверить сотрудника через Bitrix: {result.status}."]
 
-    async def _resolve_project_field(self, query: str, fields: dict[str, Any]) -> tuple[int | None, str, list[str]]:
+    async def _resolve_project_field(
+        self, query: str, fields: dict[str, Any], tools: BitrixToolset | None
+    ) -> tuple[int | None, str, list[str]]:
         if not query or "GROUP_ID" in fields:
             return None, "", []
-        result = await self.tools.resolve_project(query)
+        if tools is None:
+            return None, "", ["Bitrix API недоступен для поиска проекта."]
+        result = await tools.resolve_project(query)
         if result.status == "ok":
             candidate = result.data.get("candidate") if isinstance(result.data, dict) else None
             if isinstance(candidate, dict):
@@ -504,10 +515,13 @@ class Bitrix24Specialist(BaseSpecialist):
     async def _resolve_task_create_draft(
         self,
         draft: BitrixTaskCreateDraft,
+        tools: BitrixToolset | None,
     ) -> BitrixTaskCreateResolution | None:
         fields = _draft_fields(draft)
-        responsible_id, responsible_note, user_notes = await self._resolve_user_field(draft.responsible_query, fields)
-        group_id, group_note, project_notes = await self._resolve_project_field(draft.project_query, fields)
+        responsible_id, responsible_note, user_notes = await self._resolve_user_field(
+            draft.responsible_query, fields, tools
+        )
+        group_id, group_note, project_notes = await self._resolve_project_field(draft.project_query, fields, tools)
         notes = user_notes + project_notes
         if responsible_id is None and group_id is None and not notes:
             return None
@@ -527,6 +541,9 @@ class Bitrix24Specialist(BaseSpecialist):
             "Bitrix24 specialist is an LLM subagent; backend tools only execute and validate selected tool calls.",
             "Knowledge context is selected through hybrid retrieval over the agent package.",
         ]
+
+    def _tools_for(self, task: AgentTask) -> BitrixToolset | None:
+        return task.context.get("_bitrix_tools") or self.tools
 
 
 def _make_proposal_deliver_handler(
