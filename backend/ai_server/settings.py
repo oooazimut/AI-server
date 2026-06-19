@@ -109,6 +109,7 @@ class Settings:
     vehicle_usage_reminder_interval_minutes: int
     vehicle_usage_max_reminders: int
     vehicle_usage_admin_notify_user_ids: str
+    vehicle_usage_excluded_user_ids: str
     vehicle_usage_dry_run: bool
     task_proposal_manager_bitrix_id: int | None
     attachment_max_bytes: int
@@ -287,6 +288,10 @@ class Settings:
         return _id_list(self.vehicle_usage_admin_notify_user_ids)
 
     @property
+    def resolved_vehicle_usage_excluded_user_ids(self) -> set[int]:
+        return set(_id_list(self.vehicle_usage_excluded_user_ids))
+
+    @property
     def search_index_path(self) -> Path:
         return runtime_paths(self.var_dir).search_index_db
 
@@ -428,6 +433,7 @@ def get_settings() -> Settings:
         vehicle_usage_reminder_interval_minutes=_env_int("VEHICLE_USAGE_REMINDER_INTERVAL_MINUTES", 30) or 30,
         vehicle_usage_max_reminders=_env_int("VEHICLE_USAGE_MAX_REMINDERS", 3) or 3,
         vehicle_usage_admin_notify_user_ids=_env("VEHICLE_USAGE_ADMIN_NOTIFY_USER_IDS"),
+        vehicle_usage_excluded_user_ids=_env("VEHICLE_USAGE_EXCLUDED_USER_IDS"),
         vehicle_usage_dry_run=_env_bool("VEHICLE_USAGE_DRY_RUN", True),
         task_proposal_manager_bitrix_id=_env_int("TASK_PROPOSAL_MANAGER_BITRIX_ID"),
         attachment_max_bytes=_env_int("ATTACHMENT_MAX_BYTES", 30 * 1024 * 1024) or (30 * 1024 * 1024),
