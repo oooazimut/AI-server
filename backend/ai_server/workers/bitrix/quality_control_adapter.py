@@ -8,6 +8,7 @@ from ai_server.agents.ports import SchedulerPort
 from ai_server.integrations.bitrix.bitrix_store import BitrixAgentStore
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
+from ai_server.integrations.bitrix.ports import BitrixAgentStorePort
 from ai_server.models import AgentManifest
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import Settings
@@ -34,7 +35,7 @@ class QualityControlHandlerAdapter:
         bitrix_retriever: HybridKnowledgeRetriever | None = None,
         bitrix_llm: BitrixAgentLLM | None = None,
         scheduler: SchedulerPort | None = None,
-        bitrix_store: BitrixAgentStore | None = None,
+        bitrix_store: BitrixAgentStorePort | None = None,
         settings: Settings,
     ) -> None:
         self._bitrix = bitrix
@@ -43,7 +44,7 @@ class QualityControlHandlerAdapter:
         self._bitrix_retriever = bitrix_retriever
         self._bitrix_llm = bitrix_llm
         self._scheduler = scheduler
-        self._bitrix_store = bitrix_store or BitrixAgentStore()
+        self._bitrix_store: BitrixAgentStorePort = bitrix_store or BitrixAgentStore()
         self._settings = settings
 
     async def handle(self, payload: dict[str, Any], *, status: dict[str, Any]) -> dict[str, Any]:

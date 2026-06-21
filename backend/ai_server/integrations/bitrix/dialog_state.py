@@ -8,13 +8,13 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from ai_server.agent_store import SqliteStore
+from ai_server.integrations.bitrix.bitrix_policy import decide_bitrix_method_policy
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
 from ai_server.integrations.bitrix.ports import BitrixUserPort, BitrixWritePort
 from ai_server.integrations.bitrix.profile import compact_user_profile
 from ai_server.runtime import runtime_paths
 from ai_server.settings import Settings, get_settings
-from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
 from ai_server.utils import optional_int, truthy
 
 NO_DEADLINE_FIELD_NAMES = {

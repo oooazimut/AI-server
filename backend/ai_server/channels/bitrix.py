@@ -20,6 +20,7 @@ from ai_server.integrations.bitrix.dialog_state import (
 from ai_server.integrations.bitrix.events import MESSAGE_EVENTS, parse_incoming_message, payload_event_type
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService
 from ai_server.integrations.bitrix.portal_search import PortalSearchIndex
+from ai_server.integrations.bitrix.ports import BitrixAgentStorePort
 from ai_server.learning import LearningEventRecorder
 from ai_server.models import ActionRecord, AgentManifest, AgentTask, UserContext
 from ai_server.orchestrators.internal import InternalOrchestrator
@@ -82,7 +83,7 @@ class BitrixWebhookProcessor:
         transcriber: Any | None = None,
         learning_recorder: LearningEventRecorder | None = None,
         scheduler: SchedulerPort | None = None,
-        bitrix_store: BitrixAgentStore | None = None,
+        bitrix_store: BitrixAgentStorePort | None = None,
         search_webhook_handler: SearchWebhookHandlerPort | None = None,
         quality_control_handler: QualityControlHandlerPort | None = None,
     ) -> None:
@@ -101,7 +102,7 @@ class BitrixWebhookProcessor:
         self.attachment_service = attachment_service or AttachmentService(self.bitrix)
         self.transcriber = transcriber or build_transcriber()
         self.learning_recorder = learning_recorder
-        self._bitrix_store = bitrix_store or BitrixAgentStore()
+        self._bitrix_store: BitrixAgentStorePort = bitrix_store or BitrixAgentStore()
         self.pending_actions = pending_actions or BitrixPendingActionService(
             store=DialogStateStore(self._settings.dialog_state_path),
             bitrix=self.bitrix,
@@ -141,18 +142,7 @@ class BitrixWebhookProcessor:
     async def _handle_search_webhook(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self._search_webhook_handler is not None:
             return await self._search_webhook_handler.handle(payload, status=self.search_webhook_status)
-        # Fallback: direct worker call (used when no handler is injected, e.g. in tests)
-        from ai_server.workers.bitrix.search_webhook_indexer import (
-            prepare_search_webhook_job,
-            process_search_webhook_job,
-        )
-
-        search_job, result = prepare_search_webhook_job(payload, settings=self._settings)
-        if search_job:
-            result = await process_search_webhook_job(
-                self.bitrix, self.portal_search, search_job, status=self.search_webhook_status, settings=self._settings
-            )
-        return result
+        return {"handled": False, "reason": "handler_not_configured"}
 
     async def _handle_quality_control_webhook(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self._quality_control_handler is not None:

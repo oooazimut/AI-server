@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ai_server.integrations.bitrix.bitrix_policy import decide_bitrix_method_policy
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
 from ai_server.integrations.bitrix.dialog_state import BitrixPendingActionService, PendingBitrixAction
 from ai_server.integrations.bitrix.portal_search import (
@@ -12,7 +13,6 @@ from ai_server.integrations.bitrix.portal_search import (
 from ai_server.integrations.bitrix.ports import BitrixRestPort, BitrixToolClientPort
 from ai_server.integrations.bitrix.profile import compact_user_profile
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
-from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
 from ai_server.utils import optional_int
 
 

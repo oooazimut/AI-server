@@ -65,21 +65,23 @@ def test_webhook_event_queue_is_compatible_and_sanitizes_payload(monkeypatch, tm
     queue = WebhookEventQueue(tmp_path / "webhook_event_queue.sqlite", settings=get_settings())
     queue.ensure_schema()
 
-    event_id, inserted = queue.enqueue(_bitrix_v2_message_payload(), event_type="ONIMBOTV2MESSAGEADD")
-    duplicate_id, duplicate_inserted = queue.enqueue(_bitrix_v2_message_payload(), event_type="ONIMBOTV2MESSAGEADD")
+    event_id, inserted = anyio_run(queue.enqueue(_bitrix_v2_message_payload(), event_type="ONIMBOTV2MESSAGEADD"))
+    duplicate_id, duplicate_inserted = anyio_run(
+        queue.enqueue(_bitrix_v2_message_payload(), event_type="ONIMBOTV2MESSAGEADD")
+    )
 
     assert inserted is True
     assert duplicate_inserted is False
     assert duplicate_id == event_id
-    assert queue.stats()["pending"] == 1
+    assert anyio_run(queue.stats())["pending"] == 1
 
-    event = queue.claim_next()
+    event = anyio_run(queue.claim_next())
     assert event is not None
     assert event["partition_key"] == "dialog:chat99"
     assert "auth" not in event["payload"]
 
-    queue.mark_done(event_id, {"handled": True})
-    assert queue.stats()["done"] == 1
+    anyio_run(queue.mark_done(event_id, {"handled": True}))
+    assert anyio_run(queue.stats())["done"] == 1
 
 
 def test_bitrix_events_endpoint_enqueues_payload(monkeypatch, tmp_path):

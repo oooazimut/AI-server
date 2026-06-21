@@ -2,6 +2,7 @@ import asyncio
 import json
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist, BitrixLLMDecision, BitrixLLMService, BitrixLLMToolCall
+from ai_server.integrations.bitrix.bitrix_policy import decide_bitrix_method_policy
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import AgentTask, ToolResult
 from ai_server.registry import get_agent_manifest
@@ -9,7 +10,6 @@ from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import get_settings
 from ai_server.skills import SkillStore
 from ai_server.tools.bitrix import BitrixToolset
-from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
 from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, RecordingLLMClient
 
 

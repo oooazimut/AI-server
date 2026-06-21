@@ -7,10 +7,10 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from ai_server.integrations.bitrix.ports import BitrixTaskPort
+from ai_server.integrations.ports import WebhookEnqueuePort
 from ai_server.settings import Settings
 from ai_server.utils import MOSCOW_TZ, optional_int
 from ai_server.workers.bitrix.search_indexer import PortalSearchIndexerWorker
-from ai_server.workers.bitrix.webhook_event_queue import WebhookEventQueue
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ class ReconcileResult:
 
 async def run_reconciler(
     bitrix: BitrixTaskPort,
-    queue: WebhookEventQueue,
+    queue: WebhookEnqueuePort,
     search_indexer: PortalSearchIndexerWorker,
     *,
     status: dict[str, Any],
@@ -67,7 +67,7 @@ async def run_reconciler(
 
 async def reconcile_once(
     bitrix: BitrixTaskPort,
-    queue: WebhookEventQueue,
+    queue: WebhookEnqueuePort,
     search_indexer: PortalSearchIndexerWorker,
     *,
     status: dict[str, Any] | None = None,
@@ -90,7 +90,7 @@ async def reconcile_once(
 
 async def _reconcile_tasks(
     bitrix: BitrixTaskPort,
-    queue: WebhookEventQueue,
+    queue: WebhookEnqueuePort,
     *,
     now: datetime,
     settings: Settings,
@@ -128,7 +128,7 @@ async def _reconcile_tasks(
             },
         }
         key = f"reconcile:task:{task_id}:{changed_date or 'unknown'}"
-        _, inserted = queue.enqueue(payload, event_type="ONTASKUPDATE", dedupe_key=key)
+        _, inserted = await queue.enqueue(payload, event_type="ONTASKUPDATE", dedupe_key=key)
         if inserted:
             enqueued += 1
         else:

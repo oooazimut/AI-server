@@ -6,6 +6,15 @@ from ai_server.workers.bitrix.supervisor import run_task_supervisor_once
 from ai_server.workers.bitrix.webhook_event_queue import WebhookEventQueue
 
 
+def anyio_run(awaitable):
+    import anyio
+
+    async def runner():
+        return await awaitable
+
+    return anyio.run(runner)
+
+
 def test_task_supervisor_dry_run_does_not_notify(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
@@ -38,7 +47,7 @@ def test_reconciler_enqueues_task_updates_with_dedupe(monkeypatch, tmp_path):
     assert first.tasks["seen"] == 1
     assert first.tasks["enqueued"] == 1
     assert second.tasks["duplicates"] == 1
-    stats = queue.stats()
+    stats = anyio_run(queue.stats())
     assert stats["pending"] == 1
     assert stats["done"] == 0
 
@@ -83,12 +92,3 @@ class FakeReconcileBitrix:
 class FakeSearchIndexer:
     async def run_delta_once(self):
         raise AssertionError("disk delta should be disabled in this test")
-
-
-def anyio_run(awaitable):
-    import anyio
-
-    async def runner():
-        return await awaitable
-
-    return anyio.run(runner)

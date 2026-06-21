@@ -6,12 +6,17 @@ from fastapi import APIRouter, HTTPException, Query, Request, status
 
 from ..knowledge import MarkdownKnowledgeBase
 from ..models import AgentManifest
-from ..registry import get_agent_manifest, summarize_agents
+from ..registry import (
+    get_agent_manifest,
+    get_automation_manifest,
+    load_automation_manifests,
+    summarize_agents,
+    summarize_automations,
+)
 from ..retrieval import HybridKnowledgeRetriever
 from ..settings import get_settings
 from ..skills import SkillStore
 from ..specialists import manifest_by_id
-from ..workers.registry import get_automation_manifest, load_automation_manifests, summarize_automations
 
 router = APIRouter()
 

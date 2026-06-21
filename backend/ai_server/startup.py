@@ -10,23 +10,57 @@ from .agents.bitrix24 import BitrixLLMService
 from .agents.logistics import LogisticsLLMService, LogisticsSpecialist
 from .agents.pto import PtoLLMService
 from .channels.bitrix import BitrixWebhookProcessor
+from .integrations.bitrix.bitrix_store import BitrixAgentStore
 from .integrations.bitrix.client import BitrixClient
 from .integrations.bitrix.oauth import BitrixOAuthService
 from .integrations.bitrix.portal_search import PortalSearchIndex
+from .integrations.bitrix.ports import BitrixAgentStorePort
+from .integrations.ports import VehicleUsageStorePort
+from .integrations.postgres.bitrix_agent import PostgresBitrixAgentStore
+from .integrations.postgres.vehicle_usage import PostgresVehicleUsageStore
+from .integrations.redis.event_queue import RedisEventQueue
 from .learning import LearningEventRecorder
 from .orchestrators.internal_llm import InternalLLMRouter
 from .registry import load_agent_manifests
 from .runtime import ensure_runtime_dirs
-from .settings import get_settings
+from .settings import Settings, get_settings
 from .specialists import SpecialistDeps, manifest_by_id
 from .tools.vehicle_usage import VehicleUsageStore, VehicleUsageToolset
 from .workers.bitrix.quality_control_adapter import QualityControlHandlerAdapter
-from .workers.bitrix.reconciler import run_reconciler
+from .workers.bitrix.reconciler import reconcile_once, run_reconciler
 from .workers.bitrix.search_indexer import PortalSearchIndexerWorker
 from .workers.bitrix.search_webhook_adapter import SearchWebhookHandlerAdapter
-from .workers.bitrix.supervisor import run_task_supervisor
+from .workers.bitrix.supervisor import run_task_supervisor, run_task_supervisor_once
 from .workers.bitrix.webhook_event_queue import WebhookEventQueue, run_webhook_event_worker
 from .workers.logistics.staff_sync import run_staff_sync
+
+
+def _make_event_queue(settings: Settings) -> WebhookEventQueue | RedisEventQueue:
+    if settings.redis_url:
+        return RedisEventQueue(settings.redis_url)
+    queue = WebhookEventQueue(settings.webhook_event_queue_path, settings=settings)
+    queue.ensure_schema()
+    return queue
+
+
+def _make_vehicle_store(settings: Settings) -> VehicleUsageStorePort:
+    if settings.database_url:
+        store = PostgresVehicleUsageStore(settings.database_url)
+        store.ensure_schema()
+        return store
+    store = VehicleUsageStore(settings.vehicle_usage_db_path)
+    store.bootstrap_reference_data()
+    return store
+
+
+def _make_bitrix_store(settings: Settings) -> BitrixAgentStorePort:
+    if settings.database_url:
+        store = PostgresBitrixAgentStore(settings.database_url)
+        store.ensure_schema()
+        return store
+    store = BitrixAgentStore()
+    store.ensure_schema()
+    return store
 
 
 @asynccontextmanager
@@ -41,8 +75,8 @@ async def lifespan(app: FastAPI):
     portal_search.ensure_schema()
     portal_search_indexer = PortalSearchIndexerWorker(bitrix, portal_search, settings=settings)
     learning_recorder = LearningEventRecorder()
-    webhook_event_queue = WebhookEventQueue(settings.webhook_event_queue_path, settings=settings)
-    webhook_event_queue.ensure_schema()
+    webhook_event_queue = _make_event_queue(settings)
+    bitrix_store = _make_bitrix_store(settings)
 
     app.state.settings = settings
     app.state.manifests = manifests
@@ -141,6 +175,15 @@ async def lifespan(app: FastAPI):
         "max_reminders": settings.vehicle_usage_max_reminders,
     }
 
+    async def _reconcile_fn(*, status: dict) -> dict:
+        return await reconcile_once(bitrix, webhook_event_queue, portal_search_indexer, status=status)
+
+    async def _supervisor_fn(*, status: dict) -> dict:
+        return await run_task_supervisor_once(bitrix, status=status)
+
+    app.state.reconcile_fn = _reconcile_fn
+    app.state.supervisor_fn = _supervisor_fn
+
     scheduler = AgentScheduler()
     scheduler.start()
     app.state.scheduler = scheduler
@@ -184,6 +227,7 @@ async def lifespan(app: FastAPI):
             manifests=manifests,
             bitrix_llm=bitrix_llm_svc,
             scheduler=scheduler,
+            bitrix_store=bitrix_store,
             settings=settings,
         )
         processor = BitrixWebhookProcessor(
@@ -197,13 +241,23 @@ async def lifespan(app: FastAPI):
             learning_recorder=learning_recorder,
             scheduler=scheduler,
             specialist_deps=specialist_deps,
+            bitrix_store=bitrix_store,
             search_webhook_handler=search_webhook_handler,
             quality_control_handler=quality_control_handler,
         )
+
+        async def _dispatch_processor(payload: dict) -> dict:
+            event_key = str(payload.get("event") or "")
+            if event_key == "vehicle_usage_morning_trigger" and logistics_specialist is not None:
+                reminder_count = int((payload.get("data") or {}).get("reminder_count", 0))
+                await logistics_specialist._run_and_deliver(reminder_count=reminder_count)
+                return {"handled": True, "event": event_key}
+            return await processor.process(payload)
+
         webhook_worker_task = asyncio.create_task(
             run_webhook_event_worker(
                 webhook_event_queue,
-                processor.process,
+                _dispatch_processor,
                 status=app.state.webhook_event_queue_status,
                 settings=settings,
             )
@@ -225,8 +279,7 @@ async def lifespan(app: FastAPI):
             )
         )
     if settings.vehicle_usage_enabled:
-        vehicle_usage_store = VehicleUsageStore(settings.vehicle_usage_db_path)
-        vehicle_usage_store.bootstrap_reference_data()
+        vehicle_usage_store = _make_vehicle_store(settings)
 
         async def _vehicle_deliver(dialog_id: str, message: str) -> None:
             await bitrix.send_bot_message(dialog_id, message)
@@ -249,7 +302,8 @@ async def lifespan(app: FastAPI):
                     dialog_id=settings.vehicle_usage_dialog_id,
                 ),
             )
-            logistics_specialist.start()
+            if not settings.redis_url:
+                logistics_specialist.start()
             app.state.logistics_specialist = logistics_specialist
 
         staff_sync_task = asyncio.create_task(run_staff_sync(bitrix, vehicle_usage_store, settings=settings))

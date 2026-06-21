@@ -1,7 +1,8 @@
-from ai_server.registry import get_agent_manifest, summarize_agents
-from ai_server.workers.registry import (
+from ai_server.registry import (
+    get_agent_manifest,
     get_automation_manifest,
     load_automation_manifests,
+    summarize_agents,
     summarize_automations,
 )
 

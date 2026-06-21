@@ -6,10 +6,11 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from ai_server.agent_store import AgentStore
 from ai_server.integrations.bitrix.ports import BitrixUserPort
+from ai_server.integrations.ports import VehicleUsageStorePort
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.utils import MOSCOW_TZ, optional_int
 
@@ -34,33 +35,6 @@ class StaffMember:
 
     def as_dict(self) -> dict[str, Any]:
         return {"display_order": self.order, "full_name": self.name, "user_id": self.user_id}
-
-
-class VehicleUsageRepositoryProtocol(Protocol):
-    def context(self, *, request_date: str, user_id: int | None, dialog_id: str) -> dict[str, Any]: ...
-    def staff_roster(self) -> list[dict[str, Any]]: ...
-    def latest_request(self, *, user_id: int | None, dialog_id: str) -> dict[str, Any] | None: ...
-    def get_request(self, *, request_date: str, user_id: int | None) -> dict[str, Any] | None: ...
-    def latest_requests(self, *, limit: int = 10) -> list[dict[str, Any]]: ...
-    def create_sent_request(self, data: SentRequestData) -> int: ...
-    def mark_escalated(self, *, request_date: str, user_id: int | None, escalated_at: str) -> bool: ...
-    def save_draft(
-        self,
-        *,
-        request_date: str,
-        user_id: int | None,
-        dialog_id: str,
-        response_text: str,
-        parsed: dict[str, Any],
-        status: str = "pending_confirmation",
-    ) -> int: ...
-    def replace_day_report(
-        self,
-        *,
-        status_date: str,
-        employee_statuses: list[tuple[int, str, str]],
-        vehicle_assignments: list[tuple[int, int | None, str]],
-    ) -> None: ...
 
 
 class VehicleUsageStore(AgentStore):
@@ -379,7 +353,7 @@ class VehicleUsageStore(AgentStore):
 
 
 class VehicleReportProcessor:
-    def __init__(self, repo: VehicleUsageRepositoryProtocol) -> None:
+    def __init__(self, repo: VehicleUsageStorePort) -> None:
         self._repo = repo
 
     def save_report(
@@ -443,7 +417,7 @@ class VehicleUsageToolset:
         self,
         client: BitrixUserPort | None = None,
         *,
-        store: VehicleUsageRepositoryProtocol | None = None,
+        store: VehicleUsageStorePort | None = None,
         user_id: int | None = None,
         dialog_id: str = "",
     ) -> None:
