@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from ai_server.settings import get_settings
+from ai_server.settings import Settings
 
 
 class YandexAuthError(RuntimeError):
     pass
 
 
-def yandex_auth_header() -> dict[str, str]:
-    settings = get_settings()
+def yandex_auth_header(settings: Settings) -> dict[str, str]:
     if settings.yandex_api_key:
         return {"Authorization": f"Api-Key {settings.yandex_api_key}"}
     if settings.yandex_iam_token:

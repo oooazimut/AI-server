@@ -5,7 +5,7 @@ from typing import Any
 
 import httpx
 
-from ai_server.settings import Settings, get_settings
+from ai_server.settings import Settings
 from ai_server.utils import optional_int
 
 
@@ -26,17 +26,19 @@ class BitrixClient:
         self,
         base_url: str | None = None,
         *,
-        settings: Settings | None = None,
+        settings: Settings,
         access_token: str | None = None,
         client_endpoint: str | None = None,
+        oauth_service: Any | None = None,
     ) -> None:
-        _settings = settings or get_settings()
+        self._settings = settings
+        self._oauth_service = oauth_service
         self.access_token = access_token or ""
         resolved_base_url = client_endpoint if self.access_token else base_url
-        self.base_url = (resolved_base_url or _settings.bitrix_rest_webhook_url).rstrip("/") + "/"
+        self.base_url = (resolved_base_url or settings.bitrix_rest_webhook_url).rstrip("/") + "/"
         self.api_base_url = _to_rest_api_base_url(self.base_url)
         self.projects_base_url = (
-            self.base_url if self.access_token else (_settings.bitrix_projects_webhook_url or self.base_url)
+            self.base_url if self.access_token else (settings.bitrix_projects_webhook_url or self.base_url)
         ).rstrip("/") + "/"
         self.timeout = httpx.Timeout(30.0)
 
@@ -138,9 +140,9 @@ class BitrixClient:
         bot_id: int | None = None,
         keyboard: object | None = None,
     ) -> Any:
-        settings = get_settings()
+        settings = self._settings
         if settings.bitrix_bot_uses_oauth and not self.access_token:
-            client = await _oauth_bot_client()
+            client = await _oauth_bot_client(settings, self._oauth_service)
             return await client.send_bot_message(
                 dialog_id,
                 message,
@@ -169,9 +171,9 @@ class BitrixClient:
         *,
         bot_id: int | None = None,
     ) -> str:
-        settings = get_settings()
+        settings = self._settings
         if settings.bitrix_bot_uses_oauth and not self.access_token:
-            client = await _oauth_bot_client()
+            client = await _oauth_bot_client(settings, self._oauth_service)
             return await client.get_bot_file_download_url(file_id, bot_id=bot_id)
 
         resolved_bot_id = bot_id or settings.bitrix_bot_id
@@ -215,9 +217,9 @@ class BitrixClient:
         bot_id: int | None = None,
         owner_id: int | None = None,
     ) -> Any:
-        settings = get_settings()
+        settings = self._settings
         if settings.bitrix_bot_uses_oauth and not self.access_token:
-            client = await _oauth_bot_client()
+            client = await _oauth_bot_client(settings, self._oauth_service)
             return await client.create_bot_chat(
                 title=title,
                 user_ids=user_ids,
@@ -599,13 +601,17 @@ def _response_text(response: httpx.Response) -> str:
     return text
 
 
-async def _oauth_bot_client() -> BitrixClient:
-    settings = get_settings()
+async def _oauth_bot_client(settings: Settings, oauth_service: Any) -> BitrixClient:
     if not settings.bitrix_bot_oauth_user_id:
         raise BitrixConfigError("BITRIX_BOT_OAUTH_USER_ID is required for OAuth bot mode")
-    from ai_server.integrations.bitrix.oauth import BitrixOAuthService
+    if oauth_service is None:
+        raise BitrixConfigError("BitrixOAuthService must be injected into BitrixClient for OAuth bot mode")
+    # deferred import: oauth.py imports BitrixClient, so top-level import would be circular
+    from ai_server.integrations.bitrix.oauth import BitrixOAuthService  # noqa: PLC0415
 
-    return await BitrixOAuthService().client_for_user(settings.bitrix_bot_oauth_user_id)
+    if not isinstance(oauth_service, BitrixOAuthService):
+        raise BitrixConfigError("oauth_service must be a BitrixOAuthService instance")
+    return await oauth_service.client_for_user(settings.bitrix_bot_oauth_user_id)
 
 
 def _extract_paged_items(result: Any, *, list_key: str | None) -> list[dict[str, Any]]:

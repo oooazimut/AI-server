@@ -4,6 +4,7 @@ import asyncio
 import logging
 import uuid
 
+from ai_server.agents.ports import SchedulerPort
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentResultStatus, AgentTask
 from ai_server.orchestrators.internal_llm import InternalLLMRouter, InternalOrchestratorLLM, ScheduledTaskDecision
 from ai_server.specialists import Specialist, build_specialist_registry
@@ -18,12 +19,12 @@ class InternalOrchestrator:
         specialists: dict[str, Specialist] | None = None,
         *,
         orchestrator_llm: InternalOrchestratorLLM | None = None,
-        scheduler=None,
+        scheduler: SchedulerPort | None = None,
     ) -> None:
         self.manifests = manifests
         self.specialists = specialists or build_specialist_registry(manifests)
         self.orchestrator_llm = orchestrator_llm or InternalLLMRouter()
-        self.scheduler = scheduler
+        self.scheduler: SchedulerPort | None = scheduler
 
     async def handle(self, task: AgentTask) -> AgentResult:
         if task.context.get("pending_action"):
@@ -219,30 +220,15 @@ def _merge_status(statuses: list[AgentResultStatus]) -> AgentResultStatus:
 
 def _apply_scheduled_tasks(
     tasks: list[ScheduledTaskDecision],
-    scheduler,
+    scheduler: SchedulerPort | None,
 ) -> list[ActionRecord]:
     if not tasks or scheduler is None:
         return []
-    from apscheduler.triggers.cron import CronTrigger
-    from apscheduler.triggers.date import DateTrigger
-
-    from ai_server.utils import MOSCOW_TZ
-
     actions: list[ActionRecord] = []
     for task in tasks:
         job_id = task.job_id or str(uuid.uuid4())[:8]
         try:
-            trigger_data = task.trigger
-            trigger_type = str(trigger_data.get("type") or "date").strip()
-            if trigger_type == "date":
-                trigger = DateTrigger(run_date=trigger_data.get("run_date"), timezone=MOSCOW_TZ)
-            elif trigger_type == "cron":
-                kwargs = {k: v for k, v in trigger_data.items() if k != "type"}
-                trigger = CronTrigger(timezone=MOSCOW_TZ, **kwargs)
-            else:
-                raise ValueError(f"Unknown trigger type: {trigger_type!r}")
-
-            job = scheduler.schedule_task(task.agent_id, job_id, trigger, task.task_description)
+            job = scheduler.schedule_task(task.agent_id, job_id, task.trigger, task.task_description)
             next_run = job.next_run_time.isoformat() if job.next_run_time else None
             actions.append(
                 ActionRecord(

@@ -192,10 +192,15 @@ def build_balance_registry(settings: Settings) -> dict[str, BalanceClient]:
 
 
 class TechnicalFooterService:
-    def __init__(self, *, balance_registry: dict[str, BalanceClient] | None = None) -> None:
-        settings = get_settings()
+    def __init__(
+        self,
+        *,
+        balance_registry: dict[str, BalanceClient] | None = None,
+        settings: Settings | None = None,
+    ) -> None:
+        self._settings = settings or get_settings()
         self._balance_registry: dict[str, BalanceClient] = (
-            balance_registry if balance_registry is not None else build_balance_registry(settings)
+            balance_registry if balance_registry is not None else build_balance_registry(self._settings)
         )
 
     async def build_for_agent_result(
@@ -205,12 +210,11 @@ class TechnicalFooterService:
         user_id: int | None,
         channel: str,
     ) -> str:
-        if not _is_footer_allowed(user_id=user_id, channel=channel):
+        if not self._is_footer_allowed(user_id=user_id, channel=channel):
             return ""
 
         lines = [_format_model_usage(result.model_usage)]
-        settings = get_settings()
-        if settings.tech_footer_balance_enabled:
+        if self._settings.tech_footer_balance_enabled:
             providers = {usage.provider.casefold() for usage in result.model_usage if usage.provider}
             balance_lines = await self._collect_balance_lines(providers)
             lines.extend(balance_lines)
@@ -224,19 +228,25 @@ class TechnicalFooterService:
         status: str,
         model_usage: Any | None = None,
     ) -> str:
-        if not _is_footer_allowed(user_id=user_id, channel=channel):
+        if not self._is_footer_allowed(user_id=user_id, channel=channel):
             return ""
         usages = _coerce_model_usage_list(model_usage)
         if not usages:
             return f"LLM: не использовалась; Bitrix action: {status}."
 
         lines = [_format_model_usage(usages), f"Bitrix action: {status}."]
-        settings = get_settings()
-        if settings.tech_footer_balance_enabled:
+        if self._settings.tech_footer_balance_enabled:
             providers = {usage.provider.casefold() for usage in usages if usage.provider}
             balance_lines = await self._collect_balance_lines(providers)
             lines.extend(balance_lines)
         return "\n".join(line for line in lines if line)
+
+    def _is_footer_allowed(self, *, user_id: int | None, channel: str) -> bool:
+        if not self._settings.tech_footer_enabled:
+            return False
+        if channel != "bitrix24_chat":
+            return False
+        return bool(user_id is not None and user_id in self._settings.resolved_tech_footer_allowed_user_ids)
 
     async def _collect_balance_lines(self, providers: set[str]) -> list[str]:
         clients = [
@@ -258,15 +268,6 @@ def append_footer(message: str, footer: str) -> str:
     if not message or not footer:
         return message
     return f"{message}\n\n---\nТех: {footer}"
-
-
-def _is_footer_allowed(*, user_id: int | None, channel: str) -> bool:
-    settings = get_settings()
-    if not settings.tech_footer_enabled:
-        return False
-    if channel != "bitrix24_chat":
-        return False
-    return bool(user_id is not None and user_id in settings.resolved_tech_footer_allowed_user_ids)
 
 
 def _format_model_usage(usages: list[ModelUsageRecord]) -> str:

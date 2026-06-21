@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
-from ai_server.agent_scheduler import SchedulerPort
 from ai_server.agent_store import AgentStore
+from ai_server.agents.ports import SchedulerPort
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult
 from ai_server.retrieval import HybridKnowledgeRetriever
@@ -92,6 +93,16 @@ class BaseSpecialist:
         if self._scheduler is None:
             return None
         return self._scheduler.add_job(self.manifest.id, job_id, func, trigger, **kwargs)
+
+    def schedule_job_at(self, job_id: str, func: Any, run_date: datetime, **kwargs: Any) -> Any:
+        if self._scheduler is None:
+            return None
+        return self._scheduler.add_job_at(self.manifest.id, job_id, func, run_date, **kwargs)
+
+    def schedule_job_cron(self, job_id: str, func: Any, hour: int, minute: int, **kwargs: Any) -> Any:
+        if self._scheduler is None:
+            return None
+        return self._scheduler.add_job_cron(self.manifest.id, job_id, func, hour, minute, **kwargs)
 
     def cancel_jobs_by_prefix(self, prefix: str) -> int:
         if self._scheduler is None:

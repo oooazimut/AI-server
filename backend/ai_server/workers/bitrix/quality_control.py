@@ -10,9 +10,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ai_server.integrations.bitrix.client import BitrixClient
+from ai_server.integrations.bitrix.ports import BitrixTaskPort
 from ai_server.models import AgentTask, UserContext
-from ai_server.settings import get_settings
+from ai_server.settings import Settings
 from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)
@@ -30,21 +30,20 @@ class TaskResult:
     status: str | None
 
 
-def is_quality_exempt_responsible(responsible_id: int | None) -> bool:
-    settings = get_settings()
+def is_quality_exempt_responsible(responsible_id: int | None, *, settings: Settings) -> bool:
     return (
         responsible_id is not None and responsible_id in settings.resolved_quality_control_exempt_responsible_user_ids
     )
 
 
 async def handle_quality_control_webhook_event(
-    bitrix: BitrixClient,
+    bitrix: BitrixTaskPort,
     *,
     payload: dict[str, Any],
     status: dict[str, Any] | None = None,
     specialist: Any | None = None,
+    settings: Settings,
 ) -> dict[str, Any]:
-    settings = get_settings()
     event_type = _payload_event_type(payload)
     if event_type not in TASK_QUALITY_WEBHOOK_EVENTS:
         return {"handled": False, "reason": "unsupported_event", "event": event_type}
@@ -74,6 +73,7 @@ async def handle_quality_control_webhook_event(
                 event_type=event_type,
                 payload=payload,
                 specialist=specialist,
+                settings=settings,
             )
         except Exception as exc:
             if status is not None:
@@ -95,15 +95,14 @@ async def handle_quality_control_webhook_event(
 
 
 async def _handle_quality_control_webhook_task(
-    bitrix: BitrixClient,
+    bitrix: BitrixTaskPort,
     *,
     task_id: int,
     event_type: str,
     payload: dict[str, Any],
     specialist: Any | None,
+    settings: Settings,
 ) -> dict[str, Any]:
-    settings = get_settings()
-
     # Pre-fetch task for status check and deduplication
     task_detail = await _fetch_task_detail(bitrix, task_id)
     if not task_detail:
@@ -120,7 +119,7 @@ async def _handle_quality_control_webhook_task(
 
     # Exempt responsible check
     responsible_id = _to_int(_first(task_detail, "responsibleId", "RESPONSIBLE_ID"))
-    if is_quality_exempt_responsible(responsible_id):
+    if is_quality_exempt_responsible(responsible_id, settings=settings):
         return {"handled": False, "reason": "exempt_responsible", "event": event_type, "task_id": task_id}
 
     # Fetch results
@@ -134,13 +133,14 @@ async def _handle_quality_control_webhook_task(
     result_obj = _latest_task_result(task_id, raw_results)
     result_text = result_obj.text if result_obj else ""
     process_key = _webhook_quality_process_key(task_id, task_detail, result_obj, result_text)
-    duplicate = _quality_duplicate_result(task_id, event_type, process_key)
+    duplicate = _quality_duplicate_result(task_id, event_type, process_key, settings=settings)
     if duplicate:
         return duplicate
 
-    _mark_quality_processing(task_id, event_type, process_key)
+    _mark_quality_processing(task_id, event_type, process_key, settings=settings)
     try:
         if specialist is not None:
+            actor_user_id = settings.quality_control_actor_user_id
             agent_result = await specialist.handle(
                 AgentTask(
                     task_id=f"qc_{task_id}",
@@ -149,12 +149,13 @@ async def _handle_quality_control_webhook_task(
                         f"Контроль качества: задача #{task_id} в статусе «ждёт контроля» (STATUS=4). "
                         "Проверь результат задачи и выполни необходимые действия согласно инструкции."
                     ),
-                    user=UserContext(id=str(responsible_id) if responsible_id else ""),
+                    user=UserContext(id=str(actor_user_id) if actor_user_id else ""),
                     context={
                         "event_type": event_type,
                         "webhook_task_id": task_id,
                         "task_detail": task_detail,
                         "task_results": _extract_results(raw_results),
+                        "task_responsible_id": responsible_id,
                         "event": "quality_control_webhook",
                         "quality_control_dry_run": settings.quality_control_dry_run,
                     },
@@ -165,14 +166,18 @@ async def _handle_quality_control_webhook_task(
             logger.warning("quality_control: no specialist provided for task %s, skipping", task_id)
             actions = []
     except Exception:
-        _mark_quality_failed(task_id, event_type, process_key)
+        _mark_quality_failed(task_id, event_type, process_key, settings=settings)
         raise
 
-    return _mark_quality_done(task_id, event_type=event_type, process_key=process_key, actions=actions)
+    return _mark_quality_done(
+        task_id, event_type=event_type, process_key=process_key, actions=actions, settings=settings
+    )
 
 
-def _quality_duplicate_result(task_id: int, event_type: str, process_key: str) -> dict[str, Any] | None:
-    state = _load_state(get_settings().quality_control_state_path)
+def _quality_duplicate_result(
+    task_id: int, event_type: str, process_key: str, *, settings: Settings
+) -> dict[str, Any] | None:
+    state = _load_state(settings.quality_control_state_path)
     ledger = _webhook_quality_ledger(state)
     existing = ledger.get(process_key)
     if isinstance(existing, dict) and existing.get("status") == "done":
@@ -187,8 +192,7 @@ def _quality_duplicate_result(task_id: int, event_type: str, process_key: str) -
     return None
 
 
-def _mark_quality_processing(task_id: int, event_type: str, process_key: str) -> None:
-    settings = get_settings()
+def _mark_quality_processing(task_id: int, event_type: str, process_key: str, *, settings: Settings) -> None:
     state = _load_state(settings.quality_control_state_path)
     ledger = _webhook_quality_ledger(state)
     ledger[process_key] = {
@@ -201,8 +205,7 @@ def _mark_quality_processing(task_id: int, event_type: str, process_key: str) ->
     _save_state(settings.quality_control_state_path, state)
 
 
-def _mark_quality_failed(task_id: int, event_type: str, process_key: str) -> None:
-    settings = get_settings()
+def _mark_quality_failed(task_id: int, event_type: str, process_key: str, *, settings: Settings) -> None:
     state = _load_state(settings.quality_control_state_path)
     ledger = _webhook_quality_ledger(state)
     ledger[process_key] = {
@@ -220,8 +223,8 @@ def _mark_quality_done(
     event_type: str,
     process_key: str,
     actions: list[str] | None = None,
+    settings: Settings,
 ) -> dict[str, Any]:
-    settings = get_settings()
     state = _load_state(settings.quality_control_state_path)
     ledger = _webhook_quality_ledger(state)
     ledger[process_key] = {
@@ -259,7 +262,7 @@ def _extract_task_detail(result: object) -> dict[str, Any]:
     return {}
 
 
-async def _fetch_task_detail(bitrix: BitrixClient, task_id: int) -> dict[str, Any]:
+async def _fetch_task_detail(bitrix: BitrixTaskPort, task_id: int) -> dict[str, Any]:
     try:
         raw_detail = await bitrix.get_task(
             task_id,

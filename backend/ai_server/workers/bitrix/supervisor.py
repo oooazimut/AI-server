@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ai_server.integrations.bitrix.ports import BitrixSupervisorPort
-from ai_server.settings import get_settings
+from ai_server.settings import Settings
 from ai_server.utils import MOSCOW_TZ, optional_int
 
 logger = logging.getLogger(__name__)
@@ -61,8 +61,8 @@ async def run_task_supervisor(
     bitrix: BitrixSupervisorPort,
     *,
     status: dict[str, Any],
+    settings: Settings,
 ) -> None:
-    settings = get_settings()
     status.update(
         {
             "enabled": settings.supervisor_enabled,
@@ -82,12 +82,12 @@ async def run_task_supervisor(
 
     while True:
         try:
-            result = await run_task_supervisor_once(bitrix, status=status)
+            result = await run_task_supervisor_once(bitrix, status=status, settings=settings)
             status["last_success_at"] = _now().isoformat()
             status["last_error"] = None
             status["runs"] = int(status.get("runs") or 0) + 1
             status["last_result"] = asdict(result)
-            await _sleep_until_next(status, get_settings().supervisor_interval_seconds)
+            await _sleep_until_next(status, settings.supervisor_interval_seconds)
         except asyncio.CancelledError:
             status["running"] = False
             raise
@@ -95,16 +95,17 @@ async def run_task_supervisor(
             logger.exception("Task supervisor tick failed")
             status["last_error"] = f"{type(exc).__name__}: {exc}"
             status["errors"] = int(status.get("errors") or 0) + 1
-            await _sleep_until_next(status, min(get_settings().supervisor_interval_seconds, 300))
+            await _sleep_until_next(status, min(settings.supervisor_interval_seconds, 300))
 
 
 async def run_task_supervisor_once(
     bitrix: BitrixSupervisorPort,
     *,
     status: dict[str, Any] | None = None,
+    settings: Settings,
 ) -> SupervisorRunResult:
-    report = await build_overdue_report(bitrix, limit=get_settings().supervisor_max_tasks)
-    notifications = await send_overdue_notifications(bitrix, report)
+    report = await build_overdue_report(bitrix, limit=settings.supervisor_max_tasks)
+    notifications = await send_overdue_notifications(bitrix, report, settings=settings)
     result = SupervisorRunResult(
         checked_at=report.checked_at.isoformat(),
         overdue_tasks_seen=len(report.tasks),
@@ -140,6 +141,7 @@ async def build_overdue_report(bitrix: BitrixSupervisorPort, *, limit: int = 50)
 def format_overdue_report(
     report: OverdueReport,
     *,
+    settings: Settings,
     task_url_builder: Callable[[object], str] | None = None,
     max_users: int = 20,
     max_tasks_per_user: int | None = None,
@@ -147,7 +149,6 @@ def format_overdue_report(
     if not report.tasks:
         return "Просроченных активных задач не нашёл."
 
-    settings = get_settings()
     grouped_items = sorted(
         report.grouped_tasks.items(),
         key=lambda item: (-len(item[1]), _user_label(item[0], report.user_names)),
@@ -181,21 +182,25 @@ def format_overdue_report(
 async def send_overdue_notifications(
     bitrix: BitrixSupervisorPort,
     report: OverdueReport,
+    *,
+    settings: Settings,
 ) -> list[SupervisorNotification]:
-    settings = get_settings()
     state = _load_state(settings.supervisor_state_path)
+    task_url_builder = lambda tid: _task_url(tid, settings=settings)  # noqa: E731
     notifications: list[SupervisorNotification] = []
 
     if settings.resolved_supervisor_admin_user_ids and report.tasks:
         message = "Контроль срока задач: есть незакрытые задачи после дедлайна.\n\n" + format_overdue_report(
             report,
-            task_url_builder=_task_url,
+            settings=settings,
+            task_url_builder=task_url_builder,
         )
         for admin_user_id in settings.resolved_supervisor_admin_user_ids:
             notifications.append(
                 await _send_notification_with_cooldown(
                     bitrix,
                     state,
+                    settings=settings,
                     recipient_id=admin_user_id,
                     state_key=f"admin_digest:{admin_user_id}",
                     message=message,
@@ -214,13 +219,15 @@ async def send_overdue_notifications(
             )
             message = "Напоминание по просроченным задачам.\n\n" + format_overdue_report(
                 single_user_report,
-                task_url_builder=_task_url,
+                settings=settings,
+                task_url_builder=task_url_builder,
                 max_users=1,
             )
             notifications.append(
                 await _send_notification_with_cooldown(
                     bitrix,
                     state,
+                    settings=settings,
                     recipient_id=user_id,
                     state_key=f"responsible:{user_id}",
                     message=message,
@@ -236,12 +243,12 @@ async def _send_notification_with_cooldown(
     bitrix: BitrixSupervisorPort,
     state: dict[str, Any],
     *,
+    settings: Settings,
     recipient_id: int,
     state_key: str,
     message: str,
     task_count: int,
 ) -> SupervisorNotification:
-    settings = get_settings()
     now = _now()
     last_sent_at = _parse_datetime(state.get(state_key))
     cooldown = timedelta(hours=settings.supervisor_reminder_cooldown_hours)
@@ -353,8 +360,8 @@ def _parse_datetime(value: object) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=MOSCOW_TZ)
 
 
-def _task_url(task_id: object) -> str:
-    domain = get_settings().bitrix_domain.strip().removeprefix("https://").removeprefix("http://").rstrip("/")
+def _task_url(task_id: object, *, settings: Settings) -> str:
+    domain = settings.bitrix_domain.strip().removeprefix("https://").removeprefix("http://").rstrip("/")
     if not domain:
         return f"/company/personal/user/0/tasks/task/view/{task_id}/"
     return f"https://{domain}/company/personal/user/0/tasks/task/view/{task_id}/"

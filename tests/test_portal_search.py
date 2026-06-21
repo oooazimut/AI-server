@@ -3,8 +3,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from ai_server.agents.bitrix24 import Bitrix24Specialist
-from ai_server.agents.bitrix_llm import BitrixLLMToolCall
+from ai_server.agents.bitrix24 import Bitrix24Specialist, BitrixLLMToolCall
 from ai_server.integrations.bitrix.portal_search import (
     PortalSearchIndex,
     sync_disk_delta_index,
@@ -15,6 +14,7 @@ from ai_server.main import app
 from ai_server.models import AgentTask
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
+from ai_server.settings import get_settings
 from ai_server.tools.bitrix import BitrixToolset
 from ai_server.workers.bitrix.search_webhook_indexer import (
     prepare_search_webhook_job,
@@ -150,7 +150,7 @@ def test_portal_metadata_sync_indexes_tasks_projects_and_disk(monkeypatch, tmp_p
     index = PortalSearchIndex(tmp_path / "search_index.sqlite")
     bitrix = FakePortalBitrix()
 
-    stats = anyio_run(sync_portal_index(bitrix, index))
+    stats = anyio_run(sync_portal_index(bitrix, index, settings=get_settings()))
 
     assert stats.tasks == 1
     assert stats.projects == 1
@@ -185,6 +185,7 @@ def test_portal_delta_sync_updates_folder_and_deletes_missing_children(tmp_path)
             cursor_id=None,
             folder_limit=10,
             child_limit=10,
+            settings=get_settings(),
         )
     )
 
@@ -208,7 +209,7 @@ def test_portal_content_sync_indexes_downloaded_text(monkeypatch, tmp_path):
         source_updated_at="2026-06-02T10:00:00+03:00",
     )
 
-    stats = anyio_run(sync_portal_content_index(FakePortalBitrix(), index))
+    stats = anyio_run(sync_portal_content_index(FakePortalBitrix(), index, settings=get_settings()))
 
     item = index.get_item(entity_type="disk_file", entity_id=501)
     assert item is not None
@@ -219,12 +220,16 @@ def test_portal_content_sync_indexes_downloaded_text(monkeypatch, tmp_path):
 
 
 def test_search_webhook_indexer_upserts_and_deletes_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("SEARCH_WEBHOOK_INDEXER_ENABLED", "true")
     monkeypatch.setenv("SEARCH_WEBHOOK_CONTENT_ENABLED", "false")
+    settings = get_settings()
     index = PortalSearchIndex(tmp_path / "search_index.sqlite")
     status: dict[str, object] = {}
 
-    job, prepared = prepare_search_webhook_job({"event": "ONDISKFILEUPDATE", "data": {"FIELDS_AFTER": {"ID": "777"}}})
+    job, prepared = prepare_search_webhook_job(
+        {"event": "ONDISKFILEUPDATE", "data": {"FIELDS_AFTER": {"ID": "777"}}}, settings=settings
+    )
 
     assert job is not None
     assert prepared["handled"] is True
@@ -235,13 +240,14 @@ def test_search_webhook_indexer_upserts_and_deletes_file(monkeypatch, tmp_path):
             index,
             job,
             status=status,
+            settings=settings,
         )
     )
 
     assert result["reason"] == "metadata_indexed"
     assert index.get_item(entity_type="disk_file", entity_id=777) is not None
 
-    delete_job, _ = prepare_search_webhook_job({"event": "ONDISKFILEDELETE", "FILE_ID": "777"})
+    delete_job, _ = prepare_search_webhook_job({"event": "ONDISKFILEDELETE", "FILE_ID": "777"}, settings=settings)
     assert delete_job is not None
     delete_result = anyio_run(
         process_search_webhook_job(
@@ -249,6 +255,7 @@ def test_search_webhook_indexer_upserts_and_deletes_file(monkeypatch, tmp_path):
             index,
             delete_job,
             status=status,
+            settings=settings,
         )
     )
 

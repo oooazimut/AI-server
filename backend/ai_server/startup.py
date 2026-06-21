@@ -6,20 +6,24 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from .agent_scheduler import AgentScheduler
-from .agents.logistics import LogisticsSpecialist
-from .agents.logistics_llm import LogisticsLLMService
+from .agents.bitrix24 import BitrixLLMService
+from .agents.logistics import LogisticsLLMService, LogisticsSpecialist
+from .agents.pto import PtoLLMService
 from .channels.bitrix import BitrixWebhookProcessor
 from .integrations.bitrix.client import BitrixClient
 from .integrations.bitrix.oauth import BitrixOAuthService
 from .integrations.bitrix.portal_search import PortalSearchIndex
 from .learning import LearningEventRecorder
+from .orchestrators.internal_llm import InternalLLMRouter
 from .registry import load_agent_manifests
 from .runtime import ensure_runtime_dirs
 from .settings import get_settings
-from .specialists import manifest_by_id
+from .specialists import SpecialistDeps, manifest_by_id
 from .tools.vehicle_usage import VehicleUsageStore, VehicleUsageToolset
+from .workers.bitrix.quality_control_adapter import QualityControlHandlerAdapter
 from .workers.bitrix.reconciler import run_reconciler
 from .workers.bitrix.search_indexer import PortalSearchIndexerWorker
+from .workers.bitrix.search_webhook_adapter import SearchWebhookHandlerAdapter
 from .workers.bitrix.supervisor import run_task_supervisor
 from .workers.bitrix.webhook_event_queue import WebhookEventQueue, run_webhook_event_worker
 from .workers.logistics.staff_sync import run_staff_sync
@@ -35,9 +39,9 @@ async def lifespan(app: FastAPI):
     bitrix_oauth.ensure_schema()
     portal_search = PortalSearchIndex()
     portal_search.ensure_schema()
-    portal_search_indexer = PortalSearchIndexerWorker(bitrix, portal_search)
+    portal_search_indexer = PortalSearchIndexerWorker(bitrix, portal_search, settings=settings)
     learning_recorder = LearningEventRecorder()
-    webhook_event_queue = WebhookEventQueue(settings.webhook_event_queue_path)
+    webhook_event_queue = WebhookEventQueue(settings.webhook_event_queue_path, settings=settings)
     webhook_event_queue.ensure_schema()
 
     app.state.settings = settings
@@ -148,7 +152,40 @@ async def lifespan(app: FastAPI):
     staff_sync_task: asyncio.Task | None = None
     logistics_specialist: LogisticsSpecialist | None = None
 
+    logistics_llm_svc = LogisticsLLMService()
+
     if settings.webhook_event_queue_enabled and settings.webhook_event_worker_enabled:
+        bitrix_llm_svc = BitrixLLMService(settings=settings)
+
+        async def _bitrix_deliver(user_id_str: str, message: str) -> None:
+            uid = int(user_id_str) if user_id_str.lstrip("-").isdigit() else None
+            if uid is not None:
+                await bitrix.notify_user(user_id=uid, message=message, tag="task_proposal")
+            else:
+                await bitrix.send_bot_message(user_id_str, message, bot_id=settings.bitrix_bot_id)
+
+        specialist_deps = SpecialistDeps(
+            settings=settings,
+            scheduler=scheduler,
+            orchestrator_llm=InternalLLMRouter(),
+            bitrix_llm=bitrix_llm_svc,
+            bitrix_deliver_fn=_bitrix_deliver,
+            pto_llm=PtoLLMService(),
+            logistics_llm=logistics_llm_svc,
+        )
+        search_webhook_handler = SearchWebhookHandlerAdapter(
+            bitrix=bitrix,
+            index=portal_search,
+            settings=settings,
+        )
+        quality_control_handler = QualityControlHandlerAdapter(
+            bitrix=bitrix,
+            bitrix_oauth=bitrix_oauth,
+            manifests=manifests,
+            bitrix_llm=bitrix_llm_svc,
+            scheduler=scheduler,
+            settings=settings,
+        )
         processor = BitrixWebhookProcessor(
             settings=settings,
             manifests=manifests,
@@ -159,18 +196,24 @@ async def lifespan(app: FastAPI):
             quality_control_status=app.state.quality_control_webhook_status,
             learning_recorder=learning_recorder,
             scheduler=scheduler,
+            specialist_deps=specialist_deps,
+            search_webhook_handler=search_webhook_handler,
+            quality_control_handler=quality_control_handler,
         )
         webhook_worker_task = asyncio.create_task(
             run_webhook_event_worker(
                 webhook_event_queue,
                 processor.process,
                 status=app.state.webhook_event_queue_status,
+                settings=settings,
             )
         )
     if settings.search_background_indexer_enabled:
         search_indexer_task = asyncio.create_task(portal_search_indexer.run())
     if settings.supervisor_enabled:
-        supervisor_task = asyncio.create_task(run_task_supervisor(bitrix, status=app.state.task_supervisor_status))
+        supervisor_task = asyncio.create_task(
+            run_task_supervisor(bitrix, status=app.state.task_supervisor_status, settings=settings)
+        )
     if settings.reconcile_enabled:
         reconciler_task = asyncio.create_task(
             run_reconciler(
@@ -178,10 +221,11 @@ async def lifespan(app: FastAPI):
                 webhook_event_queue,
                 portal_search_indexer,
                 status=app.state.reconciler_status,
+                settings=settings,
             )
         )
     if settings.vehicle_usage_enabled:
-        vehicle_usage_store = VehicleUsageStore()
+        vehicle_usage_store = VehicleUsageStore(settings.vehicle_usage_db_path)
         vehicle_usage_store.bootstrap_reference_data()
 
         async def _vehicle_deliver(dialog_id: str, message: str) -> None:
@@ -194,7 +238,7 @@ async def lifespan(app: FastAPI):
         if logistics_manifest is not None:
             logistics_specialist = LogisticsSpecialist(
                 logistics_manifest,
-                llm=LogisticsLLMService(),
+                llm=logistics_llm_svc,
                 scheduler=scheduler,
                 deliver_fn=_vehicle_deliver,
                 notify_fn=_vehicle_notify,
@@ -208,7 +252,7 @@ async def lifespan(app: FastAPI):
             logistics_specialist.start()
             app.state.logistics_specialist = logistics_specialist
 
-        staff_sync_task = asyncio.create_task(run_staff_sync(bitrix, vehicle_usage_store))
+        staff_sync_task = asyncio.create_task(run_staff_sync(bitrix, vehicle_usage_store, settings=settings))
 
     try:
         yield

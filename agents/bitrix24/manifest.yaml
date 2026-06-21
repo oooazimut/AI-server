@@ -22,7 +22,6 @@ tools:
   - bitrix_api
   - current_user_profile
   - portal_search
-  - task_closure
 automations:
   - id: bitrix_chat_adapter
     name: Чатовый адаптер Битрикс24
@@ -205,7 +204,6 @@ automations:
     source_project: BitrixAIAgent
     source_modules:
       - app.agent.quality_control
-      - app.agent.task_closure
     entrypoint: backend.ai_server.workers.bitrix.quality_control.handle_quality_control_webhook_event
     status_endpoint: /automations/bitrix_task_quality_control
     enabled_by_default: false
@@ -244,7 +242,6 @@ allowed_actions:
   - add_internal_comment_draft
 approval_required:
   - bitrix_write
-  - close_task
   - send_external_message
   - delete_bitrix_entity
   - document_write

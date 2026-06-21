@@ -2,15 +2,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from ai_server.agent_scheduler import AgentScheduler
 from ai_server.agent_store import AgentStore
 from ai_server.agents.base import BaseSpecialist
-from ai_server.agents.pto_llm import PtoAgentLLM, PtoLLMToolCall, pto_llm_failure_result
+from ai_server.agents.ports import PtoToolsetPort, SchedulerPort
+from ai_server.agents.pto.llm import PtoAgentLLM, PtoLLMService, PtoLLMToolCall, pto_llm_failure_result
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentTask, ToolResult, ToolStatus
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
-from ai_server.tools.document_access import DocumentToolset
 
 
 class PtoSpecialist(BaseSpecialist):
@@ -24,9 +23,9 @@ class PtoSpecialist(BaseSpecialist):
         knowledge_base: MarkdownKnowledgeBase | None = None,
         skill_store: SkillStore | None = None,
         retriever: HybridKnowledgeRetriever | None = None,
-        tools: DocumentToolset | None = None,
+        tools: PtoToolsetPort | None = None,
         llm: PtoAgentLLM | None = None,
-        scheduler: AgentScheduler | None = None,
+        scheduler: SchedulerPort | None = None,
         store: AgentStore | None = None,
     ) -> None:
         super().__init__(
@@ -45,13 +44,15 @@ class PtoSpecialist(BaseSpecialist):
         cls,
         manifest: AgentManifest,
         *,
-        document_tools: DocumentToolset | None = None,
+        document_tools: PtoToolsetPort | None = None,
         pto_retriever: HybridKnowledgeRetriever | None = None,
         pto_llm: PtoAgentLLM | None = None,
-        scheduler: AgentScheduler | None = None,
+        scheduler: SchedulerPort | None = None,
         **_: Any,
     ) -> PtoSpecialist:
-        return cls(manifest, retriever=pto_retriever, tools=document_tools, llm=pto_llm, scheduler=scheduler)
+        return cls(
+            manifest, retriever=pto_retriever, tools=document_tools, llm=pto_llm or PtoLLMService(), scheduler=scheduler
+        )
 
     def tool_definitions(self) -> list[dict]:
         if self.tools is None:
@@ -63,9 +64,16 @@ class PtoSpecialist(BaseSpecialist):
         tool_call: PtoLLMToolCall,
         task: AgentTask,
     ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
-        tools: DocumentToolset | None = task.context.get("_pto_tools") or self.tools
+        tools: PtoToolsetPort | None = task.context.get("_pto_tools") or self.tools
         if tool_call.name == "none":
             return None, None, []
+        if tools is None:
+            result = ToolResult(
+                status=ToolStatus.ERROR,
+                tool=tool_call.name,
+                error="PTO toolset not configured",
+            )
+            return result, ActionRecord(name=tool_call.name, status=result.status, details=result.model_dump()), []
         if tool_call.name == "portal_document_search":
             result = tools.portal_document_search(tool_call.args)
             return (

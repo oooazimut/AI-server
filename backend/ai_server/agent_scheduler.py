@@ -3,23 +3,20 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any
 
 from apscheduler.job import Job
 from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 
+from ai_server.agents.ports import SchedulerPort
 from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)
 
-
-class SchedulerPort(Protocol):
-    def add_job(self, agent_id: str, job_id: str, func: Any, trigger: Any, **kwargs: Any) -> Any: ...
-
-    def remove_jobs_by_prefix(self, agent_id: str, prefix: str) -> int: ...
-
-    def list_jobs(self, agent_id: str) -> list[dict[str, Any]]: ...
+__all__ = ["AgentScheduler", "SchedulerPort", "next_run_times"]
 
 
 class AgentScheduler:
@@ -84,6 +81,27 @@ class AgentScheduler:
         logger.debug("Scheduled job %s next_run=%s", full_id, job.next_run_time)
         return job
 
+    def add_job_at(
+        self,
+        agent_id: str,
+        job_id: str,
+        func: Callable,
+        run_date: datetime,
+        **kwargs: Any,
+    ) -> Job:
+        return self.add_job(agent_id, job_id, func, DateTrigger(run_date=run_date, timezone=MOSCOW_TZ), **kwargs)
+
+    def add_job_cron(
+        self,
+        agent_id: str,
+        job_id: str,
+        func: Callable,
+        hour: int,
+        minute: int,
+        **kwargs: Any,
+    ) -> Job:
+        return self.add_job(agent_id, job_id, func, CronTrigger(hour=hour, minute=minute, timezone=MOSCOW_TZ), **kwargs)
+
     def remove_job(self, agent_id: str, job_id: str) -> bool:
         full_id = _full_id(agent_id, job_id)
         try:
@@ -134,13 +152,22 @@ class AgentScheduler:
         self,
         agent_id: str,
         job_id: str,
-        trigger: Any,
+        trigger_data: dict[str, Any],
         task_description: str,
         context: dict[str, Any] | None = None,
         *,
         replace_existing: bool = True,
     ) -> Job:
-        """Schedule a task_runner call for the given agent at trigger time."""
+        """Schedule a task_runner call for the given agent using a trigger descriptor dict."""
+        trigger_type = str(trigger_data.get("type") or "date").strip()
+        if trigger_type == "cron":
+            kwargs = {k: v for k, v in trigger_data.items() if k != "type"}
+            trigger = CronTrigger(timezone=MOSCOW_TZ, **kwargs)
+        elif trigger_type == "date":
+            trigger = DateTrigger(run_date=trigger_data.get("run_date"), timezone=MOSCOW_TZ)
+        else:
+            raise ValueError(f"Unknown trigger type: {trigger_type!r}")
+
         ctx = context or {}
 
         async def _run() -> None:

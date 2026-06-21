@@ -1,6 +1,29 @@
+from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+
+
+class ToolStatus(StrEnum):
+    OK = "ok"
+    ERROR = "error"
+    NOT_CONFIGURED = "not_configured"
+    CONFIRMATION_REQUIRED = "confirmation_required"
+    INVALID_TOOL_CALL = "invalid_tool_call"
+    NOT_FOUND = "not_found"
+    NOT_AVAILABLE = "not_available"
+    AMBIGUOUS = "ambiguous"
+    DENIED = "denied"
+    CONTRACT_VIOLATION = "contract_violation"
+    READY = "ready"
+    # pending-action passthrough statuses from PendingActionResult → ToolResult
+    EXECUTED = "executed"
+    CANCELLED = "cancelled"
+    NOTHING_TO_CANCEL = "nothing_to_cancel"
+    NOTHING_TO_CONFIRM = "nothing_to_confirm"
+    DRY_RUN = "dry_run"
+    OAUTH_REQUIRED = "oauth_required"
+
 
 AgentKind = Literal["orchestrator", "operator", "specialist"]
 AgentAutomationKind = Literal[
@@ -182,7 +205,7 @@ class ToolCall(BaseModel):
 
 
 class ToolResult(BaseModel):
-    status: str
+    status: ToolStatus
     tool: str
     data: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None

@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from ai_server.integrations.bitrix.client import BitrixApiError, BitrixClient, BitrixConfigError
+from ai_server.agent_store import SqliteStore
+from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
-from ai_server.integrations.bitrix.ports import BitrixUserPort
+from ai_server.integrations.bitrix.ports import BitrixUserPort, BitrixWritePort
 from ai_server.integrations.bitrix.profile import compact_user_profile
 from ai_server.runtime import runtime_paths
-from ai_server.settings import get_settings
+from ai_server.settings import Settings, get_settings
 from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
 from ai_server.utils import optional_int, truthy
 
@@ -58,13 +58,13 @@ class PendingActionResult:
     data: dict[str, Any] = field(default_factory=dict)
 
 
-class DialogStateStore:
+class DialogStateStore(SqliteStore):
     def __init__(self, path: Path | str | None = None) -> None:
         self.path = Path(path) if path is not None else runtime_paths().dialog_state_db
 
     def ensure_schema(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.path) as connection:
+        with self._connection() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS dialog_states (
@@ -78,7 +78,7 @@ class DialogStateStore:
 
     def load_raw(self, key: str) -> dict[str, Any] | None:
         self.ensure_schema()
-        with sqlite3.connect(self.path) as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT state_json FROM dialog_states WHERE dialog_key = ?",
                 (key,),
@@ -86,7 +86,7 @@ class DialogStateStore:
         if not row:
             return None
         try:
-            data = json.loads(str(row[0]))
+            data = json.loads(str(row["state_json"]))
         except json.JSONDecodeError:
             return None
         return data if isinstance(data, dict) else None
@@ -94,7 +94,7 @@ class DialogStateStore:
     def save_raw(self, key: str, state: dict[str, Any]) -> None:
         self.ensure_schema()
         updated_at = datetime.now(UTC).isoformat()
-        with sqlite3.connect(self.path) as connection:
+        with self._connection() as connection:
             connection.execute(
                 """
                 INSERT INTO dialog_states (dialog_key, state_json, updated_at)
@@ -137,11 +137,13 @@ class BitrixPendingActionService:
         self,
         *,
         store: DialogStateStore,
-        bitrix: BitrixClient,
+        bitrix: BitrixWritePort,
         bitrix_oauth: BitrixOAuthService | None = None,
         audit_log_path: Path | str | None = None,
         dry_run: bool = False,
+        settings: Settings | None = None,
     ) -> None:
+        self._settings = settings or get_settings()
         self.store = store
         self.bitrix = bitrix
         self.bitrix_oauth = bitrix_oauth
@@ -255,8 +257,8 @@ class BitrixPendingActionService:
         *,
         action: PendingBitrixAction,
         key: str,
-    ) -> BitrixClient | PendingActionResult:
-        settings = get_settings()
+    ) -> BitrixWritePort | PendingActionResult:
+        settings = self._settings
         if not settings.bitrix_oauth_enabled or self.bitrix_oauth is None or not user_id:
             if settings.bitrix_oauth_required_for_writes:
                 self._audit("oauth_required", key=key, action=action)
