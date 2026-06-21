@@ -4,26 +4,26 @@ import asyncio
 import hashlib
 import json
 import logging
-import sqlite3
 from collections.abc import Awaitable, Callable, Collection
-from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from ai_server.settings import get_settings
+from ai_server.agent_store import AgentStore
+from ai_server.settings import Settings
 from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)
 WebhookProcessor = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
-class WebhookEventQueue:
-    def __init__(self, path: Path) -> None:
-        self.path = path
+class WebhookEventQueue(AgentStore):
+    def __init__(self, path: Path, *, settings: Settings) -> None:
+        super().__init__("webhook_event_queue", path=path)
+        self._settings = settings
 
     def ensure_schema(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        super().ensure_schema()
         with self._connection() as db:
             db.execute(
                 """
@@ -94,7 +94,7 @@ class WebhookEventQueue:
         *,
         blocked_partition_keys: Collection[str] | None = None,
     ) -> dict[str, Any] | None:
-        settings = get_settings()
+        settings = self._settings
         now = _now()
         now_iso = now.isoformat()
         stale_before = (now - timedelta(seconds=settings.webhook_event_queue_stale_processing_seconds)).isoformat()
@@ -184,7 +184,7 @@ class WebhookEventQueue:
             )
 
     def mark_failed(self, event_id: int, error: str) -> None:
-        settings = get_settings()
+        settings = self._settings
         now = _now()
         with self._connection() as db:
             row = db.execute("SELECT attempts FROM webhook_events WHERE id = ?", (event_id,)).fetchone()
@@ -253,24 +253,14 @@ class WebhookEventQueue:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    @contextmanager
-    def _connection(self) -> Any:
-        connection = sqlite3.connect(self.path)
-        connection.row_factory = sqlite3.Row
-        try:
-            with connection:
-                yield connection
-        finally:
-            connection.close()
-
 
 async def run_webhook_event_worker(
     queue: WebhookEventQueue,
     processor: WebhookProcessor,
     *,
     status: dict[str, Any],
+    settings: Settings,
 ) -> None:
-    settings = get_settings()
     worker_count = settings.webhook_event_queue_worker_count
     active_partition_keys: set[str] = set()
     active_lock = asyncio.Lock()
@@ -299,6 +289,7 @@ async def run_webhook_event_worker(
                 status=status,
                 active_partition_keys=active_partition_keys,
                 active_lock=active_lock,
+                settings=settings,
             )
         )
         for index in range(worker_count)
@@ -321,12 +312,12 @@ async def _run_webhook_event_worker_loop(
     status: dict[str, Any],
     active_partition_keys: set[str],
     active_lock: asyncio.Lock,
+    settings: Settings,
 ) -> None:
     while True:
         event_id: int | None = None
         partition_key = ""
         try:
-            settings = get_settings()
             status["last_check_at"] = _now().isoformat()
             async with active_lock:
                 event = queue.claim_next(blocked_partition_keys=active_partition_keys)
@@ -355,7 +346,7 @@ async def _run_webhook_event_worker_loop(
                 queue.mark_failed(event_id, f"{type(exc).__name__}: {exc}")
             status["last_error"] = f"{type(exc).__name__}: {exc}"
             status["errors"] = int(status.get("errors") or 0) + 1
-            await asyncio.sleep(get_settings().webhook_event_queue_interval_seconds)
+            await asyncio.sleep(settings.webhook_event_queue_interval_seconds)
         finally:
             if partition_key:
                 async with active_lock:

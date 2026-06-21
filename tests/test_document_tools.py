@@ -1,20 +1,21 @@
 import json
 from pathlib import Path
 
-from ai_server.agents.pto import PtoSpecialist
-from ai_server.agents.pto_llm import PtoLLMToolCall
+from ai_server.agents.pto import PtoLLMToolCall, PtoSpecialist
 from ai_server.integrations.bitrix.portal_search import PortalSearchIndex
 from ai_server.models import AgentTask
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
+from ai_server.settings import get_settings
 from ai_server.tools.document_access import DocumentToolset
 from tests.fakes import FakeEmbeddingProvider, FakePtoLLM
 
 
 def test_document_toolset_compares_spreadsheets(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     index = _document_index(tmp_path / "search_index.sqlite")
-    toolset = DocumentToolset(client=FakeDocumentBitrix(), portal_search=index, user_id=9)
+    toolset = DocumentToolset(client=FakeDocumentBitrix(), portal_search=index, user_id=9, settings=get_settings())
 
     preview = anyio_run(toolset.spreadsheet_preview({"query": "смета январь"}))
     assert preview.status == "ok"
@@ -46,9 +47,10 @@ def test_document_toolset_compares_spreadsheets(monkeypatch, tmp_path):
 
 
 def test_spreadsheet_compare_requires_llm_selected_schema(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     index = _document_index(tmp_path / "search_index.sqlite")
-    toolset = DocumentToolset(client=FakeDocumentBitrix(), portal_search=index, user_id=9)
+    toolset = DocumentToolset(client=FakeDocumentBitrix(), portal_search=index, user_id=9, settings=get_settings())
 
     result = anyio_run(
         toolset.spreadsheet_compare(
@@ -65,9 +67,13 @@ def test_spreadsheet_compare_requires_llm_selected_schema(monkeypatch, tmp_path)
 
 
 def test_document_toolset_creates_local_draft(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     toolset = DocumentToolset(
-        client=FakeDocumentBitrix(), portal_search=_document_index(tmp_path / "search_index.sqlite"), user_id=9
+        client=FakeDocumentBitrix(),
+        portal_search=_document_index(tmp_path / "search_index.sqlite"),
+        user_id=9,
+        settings=get_settings(),
     )
 
     result = toolset.document_draft_create(
@@ -87,6 +93,7 @@ def test_document_toolset_creates_local_draft(monkeypatch, tmp_path):
 
 
 def test_pto_specialist_uses_spreadsheet_compare_tool(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     manifest = get_agent_manifest("pto")
     assert manifest is not None
@@ -117,7 +124,7 @@ def test_pto_specialist_uses_spreadsheet_compare_tool(monkeypatch, tmp_path):
     specialist = PtoSpecialist(
         manifest,
         retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
-        tools=DocumentToolset(client=FakeDocumentBitrix(), portal_search=index, user_id=9),
+        tools=DocumentToolset(client=FakeDocumentBitrix(), portal_search=index, user_id=9, settings=get_settings()),
         llm=fake_llm,
     )
 
@@ -133,6 +140,7 @@ def test_pto_specialist_uses_spreadsheet_compare_tool(monkeypatch, tmp_path):
 
 
 def test_pto_specialist_creates_document_draft(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     manifest = get_agent_manifest("pto")
     assert manifest is not None
@@ -140,7 +148,10 @@ def test_pto_specialist_creates_document_draft(monkeypatch, tmp_path):
         manifest,
         retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
         tools=DocumentToolset(
-            client=FakeDocumentBitrix(), portal_search=_document_index(tmp_path / "search_index.sqlite"), user_id=9
+            client=FakeDocumentBitrix(),
+            portal_search=_document_index(tmp_path / "search_index.sqlite"),
+            user_id=9,
+            settings=get_settings(),
         ),
         llm=FakePtoLLM(
             tool_call_steps=[

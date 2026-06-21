@@ -4,6 +4,7 @@ import asyncio
 
 from ai_server.models import ActionRecord, AgentResult, AgentTask
 from ai_server.result_templates import active_result_templates_context
+from ai_server.settings import get_settings
 from ai_server.workers.bitrix.quality_control import handle_quality_control_webhook_event
 
 
@@ -83,6 +84,7 @@ def test_quality_control_calls_specialist_for_status4_task(monkeypatch, tmp_path
             payload=_task_update_payload(101),
             status={},
             specialist=specialist,
+            settings=get_settings(),
         )
     )
 
@@ -111,6 +113,7 @@ def test_quality_control_skips_non_status4_task(monkeypatch, tmp_path):
             payload=_task_update_payload(202),
             status={},
             specialist=specialist,
+            settings=get_settings(),
         )
     )
 
@@ -133,6 +136,7 @@ def test_quality_control_disabled_skips(monkeypatch, tmp_path):
             payload=_task_update_payload(303),
             status={},
             specialist=specialist,
+            settings=get_settings(),
         )
     )
 
@@ -149,6 +153,7 @@ def test_quality_control_deduplication(monkeypatch, tmp_path):
 
     bitrix = FakeQualityBitrix(status="4")
     specialist = FakeSpecialist()
+    settings = get_settings()
 
     first = asyncio.run(
         handle_quality_control_webhook_event(
@@ -156,6 +161,7 @@ def test_quality_control_deduplication(monkeypatch, tmp_path):
             payload=_task_update_payload(404),
             status={},
             specialist=specialist,
+            settings=settings,
         )
     )
     assert first["handled"] is True
@@ -166,6 +172,7 @@ def test_quality_control_deduplication(monkeypatch, tmp_path):
             payload=_task_update_payload(404),
             status={},
             specialist=specialist,
+            settings=settings,
         )
     )
     assert duplicate["handled"] is False
@@ -187,6 +194,7 @@ def test_quality_control_no_specialist_marks_done_with_empty_actions(monkeypatch
             payload=_task_update_payload(505),
             status={},
             specialist=None,
+            settings=get_settings(),
         )
     )
 

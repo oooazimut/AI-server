@@ -9,7 +9,6 @@ from typing import Any
 
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.portal_search import (
-    MOSCOW_TZ,
     PortalContentSyncStats,
     PortalDeltaSyncStats,
     PortalSearchIndex,
@@ -21,7 +20,8 @@ from ai_server.integrations.bitrix.portal_search import (
     sync_portal_content_index,
     sync_portal_index,
 )
-from ai_server.settings import get_settings
+from ai_server.settings import Settings
+from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)
 
@@ -61,10 +61,10 @@ PERSISTED_STATUS_KEYS = {
 
 
 class PortalSearchIndexerWorker:
-    def __init__(self, bitrix: BitrixClient, index: PortalSearchIndex) -> None:
-        settings = get_settings()
+    def __init__(self, bitrix: BitrixClient, index: PortalSearchIndex, *, settings: Settings) -> None:
         self.bitrix = bitrix
         self.index = index
+        self._settings = settings
         self._lock = asyncio.Lock()
         self._owns_lock = False
         self.status: dict[str, Any] = {
@@ -116,29 +116,27 @@ class PortalSearchIndexerWorker:
         self._load_state()
 
     def public_status(self) -> dict[str, Any]:
-        settings = get_settings()
         return {
             **self.status,
-            "enabled": settings.search_background_indexer_enabled,
-            "lock_path": str(settings.search_background_lock_path),
-            "state_path": str(settings.search_background_state_path),
-            "index_path": str(settings.search_index_path),
+            "enabled": self._settings.search_background_indexer_enabled,
+            "lock_path": str(self._settings.search_background_lock_path),
+            "state_path": str(self._settings.search_background_state_path),
+            "index_path": str(self._settings.search_index_path),
         }
 
     async def run(self) -> None:
         self.status["running"] = True
-        settings = get_settings()
-        initial_delay = timedelta(seconds=settings.search_background_initial_delay_seconds)
+        initial_delay = timedelta(seconds=self._settings.search_background_initial_delay_seconds)
         now = _now()
         next_metadata_at = self._next_run_at(
             "last_metadata_sync_at",
-            settings.search_background_metadata_interval_seconds,
+            self._settings.search_background_metadata_interval_seconds,
             initial_delay=initial_delay,
             now=now,
         )
         next_content_at = self._next_run_at(
             "last_content_sync_at",
-            settings.search_background_content_interval_seconds,
+            self._settings.search_background_content_interval_seconds,
             initial_delay=initial_delay,
             now=now,
         )
@@ -147,9 +145,8 @@ class PortalSearchIndexerWorker:
 
         try:
             while self.status["running"]:
-                settings = get_settings()
-                self.status["enabled"] = settings.search_background_indexer_enabled
-                if not settings.search_background_indexer_enabled:
+                self.status["enabled"] = self._settings.search_background_indexer_enabled
+                if not self._settings.search_background_indexer_enabled:
                     await asyncio.sleep(30)
                     continue
 
@@ -165,21 +162,25 @@ class PortalSearchIndexerWorker:
                 if now >= next_metadata_at:
                     await self.run_metadata_once()
                     self._heartbeat_lock()
-                    next_metadata_at = _now() + timedelta(seconds=settings.search_background_metadata_interval_seconds)
+                    next_metadata_at = _now() + timedelta(
+                        seconds=self._settings.search_background_metadata_interval_seconds
+                    )
                     self.status["next_metadata_sync_at"] = _format_time(next_metadata_at)
 
                 now = _now()
-                if settings.search_content_enabled and now >= next_content_at:
+                if self._settings.search_content_enabled and now >= next_content_at:
                     await self.run_content_once()
                     self._heartbeat_lock()
-                    next_content_at = _now() + timedelta(seconds=settings.search_background_content_interval_seconds)
+                    next_content_at = _now() + timedelta(
+                        seconds=self._settings.search_background_content_interval_seconds
+                    )
                     self.status["next_content_sync_at"] = _format_time(next_content_at)
 
                 now = _now()
-                if settings.search_delta_indexer_enabled and now >= next_delta_at:
+                if self._settings.search_delta_indexer_enabled and now >= next_delta_at:
                     await self.run_delta_once()
                     self._heartbeat_lock()
-                    next_delta_at = _now() + timedelta(seconds=settings.search_delta_interval_seconds)
+                    next_delta_at = _now() + timedelta(seconds=self._settings.search_delta_interval_seconds)
                     self.status["next_delta_sync_at"] = _format_time(next_delta_at)
 
                 sleep_candidates = [
@@ -187,7 +188,7 @@ class PortalSearchIndexerWorker:
                     max((next_content_at - _now()).total_seconds(), 1),
                     30,
                 ]
-                if settings.search_delta_indexer_enabled:
+                if self._settings.search_delta_indexer_enabled:
                     sleep_candidates.append(max((next_delta_at - _now()).total_seconds(), 1))
                 await asyncio.sleep(min(sleep_candidates))
         except asyncio.CancelledError:
@@ -215,6 +216,7 @@ class PortalSearchIndexerWorker:
                     self.bitrix,
                     self.index,
                     include_content=include_content,
+                    settings=self._settings,
                 )
                 self.status["metadata_runs"] += 1
                 self.status["last_metadata_sync_at"] = _format_time(_now())
@@ -256,6 +258,7 @@ class PortalSearchIndexerWorker:
                     self.bitrix,
                     self.index,
                     extensions=extensions,
+                    settings=self._settings,
                 )
                 self._save_content_status(stats)
                 self.status["last_content_duration_seconds"] = round(
@@ -276,7 +279,6 @@ class PortalSearchIndexerWorker:
 
     async def run_delta_once(self) -> PortalDeltaSyncStats:
         async with self._lock:
-            settings = get_settings()
             acquired_for_call = self._ensure_lock_for_operation()
             self.status["delta_running"] = True
             started_at = _now()
@@ -289,8 +291,9 @@ class PortalSearchIndexerWorker:
                     self.index,
                     cursor_type=self.status.get("delta_folder_cursor_type"),
                     cursor_id=self.status.get("delta_folder_cursor_id"),
-                    folder_limit=settings.search_delta_folders_per_run,
-                    child_limit=settings.search_delta_max_children_per_folder,
+                    folder_limit=self._settings.search_delta_folders_per_run,
+                    child_limit=self._settings.search_delta_max_children_per_folder,
+                    settings=self._settings,
                 )
                 self._save_delta_status(stats)
                 self.status["last_delta_duration_seconds"] = round(
@@ -314,7 +317,7 @@ class PortalSearchIndexerWorker:
         self.status["last_content_sync_at"] = _format_time(_now())
         self.status["last_content_summary"] = format_portal_content_sync_stats(stats)
         self.status["last_content_pending_after"] = self.index.content_readiness(
-            allowed_extensions=get_settings().resolved_search_content_allowed_extensions,
+            allowed_extensions=self._settings.resolved_search_content_allowed_extensions,
         ).pending
         self._save_state()
 
@@ -380,7 +383,7 @@ class PortalSearchIndexerWorker:
         raise RuntimeError(f"Portal search indexer is locked by another process: {owner}")
 
     def _acquire_lock(self) -> bool:
-        path = get_settings().search_background_lock_path
+        path = self._settings.search_background_lock_path
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = self._lock_payload()
         flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
@@ -410,7 +413,7 @@ class PortalSearchIndexerWorker:
             return
         payload = self._lock_payload()
         try:
-            get_settings().search_background_lock_path.write_text(
+            self._settings.search_background_lock_path.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
@@ -422,7 +425,7 @@ class PortalSearchIndexerWorker:
     def _release_lock(self) -> None:
         if not self._owns_lock:
             return
-        path = get_settings().search_background_lock_path
+        path = self._settings.search_background_lock_path
         existing = self._read_lock()
         if existing and int(existing.get("pid") or -1) != os.getpid():
             self._owns_lock = False
@@ -438,7 +441,7 @@ class PortalSearchIndexerWorker:
         self._set_lock_status(acquired=False, owner=None)
 
     def _read_lock(self) -> dict[str, Any] | None:
-        path = get_settings().search_background_lock_path
+        path = self._settings.search_background_lock_path
         if not path.exists():
             return None
         try:
@@ -457,30 +460,29 @@ class PortalSearchIndexerWorker:
         except ValueError:
             return True
         age = (_now() - heartbeat_at.astimezone(MOSCOW_TZ)).total_seconds()
-        return age > get_settings().search_background_lock_stale_seconds
+        return age > self._settings.search_background_lock_stale_seconds
 
     def _lock_payload(self) -> dict[str, Any]:
-        settings = get_settings()
         now = _format_time(_now())
         existing = self._read_lock() if self._owns_lock else {}
         return {
             "pid": os.getpid(),
             "started_at": existing.get("started_at") if existing else now,
             "heartbeat_at": now,
-            "state_path": str(settings.search_background_state_path),
-            "index_path": str(settings.search_index_path),
+            "state_path": str(self._settings.search_background_state_path),
+            "index_path": str(self._settings.search_index_path),
         }
 
     def _set_lock_status(self, *, acquired: bool, owner: dict[str, Any] | None) -> None:
         self.status["lock_acquired"] = acquired
         self.status["lock_owner"] = owner
         self.status["lock_last_heartbeat_at"] = str(owner.get("heartbeat_at") or "") if owner else None
-        self.status["lock_path"] = str(get_settings().search_background_lock_path)
+        self.status["lock_path"] = str(self._settings.search_background_lock_path)
         if acquired:
             self.status["lock_retry_at"] = None
 
     def _load_state(self) -> None:
-        path = get_settings().search_background_state_path
+        path = self._settings.search_background_state_path
         if not path.exists():
             return
         try:
@@ -495,7 +497,7 @@ class PortalSearchIndexerWorker:
                 self.status[key] = data[key]
 
     def _save_state(self) -> None:
-        path = get_settings().search_background_state_path
+        path = self._settings.search_background_state_path
         path.parent.mkdir(parents=True, exist_ok=True)
         data = {key: self.status.get(key) for key in PERSISTED_STATUS_KEYS}
         try:

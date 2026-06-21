@@ -126,7 +126,7 @@ class YandexSpeechKitTranscriber:
             params["folderId"] = settings.yandex_folder_id
 
         try:
-            headers = yandex_auth_header()
+            headers = yandex_auth_header(self._settings)
         except YandexAuthError as exc:
             raise TranscriptionNotConfigured(str(exc)) from exc
 

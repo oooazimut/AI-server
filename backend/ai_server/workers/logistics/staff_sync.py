@@ -5,18 +5,16 @@ import logging
 from datetime import datetime, timedelta
 
 from ai_server.integrations.bitrix.client import BitrixClient
-from ai_server.settings import get_settings
+from ai_server.settings import Settings
 from ai_server.tools.vehicle_usage import VehicleUsageStore, fetch_staff_roster
 from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)
 
 
-async def run_staff_sync(bitrix: BitrixClient, store: VehicleUsageStore) -> None:
+async def run_staff_sync(bitrix: BitrixClient, store: VehicleUsageStore, *, settings: Settings) -> None:
     while True:
-        await _sleep_until_midnight_moscow()
         try:
-            settings = get_settings()
             roster = await fetch_staff_roster(
                 bitrix, exclude_user_ids=settings.resolved_vehicle_usage_excluded_user_ids
             )
@@ -24,6 +22,7 @@ async def run_staff_sync(bitrix: BitrixClient, store: VehicleUsageStore) -> None
             logger.info("staff_sync: upserted %d employees", len(roster))
         except Exception:
             logger.exception("staff_sync: failed to sync employees from Bitrix")
+        await _sleep_until_midnight_moscow()
 
 
 async def _sleep_until_midnight_moscow() -> None:

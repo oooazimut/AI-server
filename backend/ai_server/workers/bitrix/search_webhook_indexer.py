@@ -14,7 +14,7 @@ from ai_server.integrations.bitrix.portal_search import (
     sync_disk_file_item,
     sync_portal_content_item,
 )
-from ai_server.settings import get_settings
+from ai_server.settings import Settings
 from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)
@@ -31,9 +31,11 @@ class SearchWebhookJob:
     file_id: int
 
 
-def prepare_search_webhook_job(payload: dict[str, Any]) -> tuple[SearchWebhookJob | None, dict[str, Any]]:
+def prepare_search_webhook_job(
+    payload: dict[str, Any], *, settings: Settings
+) -> tuple[SearchWebhookJob | None, dict[str, Any]]:
     event = _payload_event_type(payload)
-    if not get_settings().search_webhook_indexer_enabled:
+    if not settings.search_webhook_indexer_enabled:
         return None, {"handled": False, "reason": "disabled", "event": event}
     if not _is_disk_file_event(event):
         return None, {"handled": False, "reason": "unsupported_event", "event": event}
@@ -61,13 +63,14 @@ async def process_search_webhook_job(
     job: SearchWebhookJob,
     *,
     status: dict[str, Any],
+    settings: Settings,
 ) -> dict[str, Any]:
-    _record_seen(status, job)
+    _record_seen(status, job, settings=settings)
     try:
         if job.action == "delete":
-            result = await _delete_indexed_file(index, job)
+            result = await _delete_indexed_file(index, job, settings=settings)
         else:
-            result = await _upsert_indexed_file(bitrix, index, job)
+            result = await _upsert_indexed_file(bitrix, index, job, settings=settings)
         status["last_reason"] = result.get("reason")
         status["last_result"] = result
         status["processed"] = int(status.get("processed") or 0) + 1
@@ -87,10 +90,12 @@ async def process_search_webhook_job(
         }
 
 
-async def _delete_indexed_file(index: PortalSearchIndex, job: SearchWebhookJob) -> dict[str, Any]:
+async def _delete_indexed_file(
+    index: PortalSearchIndex, job: SearchWebhookJob, *, settings: Settings
+) -> dict[str, Any]:
     existing = index.get_item(entity_type="disk_file", entity_id=job.file_id)
     if existing:
-        delete_portal_file_cache_path(portal_file_cache_path(existing))
+        delete_portal_file_cache_path(portal_file_cache_path(existing, settings), settings)
     deleted = index.delete_item(entity_type="disk_file", entity_id=job.file_id)
     return {
         "handled": True,
@@ -106,12 +111,15 @@ async def _upsert_indexed_file(
     bitrix: BitrixClient,
     index: PortalSearchIndex,
     job: SearchWebhookJob,
+    *,
+    settings: Settings,
 ) -> dict[str, Any]:
     item = await sync_disk_file_item(
         bitrix,
         index,
         file_id=job.file_id,
         preserve_content=True,
+        settings=settings,
     )
     if not item:
         return {
@@ -130,7 +138,6 @@ async def _upsert_indexed_file(
         "file_id": job.file_id,
         "title": item.title,
     }
-    settings = get_settings()
     if not settings.search_webhook_content_enabled:
         result["content"] = {"handled": False, "reason": "disabled"}
         return result
@@ -144,7 +151,7 @@ async def _upsert_indexed_file(
         }
         return result
 
-    stats = await sync_portal_content_item(bitrix, index, item, extensions={extension})
+    stats = await sync_portal_content_item(bitrix, index, item, extensions={extension}, settings=settings)
     result["content"] = {
         "handled": True,
         "summary": format_portal_content_sync_stats(stats),
@@ -158,8 +165,8 @@ async def _upsert_indexed_file(
     return result
 
 
-def _record_seen(status: dict[str, Any], job: SearchWebhookJob) -> None:
-    status["enabled"] = get_settings().search_webhook_indexer_enabled
+def _record_seen(status: dict[str, Any], job: SearchWebhookJob, *, settings: Settings) -> None:
+    status["enabled"] = settings.search_webhook_indexer_enabled
     status["last_received_at"] = datetime.now(MOSCOW_TZ).isoformat()
     status["last_event"] = job.event
     status["last_file_id"] = job.file_id

@@ -18,7 +18,7 @@ from ai_server.agents.specialist_llm_shared import (
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
 from ai_server.retrieval import RetrievalHit
-from ai_server.settings import Settings, get_settings
+from ai_server.settings import Settings
 from ai_server.utils import confidence, optional_int
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,7 @@ ALLOWED_TOOL_NAMES = {
     "task_create_draft",
     "save_incomplete_proposal",
     "delete_incomplete_proposal",
+    "save_responsible_response",
     "portal_search",
     "none",
 }
@@ -90,9 +91,9 @@ class BitrixLLMFinalResult:
 
 
 class BitrixLLMService:
-    def __init__(self, client: LLMClient | None = None, settings: Settings | None = None) -> None:
+    def __init__(self, client: LLMClient | None = None, *, settings: Settings) -> None:
         self.client = client or OpenAICompatibleLLMClient()
-        self.settings = settings or get_settings()
+        self.settings = settings
 
     async def decide(
         self,
@@ -215,7 +216,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
-        '"tool_calls":[{"name":"current_user_profile|bitrix_api|task_create_draft|save_incomplete_proposal|delete_incomplete_proposal|portal_search|none","args":{},"summary":""}]}. '
+        '"tool_calls":[{"name":"current_user_profile|bitrix_api|task_create_draft|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
         "Перед каждым tool_call сам проверь, хватает ли данных для его корректного вызова. "
         "Нельзя вызывать tool с надеждой, что backend или tool сам разберётся с недостающими данными. "
         'Если данных не хватает, не вызывай tool: верни status=needs_clarification, tool_calls=[{"name":"none"}], '
