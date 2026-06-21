@@ -6,19 +6,19 @@ import re
 from collections import Counter
 from dataclasses import dataclass as _dataclass
 
-from ai_server.agents.bitrix_llm import (
+from ai_server.agents.bitrix24 import (
     BitrixLLMDecision,
     BitrixLLMDecisionResult,
     BitrixLLMFinalResult,
     BitrixLLMToolCall,
 )
-from ai_server.agents.logistics_llm import (
+from ai_server.agents.logistics import (
     LogisticsLLMDecision,
     LogisticsLLMDecisionResult,
     LogisticsLLMFinalResult,
     LogisticsLLMToolCall,
 )
-from ai_server.agents.pto_llm import (
+from ai_server.agents.pto import (
     PtoLLMDecision,
     PtoLLMDecisionResult,
     PtoLLMFinalResult,

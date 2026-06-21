@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from ai_server.models import AgentManifest, AgentResult, AgentTask
@@ -8,6 +9,40 @@ from ai_server.models import AgentManifest, AgentResult, AgentTask
 
 class Specialist(Protocol):
     async def handle(self, task: AgentTask) -> AgentResult: ...
+
+
+@dataclass
+class SpecialistDeps:
+    """Collected dependencies for specialist construction.
+
+    To add specialist N: add its deps as a field here and populate in startup.py.
+    build_specialist_registry, _build_orchestrator, and BitrixWebhookProcessor need no changes.
+    """
+
+    settings: Any  # Settings — typed as Any to avoid a circular import at module level
+    scheduler: Any = None  # SchedulerPort | None
+    orchestrator_llm: Any = None
+    # bitrix24
+    bitrix_llm: Any = None
+    bitrix_retriever: Any = None
+    bitrix_store: Any = None
+    bitrix_deliver_fn: Any = None
+    bitrix_tools: Any = None  # BitrixToolsetPort | None
+    # pto
+    document_tools: Any = None  # DocumentToolset | None
+    pto_llm: Any = None
+    # logistics
+    vehicle_usage_tools: Any = None  # VehicleUsageToolsetPort | None
+    logistics_llm: Any = None
+
+    def as_registry_kwargs(self) -> dict[str, Any]:
+        """Returns kwargs for build_specialist_registry.
+
+        Excludes orchestrator_llm (passed directly to InternalOrchestrator)
+        and None values (let each specialist's build() apply its own defaults).
+        """
+        excluded = {"orchestrator_llm"}
+        return {k: v for k, v in vars(self).items() if k not in excluded and v is not None}
 
 
 def build_specialist_registry(

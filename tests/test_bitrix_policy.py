@@ -1,6 +1,6 @@
 import pytest
 
-from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
+from ai_server.integrations.bitrix.bitrix_policy import decide_bitrix_method_policy
 
 
 def test_empty_method_denied():

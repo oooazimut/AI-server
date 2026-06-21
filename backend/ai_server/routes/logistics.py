@@ -11,7 +11,7 @@ router = APIRouter()
 def logistics_vehicle_usage_status(request: Request) -> dict[str, Any]:
     from ..tools.vehicle_usage import VehicleUsageStore
 
-    store = VehicleUsageStore()
+    store = VehicleUsageStore(request.app.state.settings.vehicle_usage_db_path)
     return {
         "status": dict(request.app.state.vehicle_usage_status),
         "latest_requests": store.latest_requests(limit=10),

@@ -18,8 +18,6 @@ from ..integrations.bitrix.portal_search import (
     format_portal_search_results,
     format_portal_sync_stats,
 )
-from ..workers.bitrix.reconciler import reconcile_once
-from ..workers.bitrix.supervisor import run_task_supervisor_once
 from ._common import now_ts, validate_webhook_secret
 
 router = APIRouter()
@@ -31,7 +29,7 @@ router = APIRouter()
 
 
 @router.get("/bitrix/status")
-def bitrix_status(request: Request) -> dict[str, Any]:
+async def bitrix_status(request: Request) -> dict[str, Any]:
     settings = request.app.state.settings
     return {
         "configured": settings.bitrix_configured,
@@ -48,15 +46,15 @@ def bitrix_status(request: Request) -> dict[str, Any]:
         "webhook_events": dict(request.app.state.webhook_event_status),
         "webhook_event_queue": {
             **dict(request.app.state.webhook_event_queue_status),
-            **request.app.state.webhook_event_queue.stats(),
+            **await request.app.state.webhook_event_queue.stats(),
         },
     }
 
 
 @router.get("/agent/status")
-def legacy_agent_status(request: Request) -> dict[str, Any]:
+async def legacy_agent_status(request: Request) -> dict[str, Any]:
     return {
-        **bitrix_status(request),
+        **await bitrix_status(request),
         "agent_runtime": "multi_agent",
         "vehicle_usage": dict(request.app.state.vehicle_usage_status),
     }
@@ -138,17 +136,17 @@ def bitrix_oauth_start(request: Request) -> RedirectResponse:
 
 
 @router.get("/bitrix/webhook-events/status")
-def bitrix_webhook_events_status(request: Request) -> dict[str, Any]:
+async def bitrix_webhook_events_status(request: Request) -> dict[str, Any]:
     return {
         "worker": dict(request.app.state.webhook_event_queue_status),
-        "queue": request.app.state.webhook_event_queue.stats(),
-        "latest_events": request.app.state.webhook_event_queue.latest(limit=20),
+        "queue": await request.app.state.webhook_event_queue.stats(),
+        "latest_events": await request.app.state.webhook_event_queue.latest(limit=20),
     }
 
 
 @router.get("/agent/webhook-events/status")
-def legacy_webhook_events_status(request: Request) -> dict[str, Any]:
-    return bitrix_webhook_events_status(request)
+async def legacy_webhook_events_status(request: Request) -> dict[str, Any]:
+    return await bitrix_webhook_events_status(request)
 
 
 @router.post("/bitrix/events")
@@ -174,7 +172,7 @@ async def bitrix_events(
     webhook_status["last_event"] = event_type
 
     if settings.webhook_event_queue_enabled:
-        event_id, inserted = request.app.state.webhook_event_queue.enqueue(
+        event_id, inserted = await request.app.state.webhook_event_queue.enqueue(
             payload,
             event_type=event_type,
         )
@@ -361,10 +359,7 @@ def bitrix_supervisor_status(request: Request) -> dict[str, Any]:
 
 @router.post("/bitrix/supervisor/run-once")
 async def bitrix_supervisor_run_once(request: Request) -> dict[str, Any]:
-    result = await run_task_supervisor_once(
-        request.app.state.bitrix,
-        status=request.app.state.task_supervisor_status,
-    )
+    result = await request.app.state.supervisor_fn(status=request.app.state.task_supervisor_status)
     return {"ok": True, **result, "status": dict(request.app.state.task_supervisor_status)}
 
 
@@ -383,12 +378,7 @@ def legacy_reconciler_status(request: Request) -> dict[str, Any]:
 
 @router.post("/bitrix/reconciler/run-once")
 async def bitrix_reconciler_run_once(request: Request) -> dict[str, Any]:
-    result = await reconcile_once(
-        request.app.state.bitrix,
-        request.app.state.webhook_event_queue,
-        request.app.state.portal_search_indexer,
-        status=request.app.state.reconciler_status,
-    )
+    result = await request.app.state.reconcile_fn(status=request.app.state.reconciler_status)
     return {"ok": True, "result": result, "status": dict(request.app.state.reconciler_status)}
 
 

@@ -9,12 +9,22 @@ from pathlib import Path
 from typing import Any
 
 from ai_server.agent_store import AgentStore
-from ai_server.integrations.bitrix.client import BitrixClient
-from ai_server.models import ToolDefinition, ToolResult
-from ai_server.settings import get_settings
+from ai_server.integrations.bitrix.ports import BitrixUserPort
+from ai_server.integrations.ports import VehicleUsageStorePort
+from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.utils import MOSCOW_TZ, optional_int
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SentRequestData:
+    request_date: str
+    user_id: int | None
+    dialog_id: str
+    message: str
+    sent_at: str
+    reminder_count: int
 
 
 @dataclass(frozen=True)
@@ -28,8 +38,8 @@ class StaffMember:
 
 
 class VehicleUsageStore(AgentStore):
-    def __init__(self, path: Path | None = None) -> None:
-        super().__init__("logistics", path or get_settings().vehicle_usage_db_path)
+    def __init__(self, path: Path) -> None:
+        super().__init__("logistics", path)
 
     def ensure_schema(self) -> None:
         super().ensure_schema()
@@ -207,16 +217,7 @@ class VehicleUsageStore(AgentStore):
             ).fetchall()
         return [item for row in rows if (item := _request_row_dict(row)) is not None]
 
-    def create_sent_request(
-        self,
-        *,
-        request_date: str,
-        user_id: int | None,
-        dialog_id: str,
-        message: str,
-        sent_at: str,
-        reminder_count: int,
-    ) -> int:
+    def create_sent_request(self, data: SentRequestData) -> int:
         self.bootstrap_reference_data()
         with self._connection() as db:
             db.execute(
@@ -237,7 +238,15 @@ class VehicleUsageStore(AgentStore):
                     reminder_count = MAX(vehicle_usage_requests.reminder_count, excluded.reminder_count),
                     last_reminder_at = excluded.last_reminder_at
                 """,
-                (request_date, user_id, dialog_id, message, sent_at, reminder_count, sent_at),
+                (
+                    data.request_date,
+                    data.user_id,
+                    data.dialog_id,
+                    data.message,
+                    data.sent_at,
+                    data.reminder_count,
+                    data.sent_at,
+                ),
             )
             row = db.execute(
                 """
@@ -245,7 +254,7 @@ class VehicleUsageStore(AgentStore):
                 FROM vehicle_usage_requests
                 WHERE request_date = ? AND (user_id = ? OR (? IS NULL AND user_id IS NULL))
                 """,
-                (request_date, user_id, user_id),
+                (data.request_date, data.user_id, data.user_id),
             ).fetchone()
         return int(row["id"]) if row else 0
 
@@ -308,6 +317,45 @@ class VehicleUsageStore(AgentStore):
             ).fetchone()
         return int(row["id"]) if row else 0
 
+    def replace_day_report(
+        self,
+        *,
+        status_date: str,
+        employee_statuses: list[tuple[int, str, str]],
+        vehicle_assignments: list[tuple[int, int | None, str]],
+    ) -> None:
+        self.ensure_schema()
+        with self._connection() as db:
+            db.execute("DELETE FROM employee_daily_statuses WHERE status_date = ?", (status_date,))
+            db.execute("DELETE FROM vehicle_daily_assignments WHERE assignment_date = ?", (status_date,))
+            for employee_id, status, notes in employee_statuses:
+                db.execute(
+                    """
+                    INSERT INTO employee_daily_statuses (status_date, employee_id, status, notes)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(status_date, employee_id) DO UPDATE SET
+                        status = excluded.status,
+                        notes = excluded.notes
+                    """,
+                    (status_date, employee_id, status, notes),
+                )
+            for vehicle_id, employee_id, notes in vehicle_assignments:
+                db.execute(
+                    """
+                    INSERT INTO vehicle_daily_assignments (assignment_date, vehicle_id, employee_id, notes)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(assignment_date, vehicle_id) DO UPDATE SET
+                        employee_id = excluded.employee_id,
+                        notes = excluded.notes
+                    """,
+                    (status_date, vehicle_id, employee_id, notes),
+                )
+
+
+class VehicleReportProcessor:
+    def __init__(self, repo: VehicleUsageStorePort) -> None:
+        self._repo = repo
+
     def save_report(
         self,
         *,
@@ -317,7 +365,7 @@ class VehicleUsageStore(AgentStore):
         source_text: str,
         parsed: dict[str, Any],
     ) -> dict[str, Any]:
-        request_id = self.save_draft(
+        request_id = self._repo.save_draft(
             request_date=request_date,
             user_id=user_id,
             dialog_id=dialog_id,
@@ -327,66 +375,54 @@ class VehicleUsageStore(AgentStore):
         )
         staff_entries = _staff_entries(parsed)
         vehicle_entries = _vehicle_entries(parsed)
-        employees_by_name = {str(row["full_name"]).casefold(): int(row["display_order"]) for row in self.staff_roster()}
-        with self._connection() as db:
-            db.execute("DELETE FROM employee_daily_statuses WHERE status_date = ?", (request_date,))
-            db.execute("DELETE FROM vehicle_daily_assignments WHERE assignment_date = ?", (request_date,))
-            for entry in staff_entries:
-                employee_id = optional_int(entry.get("staff_order")) or employees_by_name.get(
-                    str(entry.get("full_name") or "").casefold()
-                )
-                if employee_id is None:
-                    continue
-                db.execute(
-                    """
-                    INSERT INTO employee_daily_statuses (status_date, employee_id, status, notes)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(status_date, employee_id) DO UPDATE SET
-                        status = excluded.status,
-                        notes = excluded.notes
-                    """,
-                    (
-                        request_date,
-                        employee_id,
-                        str(entry.get("status") or "unknown"),
-                        str(entry.get("notes") or ""),
-                    ),
-                )
-            for entry in vehicle_entries:
-                vehicle_id = optional_int(entry.get("vehicle_id"))
-                if vehicle_id is None:
-                    continue
-                employee_id = optional_int(entry.get("employee_id")) or employees_by_name.get(
-                    str(entry.get("employee_name") or "").casefold()
-                )
-                db.execute(
-                    """
-                    INSERT INTO vehicle_daily_assignments (assignment_date, vehicle_id, employee_id, notes)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(assignment_date, vehicle_id) DO UPDATE SET
-                        employee_id = excluded.employee_id,
-                        notes = excluded.notes
-                    """,
-                    (request_date, vehicle_id, employee_id, str(entry.get("notes") or "")),
-                )
+        employees_by_name = {
+            str(row["full_name"]).casefold(): int(row["display_order"]) for row in self._repo.staff_roster()
+        }
+
+        employee_statuses: list[tuple[int, str, str]] = []
+        for entry in staff_entries:
+            employee_id = optional_int(entry.get("staff_order")) or employees_by_name.get(
+                str(entry.get("full_name") or "").casefold()
+            )
+            if employee_id is None:
+                continue
+            employee_statuses.append(
+                (employee_id, str(entry.get("status") or "unknown"), str(entry.get("notes") or ""))
+            )
+
+        vehicle_assignments: list[tuple[int, int | None, str]] = []
+        for entry in vehicle_entries:
+            vehicle_id = optional_int(entry.get("vehicle_id"))
+            if vehicle_id is None:
+                continue
+            resolved_employee_id = optional_int(entry.get("employee_id")) or employees_by_name.get(
+                str(entry.get("employee_name") or "").casefold()
+            )
+            vehicle_assignments.append((vehicle_id, resolved_employee_id, str(entry.get("notes") or "")))
+
+        self._repo.replace_day_report(
+            status_date=request_date,
+            employee_statuses=employee_statuses,
+            vehicle_assignments=vehicle_assignments,
+        )
         return {
             "request_id": request_id,
-            "staff_entries_saved": len(staff_entries),
-            "vehicle_assignments_saved": len(vehicle_entries),
+            "staff_entries_saved": len(employee_statuses),
+            "vehicle_assignments_saved": len(vehicle_assignments),
         }
 
 
 class VehicleUsageToolset:
     def __init__(
         self,
-        client: BitrixClient | None = None,
+        client: BitrixUserPort | None = None,
         *,
-        store: VehicleUsageStore | None = None,
+        store: VehicleUsageStorePort | None = None,
         user_id: int | None = None,
         dialog_id: str = "",
     ) -> None:
-        self.client = client or BitrixClient()
-        self.store = store or VehicleUsageStore()
+        self.client = client
+        self.store = store
         self.user_id = user_id
         self.dialog_id = dialog_id
 
@@ -430,18 +466,30 @@ class VehicleUsageToolset:
         ]
 
     def vehicle_usage_context(self, args: dict[str, Any]) -> ToolResult:
+        if self.store is None:
+            return ToolResult(
+                status=ToolStatus.NOT_CONFIGURED,
+                tool="vehicle_usage_context",
+                error="VehicleUsageStore is not injected",
+            )
         request_date = _request_date(args.get("request_date"))
         return ToolResult(
-            status="ok",
+            status=ToolStatus.OK,
             tool="vehicle_usage_context",
             data=self.store.context(request_date=request_date, user_id=self.user_id, dialog_id=self.dialog_id),
         )
 
     def vehicle_usage_save_draft(self, args: dict[str, Any]) -> ToolResult:
+        if self.store is None:
+            return ToolResult(
+                status=ToolStatus.NOT_CONFIGURED,
+                tool="vehicle_usage_save_draft",
+                error="VehicleUsageStore is not injected",
+            )
         parsed = args.get("parsed")
         if not isinstance(parsed, dict):
             return ToolResult(
-                status="invalid_tool_call", tool="vehicle_usage_save_draft", error="parsed object is required"
+                status=ToolStatus.INVALID_TOOL_CALL, tool="vehicle_usage_save_draft", error="parsed object is required"
             )
         request_id = self.store.save_draft(
             request_date=_request_date(args.get("request_date") or parsed.get("date")),
@@ -451,26 +499,32 @@ class VehicleUsageToolset:
             parsed=parsed,
             status=str(args.get("status") or "pending_confirmation"),
         )
-        return ToolResult(status="ok", tool="vehicle_usage_save_draft", data={"request_id": request_id})
+        return ToolResult(status=ToolStatus.OK, tool="vehicle_usage_save_draft", data={"request_id": request_id})
 
     def vehicle_usage_save_report(self, args: dict[str, Any]) -> ToolResult:
+        if self.store is None:
+            return ToolResult(
+                status=ToolStatus.NOT_CONFIGURED,
+                tool="vehicle_usage_save_report",
+                error="VehicleUsageStore is not injected",
+            )
         parsed = args.get("parsed")
         if not isinstance(parsed, dict):
             return ToolResult(
-                status="invalid_tool_call", tool="vehicle_usage_save_report", error="parsed object is required"
+                status=ToolStatus.INVALID_TOOL_CALL, tool="vehicle_usage_save_report", error="parsed object is required"
             )
-        saved = self.store.save_report(
+        saved = VehicleReportProcessor(self.store).save_report(
             request_date=_request_date(args.get("request_date") or parsed.get("date")),
             user_id=self.user_id,
             dialog_id=self.dialog_id,
             source_text=str(args.get("source_text") or ""),
             parsed=parsed,
         )
-        return ToolResult(status="ok", tool="vehicle_usage_save_report", data=saved)
+        return ToolResult(status=ToolStatus.OK, tool="vehicle_usage_save_report", data=saved)
 
 
 async def fetch_staff_roster(
-    client: BitrixClient,
+    client: BitrixUserPort,
     *,
     exclude_user_ids: set[int] | None = None,
 ) -> list[StaffMember]:

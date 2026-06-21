@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 
+from ai_server.agent_store import SqliteStore
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixClient, BitrixConfigError
 from ai_server.settings import Settings, get_settings
 from ai_server.utils import optional_int
@@ -51,13 +52,13 @@ class BitrixOAuthSaveResult:
     source: str
 
 
-class BitrixOAuthService:
+class BitrixOAuthService(SqliteStore):
     def __init__(self, settings: Settings | None = None, db_path: Path | str | None = None) -> None:
-        _settings = settings or get_settings()
-        self.db_path = Path(db_path or _settings.bitrix_oauth_db_path)
+        self._settings = settings or get_settings()
+        self.path = Path(db_path or self._settings.bitrix_oauth_db_path)
 
     def ensure_schema(self) -> None:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.execute(
                 """
@@ -95,7 +96,7 @@ class BitrixOAuthService:
         *,
         source: str,
     ) -> BitrixOAuthSaveResult:
-        auth = _extract_auth(payload)
+        auth = _extract_auth(payload, self._settings)
         if not auth.access_token:
             raise BitrixOAuthError("OAuth access token is missing in Bitrix payload")
         if not auth.refresh_token:
@@ -130,7 +131,7 @@ class BitrixOAuthService:
         code: str,
         source: str,
     ) -> BitrixOAuthSaveResult:
-        settings = get_settings()
+        settings = self._settings
         if not settings.bitrix_oauth_client_id or not settings.bitrix_oauth_client_secret:
             raise BitrixConfigError("BITRIX_OAUTH_CLIENT_ID and BITRIX_OAUTH_CLIENT_SECRET are required")
         payload = await self._request_token(
@@ -163,10 +164,12 @@ class BitrixOAuthService:
             raise BitrixOAuthTokenMissing(user_id)
         if token.expires_soon:
             token = await self.refresh_token(token)
-        return BitrixClient(access_token=token.access_token, client_endpoint=token.client_endpoint)
+        return BitrixClient(
+            settings=self._settings, access_token=token.access_token, client_endpoint=token.client_endpoint
+        )
 
     async def refresh_token(self, token: BitrixOAuthToken) -> BitrixOAuthToken:
-        settings = get_settings()
+        settings = self._settings
         if not settings.bitrix_oauth_client_id or not settings.bitrix_oauth_client_secret:
             raise BitrixConfigError("OAuth token expired, but client credentials are not configured")
         payload = await self._request_token(
@@ -176,9 +179,9 @@ class BitrixOAuthService:
                 "client_secret": settings.bitrix_oauth_client_secret,
                 "refresh_token": token.refresh_token,
             },
-            endpoint=_token_endpoint_from_server(token.server_endpoint),
+            endpoint=_token_endpoint_from_server(token.server_endpoint, settings),
         )
-        normalized = _normalize_auth(payload, fallback=token)
+        normalized = _normalize_auth(payload, fallback=token, settings=settings)
         refreshed = BitrixOAuthToken(
             user_id=token.user_id,
             access_token=normalized.access_token,
@@ -245,7 +248,7 @@ class BitrixOAuthService:
             )
 
     def public_status(self) -> dict[str, Any]:
-        settings = get_settings()
+        settings = self._settings
         self.ensure_schema()
         with self._connect() as connection:
             count = int(connection.execute("SELECT COUNT(*) FROM bitrix_oauth_tokens").fetchone()[0])
@@ -261,7 +264,7 @@ class BitrixOAuthService:
             "enabled": settings.bitrix_oauth_enabled,
             "configured": settings.bitrix_oauth_configured,
             "required_for_writes": settings.bitrix_oauth_required_for_writes,
-            "db_path": str(self.db_path),
+            "db_path": str(self.path),
             "linked_users_count": count,
             "linked_users": [
                 {
@@ -277,7 +280,7 @@ class BitrixOAuthService:
         }
 
     def authorization_hint(self, user_id: int | None = None) -> dict[str, Any]:
-        settings = get_settings()
+        settings = self._settings
         return {
             "user_id": user_id,
             "app_url": settings.resolved_bitrix_app_url,
@@ -293,7 +296,9 @@ class BitrixOAuthService:
     async def _resolve_user_id(self, auth: _NormalizedAuth) -> int:
         if auth.user_id:
             return auth.user_id
-        client = BitrixClient(access_token=auth.access_token, client_endpoint=auth.client_endpoint)
+        client = BitrixClient(
+            settings=self._settings, access_token=auth.access_token, client_endpoint=auth.client_endpoint
+        )
         result = await client.result("user.current", {})
         if not isinstance(result, dict):
             raise BitrixOAuthError("user.current did not return user data")
@@ -303,8 +308,7 @@ class BitrixOAuthService:
         return int(raw_id)
 
     async def _request_token(self, data: dict[str, str], *, endpoint: str | None = None) -> dict[str, Any]:
-        settings = get_settings()
-        url = endpoint or settings.bitrix_oauth_token_endpoint
+        url = endpoint or self._settings.bitrix_oauth_token_endpoint
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), trust_env=False) as client:
             response = await client.post(url, data=data)
         payload = _response_json(response)
@@ -321,11 +325,6 @@ class BitrixOAuthService:
                 _response_text(response),
             ) from None
         return payload
-
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        return connection
 
 
 def _row_to_token(row: sqlite3.Row) -> BitrixOAuthToken:
@@ -356,7 +355,7 @@ class _NormalizedAuth:
     user_id: int | None = None
 
 
-def _extract_auth(payload: dict[str, Any]) -> _NormalizedAuth:
+def _extract_auth(payload: dict[str, Any], settings: Settings) -> _NormalizedAuth:
     auth = payload.get("auth") if isinstance(payload.get("auth"), dict) else {}
     values = {**payload, **auth}
     if "AUTH_ID" in payload:
@@ -367,13 +366,15 @@ def _extract_auth(payload: dict[str, Any]) -> _NormalizedAuth:
         values["expires_in"] = payload.get("AUTH_EXPIRES")
     if "DOMAIN" in payload and "domain" not in values:
         values["domain"] = payload.get("DOMAIN")
-    return _normalize_auth(values)
+    return _normalize_auth(values, settings=settings)
 
 
-def _normalize_auth(value: dict[str, Any], *, fallback: BitrixOAuthToken | None = None) -> _NormalizedAuth:
+def _normalize_auth(
+    value: dict[str, Any], *, fallback: BitrixOAuthToken | None = None, settings: Settings
+) -> _NormalizedAuth:
     access_token = str(value.get("access_token") or (fallback.access_token if fallback else "") or "")
     refresh_token = str(value.get("refresh_token") or (fallback.refresh_token if fallback else "") or "")
-    domain = _domain(str(value.get("domain") or (fallback.domain if fallback else "") or get_settings().bitrix_domain))
+    domain = _domain(str(value.get("domain") or (fallback.domain if fallback else "") or settings.bitrix_domain))
     client_endpoint = str(value.get("client_endpoint") or (fallback.client_endpoint if fallback else "") or "")
     if not client_endpoint and domain:
         client_endpoint = f"https://{domain}/rest/"
@@ -426,8 +427,7 @@ def _expires_at(expires: Any, expires_in: Any) -> datetime:
         return now + timedelta(hours=1)
 
 
-def _token_endpoint_from_server(server_endpoint: str) -> str:
-    settings = get_settings()
+def _token_endpoint_from_server(server_endpoint: str, settings: Settings) -> str:
     if settings.bitrix_oauth_token_endpoint:
         return settings.bitrix_oauth_token_endpoint
     endpoint = server_endpoint.strip()

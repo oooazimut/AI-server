@@ -3,8 +3,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 
-from ai_server.agents.bitrix24 import Bitrix24Specialist
-from ai_server.agents.bitrix_llm import BitrixLLMToolCall
+from ai_server.agents.bitrix24 import Bitrix24Specialist, BitrixLLMToolCall
 from ai_server.attachments import StoredAttachment
 from ai_server.channels.bitrix import BitrixWebhookProcessor
 from ai_server.integrations.bitrix.client import BitrixClient
@@ -22,10 +21,12 @@ from ai_server.models import ActionRecord, AgentResult, ModelUsageRecord, ToolRe
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.registry import load_agent_manifests
 from ai_server.retrieval import HybridKnowledgeRetriever
+from ai_server.settings import get_settings
 from ai_server.specialists import manifest_by_id
 from ai_server.technical_footer import ProviderBalanceSnapshot, TechnicalFooterService
 from ai_server.tools.bitrix import BitrixToolset
 from ai_server.transcription import TranscriptionResult
+from ai_server.workers.bitrix.quality_control_adapter import QualityControlHandlerAdapter
 from ai_server.workers.bitrix.webhook_event_queue import WebhookEventQueue
 from scripts.create_bitrix_dev_chat import chat_reference, sanitize_result
 from tests.fakes import (
@@ -59,25 +60,28 @@ def test_parse_bitrix_v2_message():
     assert incoming.text == "Покажи задачи в Битриксе"
 
 
-def test_webhook_event_queue_is_compatible_and_sanitizes_payload(tmp_path):
-    queue = WebhookEventQueue(tmp_path / "webhook_event_queue.sqlite")
+def test_webhook_event_queue_is_compatible_and_sanitizes_payload(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    queue = WebhookEventQueue(tmp_path / "webhook_event_queue.sqlite", settings=get_settings())
     queue.ensure_schema()
 
-    event_id, inserted = queue.enqueue(_bitrix_v2_message_payload(), event_type="ONIMBOTV2MESSAGEADD")
-    duplicate_id, duplicate_inserted = queue.enqueue(_bitrix_v2_message_payload(), event_type="ONIMBOTV2MESSAGEADD")
+    event_id, inserted = anyio_run(queue.enqueue(_bitrix_v2_message_payload(), event_type="ONIMBOTV2MESSAGEADD"))
+    duplicate_id, duplicate_inserted = anyio_run(
+        queue.enqueue(_bitrix_v2_message_payload(), event_type="ONIMBOTV2MESSAGEADD")
+    )
 
     assert inserted is True
     assert duplicate_inserted is False
     assert duplicate_id == event_id
-    assert queue.stats()["pending"] == 1
+    assert anyio_run(queue.stats())["pending"] == 1
 
-    event = queue.claim_next()
+    event = anyio_run(queue.claim_next())
     assert event is not None
     assert event["partition_key"] == "dialog:chat99"
     assert "auth" not in event["payload"]
 
-    queue.mark_done(event_id, {"handled": True})
-    assert queue.stats()["done"] == 1
+    anyio_run(queue.mark_done(event_id, {"handled": True}))
+    assert anyio_run(queue.stats())["done"] == 1
 
 
 def test_bitrix_events_endpoint_enqueues_payload(monkeypatch, tmp_path):
@@ -458,6 +462,7 @@ def test_bitrix_pending_action_new_request_goes_to_orchestrator(monkeypatch, tmp
 
 
 def test_quality_control_live_webhook_requires_actor(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("QUALITY_CONTROL_WEBHOOK_ENABLED", "true")
     monkeypatch.setenv("QUALITY_CONTROL_DRY_RUN", "false")
     monkeypatch.delenv("QUALITY_CONTROL_ACTOR_USER_ID", raising=False)
@@ -466,8 +471,19 @@ def test_quality_control_live_webhook_requires_actor(monkeypatch):
         "event": "ONTASKUPDATE",
         "data": {"FIELDS_AFTER": {"ID": 8413}},
     }
+    settings = get_settings()
+    qc_handler = QualityControlHandlerAdapter(
+        bitrix=fake_bitrix,
+        bitrix_oauth=None,
+        manifests=[],
+        settings=settings,
+    )
 
-    result = anyio_run(BitrixWebhookProcessor(bitrix=fake_bitrix).process(payload))
+    result = anyio_run(
+        BitrixWebhookProcessor(bitrix=fake_bitrix, settings=settings, quality_control_handler=qc_handler).process(
+            payload
+        )
+    )
 
     assert result["handled"] is False
     assert result["quality_control"]["reason"] == "quality_actor_not_configured"
@@ -679,8 +695,12 @@ def test_bitrix_oauth_service_saves_token_from_app_payload(monkeypatch, tmp_path
 def test_bitrix_oauth_token_endpoint_handles_rest_server_endpoint(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("BITRIX_OAUTH_TOKEN_ENDPOINT", "")
+    from ai_server.settings import get_settings
 
-    assert _token_endpoint_from_server("https://oauth.bitrix.info/rest/") == "https://oauth.bitrix.info/oauth/token/"
+    assert (
+        _token_endpoint_from_server("https://oauth.bitrix.info/rest/", get_settings())
+        == "https://oauth.bitrix.info/oauth/token/"
+    )
 
 
 def anyio_run(awaitable):
@@ -776,7 +796,9 @@ class FakeBitrixClient:
 
 class RecordingCreateChatClient(BitrixClient):
     def __init__(self) -> None:
-        super().__init__(base_url="https://example.bitrix24.ru/rest/1/webhook/")
+        from ai_server.settings import get_settings
+
+        super().__init__(settings=get_settings(), base_url="https://example.bitrix24.ru/rest/1/webhook/")
         self.calls = []
 
     async def result(self, method, payload=None, *, base_url=None):

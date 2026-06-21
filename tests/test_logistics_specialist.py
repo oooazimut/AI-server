@@ -3,18 +3,19 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from ai_server.agents.logistics import LogisticsSpecialist
-from ai_server.agents.logistics_llm import LogisticsLLMService, LogisticsLLMToolCall
+from ai_server.agents.logistics import LogisticsLLMService, LogisticsLLMToolCall, LogisticsSpecialist
 from ai_server.models import AgentTask, UserContext
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
-from ai_server.tools.vehicle_usage import StaffMember, VehicleUsageStore, VehicleUsageToolset
+from ai_server.settings import get_settings
+from ai_server.tools.vehicle_usage import SentRequestData, StaffMember, VehicleUsageStore, VehicleUsageToolset
 from tests.fakes import FakeEmbeddingProvider, FakeLogisticsLLM, RecordingLLMClient
 
 _FAKE_RETRIEVER = HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider())
 
 
 def test_logistics_specialist_forwards_dialog_history_to_decide(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
@@ -29,6 +30,7 @@ def test_logistics_specialist_forwards_dialog_history_to_decide(monkeypatch, tmp
         retriever=_FAKE_RETRIEVER,
         tools=VehicleUsageToolset(store=VehicleUsageStore(tmp_path / "vehicle_usage.sqlite"), user_id=9),
         llm=llm,
+        settings=get_settings(),
     )
     anyio_run(
         specialist.handle(
@@ -70,6 +72,7 @@ def test_logistics_llm_decide_payload_includes_dialog_history_and_raw_context():
 
 
 def test_logistics_specialist_saves_llm_parsed_draft(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
@@ -106,6 +109,7 @@ def test_logistics_specialist_saves_llm_parsed_draft(monkeypatch, tmp_path):
         retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
         tools=VehicleUsageToolset(store=store, user_id=9, dialog_id="chat9"),
         llm=fake_llm,
+        settings=get_settings(),
     )
 
     result = anyio_run(
@@ -128,6 +132,7 @@ def test_logistics_specialist_saves_llm_parsed_draft(monkeypatch, tmp_path):
 
 
 def test_logistics_specialist_saves_confirmed_report(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
@@ -159,6 +164,7 @@ def test_logistics_specialist_saves_confirmed_report(monkeypatch, tmp_path):
         retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
         tools=VehicleUsageToolset(store=store, user_id=9, dialog_id="chat9"),
         llm=fake_llm,
+        settings=get_settings(),
     )
 
     result = anyio_run(specialist.handle(AgentTask(task_id="log-2", request="подтверждаю", user=UserContext(id="9"))))
@@ -233,12 +239,14 @@ def test_logistics_escalates_after_max_reminders(monkeypatch, tmp_path):
     today = datetime.now(MOSCOW_TZ).date().isoformat()
     store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
     store.create_sent_request(
-        request_date=today,
-        user_id=9,
-        dialog_id="chat9",
-        message="Нужен отчет.",
-        sent_at=f"{today}T08:00:00+03:00",
-        reminder_count=3,
+        SentRequestData(
+            request_date=today,
+            user_id=9,
+            dialog_id="chat9",
+            message="Нужен отчет.",
+            sent_at=f"{today}T08:00:00+03:00",
+            reminder_count=3,
+        )
     )
     fake_llm = FakeLogisticsLLM(
         tool_call_steps=[

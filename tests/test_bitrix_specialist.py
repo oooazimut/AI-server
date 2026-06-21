@@ -1,8 +1,8 @@
 import asyncio
 import json
 
-from ai_server.agents.bitrix24 import Bitrix24Specialist
-from ai_server.agents.bitrix_llm import BitrixLLMDecision, BitrixLLMService, BitrixLLMToolCall
+from ai_server.agents.bitrix24 import Bitrix24Specialist, BitrixLLMDecision, BitrixLLMService, BitrixLLMToolCall
+from ai_server.integrations.bitrix.bitrix_policy import decide_bitrix_method_policy
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import AgentTask, ToolResult
 from ai_server.registry import get_agent_manifest
@@ -10,7 +10,6 @@ from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import get_settings
 from ai_server.skills import SkillStore
 from ai_server.tools.bitrix import BitrixToolset
-from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
 from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, RecordingLLMClient
 
 
@@ -20,6 +19,7 @@ def _bitrix_specialist(*, tools=None, llm=None) -> Bitrix24Specialist:
     return Bitrix24Specialist(
         manifest,
         retriever=retriever,
+        skill_store=SkillStore(),
         tools=tools,
         llm=llm or FakeBitrixLLM(),
     )
@@ -460,7 +460,7 @@ def test_bitrix_llm_decision_payload_includes_permission_context(monkeypatch):
     }
 
     asyncio.run(
-        BitrixLLMService(client).decide(
+        BitrixLLMService(client, settings=get_settings()).decide(
             manifest=manifest,
             task=AgentTask(task_id="t1", request="Создай задачу", user={"id": "15"}, context=context),
             retrieval_hits=[],

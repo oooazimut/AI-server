@@ -102,23 +102,10 @@ class ReconcilerStatus(TypedDict):
 
 class VehicleUsageStatus(TypedDict):
     enabled: bool
-    running: bool
     dry_run: bool
-    interval_seconds: int
     dialog_id: str
     manager_user_id: int | None
     admin_notify_user_ids: list[int]
     request_time: str
-    db_path: str
-    last_check_at: str | None
-    last_sent_at: str | None
-    last_escalated_at: str | None
-    last_error: str | None
-    runs: int
-    errors: int
-    last_skipped_date: str | None
-    last_skip_reason: str | None
-    last_result: dict[str, Any] | None
-    last_delivery: str | None
-    last_request_date: str | None
-    last_reminder_number: int | None
+    reminder_interval_minutes: int
+    max_reminders: int

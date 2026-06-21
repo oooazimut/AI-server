@@ -7,6 +7,7 @@ from ai_server.models import AgentTask
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.registry import load_agent_manifests
 from ai_server.retrieval import HybridKnowledgeRetriever
+from ai_server.settings import get_settings
 from ai_server.specialists import manifest_by_id
 from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, FakeInternalOrchestratorLLM, FakeLogisticsLLM, FakePtoLLM
 
@@ -78,7 +79,8 @@ def test_internal_orchestrator_reports_configured_model(monkeypatch):
     assert result.actions_taken[0].name == "orchestrator_llm_route"
 
 
-def test_internal_orchestrator_delegates_logistics_request():
+def test_internal_orchestrator_delegates_logistics_request(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     manifests = load_agent_manifests()
     result = asyncio.run(
         InternalOrchestrator(
@@ -88,6 +90,7 @@ def test_internal_orchestrator_delegates_logistics_request():
                     manifest_by_id(manifests, "logistics"),
                     retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
                     llm=FakeLogisticsLLM(final_answer="Логист обработал отчет."),
+                    settings=get_settings(),
                 ),
             },
             orchestrator_llm=FakeInternalOrchestratorLLM(handoff_to=["logistics"]),

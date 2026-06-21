@@ -1,40 +1,53 @@
 from __future__ import annotations
 
+from ai_server.settings import get_settings
 from ai_server.workers.bitrix.reconciler import reconcile_once
 from ai_server.workers.bitrix.supervisor import run_task_supervisor_once
 from ai_server.workers.bitrix.webhook_event_queue import WebhookEventQueue
 
 
+def anyio_run(awaitable):
+    import anyio
+
+    async def runner():
+        return await awaitable
+
+    return anyio.run(runner)
+
+
 def test_task_supervisor_dry_run_does_not_notify(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     monkeypatch.setenv("SUPERVISOR_ADMIN_USER_IDS", "9")
     monkeypatch.setenv("SUPERVISOR_DRY_RUN", "true")
     bitrix = FakeSupervisorBitrix()
 
-    result = anyio_run(run_task_supervisor_once(bitrix))
+    result = anyio_run(run_task_supervisor_once(bitrix, settings=get_settings()))
 
-    assert result["overdue_tasks_seen"] == 1
-    assert result["notifications_planned"] == 1
-    assert result["notifications_sent"] == 0
-    assert result["notifications"][0]["reason"] == "dry_run"
+    assert result.overdue_tasks_seen == 1
+    assert result.notifications_planned == 1
+    assert result.notifications_sent == 0
+    assert result.notifications[0]["reason"] == "dry_run"
     assert bitrix.notifications == []
 
 
 def test_reconciler_enqueues_task_updates_with_dedupe(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     monkeypatch.setenv("RECONCILE_TASKS_ENABLED", "true")
     monkeypatch.setenv("RECONCILE_DISK_DELTA_ENABLED", "false")
-    queue = WebhookEventQueue(tmp_path / "webhook_event_queue.sqlite")
+    settings = get_settings()
+    queue = WebhookEventQueue(tmp_path / "webhook_event_queue.sqlite", settings=settings)
     queue.ensure_schema()
     bitrix = FakeReconcileBitrix()
 
-    first = anyio_run(reconcile_once(bitrix, queue, FakeSearchIndexer()))
-    second = anyio_run(reconcile_once(bitrix, queue, FakeSearchIndexer()))
+    first = anyio_run(reconcile_once(bitrix, queue, FakeSearchIndexer(), settings=settings))
+    second = anyio_run(reconcile_once(bitrix, queue, FakeSearchIndexer(), settings=settings))
 
-    assert first["tasks"]["seen"] == 1
-    assert first["tasks"]["enqueued"] == 1
-    assert second["tasks"]["duplicates"] == 1
-    stats = queue.stats()
+    assert first.tasks["seen"] == 1
+    assert first.tasks["enqueued"] == 1
+    assert second.tasks["duplicates"] == 1
+    stats = anyio_run(queue.stats())
     assert stats["pending"] == 1
     assert stats["done"] == 0
 
@@ -79,12 +92,3 @@ class FakeReconcileBitrix:
 class FakeSearchIndexer:
     async def run_delta_once(self):
         raise AssertionError("disk delta should be disabled in this test")
-
-
-def anyio_run(awaitable):
-    import anyio
-
-    async def runner():
-        return await awaitable
-
-    return anyio.run(runner)
