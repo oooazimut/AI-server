@@ -60,6 +60,11 @@ def allowed_tool_definitions(definitions: list[dict[str, Any]], allowed_tool_nam
     return [definition for definition in definitions if definition.get("name") in allowed_tool_names]
 
 
+def safe_context(context: dict[str, Any]) -> dict[str, Any]:
+    """Strip internal per-request keys (toolset objects) before passing context to json.dumps."""
+    return {k: v for k, v in context.items() if not k.startswith("_")}
+
+
 def compact_tool_result(result: ToolResult) -> dict[str, Any]:
     return {
         "status": result.status,
