@@ -10,7 +10,7 @@ from ai_server.integrations.bitrix.portal_search import (
     entity_types_for_scope,
     format_portal_search_results,
 )
-from ai_server.integrations.bitrix.ports import BitrixRestPort, BitrixToolClientPort
+from ai_server.integrations.bitrix.ports import BitrixBotPort, BitrixRestPort, BitrixToolClientPort
 from ai_server.integrations.bitrix.profile import compact_user_profile
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.utils import optional_int
@@ -26,6 +26,7 @@ class BitrixToolset:
         dialog_key: str | None = None,
         user_id: int | None = None,
         actor_client: BitrixRestPort | None = None,
+        bot: BitrixBotPort | None = None,
         auto_execute: bool = False,
     ) -> None:
         self.client = client
@@ -34,6 +35,7 @@ class BitrixToolset:
         self.dialog_key = dialog_key
         self.user_id = user_id
         self._actor_client = actor_client
+        self._bot = bot
         self._auto_execute = auto_execute
 
     def definitions(self) -> list[ToolDefinition]:
@@ -78,6 +80,31 @@ class BitrixToolset:
                     "type": "object",
                     "properties": {},
                     "additionalProperties": False,
+                },
+            ),
+            ToolDefinition(
+                name="bitrix_send_message",
+                description="Отправить сообщение от бота в диалог или чат Bitrix24.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "dialog_id": {"type": "string", "description": "ID диалога или чата"},
+                        "message": {"type": "string", "description": "Текст сообщения"},
+                    },
+                    "required": ["dialog_id", "message"],
+                },
+            ),
+            ToolDefinition(
+                name="bitrix_notify_users",
+                description="Отправить уведомления (личные сообщения) одному или нескольким пользователям Bitrix24.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "user_ids": {"type": "array", "items": {"type": "integer"}, "description": "ID пользователей"},
+                        "message": {"type": "string", "description": "Текст уведомления"},
+                        "tag": {"type": "string", "description": "Тег уведомления (по умолчанию: ai_server)"},
+                    },
+                    "required": ["user_ids", "message"],
                 },
             ),
         ]
@@ -235,6 +262,68 @@ class BitrixToolset:
             tool="current_user_profile",
             data={"user_id": user_id, "profile": compact_user_profile(user)},
         )
+
+    async def send_message(self, args: dict[str, Any]) -> ToolResult:
+        dialog_id = str(args.get("dialog_id") or "").strip()
+        message = str(args.get("message") or "").strip()
+        if not dialog_id or not message:
+            return ToolResult(
+                status=ToolStatus.INVALID_TOOL_CALL,
+                tool="bitrix_send_message",
+                error="dialog_id and message are required",
+            )
+        if self._bot is None:
+            return ToolResult(
+                status=ToolStatus.NOT_CONFIGURED,
+                tool="bitrix_send_message",
+                error="BitrixBotPort is not injected",
+            )
+        try:
+            result = await self._bot.send_bot_message(dialog_id, message)
+        except (BitrixApiError, BitrixConfigError) as exc:
+            return ToolResult(
+                status=ToolStatus.NOT_CONFIGURED if isinstance(exc, BitrixConfigError) else ToolStatus.ERROR,
+                tool="bitrix_send_message",
+                error=str(exc),
+                data={"dialog_id": dialog_id},
+            )
+        return ToolResult(
+            status=ToolStatus.OK,
+            tool="bitrix_send_message",
+            data={"dialog_id": dialog_id, "result": result},
+        )
+
+    async def notify_users(self, args: dict[str, Any]) -> ToolResult:
+        user_ids_raw = args.get("user_ids") or []
+        user_ids = [int(uid) for uid in user_ids_raw if uid] if isinstance(user_ids_raw, list) else []
+        message = str(args.get("message") or "").strip()
+        tag = str(args.get("tag") or "ai_server").strip()
+        if not user_ids or not message:
+            return ToolResult(
+                status=ToolStatus.INVALID_TOOL_CALL,
+                tool="bitrix_notify_users",
+                error="user_ids and message are required",
+            )
+        if self.client is None:
+            return ToolResult(
+                status=ToolStatus.NOT_CONFIGURED,
+                tool="bitrix_notify_users",
+                error="BitrixClient is not injected",
+            )
+        errors = []
+        for user_id in user_ids:
+            try:
+                await self.client.notify_user(user_id=user_id, message=message, tag=tag)
+            except (BitrixApiError, BitrixConfigError) as exc:
+                errors.append({"user_id": user_id, "error": str(exc)})
+        if errors:
+            return ToolResult(
+                status=ToolStatus.ERROR,
+                tool="bitrix_notify_users",
+                error="Some notifications failed",
+                data={"errors": errors},
+            )
+        return ToolResult(status=ToolStatus.OK, tool="bitrix_notify_users", data={"user_ids": user_ids})
 
     def portal_search_contract(self, args: dict[str, Any]) -> ToolResult:
         if self.portal_search is None:

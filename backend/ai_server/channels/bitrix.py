@@ -117,6 +117,7 @@ class BitrixWebhookProcessor:
             bitrix=self.bitrix,
             portal_search=self.portal_search,
             pending_actions=self.pending_actions,
+            bot=self.bitrix,
         )
 
     async def process(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -219,6 +220,7 @@ class BitrixWebhookProcessor:
                 pending_actions=self.pending_actions,
                 dialog_key=dialog_key,
                 user_id=incoming.user_id,
+                bot=self.bitrix,
             ),
             "_pto_tools": DocumentToolset(
                 client=self.bitrix,
@@ -372,11 +374,12 @@ def _build_orchestrator(
     bitrix: BitrixClient,
     portal_search: PortalSearchIndex,
     pending_actions: BitrixPendingActionService,
+    bot: Any = None,
 ) -> InternalOrchestrator:
     registry_kwargs = deps.as_registry_kwargs()
     registry_kwargs.setdefault(
         "bitrix_tools",
-        BitrixToolset(client=bitrix, portal_search=portal_search, pending_actions=pending_actions),
+        BitrixToolset(client=bitrix, portal_search=portal_search, pending_actions=pending_actions, bot=bot or bitrix),
     )
     registry_kwargs.setdefault(
         "document_tools",
@@ -388,6 +391,8 @@ def _build_orchestrator(
         specialists=build_specialist_registry(manifests, audience="employee", **registry_kwargs),
         orchestrator_llm=deps.orchestrator_llm,
         scheduler=deps.scheduler,
+        store=deps.orchestrator_store,
+        retriever=deps.orchestrator_retriever,
     )
 
 

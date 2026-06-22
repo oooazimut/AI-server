@@ -8,6 +8,7 @@ handoff_description: Использовать для входящих внутр
 entrypoint: backend.ai_server.orchestrators.internal.InternalOrchestrator
 instructions_file: agents/internal_orchestrator/instructions.md
 skills_path: agents/internal_orchestrator/skills
+knowledge_path: agents/internal_orchestrator/knowledge
 channels:
   - bitrix24_chat
   - web

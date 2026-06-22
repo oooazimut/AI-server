@@ -31,6 +31,8 @@ ALLOWED_TOOL_NAMES = {
     "delete_incomplete_proposal",
     "save_responsible_response",
     "portal_search",
+    "bitrix_send_message",
+    "bitrix_notify_users",
     "none",
 }
 

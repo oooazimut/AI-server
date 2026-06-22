@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -13,16 +13,26 @@ from ai_server.agents.logistics.llm import (
     LogisticsLLMToolCall,
     logistics_llm_failure_result,
 )
-from ai_server.agents.ports import SchedulerPort, VehicleUsageToolsetPort
+from ai_server.agents.ports import SchedulerPort, SpecialistOutputPort, VehicleUsageToolsetPort
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentTask, ToolResult, ToolStatus, UserContext
 from ai_server.retrieval import HybridKnowledgeRetriever
-from ai_server.settings import Settings
 from ai_server.skills import SkillStore
 from ai_server.tools.vehicle_usage import SentRequestData
 from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class VehicleUsageSettings:
+    dialog_id: str
+    manager_user_id: int | None
+    max_reminders: int
+    reminder_interval_minutes: int
+    admin_notify_user_ids: list[int] = field(default_factory=list)
+    dry_run: bool = True
+    request_time: str = "08:00"
 
 
 class LogisticsSpecialist(BaseSpecialist):
@@ -40,13 +50,16 @@ class LogisticsSpecialist(BaseSpecialist):
         llm: LogisticsAgentLLM | None = None,
         scheduler: SchedulerPort | None = None,
         store: Any | None = None,
-        deliver_fn: Callable[[str, str], Awaitable[None]] | None = None,
-        notify_fn: Callable[[int, str], Awaitable[None]] | None = None,
-        settings: Settings,
+        output_fn: SpecialistOutputPort | None = None,
+        vu_settings: VehicleUsageSettings | None = None,
     ) -> None:
-        self._settings = settings
-        self._deliver_fn = deliver_fn
-        self._notify_fn = notify_fn
+        self._output_fn = output_fn
+        self._vu_settings = vu_settings or VehicleUsageSettings(
+            dialog_id="",
+            manager_user_id=None,
+            max_reminders=3,
+            reminder_interval_minutes=60,
+        )
         super().__init__(
             manifest,
             knowledge_base=knowledge_base,
@@ -68,11 +81,8 @@ class LogisticsSpecialist(BaseSpecialist):
         logistics_llm: LogisticsAgentLLM | None = None,
         logistics_store: Any | None = None,
         scheduler: SchedulerPort | None = None,
-        settings: Settings | None = None,
         **_: Any,
     ) -> LogisticsSpecialist:
-        from ai_server.settings import get_settings
-
         return cls(
             manifest,
             retriever=logistics_retriever,
@@ -80,7 +90,6 @@ class LogisticsSpecialist(BaseSpecialist):
             llm=logistics_llm or LogisticsLLMService(),
             scheduler=scheduler,
             store=logistics_store,
-            settings=settings or get_settings(),
         )
 
     # ------------------------------------------------------------------
@@ -88,7 +97,7 @@ class LogisticsSpecialist(BaseSpecialist):
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        if self._deliver_fn and self._settings.vehicle_usage_enabled:
+        if self._output_fn and self._vu_settings.dialog_id:
             self._setup_morning_cron()
 
     # ------------------------------------------------------------------
@@ -96,7 +105,7 @@ class LogisticsSpecialist(BaseSpecialist):
     # ------------------------------------------------------------------
 
     def _setup_morning_cron(self) -> None:
-        hour, minute = _parse_hhmm(self._settings.vehicle_usage_request_time)
+        hour, minute = _parse_hhmm(self._vu_settings.request_time)
         self.schedule_job_cron(
             "morning_report",
             self._morning_handler,
@@ -104,14 +113,12 @@ class LogisticsSpecialist(BaseSpecialist):
             minute,
             replace_existing=False,
         )
-        logger.info(
-            "LogisticsSpecialist: morning_report cron scheduled at %s МСК", self._settings.vehicle_usage_request_time
-        )
+        logger.info("LogisticsSpecialist: morning_report cron scheduled at %s МСК", self._vu_settings.request_time)
 
     async def _morning_handler(self) -> None:
         await self._run_and_deliver(reminder_count=0)
 
-    def _make_reminder_handler(self, count: int) -> Callable[[], Awaitable[None]]:
+    def _make_reminder_handler(self, count: int):  # noqa: ANN201
         async def _handler() -> None:
             await self._run_and_deliver(reminder_count=count)
 
@@ -126,17 +133,16 @@ class LogisticsSpecialist(BaseSpecialist):
             return None
 
     async def _run_and_deliver(self, reminder_count: int) -> None:
-        settings = self._settings
-        dialog_id = settings.vehicle_usage_dialog_id
-        manager_user_id = settings.vehicle_usage_manager_user_id
-        max_reminders = settings.vehicle_usage_max_reminders
+        vu = self._vu_settings
+        dialog_id = vu.dialog_id
+        manager_user_id = vu.manager_user_id
 
-        if reminder_count >= max_reminders:
+        if reminder_count >= vu.max_reminders:
             await self._escalate()
             return
 
         if not dialog_id:
-            logger.warning("LogisticsSpecialist: VEHICLE_USAGE_DIALOG_ID not set, skipping")
+            logger.warning("LogisticsSpecialist: dialog_id not set, skipping")
             return
 
         task = AgentTask(
@@ -155,9 +161,21 @@ class LogisticsSpecialist(BaseSpecialist):
         if answer is None:
             return
 
-        if answer and self._deliver_fn:
-            if not settings.vehicle_usage_dry_run:
-                await self._deliver_fn(dialog_id, answer)
+        if answer and self._output_fn:
+            if not vu.dry_run:
+                await self._output_fn(
+                    AgentTask(
+                        task_id=f"logistics_deliver_{uuid.uuid4().hex[:8]}",
+                        request=answer,
+                        user=UserContext(id=str(manager_user_id) if manager_user_id else ""),
+                        context={
+                            "_source": "logistics",
+                            "_intent": "deliver_to_dialog",
+                            "dialog_id": dialog_id,
+                            "reminder_count": reminder_count,
+                        },
+                    )
+                )
                 if self.tools is not None:
                     self.tools.store.create_sent_request(
                         SentRequestData(
@@ -170,11 +188,10 @@ class LogisticsSpecialist(BaseSpecialist):
                         )
                     )
             else:
-                logger.info("LogisticsSpecialist: dry_run, would send: %s", answer[:120])
+                logger.info("LogisticsSpecialist: dry_run, would deliver: %s", answer[:120])
 
         next_count = reminder_count + 1
-        interval = settings.vehicle_usage_reminder_interval_minutes
-        run_date = datetime.now(MOSCOW_TZ) + timedelta(minutes=interval)
+        run_date = datetime.now(MOSCOW_TZ) + timedelta(minutes=vu.reminder_interval_minutes)
         self.schedule_job_at(
             f"reminder_{next_count}",
             self._make_reminder_handler(next_count),
@@ -183,10 +200,10 @@ class LogisticsSpecialist(BaseSpecialist):
         logger.info("LogisticsSpecialist: scheduled reminder_%d at %s", next_count, run_date.isoformat())
 
     async def _escalate(self) -> None:
-        settings = self._settings
-        admin_ids = settings.resolved_vehicle_usage_admin_notify_user_ids
+        vu = self._vu_settings
+        admin_ids = vu.admin_notify_user_ids
         if not admin_ids:
-            logger.warning("LogisticsSpecialist: VEHICLE_USAGE_ADMIN_NOTIFY_USER_IDS not set, skipping escalation")
+            logger.warning("LogisticsSpecialist: admin_notify_user_ids not set, skipping escalation")
             return
 
         task = AgentTask(
@@ -196,21 +213,28 @@ class LogisticsSpecialist(BaseSpecialist):
         )
         message = await self._run_llm_task(task) or "Утренний отчёт по служебным автомобилям не получен."
 
-        if settings.vehicle_usage_dry_run:
+        if vu.dry_run:
             logger.info("LogisticsSpecialist: dry_run, escalation would notify %s", admin_ids)
             return
 
-        for user_id in admin_ids:
-            if self._notify_fn:
-                try:
-                    await self._notify_fn(user_id, message)
-                except Exception:
-                    logger.exception("LogisticsSpecialist: escalation notify failed for user_id=%d", user_id)
+        if self._output_fn:
+            await self._output_fn(
+                AgentTask(
+                    task_id=f"logistics_esc_{uuid.uuid4().hex[:8]}",
+                    request=message,
+                    user=UserContext(id=""),
+                    context={
+                        "_source": "logistics",
+                        "_intent": "escalate",
+                        "admin_user_ids": admin_ids,
+                    },
+                )
+            )
 
         if self.tools is not None:
             self.tools.store.mark_escalated(
                 request_date=datetime.now(MOSCOW_TZ).date().isoformat(),
-                user_id=settings.vehicle_usage_manager_user_id,
+                user_id=vu.manager_user_id,
                 escalated_at=datetime.now(MOSCOW_TZ).isoformat(),
             )
         logger.info("LogisticsSpecialist: escalation sent to %s", admin_ids)
@@ -276,14 +300,14 @@ class LogisticsSpecialist(BaseSpecialist):
         )
         return result, ActionRecord(name=tool_call.name, status=result.status, details=result.model_dump()), []
 
-    def _llm_failure_result(self, message: str):
+    def _llm_failure_result(self, message: str):  # noqa: ANN201
         return logistics_llm_failure_result(message, agent_id=self.manifest.id)
 
     def _logs(self) -> list[str]:
         return [
-            "Logistics specialist is an LLM specialist; vehicle tools only read/write structured state.",
-            "User-facing delivery belongs to the Negotiator/channel runtime.",
-            "Bitrix remains the channel/source layer; Logistics owns vehicle usage interpretation.",
+            "Логист — LLM-специалист; инструменты только читают/пишут структурированное состояние.",
+            "Доставка сообщений пользователю — зона Переговорщика и канального уровня.",
+            "Bitrix остаётся слоем канала/источника; Логист владеет только интерпретацией vehicle_usage.",
         ]
 
 
@@ -293,6 +317,6 @@ def _parse_hhmm(value: str) -> tuple[int, int]:
         hour = int(parts[0])
         minute = int(parts[1]) if len(parts) > 1 else 0
     except (ValueError, IndexError):
-        logger.warning("LogisticsSpecialist: invalid vehicle_usage_request_time %r, defaulting to 08:00", value)
+        logger.warning("LogisticsSpecialist: invalid request_time %r, defaulting to 08:00", value)
         return 8, 0
     return hour, minute
