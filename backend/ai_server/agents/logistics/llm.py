@@ -14,6 +14,7 @@ from ai_server.agents.specialist_llm_shared import (
     load_instructions,
     result_status,
     retrieval_context,
+    safe_context,
 )
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
@@ -115,7 +116,7 @@ class LogisticsLLMService:
                             },
                             "request": task.request,
                             "user": task.user.model_dump(),
-                            "context": task.context,
+                            "context": safe_context(task.context),
                             "current_datetime": datetime.now(UTC).astimezone().isoformat(),
                             "dialog_history": dialog_history or [],
                             "retrieval_context": retrieval_context(retrieval_hits),
@@ -221,6 +222,12 @@ def _compose_system_prompt() -> str:
         "Если сохранен финальный отчет, скажи кратко что сохранено. "
         "Если задача от scheduler про напоминание или эскалацию, answer должен быть точным текстом сообщения, "
         "которое Переговорщик отправит людям. "
+        "ФОРМАТИРОВАНИЕ ОБЯЗАТЕЛЬНО: используй переносы строк (\\n) для структуры. "
+        "Для утреннего запроса/напоминания — вежливое обращение + суть в одной строке. "
+        "Для подтверждения отчёта — сначала краткий итог, затем список сотрудников построчно "
+        "(имя — статус/авто), затем список машин построчно (авто — водитель). "
+        "Для эскалации — чёткий сигнал + дата + что именно отсутствует. "
+        "Никогда не сваливай всё в одну строку через запятую или пробел. "
         "Верни только JSON-объект без markdown: "
         '{"status":"completed|needs_clarification|needs_human|failed","answer":"ответ человеку"}.'
     )
