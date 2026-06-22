@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI
 
@@ -17,6 +18,8 @@ from .integrations.bitrix.portal_search import PortalSearchIndex
 from .integrations.bitrix.ports import BitrixAgentStorePort
 from .integrations.ports import VehicleUsageStorePort
 from .integrations.postgres.bitrix_agent import PostgresBitrixAgentStore
+from .integrations.postgres.portal_search import PostgresPortalSearchIndex
+from .integrations.postgres.pto_agent import PostgresPtoAgentStore
 from .integrations.postgres.vehicle_usage import PostgresVehicleUsageStore
 from .integrations.redis.event_queue import RedisEventQueue
 from .learning import LearningEventRecorder
@@ -35,6 +38,16 @@ from .workers.bitrix.webhook_event_queue import WebhookEventQueue, run_webhook_e
 from .workers.logistics.staff_sync import run_staff_sync
 
 
+async def _make_portal_search(settings: Settings) -> PortalSearchIndex:
+    if settings.database_url:
+        index = PostgresPortalSearchIndex(settings.database_url)
+        await index.ensure_schema()
+        return index  # type: ignore[return-value]
+    index = PortalSearchIndex()
+    index.ensure_schema()
+    return index
+
+
 def _make_event_queue(settings: Settings) -> WebhookEventQueue | RedisEventQueue:
     if settings.redis_url:
         return RedisEventQueue(settings.redis_url)
@@ -43,23 +56,31 @@ def _make_event_queue(settings: Settings) -> WebhookEventQueue | RedisEventQueue
     return queue
 
 
-def _make_vehicle_store(settings: Settings) -> VehicleUsageStorePort:
+async def _make_vehicle_store(settings: Settings) -> VehicleUsageStorePort:
     if settings.database_url:
         store = PostgresVehicleUsageStore(settings.database_url)
-        store.ensure_schema()
+        await store.ensure_schema()
         return store
     store = VehicleUsageStore(settings.vehicle_usage_db_path)
     store.bootstrap_reference_data()
     return store
 
 
-def _make_bitrix_store(settings: Settings) -> BitrixAgentStorePort:
+async def _make_bitrix_store(settings: Settings) -> BitrixAgentStorePort:
     if settings.database_url:
         store = PostgresBitrixAgentStore(settings.database_url)
-        store.ensure_schema()
+        await store.ensure_schema()
         return store
     store = BitrixAgentStore()
     store.ensure_schema()
+    return store
+
+
+async def _make_pto_store(settings: Settings) -> Any:
+    if not settings.database_url:
+        return None
+    store = PostgresPtoAgentStore(settings.database_url)
+    await store.ensure_schema()
     return store
 
 
@@ -71,12 +92,12 @@ async def lifespan(app: FastAPI):
     bitrix_oauth = BitrixOAuthService()
     bitrix = BitrixClient(settings=settings, oauth_service=bitrix_oauth)
     bitrix_oauth.ensure_schema()
-    portal_search = PortalSearchIndex()
-    portal_search.ensure_schema()
+    portal_search = await _make_portal_search(settings)
     portal_search_indexer = PortalSearchIndexerWorker(bitrix, portal_search, settings=settings)
     learning_recorder = LearningEventRecorder()
     webhook_event_queue = _make_event_queue(settings)
-    bitrix_store = _make_bitrix_store(settings)
+    bitrix_store = await _make_bitrix_store(settings)
+    pto_store = await _make_pto_store(settings)
 
     app.state.settings = settings
     app.state.manifests = manifests
@@ -214,6 +235,7 @@ async def lifespan(app: FastAPI):
             bitrix_llm=bitrix_llm_svc,
             bitrix_deliver_fn=_bitrix_deliver,
             pto_llm=PtoLLMService(),
+            pto_store=pto_store,
             logistics_llm=logistics_llm_svc,
         )
         search_webhook_handler = SearchWebhookHandlerAdapter(
@@ -279,7 +301,7 @@ async def lifespan(app: FastAPI):
             )
         )
     if settings.vehicle_usage_enabled:
-        vehicle_usage_store = _make_vehicle_store(settings)
+        vehicle_usage_store = await _make_vehicle_store(settings)
 
         async def _vehicle_deliver(dialog_id: str, message: str) -> None:
             await bitrix.send_bot_message(dialog_id, message)
@@ -296,6 +318,7 @@ async def lifespan(app: FastAPI):
                 deliver_fn=_vehicle_deliver,
                 notify_fn=_vehicle_notify,
                 settings=settings,
+                store=vehicle_usage_store,
                 tools=VehicleUsageToolset(
                     store=vehicle_usage_store,
                     user_id=settings.vehicle_usage_manager_user_id,

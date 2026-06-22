@@ -6,7 +6,6 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from typing import Any
 
-from ai_server.agent_store import AgentStore
 from ai_server.agents.base import BaseSpecialist
 from ai_server.agents.logistics.llm import (
     LogisticsAgentLLM,
@@ -40,7 +39,7 @@ class LogisticsSpecialist(BaseSpecialist):
         tools: VehicleUsageToolsetPort | None = None,
         llm: LogisticsAgentLLM | None = None,
         scheduler: SchedulerPort | None = None,
-        store: AgentStore | None = None,
+        store: Any | None = None,
         deliver_fn: Callable[[str, str], Awaitable[None]] | None = None,
         notify_fn: Callable[[int, str], Awaitable[None]] | None = None,
         settings: Settings,
@@ -67,6 +66,7 @@ class LogisticsSpecialist(BaseSpecialist):
         vehicle_usage_tools: VehicleUsageToolsetPort | None = None,
         logistics_retriever: HybridKnowledgeRetriever | None = None,
         logistics_llm: LogisticsAgentLLM | None = None,
+        logistics_store: Any | None = None,
         scheduler: SchedulerPort | None = None,
         settings: Settings | None = None,
         **_: Any,
@@ -79,6 +79,7 @@ class LogisticsSpecialist(BaseSpecialist):
             tools=vehicle_usage_tools,
             llm=logistics_llm or LogisticsLLMService(),
             scheduler=scheduler,
+            store=logistics_store,
             settings=settings or get_settings(),
         )
 
