@@ -64,11 +64,15 @@ class InternalOrchestrator:
                     tool=tool_call.name,
                     error=f"Специалист '{specialist_id}' не найден",
                 )
-                return result, ActionRecord(
-                    name="delegate_to_specialist",
-                    status="error",
-                    details={"specialist": specialist_id, "error": result.error},
-                ), []
+                return (
+                    result,
+                    ActionRecord(
+                        name="delegate_to_specialist",
+                        status="error",
+                        details={"specialist": specialist_id, "error": result.error},
+                    ),
+                    [],
+                )
             sub_task = AgentTask(
                 task_id=task.task_id,
                 request=tool_call.args.get("request") or task.request,
@@ -80,21 +84,29 @@ class InternalOrchestrator:
             except Exception as exc:
                 err = f"{type(exc).__name__}: {exc}"
                 result = ToolResult(status=ToolStatus.ERROR, tool=tool_call.name, error=err)
-                return result, ActionRecord(
-                    name="delegate_to_specialist",
-                    status="error",
-                    details={"specialist": specialist_id, "error": err},
-                ), []
+                return (
+                    result,
+                    ActionRecord(
+                        name="delegate_to_specialist",
+                        status="error",
+                        details={"specialist": specialist_id, "error": err},
+                    ),
+                    [],
+                )
             result = ToolResult(
                 status=ToolStatus.OK,
                 tool=tool_call.name,
                 data={"specialist": specialist_id, "answer": sr.answer, "status": sr.status},
             )
-            return result, ActionRecord(
-                name="delegate_to_specialist",
-                status="completed",
-                details={"specialist": specialist_id},
-            ), list(sr.actions_requiring_approval)
+            return (
+                result,
+                ActionRecord(
+                    name="delegate_to_specialist",
+                    status="completed",
+                    details={"specialist": specialist_id},
+                ),
+                list(sr.actions_requiring_approval),
+            )
         result = ToolResult(
             status=ToolStatus.INVALID_TOOL_CALL,
             tool=tool_call.name,
