@@ -3,7 +3,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Protocol
 
-from ai_server.models import ToolDefinition, ToolResult
+from ai_server.models import AgentResult, AgentTask, ToolDefinition, ToolResult
+
+
+class SpecialistOutputPort(Protocol):
+    """Outbound port for specialist-initiated tasks. All outgoing specialist communication goes through this."""
+
+    async def __call__(self, task: AgentTask) -> AgentResult: ...
 
 
 class AgentDialogStorePort(Protocol):
@@ -49,6 +55,10 @@ class BitrixToolsetPort(Protocol):
     async def resolve_user(self, query: str, *, limit: int = 5) -> ToolResult: ...
 
     async def resolve_project(self, query: str, *, limit: int = 5) -> ToolResult: ...
+
+    async def send_message(self, args: dict[str, Any]) -> ToolResult: ...
+
+    async def notify_users(self, args: dict[str, Any]) -> ToolResult: ...
 
 
 class PtoToolsetPort(Protocol):

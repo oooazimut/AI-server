@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from .agent_scheduler import AgentScheduler
 from .agents.bitrix24 import BitrixLLMService
 from .agents.logistics import LogisticsLLMService, LogisticsSpecialist
+from .agents.logistics.specialist import VehicleUsageSettings
 from .agents.pto import PtoLLMService
 from .channels.bitrix import BitrixWebhookProcessor
 from .integrations.bitrix.bitrix_store import BitrixAgentStore
@@ -18,12 +19,13 @@ from .integrations.bitrix.portal_search import PortalSearchIndex
 from .integrations.bitrix.ports import BitrixAgentStorePort
 from .integrations.ports import VehicleUsageStorePort
 from .integrations.postgres.bitrix_agent import PostgresBitrixAgentStore
+from .integrations.postgres.orchestrator_agent import PostgresOrchestratorStore
 from .integrations.postgres.portal_search import PostgresPortalSearchIndex
 from .integrations.postgres.pto_agent import PostgresPtoAgentStore
 from .integrations.postgres.vehicle_usage import PostgresVehicleUsageStore
 from .integrations.redis.event_queue import RedisEventQueue
 from .learning import LearningEventRecorder
-from .orchestrators.internal_llm import InternalLLMRouter
+from .orchestrators.orchestrator_llm import OrchestratorLLMService
 from .registry import load_agent_manifests
 from .runtime import ensure_runtime_dirs
 from .settings import Settings, get_settings
@@ -84,6 +86,14 @@ async def _make_pto_store(settings: Settings) -> Any:
     return store
 
 
+async def _make_orchestrator_store(settings: Settings) -> Any:
+    if not settings.database_url:
+        return None
+    store = PostgresOrchestratorStore(settings.database_url)
+    await store.ensure_schema()
+    return store
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -98,6 +108,7 @@ async def lifespan(app: FastAPI):
     webhook_event_queue = _make_event_queue(settings)
     bitrix_store = await _make_bitrix_store(settings)
     pto_store = await _make_pto_store(settings)
+    orchestrator_store = await _make_orchestrator_store(settings)
 
     app.state.settings = settings
     app.state.manifests = manifests
@@ -215,6 +226,9 @@ async def lifespan(app: FastAPI):
     reconciler_task: asyncio.Task | None = None
     staff_sync_task: asyncio.Task | None = None
     logistics_specialist: LogisticsSpecialist | None = None
+    vehicle_usage_store = None
+    if settings.vehicle_usage_enabled:
+        vehicle_usage_store = await _make_vehicle_store(settings)
 
     logistics_llm_svc = LogisticsLLMService()
 
@@ -231,7 +245,8 @@ async def lifespan(app: FastAPI):
         specialist_deps = SpecialistDeps(
             settings=settings,
             scheduler=scheduler,
-            orchestrator_llm=InternalLLMRouter(),
+            orchestrator_llm=OrchestratorLLMService(),
+            orchestrator_store=orchestrator_store,
             bitrix_llm=bitrix_llm_svc,
             bitrix_deliver_fn=_bitrix_deliver,
             pto_llm=PtoLLMService(),
@@ -268,6 +283,38 @@ async def lifespan(app: FastAPI):
             quality_control_handler=quality_control_handler,
         )
 
+        if vehicle_usage_store is not None:
+            logistics_manifest = manifest_by_id(manifests, "logistics")
+            if logistics_manifest is not None:
+
+                async def _logistics_output(task):
+                    return await processor._orchestrator.handle(task)
+
+                logistics_specialist = LogisticsSpecialist(
+                    logistics_manifest,
+                    llm=logistics_llm_svc,
+                    scheduler=scheduler,
+                    output_fn=_logistics_output,
+                    vu_settings=VehicleUsageSettings(
+                        dialog_id=settings.vehicle_usage_dialog_id or "",
+                        manager_user_id=settings.vehicle_usage_manager_user_id,
+                        max_reminders=settings.vehicle_usage_max_reminders,
+                        reminder_interval_minutes=settings.vehicle_usage_reminder_interval_minutes,
+                        admin_notify_user_ids=settings.resolved_vehicle_usage_admin_notify_user_ids,
+                        dry_run=settings.vehicle_usage_dry_run,
+                        request_time=settings.vehicle_usage_request_time,
+                    ),
+                    store=vehicle_usage_store,
+                    tools=VehicleUsageToolset(
+                        store=vehicle_usage_store,
+                        user_id=settings.vehicle_usage_manager_user_id,
+                        dialog_id=settings.vehicle_usage_dialog_id,
+                    ),
+                )
+                if not settings.redis_url:
+                    logistics_specialist.start()
+                app.state.logistics_specialist = logistics_specialist
+
         async def _dispatch_processor(payload: dict) -> dict:
             event_key = str(payload.get("event") or "")
             if event_key == "vehicle_usage_morning_trigger" and logistics_specialist is not None:
@@ -284,6 +331,8 @@ async def lifespan(app: FastAPI):
                 settings=settings,
             )
         )
+    if settings.vehicle_usage_enabled and vehicle_usage_store is not None:
+        staff_sync_task = asyncio.create_task(run_staff_sync(bitrix, vehicle_usage_store, settings=settings))
     if settings.search_background_indexer_enabled:
         search_indexer_task = asyncio.create_task(portal_search_indexer.run())
     if settings.supervisor_enabled:
@@ -300,36 +349,6 @@ async def lifespan(app: FastAPI):
                 settings=settings,
             )
         )
-    if settings.vehicle_usage_enabled:
-        vehicle_usage_store = await _make_vehicle_store(settings)
-
-        async def _vehicle_deliver(dialog_id: str, message: str) -> None:
-            await bitrix.send_bot_message(dialog_id, message)
-
-        async def _vehicle_notify(user_id: int, message: str) -> None:
-            await bitrix.notify_user(user_id=user_id, message=message, tag="vehicle_usage_escalation")
-
-        logistics_manifest = manifest_by_id(manifests, "logistics")
-        if logistics_manifest is not None:
-            logistics_specialist = LogisticsSpecialist(
-                logistics_manifest,
-                llm=logistics_llm_svc,
-                scheduler=scheduler,
-                deliver_fn=_vehicle_deliver,
-                notify_fn=_vehicle_notify,
-                settings=settings,
-                store=vehicle_usage_store,
-                tools=VehicleUsageToolset(
-                    store=vehicle_usage_store,
-                    user_id=settings.vehicle_usage_manager_user_id,
-                    dialog_id=settings.vehicle_usage_dialog_id,
-                ),
-            )
-            if not settings.redis_url:
-                logistics_specialist.start()
-            app.state.logistics_specialist = logistics_specialist
-
-        staff_sync_task = asyncio.create_task(run_staff_sync(bitrix, vehicle_usage_store, settings=settings))
 
     try:
         yield

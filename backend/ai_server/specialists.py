@@ -36,13 +36,16 @@ class SpecialistDeps:
     vehicle_usage_tools: Any = None  # VehicleUsageToolsetPort | None
     logistics_llm: Any = None
 
+    orchestrator_store: Any = None  # AgentDialogStorePort | None
+    orchestrator_retriever: Any = None  # HybridKnowledgeRetriever | None
+
     def as_registry_kwargs(self) -> dict[str, Any]:
         """Returns kwargs for build_specialist_registry.
 
-        Excludes orchestrator_llm (passed directly to InternalOrchestrator)
-        and None values (let each specialist's build() apply its own defaults).
+        Excludes orchestrator_llm, orchestrator_store, orchestrator_retriever
+        (passed directly to InternalOrchestrator) and None values.
         """
-        excluded = {"orchestrator_llm"}
+        excluded = {"orchestrator_llm", "orchestrator_store", "orchestrator_retriever"}
         return {k: v for k, v in vars(self).items() if k not in excluded and v is not None}
 
 

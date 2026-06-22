@@ -594,7 +594,7 @@ def test_bitrix_task_create_chat_flow_saves_and_confirms_pending_action(monkeypa
         orchestrator=InternalOrchestrator(
             manifests,
             specialists={"bitrix24": specialist},
-            orchestrator_llm=FakeInternalOrchestratorLLM(handoff_to=["bitrix24"]),
+            orchestrator_llm=FakeInternalOrchestratorLLM(call_specialists=["bitrix24"]),
         ),
         pending_actions=pending_service,
     )

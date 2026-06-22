@@ -26,7 +26,12 @@ from ai_server.agents.pto import (
 )
 from ai_server.llm import LLMCompletion
 from ai_server.models import ModelUsageRecord
-from ai_server.orchestrators.internal_llm import InternalRouteDecision, InternalRouteResult, InternalSynthesisResult
+from ai_server.orchestrators.orchestrator_llm import (
+    OrchestratorDecision,
+    OrchestratorDecisionResult,
+    OrchestratorFinalResult,
+    OrchestratorToolCall,
+)
 
 
 class RecordingLLMClient:
@@ -256,45 +261,66 @@ class FakeInternalOrchestratorLLM:
     def __init__(
         self,
         *,
-        handoff_to: list[str] | None = None,
+        call_specialists: list[str] | None = None,
         status: str = "completed",
         answer: str = "",
         confidence: float = 0.9,
         synthesized_answer: str = "",
     ) -> None:
-        self.handoff_to = handoff_to or []
+        self.call_specialists = call_specialists or []
         self.status = status
         self.answer = answer
         self.confidence = confidence
         self.synthesized_answer = synthesized_answer
-        self.route_calls = []
-        self.synthesize_calls = []
+        self.decide_calls: list[dict] = []
+        self.compose_calls: list[dict] = []
 
-    async def route(self, **kwargs):
-        self.route_calls.append(kwargs)
-        return InternalRouteResult(
-            decision=InternalRouteDecision(
-                status=self.status,
-                answer=self.answer,
-                handoff_to=self.handoff_to,
-                confidence=self.confidence,
-            ),
-            model_usage=ModelUsageRecord(
-                agent_id="internal_orchestrator",
-                provider="fake",
-                model="fake-orchestrator-llm",
-                status="used",
-            ),
+    def _make_usage(self) -> ModelUsageRecord:
+        return ModelUsageRecord(
+            agent_id="internal_orchestrator",
+            provider="fake",
+            model="fake-orchestrator-llm",
+            status="used",
         )
 
-    async def synthesize(self, **kwargs):
-        self.synthesize_calls.append(kwargs)
-        return InternalSynthesisResult(
-            answer=self.synthesized_answer or "Синтезированный ответ.",
-            model_usage=ModelUsageRecord(
-                agent_id="internal_orchestrator",
-                provider="fake",
-                model="fake-orchestrator-llm",
-                status="used",
+    async def decide(self, *, task, tool_results=None, **kwargs):
+        self.decide_calls.append({"task": task, "tool_results": tool_results or [], **kwargs})
+        existing = tool_results or []
+        if existing or not self.call_specialists:
+            # Уже есть результаты или нечего вызывать — завершить цикл
+            tool_calls = [OrchestratorToolCall(name="none")]
+        else:
+            tool_calls = [
+                OrchestratorToolCall(name=f"call_{sid}", args={"request": task.request})
+                for sid in self.call_specialists
+            ]
+        return OrchestratorDecisionResult(
+            decision=OrchestratorDecision(
+                status=self.status,
+                answer=self.answer,
+                tool_calls=tool_calls,
+                confidence=self.confidence,
             ),
+            model_usage=self._make_usage(),
+        )
+
+    async def compose(self, *, tool_results=None, **kwargs):
+        self.compose_calls.append({"tool_results": tool_results or [], **kwargs})
+        successful = [tr for tr in (tool_results or []) if getattr(tr, "status", None) == "ok"]
+        if not successful:
+            # Нет успешных специалистов — прямой ответ или ошибка
+            return OrchestratorFinalResult(
+                answer=self.answer or "",
+                status=self.status if self.answer else "failed",
+                model_usage=self._make_usage(),
+            )
+        if self.synthesized_answer and len(successful) > 1:
+            answer = self.synthesized_answer
+        else:
+            data = successful[0].data or {}
+            answer = data.get("answer", self.answer)
+        return OrchestratorFinalResult(
+            answer=answer,
+            status=self.status,
+            model_usage=self._make_usage(),
         )

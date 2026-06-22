@@ -275,6 +275,8 @@ class Bitrix24Specialist(BaseSpecialist):
             "delete_incomplete_proposal": self._call_delete_incomplete_proposal,
             "save_responsible_response": self._call_save_responsible_response,
             "bitrix_api": self._call_bitrix_api,
+            "bitrix_send_message": self._call_send_message,
+            "bitrix_notify_users": self._call_notify_users,
         }.get(tool_call.name)
         if handler is None:
             result = ToolResult(
@@ -381,6 +383,32 @@ class Bitrix24Specialist(BaseSpecialist):
     ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
         result = await tools.bitrix_api(tool_call.args)
         return result, ActionRecord(name="bitrix_api", status=result.status, details=result.model_dump()), []
+
+    async def _call_send_message(
+        self, tool_call: BitrixLLMToolCall, task: AgentTask, tools: BitrixToolsetPort | None
+    ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
+        if tools is None:
+            result = ToolResult(status=ToolStatus.NOT_CONFIGURED, tool="bitrix_send_message", error="Toolset not bound")
+            return (
+                result,
+                ActionRecord(name="bitrix_send_message", status=result.status, details=result.model_dump()),
+                [],
+            )
+        result = await tools.send_message(tool_call.args)
+        return result, ActionRecord(name="bitrix_send_message", status=result.status, details=result.model_dump()), []
+
+    async def _call_notify_users(
+        self, tool_call: BitrixLLMToolCall, task: AgentTask, tools: BitrixToolsetPort | None
+    ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
+        if tools is None:
+            result = ToolResult(status=ToolStatus.NOT_CONFIGURED, tool="bitrix_notify_users", error="Toolset not bound")
+            return (
+                result,
+                ActionRecord(name="bitrix_notify_users", status=result.status, details=result.model_dump()),
+                [],
+            )
+        result = await tools.notify_users(tool_call.args)
+        return result, ActionRecord(name="bitrix_notify_users", status=result.status, details=result.model_dump()), []
 
     def _save_incomplete_proposal(self, proposal: IncompleteProposal) -> ToolResult:
         if self._proposals is None:
