@@ -3,8 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from ai_server.agent_store import AgentStore
-from ai_server.agents.ports import SchedulerPort
+from ai_server.agents.ports import AgentDialogStorePort, SchedulerPort
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult
 from ai_server.retrieval import HybridKnowledgeRetriever
@@ -36,7 +35,7 @@ class BaseSpecialist:
         tools: Any = None,
         llm: Any = None,
         scheduler: SchedulerPort | None = None,
-        store: AgentStore | None = None,
+        store: AgentDialogStorePort | None = None,
     ) -> None:
         self.manifest = manifest
         self.knowledge_base = knowledge_base
@@ -131,6 +130,15 @@ class BaseSpecialist:
                 confidence=0.0,
                 logs=self._logs(),
             )
+
+        # Load per-specialist dialog history from agent's own PG schema (if configured),
+        # otherwise fall back to the shared history passed via task.context.
+        dialog_key: str = task.context.get("dialog_key") or ""
+        if self.store is not None and dialog_key:
+            dialog_history: list[dict] = await self.store.load_turns(dialog_key, limit=20)
+        else:
+            dialog_history = list(task.context.get("dialog_history") or [])
+
         available_skills = self.skill_store.list_skills(self.manifest) if self.skill_store is not None else []
         task, extra_context_details = await self._load_extra_context(task)
         retrieval_hits = (
@@ -174,7 +182,7 @@ class BaseSpecialist:
                     retrieval_hits=retrieval_hits,
                     tool_definitions=self.tool_definitions(),
                     tool_results=list(tool_results),
-                    dialog_history=task.context.get("dialog_history"),
+                    dialog_history=dialog_history or None,
                 )
             except Exception as exc:
                 failure = self._llm_failure_result(f"{type(exc).__name__}: {exc}")
@@ -281,6 +289,9 @@ class BaseSpecialist:
             )
         )
         status = "needs_human" if approval_actions else final_result.status
+
+        if self.store is not None and dialog_key and final_result.answer:
+            await self.store.append_turn(dialog_key, task.request, final_result.answer)
 
         return AgentResult(
             status=status,

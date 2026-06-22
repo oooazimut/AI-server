@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from ai_server.agent_store import AgentStore
 from ai_server.agents.base import BaseSpecialist
 from ai_server.agents.ports import PtoToolsetPort, SchedulerPort
 from ai_server.agents.pto.llm import PtoAgentLLM, PtoLLMService, PtoLLMToolCall, pto_llm_failure_result
@@ -26,7 +25,7 @@ class PtoSpecialist(BaseSpecialist):
         tools: PtoToolsetPort | None = None,
         llm: PtoAgentLLM | None = None,
         scheduler: SchedulerPort | None = None,
-        store: AgentStore | None = None,
+        store: Any | None = None,
     ) -> None:
         super().__init__(
             manifest,
@@ -47,11 +46,17 @@ class PtoSpecialist(BaseSpecialist):
         document_tools: PtoToolsetPort | None = None,
         pto_retriever: HybridKnowledgeRetriever | None = None,
         pto_llm: PtoAgentLLM | None = None,
+        pto_store: Any | None = None,
         scheduler: SchedulerPort | None = None,
         **_: Any,
     ) -> PtoSpecialist:
         return cls(
-            manifest, retriever=pto_retriever, tools=document_tools, llm=pto_llm or PtoLLMService(), scheduler=scheduler
+            manifest,
+            retriever=pto_retriever,
+            tools=document_tools,
+            llm=pto_llm or PtoLLMService(),
+            scheduler=scheduler,
+            store=pto_store,
         )
 
     def tool_definitions(self) -> list[dict]:

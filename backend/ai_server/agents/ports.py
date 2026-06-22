@@ -6,6 +6,16 @@ from typing import Any, Protocol
 from ai_server.models import ToolDefinition, ToolResult
 
 
+class AgentDialogStorePort(Protocol):
+    """Per-specialist async dialog history store backed by PostgreSQL."""
+
+    async def ensure_schema(self) -> None: ...
+
+    async def load_turns(self, dialog_key: str, *, limit: int = 20) -> list[dict[str, str]]: ...
+
+    async def append_turn(self, dialog_key: str, user_text: str, agent_response: str) -> None: ...
+
+
 class SchedulerPort(Protocol):
     def add_job(self, agent_id: str, job_id: str, func: Any, trigger: Any, **kwargs: Any) -> Any: ...
 

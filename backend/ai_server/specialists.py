@@ -31,6 +31,7 @@ class SpecialistDeps:
     # pto
     document_tools: Any = None  # DocumentToolset | None
     pto_llm: Any = None
+    pto_store: Any = None  # AgentDialogStorePort | None
     # logistics
     vehicle_usage_tools: Any = None  # VehicleUsageToolsetPort | None
     logistics_llm: Any = None

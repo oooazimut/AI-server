@@ -175,11 +175,14 @@ class BitrixWebhookProcessor:
     ) -> AgentTask:
         pending_action = dialog_state.pending_action
         toolsets = self._build_request_toolsets(incoming, dialog_key=dialog_key)
+        # In PG mode each specialist loads its own dialog history from its schema.
+        # In SQLite mode use the shared turns from DialogStateStore.
+        shared_turns = [] if self._settings.database_url else dialog_state.turns[-8:]
         ctx = BitrixTaskContext(
             bitrix_event_type=incoming.event_type,
             dialog_key=dialog_key,
             pending_action=asdict(pending_action) if pending_action is not None else None,
-            dialog_history=dialog_state.turns[-8:],
+            dialog_history=shared_turns,
             transcriptions=attachment_context["transcriptions"],
             attachment_errors=attachment_context["errors"],
             bitrix_tools=toolsets["_bitrix_tools"],
@@ -239,7 +242,8 @@ class BitrixWebhookProcessor:
         event_type: str,
         attachment_context: dict[str, Any],
     ) -> dict[str, Any]:
-        if incoming.text and result.answer:
+        # In PG mode each specialist appends its own turn in BaseSpecialist.handle().
+        if incoming.text and result.answer and not self._settings.database_url:
             self.pending_actions.store.append_turn(dialog_key, incoming.text, result.answer)
         pending_action = self._save_first_pending_action(
             dialog_key, result.actions_requiring_approval, user_id=incoming.user_id

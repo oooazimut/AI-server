@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from ai_server.agent_store import AgentStore
 from ai_server.agents.base import BaseSpecialist
 from ai_server.agents.bitrix24.llm import (
     BitrixAgentLLM,
@@ -202,7 +201,7 @@ class Bitrix24Specialist(BaseSpecialist):
         tools: BitrixToolsetPort | None = None,
         llm: BitrixAgentLLM | None = None,
         scheduler: SchedulerPort | None = None,
-        store: AgentStore | None = None,
+        store: Any | None = None,
         proposals: BitrixProposalService | None = None,
     ) -> None:
         self._proposals = proposals
@@ -244,6 +243,7 @@ class Bitrix24Specialist(BaseSpecialist):
             llm=bitrix_llm or BitrixLLMService(settings=_settings),
             scheduler=scheduler,
             proposals=proposals,
+            store=bitrix_store,
         )
 
     def tool_definitions(self) -> list[dict]:
