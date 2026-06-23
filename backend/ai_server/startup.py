@@ -318,8 +318,6 @@ async def lifespan(app: FastAPI):
             search_webhook_status=app.state.search_webhook_indexer_status,
             quality_control_status=app.state.quality_control_webhook_status,
             learning_recorder=learning_recorder,
-            scheduler=scheduler,
-            specialist_deps=specialist_deps,
             bitrix_store=bitrix_store,
             search_webhook_handler=search_webhook_handler,
             quality_control_handler=quality_control_handler,

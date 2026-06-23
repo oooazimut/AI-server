@@ -6,7 +6,6 @@ from dataclasses import asdict, dataclass
 from typing import Any
 from uuid import uuid4
 
-from ai_server.agents.ports import SchedulerPort
 from ai_server.attachments import AttachmentService, StoredAttachment
 from ai_server.channels.ports import QualityControlHandlerPort, SearchWebhookHandlerPort
 from ai_server.integrations.bitrix.bitrix_store import BitrixAgentStore
@@ -26,7 +25,6 @@ from ai_server.models import ActionRecord, AgentManifest, AgentTask, UserContext
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.registry import load_agent_manifests
 from ai_server.settings import Settings, get_settings
-from ai_server.specialists import SpecialistDeps
 from ai_server.technical_footer import TechnicalFooterService, append_footer
 from ai_server.transcription import TranscriptionResult, build_transcriber
 
@@ -70,12 +68,10 @@ class BitrixWebhookProcessor:
         quality_control_status: dict[str, Any] | None = None,
         orchestrator: InternalOrchestrator | None = None,
         pending_actions: BitrixPendingActionService | None = None,
-        specialist_deps: SpecialistDeps | None = None,
         technical_footer: TechnicalFooterService | None = None,
         attachment_service: AttachmentService | None = None,
         transcriber: Any | None = None,
         learning_recorder: LearningEventRecorder | None = None,
-        scheduler: SchedulerPort | None = None,
         bitrix_store: BitrixAgentStorePort | None = None,
         search_webhook_handler: SearchWebhookHandlerPort | None = None,
         quality_control_handler: QualityControlHandlerPort | None = None,
@@ -87,10 +83,8 @@ class BitrixWebhookProcessor:
         self.bitrix = bitrix or BitrixClient(settings=self._settings)
         self.portal_search = portal_search or PortalSearchIndex()
         self.bitrix_oauth = bitrix_oauth
-        self.scheduler = scheduler
         self.search_webhook_status = search_webhook_status if search_webhook_status is not None else {}
         self.quality_control_status = quality_control_status if quality_control_status is not None else {}
-        self._specialist_deps = specialist_deps or SpecialistDeps(settings=self._settings)
         self.technical_footer = technical_footer or TechnicalFooterService(settings=self._settings)
         self.attachment_service = attachment_service or AttachmentService(self.bitrix)
         self.transcriber = transcriber or build_transcriber()
