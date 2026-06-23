@@ -1,0 +1,223 @@
+"""Tests for BitrixTaskCreateDraft builder (build_task_create_draft_from_args)."""
+
+from __future__ import annotations
+
+from ai_server.agents.bitrix24.task_create import (
+    BitrixTaskCreateDraft,
+    BitrixTaskCreateResolution,
+    build_task_create_draft_from_args,
+)
+from ai_server.models import AgentTask, UserContext
+
+
+def _task(user_id: str = "9") -> AgentTask:
+    return AgentTask(task_id="t1", request="создай задачу", user=UserContext(id=user_id))
+
+
+# ---------------------------------------------------------------------------
+# BitrixTaskCreateDraft.is_ready
+# ---------------------------------------------------------------------------
+
+
+def test_draft_is_ready_with_fields():
+    draft = BitrixTaskCreateDraft(params={"fields": {"TITLE": "Тест"}})
+    assert draft.is_ready
+
+
+def test_draft_not_ready_with_contract_errors():
+    draft = BitrixTaskCreateDraft(params={"fields": {"TITLE": "Тест"}}, contract_errors=["missing responsible"])
+    assert not draft.is_ready
+
+
+def test_draft_not_ready_without_fields():
+    draft = BitrixTaskCreateDraft(params={})
+    assert not draft.is_ready
+
+
+# ---------------------------------------------------------------------------
+# build_task_create_draft_from_args — happy paths
+# ---------------------------------------------------------------------------
+
+
+def test_draft_complete_with_no_deadline():
+    draft = build_task_create_draft_from_args(
+        _task(),
+        {"title": "Проверить камеру", "responsible_id": 9, "no_deadline": True},
+    )
+    assert draft.is_ready
+    assert draft.params["fields"]["TITLE"] == "Проверить камеру"
+    assert draft.params["fields"]["RESPONSIBLE_ID"] == 9
+    assert draft.params["fields"]["NO_DEADLINE"] is True
+
+
+def test_draft_strips_title_punctuation():
+    draft = build_task_create_draft_from_args(
+        _task(),
+        {"title": "  Задача.  ", "responsible_id": 9, "no_deadline": True},
+    )
+    assert draft.params["fields"]["TITLE"] == "Задача"
+
+
+def test_draft_sets_created_by_from_user():
+    draft = build_task_create_draft_from_args(
+        _task(user_id="15"),
+        {"title": "Задача", "responsible_id": 9, "no_deadline": True},
+    )
+    assert draft.params["fields"]["CREATED_BY"] == 15
+
+
+def test_draft_deadline_iso():
+    draft = build_task_create_draft_from_args(
+        _task(),
+        {"title": "Задача", "responsible_id": 9, "deadline_iso": "2026-07-01T09:00:00+03:00"},
+    )
+    assert draft.is_ready
+    assert draft.params["fields"]["DEADLINE"] == "2026-07-01T09:00:00+03:00"
+
+
+def test_draft_deadline_z_suffix():
+    draft = build_task_create_draft_from_args(
+        _task(),
+        {"title": "Задача", "responsible_id": 9, "deadline_iso": "2026-07-01T09:00:00Z"},
+    )
+    assert draft.is_ready
+
+
+def test_draft_responsible_self():
+    draft = build_task_create_draft_from_args(
+        _task(user_id="15"),
+        {"title": "Задача", "responsible_self": True, "no_deadline": True},
+    )
+    assert draft.is_ready
+    assert draft.params["fields"]["RESPONSIBLE_ID"] == 15
+
+
+def test_draft_resolution_sets_responsible():
+    resolution = BitrixTaskCreateResolution(responsible_id=42, responsible_note="найден по запросу")
+    draft = build_task_create_draft_from_args(
+        _task(),
+        {"title": "Задача", "responsible_query": "Иван", "no_deadline": True},
+        resolution=resolution,
+    )
+    assert draft.is_ready
+    assert draft.params["fields"]["RESPONSIBLE_ID"] == 42
+    assert any("найден" in note for note in draft.notes)
+
+
+def test_draft_resolution_sets_group():
+    resolution = BitrixTaskCreateResolution(responsible_id=9, group_id=17, group_note="Склад")
+    draft = build_task_create_draft_from_args(
+        _task(),
+        {"title": "Задача", "no_deadline": True, "project_query": "Склад"},
+        resolution=resolution,
+    )
+    assert draft.is_ready
+    assert draft.params["fields"]["GROUP_ID"] == 17
+
+
+def test_draft_description_included():
+    draft = build_task_create_draft_from_args(
+        _task(),
+        {"title": "Задача", "description": "Подробное описание", "responsible_id": 9, "no_deadline": True},
+    )
+    assert draft.params["fields"]["DESCRIPTION"] == "Подробное описание"
+
+
+# ---------------------------------------------------------------------------
+# build_task_create_draft_from_args — contract errors
+# ---------------------------------------------------------------------------
+
+
+def test_draft_missing_title():
+    draft = build_task_create_draft_from_args(
+        _task(),
+        {"title": "", "responsible_id": 9, "no_deadline": True},
+    )
+    assert not draft.is_ready
+    assert any("title" in e for e in draft.contract_errors)
+
+
+def test_draft_missing_responsible():
+    draft = build_task_create_draft_from_args(
+        _task(),
+        {"title": "Задача", "no_deadline": True},
+    )
+    assert not draft.is_ready
+    assert any("responsible" in e for e in draft.contract_errors)
+
+
+def test_draft_responsible_self_without_user_id():
+    draft = build_task_create_draft_from_args(
+        _task(user_id=""),
+        {"title": "Задача", "responsible_self": True, "no_deadline": True},
+    )
+    assert not draft.is_ready
+
+
+def test_draft_missing_deadline():
+    draft = build_task_create_draft_from_args(
+        _task(),
+        {"title": "Задача", "responsible_id": 9},
+    )
+    assert not draft.is_ready
+    assert any("deadline" in e for e in draft.contract_errors)
+
+
+def test_draft_invalid_deadline_format():
+    draft = build_task_create_draft_from_args(
+        _task(),
+        {"title": "Задача", "responsible_id": 9, "deadline_iso": "01.07.2026"},
+    )
+    assert not draft.is_ready
+    assert any("ISO 8601" in e for e in draft.contract_errors)
+
+
+def test_draft_unresolved_responsible_query():
+    draft = build_task_create_draft_from_args(
+        _task(),
+        {"title": "Задача", "responsible_query": "НетТакого", "no_deadline": True},
+    )
+    assert not draft.is_ready
+    assert any("responsible_query" in e for e in draft.contract_errors)
+
+
+def test_draft_unresolved_project_query():
+    draft = build_task_create_draft_from_args(
+        _task(),
+        {"title": "Задача", "responsible_id": 9, "no_deadline": True, "project_query": "НетТакого"},
+    )
+    assert not draft.is_ready
+    assert any("project_query" in e for e in draft.contract_errors)
+
+
+# ---------------------------------------------------------------------------
+# summary
+# ---------------------------------------------------------------------------
+
+
+def test_draft_summary_contains_title():
+    draft = build_task_create_draft_from_args(
+        _task(),
+        {"title": "Сводка теста", "responsible_id": 9, "no_deadline": True},
+    )
+    assert "Сводка теста" in draft.summary
+
+
+def test_draft_summary_contains_responsible_id():
+    draft = build_task_create_draft_from_args(
+        _task(),
+        {"title": "Задача", "responsible_id": 9, "no_deadline": True},
+    )
+    assert "#9" in draft.summary
+
+
+def test_draft_as_action_details_keys():
+    draft = build_task_create_draft_from_args(
+        _task(),
+        {"title": "Задача", "responsible_id": 9, "no_deadline": True},
+    )
+    details = draft.as_action_details()
+    assert "method" in details
+    assert "params" in details
+    assert "contract_errors" in details
+    assert details["method"] == "tasks.task.add"
