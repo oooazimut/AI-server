@@ -4,6 +4,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist, BitrixLLMToolCall
+from ai_server.agents.bitrix24.tools import PortalSearchTool
 from ai_server.integrations.bitrix.portal_search import (
     PortalSearchIndex,
     sync_disk_delta_index,
@@ -15,7 +16,6 @@ from ai_server.models import AgentTask
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import get_settings
-from ai_server.tools.bitrix import BitrixToolset
 from ai_server.workers.bitrix.search_webhook_indexer import (
     prepare_search_webhook_job,
     process_search_webhook_job,
@@ -87,10 +87,12 @@ def test_portal_search_index_searches_old_schema(tmp_path):
 
 
 def test_portal_search_tool_returns_results(tmp_path):
-    index = _create_index(tmp_path / "search_index.sqlite")
-    toolset = BitrixToolset(portal_search=index)
+    import asyncio
 
-    result = toolset.portal_search_contract({"query": "транзит договор", "scope": "documents", "limit": 5})
+    index = _create_index(tmp_path / "search_index.sqlite")
+    tool = PortalSearchTool(portal_search=index)
+
+    result = asyncio.run(tool.execute({"query": "транзит договор", "scope": "documents", "limit": 5}))
 
     assert result.status == "ok"
     assert result.data["results"][0]["entity_type"] == "disk_file"
@@ -98,9 +100,11 @@ def test_portal_search_tool_returns_results(tmp_path):
 
 
 def test_portal_search_tool_reports_missing_index(tmp_path):
-    toolset = BitrixToolset(portal_search=PortalSearchIndex(tmp_path / "missing.sqlite"))
+    import asyncio
 
-    result = toolset.portal_search_contract({"query": "договор", "scope": "documents"})
+    tool = PortalSearchTool(portal_search=PortalSearchIndex(tmp_path / "missing.sqlite"))
+
+    result = asyncio.run(tool.execute({"query": "договор", "scope": "documents"}))
 
     assert result.status == "not_configured"
     assert "missing" in result.data["message"].lower()
@@ -127,7 +131,7 @@ def test_bitrix_specialist_uses_portal_search_for_document_requests(tmp_path):
     specialist = Bitrix24Specialist(
         manifest,
         retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
-        tools=BitrixToolset(portal_search=index),
+        agent_tools=[PortalSearchTool(portal_search=index)],
         llm=FakeBitrixLLM(
             tool_calls=[
                 BitrixLLMToolCall(

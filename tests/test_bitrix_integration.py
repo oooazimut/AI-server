@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from fastapi.testclient import TestClient
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist, BitrixLLMToolCall
+from ai_server.agents.bitrix24.tools import BitrixApiTool
 from ai_server.attachments import StoredAttachment
 from ai_server.channels.bitrix import BitrixWebhookProcessor
 from ai_server.integrations.bitrix.client import BitrixClient
@@ -24,7 +25,6 @@ from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import get_settings
 from ai_server.specialists import manifest_by_id
 from ai_server.technical_footer import ProviderBalanceSnapshot, TechnicalFooterService
-from ai_server.tools.bitrix import BitrixToolset
 from ai_server.transcription import TranscriptionResult
 from ai_server.workers.bitrix.quality_control_adapter import QualityControlHandlerAdapter
 from ai_server.workers.bitrix.webhook_event_queue import WebhookEventQueue
@@ -340,7 +340,7 @@ def test_bitrix_pending_action_confirm_executes_and_clears_state(monkeypatch, tm
     specialist = Bitrix24Specialist(
         manifest_by_id(manifests, "bitrix24"),
         retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
-        tools=BitrixToolset(client=fake_bitrix, pending_actions=pending_service, dialog_key=key, user_id=9),
+        agent_tools=[BitrixApiTool(client=fake_bitrix, pending_actions=pending_service)],
         llm=FakeBitrixLLM(
             tool_calls=[BitrixLLMToolCall(name="bitrix_api", args={"action": "confirm_pending"})],
             final_answer="Подтвердил, задача создана.",
@@ -389,7 +389,7 @@ def test_bitrix_pending_action_cancel_clears_state_without_call(monkeypatch, tmp
     specialist = Bitrix24Specialist(
         manifest_by_id(manifests, "bitrix24"),
         retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
-        tools=BitrixToolset(client=fake_bitrix, pending_actions=pending_service, dialog_key=key, user_id=9),
+        agent_tools=[BitrixApiTool(client=fake_bitrix, pending_actions=pending_service)],
         llm=FakeBitrixLLM(
             tool_calls=[BitrixLLMToolCall(name="bitrix_api", args={"action": "cancel_pending"})],
             final_answer="Отменил, создавать не буду.",
@@ -567,11 +567,10 @@ def test_bitrix_task_create_chat_flow_saves_and_confirms_pending_action(monkeypa
         dry_run=False,
     )
     manifests = load_agent_manifests()
-    bitrix_tools = BitrixToolset(client=fake_bitrix, pending_actions=pending_service, dialog_key=key, user_id=9)
     specialist = Bitrix24Specialist(
         manifest_by_id(manifests, "bitrix24"),
         retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
-        tools=bitrix_tools,
+        agent_tools=[BitrixApiTool(client=fake_bitrix, pending_actions=pending_service)],
         llm=FakeBitrixLLM(
             tool_call_steps=[
                 [

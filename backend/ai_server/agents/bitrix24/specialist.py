@@ -18,7 +18,20 @@ from ai_server.agents.bitrix24.task_create import (
     BitrixTaskCreateResolution,
     build_task_create_draft_from_args,
 )
-from ai_server.agents.ports import BitrixToolsetPort, SchedulerPort
+from ai_server.agents.bitrix24.tools import (
+    BitrixApiTool,
+    CurrentUserProfileTool,
+    NotifyUsersTool,
+    PortalSearchTool,
+    ResolveProjectTool,
+    ResolveUserTool,
+    SendMessageTool,
+)
+from ai_server.agents.ports import SchedulerPort
+from ai_server.agents.tool import AgentTool
+from ai_server.integrations.bitrix.dialog_state import BitrixPendingActionService
+from ai_server.integrations.bitrix.portal_search import PortalSearchIndex
+from ai_server.integrations.bitrix.ports import BitrixBotPort, BitrixRestPort, BitrixToolClientPort
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentTask, ToolResult, ToolStatus
 from ai_server.retrieval import HybridKnowledgeRetriever
@@ -128,6 +141,11 @@ _BITRIX_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     _SAVE_RESPONSIBLE_RESPONSE_DEF,
 ]
 
+# Tools in the registry that the LLM can call directly.
+_LLM_TOOL_NAMES = frozenset(
+    {"portal_search", "bitrix_api", "current_user_profile", "bitrix_send_message", "bitrix_notify_users"}
+)
+
 
 @dataclass(frozen=True)
 class IncompleteProposal:
@@ -198,7 +216,7 @@ class Bitrix24Specialist(BaseSpecialist):
         knowledge_base: MarkdownKnowledgeBase | None = None,
         skill_store: SkillStore | None = None,
         retriever: HybridKnowledgeRetriever | None = None,
-        tools: BitrixToolsetPort | None = None,
+        agent_tools: list[AgentTool] | None = None,
         llm: BitrixAgentLLM | None = None,
         scheduler: SchedulerPort | None = None,
         store: Any | None = None,
@@ -210,7 +228,7 @@ class Bitrix24Specialist(BaseSpecialist):
             knowledge_base=knowledge_base,
             skill_store=skill_store,
             retriever=retriever,
-            tools=tools,
+            agent_tools=agent_tools,
             llm=llm,
             scheduler=scheduler,
             store=store,
@@ -221,7 +239,12 @@ class Bitrix24Specialist(BaseSpecialist):
         cls,
         manifest: AgentManifest,
         *,
-        bitrix_tools: BitrixToolsetPort | None = None,
+        bitrix_client: BitrixToolClientPort | None = None,
+        portal_search_index: PortalSearchIndex | None = None,
+        pending_actions_service: BitrixPendingActionService | None = None,
+        bitrix_bot: BitrixBotPort | None = None,
+        actor_client: BitrixRestPort | None = None,
+        auto_execute: bool = False,
         bitrix_retriever: HybridKnowledgeRetriever | None = None,
         bitrix_llm: BitrixAgentLLM | None = None,
         scheduler: SchedulerPort | None = None,
@@ -236,10 +259,24 @@ class Bitrix24Specialist(BaseSpecialist):
             if bitrix_store is not None
             else None
         )
+        tools: list[AgentTool] = [
+            PortalSearchTool(portal_search=portal_search_index),
+            BitrixApiTool(
+                client=bitrix_client,
+                pending_actions=pending_actions_service,
+                actor_client=actor_client,
+                auto_execute=auto_execute,
+            ),
+            CurrentUserProfileTool(client=bitrix_client),
+            SendMessageTool(bot=bitrix_bot),
+            NotifyUsersTool(client=bitrix_client),
+            ResolveUserTool(client=bitrix_client),
+            ResolveProjectTool(client=bitrix_client),
+        ]
         return cls(
             manifest,
             retriever=bitrix_retriever,
-            tools=bitrix_tools,
+            agent_tools=tools,
             llm=bitrix_llm or BitrixLLMService(settings=_settings),
             scheduler=scheduler,
             proposals=proposals,
@@ -247,14 +284,13 @@ class Bitrix24Specialist(BaseSpecialist):
         )
 
     def tool_definitions(self) -> list[dict]:
-        toolset_defs = [definition.model_dump() for definition in self.tools.definitions()] if self.tools else []
+        # Expose only LLM-facing registry tools; resolve_user/resolve_project are internal.
+        toolset_defs = [t.definition().model_dump() for t in self._tool_registry.values() if t.name in _LLM_TOOL_NAMES]
         return [*toolset_defs, *_BITRIX_TOOL_DEFINITIONS]
 
-    async def _task_create_draft(
-        self, task: AgentTask, args: dict, tools: BitrixToolsetPort | None
-    ) -> BitrixTaskCreateDraft:
+    async def _task_create_draft(self, task: AgentTask, args: dict) -> BitrixTaskCreateDraft:
         draft = build_task_create_draft_from_args(task, args)
-        resolution = await self._resolve_task_create_draft(draft, tools)
+        resolution = await self._resolve_task_create_draft(draft)
         if resolution is None:
             return draft
         return build_task_create_draft_from_args(task, args, resolution=resolution)
@@ -266,151 +302,47 @@ class Bitrix24Specialist(BaseSpecialist):
     ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
         if tool_call.name == "none":
             return None, None, []
-        tools = self._tools_for(task)
-        handler = {
-            "current_user_profile": self._call_current_user_profile,
-            "portal_search": self._call_portal_search,
-            "task_create_draft": self._call_task_create_draft,
-            "save_incomplete_proposal": self._call_save_incomplete_proposal,
-            "delete_incomplete_proposal": self._call_delete_incomplete_proposal,
-            "save_responsible_response": self._call_save_responsible_response,
-            "bitrix_api": self._call_bitrix_api,
-            "bitrix_send_message": self._call_send_message,
-            "bitrix_notify_users": self._call_notify_users,
-        }.get(tool_call.name)
-        if handler is None:
-            result = ToolResult(
-                status=ToolStatus.INVALID_TOOL_CALL,
-                tool=tool_call.name,
-                error=f"unknown Bitrix LLM tool call: {tool_call.name}",
+
+        if tool_call.name == "task_create_draft":
+            draft = await self._task_create_draft(task, tool_call.args)
+            result = _tool_result_from_task_create_draft(draft)
+            action = ActionRecord(
+                name="bitrix_task_create_draft", status=result.status, details=draft.as_action_details()
             )
-            return result, ActionRecord(name=tool_call.name, status=result.status, details=result.model_dump()), []
-        return await handler(tool_call, task, tools)
+            return result, action, _approval_actions_from_task_create_draft(draft, self.manifest)
 
-    async def _call_current_user_profile(
-        self, tool_call: BitrixLLMToolCall, task: AgentTask, tools: BitrixToolsetPort | None
-    ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
-        profile_tool = getattr(tools, "current_user_profile", None)
-        if profile_tool is None:
-            result = ToolResult(
-                status=ToolStatus.NOT_CONFIGURED,
-                tool="current_user_profile",
-                error="current_user_profile tool is not bound",
-            )
-        else:
-            result = await profile_tool(tool_call.args)
-        return (
-            result,
-            ActionRecord(name="bitrix_current_user_profile", status=result.status, details=result.model_dump()),
-            [],
-        )
-
-    async def _call_portal_search(
-        self, tool_call: BitrixLLMToolCall, task: AgentTask, tools: BitrixToolsetPort | None
-    ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
-        result = tools.portal_search_contract(tool_call.args)
-        return result, ActionRecord(name="portal_search", status=result.status, details=result.model_dump()), []
-
-    async def _call_task_create_draft(
-        self, tool_call: BitrixLLMToolCall, task: AgentTask, tools: BitrixToolsetPort | None
-    ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
-        draft = await self._task_create_draft(task, tool_call.args, tools)
-        result = _tool_result_from_task_create_draft(draft)
-        action = ActionRecord(name="bitrix_task_create_draft", status=result.status, details=draft.as_action_details())
-        return result, action, _approval_actions_from_task_create_draft(draft, self.manifest)
-
-    async def _call_save_incomplete_proposal(
-        self, tool_call: BitrixLLMToolCall, task: AgentTask, tools: BitrixToolsetPort | None
-    ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
-        task_id = optional_int(tool_call.args.get("task_id"))
-        if task_id is None:
-            result = ToolResult(
-                status=ToolStatus.INVALID_TOOL_CALL, tool="save_incomplete_proposal", error="task_id is required"
-            )
+        if tool_call.name == "save_incomplete_proposal":
+            result = self._save_incomplete_proposal(tool_call.args)
             return (
                 result,
                 ActionRecord(name="bitrix_save_incomplete_proposal", status=result.status, details=result.model_dump()),
                 [],
             )
-        missing_parts = str(tool_call.args.get("missing_parts") or "").strip()
-        if not missing_parts:
-            result = ToolResult(
-                status=ToolStatus.INVALID_TOOL_CALL,
-                tool="save_incomplete_proposal",
-                error="missing_parts is required and must not be empty",
-            )
+
+        if tool_call.name == "delete_incomplete_proposal":
+            result = self._delete_incomplete_proposal(tool_call.args)
             return (
                 result,
-                ActionRecord(name="bitrix_save_incomplete_proposal", status=result.status, details=result.model_dump()),
+                ActionRecord(
+                    name="bitrix_delete_incomplete_proposal", status=result.status, details=result.model_dump()
+                ),
                 [],
             )
-        proposal = IncompleteProposal(
-            task_id=task_id,
-            task_title=str(tool_call.args.get("task_title") or ""),
-            missing_parts=missing_parts,
-            responsible_id=optional_int(tool_call.args.get("responsible_id")),
-            responsible_dialog_id=str(tool_call.args.get("responsible_dialog_id") or ""),
-        )
-        result = self._save_incomplete_proposal(proposal)
-        return (
-            result,
-            ActionRecord(name="bitrix_save_incomplete_proposal", status=result.status, details=result.model_dump()),
-            [],
-        )
 
-    async def _call_delete_incomplete_proposal(
-        self, tool_call: BitrixLLMToolCall, task: AgentTask, tools: BitrixToolsetPort | None
-    ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
-        result = self._delete_incomplete_proposal(tool_call.args)
-        return (
-            result,
-            ActionRecord(name="bitrix_delete_incomplete_proposal", status=result.status, details=result.model_dump()),
-            [],
-        )
-
-    async def _call_save_responsible_response(
-        self, tool_call: BitrixLLMToolCall, task: AgentTask, tools: BitrixToolsetPort | None
-    ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
-        result = self._save_responsible_response(tool_call.args)
-        return (
-            result,
-            ActionRecord(name="bitrix_save_responsible_response", status=result.status, details=result.model_dump()),
-            [],
-        )
-
-    async def _call_bitrix_api(
-        self, tool_call: BitrixLLMToolCall, task: AgentTask, tools: BitrixToolsetPort | None
-    ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
-        result = await tools.bitrix_api(tool_call.args)
-        return result, ActionRecord(name="bitrix_api", status=result.status, details=result.model_dump()), []
-
-    async def _call_send_message(
-        self, tool_call: BitrixLLMToolCall, task: AgentTask, tools: BitrixToolsetPort | None
-    ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
-        if tools is None:
-            result = ToolResult(status=ToolStatus.NOT_CONFIGURED, tool="bitrix_send_message", error="Toolset not bound")
+        if tool_call.name == "save_responsible_response":
+            result = self._save_responsible_response(tool_call.args)
             return (
                 result,
-                ActionRecord(name="bitrix_send_message", status=result.status, details=result.model_dump()),
+                ActionRecord(
+                    name="bitrix_save_responsible_response", status=result.status, details=result.model_dump()
+                ),
                 [],
             )
-        result = await tools.send_message(tool_call.args)
-        return result, ActionRecord(name="bitrix_send_message", status=result.status, details=result.model_dump()), []
 
-    async def _call_notify_users(
-        self, tool_call: BitrixLLMToolCall, task: AgentTask, tools: BitrixToolsetPort | None
-    ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
-        if tools is None:
-            result = ToolResult(status=ToolStatus.NOT_CONFIGURED, tool="bitrix_notify_users", error="Toolset not bound")
-            return (
-                result,
-                ActionRecord(name="bitrix_notify_users", status=result.status, details=result.model_dump()),
-                [],
-            )
-        result = await tools.notify_users(tool_call.args)
-        return result, ActionRecord(name="bitrix_notify_users", status=result.status, details=result.model_dump()), []
+        # Registry tools: portal_search, bitrix_api, current_user_profile, send_message, notify_users
+        return await super()._execute_tool_call(tool_call, task)
 
-    def _save_incomplete_proposal(self, proposal: IncompleteProposal) -> ToolResult:
+    def _save_incomplete_proposal(self, args: dict[str, Any]) -> ToolResult:
         if self._proposals is None:
             return ToolResult(
                 status=ToolStatus.NOT_CONFIGURED,
@@ -423,6 +355,25 @@ class Bitrix24Specialist(BaseSpecialist):
                 tool="save_incomplete_proposal",
                 error="scheduler is not configured — cannot schedule morning delivery",
             )
+        task_id = optional_int(args.get("task_id"))
+        if task_id is None:
+            return ToolResult(
+                status=ToolStatus.INVALID_TOOL_CALL, tool="save_incomplete_proposal", error="task_id is required"
+            )
+        missing_parts = str(args.get("missing_parts") or "").strip()
+        if not missing_parts:
+            return ToolResult(
+                status=ToolStatus.INVALID_TOOL_CALL,
+                tool="save_incomplete_proposal",
+                error="missing_parts is required and must not be empty",
+            )
+        proposal = IncompleteProposal(
+            task_id=task_id,
+            task_title=str(args.get("task_title") or ""),
+            missing_parts=missing_parts,
+            responsible_id=optional_int(args.get("responsible_id")),
+            responsible_dialog_id=str(args.get("responsible_dialog_id") or ""),
+        )
         run_date = _next_morning_830()
         proposal_id = self._proposals.save(proposal, run_date)
         self._schedule_proposal_job(proposal_id, run_date)
@@ -529,7 +480,7 @@ class Bitrix24Specialist(BaseSpecialist):
 
     async def _current_user_profile_result(self, task: AgentTask) -> ToolResult:
         user_id = optional_int(task.user.id)
-        tool = getattr(self._tools_for(task), "current_user_profile", None)
+        tool = self._tool_registry.get("current_user_profile")
         if user_id is None or tool is None:
             return ToolResult(
                 status=ToolStatus.NOT_AVAILABLE,
@@ -537,7 +488,7 @@ class Bitrix24Specialist(BaseSpecialist):
                 error="current Bitrix user id is not available",
             )
         try:
-            return await tool({"user_id": user_id})
+            return await tool.execute({}, user_id=user_id)
         except Exception as exc:
             return ToolResult(
                 status=ToolStatus.ERROR,
@@ -546,14 +497,13 @@ class Bitrix24Specialist(BaseSpecialist):
                 data={"user_id": user_id},
             )
 
-    async def _resolve_user_field(
-        self, query: str, fields: dict[str, Any], tools: BitrixToolsetPort | None
-    ) -> tuple[int | None, str, list[str]]:
+    async def _resolve_user_field(self, query: str, fields: dict[str, Any]) -> tuple[int | None, str, list[str]]:
         if not query or "RESPONSIBLE_ID" in fields:
             return None, "", []
-        if tools is None:
+        tool = self._tool_registry.get("resolve_user")
+        if tool is None:
             return None, "", ["Bitrix API недоступен для поиска сотрудника."]
-        result = await tools.resolve_user(query)
+        result = await tool.execute({"query": query})
         if result.status == "ok":
             candidate = result.data.get("candidate") if isinstance(result.data, dict) else None
             if isinstance(candidate, dict):
@@ -568,14 +518,13 @@ class Bitrix24Specialist(BaseSpecialist):
             return None, "", [f"Не нашёл сотрудника в Bitrix по запросу `{query}`."]
         return None, "", [f"Не смог проверить сотрудника через Bitrix: {result.status}."]
 
-    async def _resolve_project_field(
-        self, query: str, fields: dict[str, Any], tools: BitrixToolsetPort | None
-    ) -> tuple[int | None, str, list[str]]:
+    async def _resolve_project_field(self, query: str, fields: dict[str, Any]) -> tuple[int | None, str, list[str]]:
         if not query or "GROUP_ID" in fields:
             return None, "", []
-        if tools is None:
+        tool = self._tool_registry.get("resolve_project")
+        if tool is None:
             return None, "", ["Bitrix API недоступен для поиска проекта."]
-        result = await tools.resolve_project(query)
+        result = await tool.execute({"query": query})
         if result.status == "ok":
             candidate = result.data.get("candidate") if isinstance(result.data, dict) else None
             if isinstance(candidate, dict):
@@ -593,13 +542,10 @@ class Bitrix24Specialist(BaseSpecialist):
     async def _resolve_task_create_draft(
         self,
         draft: BitrixTaskCreateDraft,
-        tools: BitrixToolsetPort | None,
     ) -> BitrixTaskCreateResolution | None:
         fields = _draft_fields(draft)
-        responsible_id, responsible_note, user_notes = await self._resolve_user_field(
-            draft.responsible_query, fields, tools
-        )
-        group_id, group_note, project_notes = await self._resolve_project_field(draft.project_query, fields, tools)
+        responsible_id, responsible_note, user_notes = await self._resolve_user_field(draft.responsible_query, fields)
+        group_id, group_note, project_notes = await self._resolve_project_field(draft.project_query, fields)
         notes = user_notes + project_notes
         if responsible_id is None and group_id is None and not notes:
             return None
@@ -619,9 +565,6 @@ class Bitrix24Specialist(BaseSpecialist):
             "Bitrix24 specialist is an LLM subagent; backend tools only execute and validate selected tool calls.",
             "Knowledge context is selected through hybrid retrieval over the agent package.",
         ]
-
-    def _tools_for(self, task: AgentTask) -> BitrixToolsetPort | None:
-        return task.context.get("_bitrix_tools") or self.tools
 
 
 def _make_proposal_deliver_handler(

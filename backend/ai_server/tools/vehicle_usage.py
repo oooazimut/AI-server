@@ -11,7 +11,6 @@ from typing import Any
 from ai_server.agent_store import AgentStore
 from ai_server.integrations.bitrix.ports import BitrixUserPort
 from ai_server.integrations.ports import VehicleUsageStorePort
-from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.utils import MOSCOW_TZ, optional_int
 
 logger = logging.getLogger(__name__)
@@ -410,117 +409,6 @@ class VehicleReportProcessor:
             "staff_entries_saved": len(employee_statuses),
             "vehicle_assignments_saved": len(vehicle_assignments),
         }
-
-
-class VehicleUsageToolset:
-    def __init__(
-        self,
-        client: BitrixUserPort | None = None,
-        *,
-        store: VehicleUsageStorePort | None = None,
-        user_id: int | None = None,
-        dialog_id: str = "",
-    ) -> None:
-        self.client = client
-        self.store = store
-        self.user_id = user_id
-        self.dialog_id = dialog_id
-
-    def definitions(self) -> list[ToolDefinition]:
-        return [
-            ToolDefinition(
-                name="vehicle_usage_context",
-                description="Read staff roster, known vehicles and latest vehicle usage draft/request.",
-                parameters={
-                    "type": "object",
-                    "properties": {"request_date": {"type": "string"}},
-                },
-            ),
-            ToolDefinition(
-                name="vehicle_usage_save_draft",
-                description="Save the logistics LLM parsed draft; does not finalize daily report.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "request_date": {"type": "string"},
-                        "response_text": {"type": "string"},
-                        "parsed": {"type": "object"},
-                        "status": {"type": "string"},
-                    },
-                    "required": ["parsed"],
-                },
-            ),
-            ToolDefinition(
-                name="vehicle_usage_save_report",
-                description="Finalize confirmed daily vehicle/staff report using the JSON chosen by Logistics LLM.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "request_date": {"type": "string"},
-                        "source_text": {"type": "string"},
-                        "parsed": {"type": "object"},
-                    },
-                    "required": ["parsed"],
-                },
-            ),
-        ]
-
-    def vehicle_usage_context(self, args: dict[str, Any]) -> ToolResult:
-        if self.store is None:
-            return ToolResult(
-                status=ToolStatus.NOT_CONFIGURED,
-                tool="vehicle_usage_context",
-                error="VehicleUsageStore is not injected",
-            )
-        request_date = _request_date(args.get("request_date"))
-        return ToolResult(
-            status=ToolStatus.OK,
-            tool="vehicle_usage_context",
-            data=self.store.context(request_date=request_date, user_id=self.user_id, dialog_id=self.dialog_id),
-        )
-
-    def vehicle_usage_save_draft(self, args: dict[str, Any]) -> ToolResult:
-        if self.store is None:
-            return ToolResult(
-                status=ToolStatus.NOT_CONFIGURED,
-                tool="vehicle_usage_save_draft",
-                error="VehicleUsageStore is not injected",
-            )
-        parsed = args.get("parsed")
-        if not isinstance(parsed, dict):
-            return ToolResult(
-                status=ToolStatus.INVALID_TOOL_CALL, tool="vehicle_usage_save_draft", error="parsed object is required"
-            )
-        request_id = self.store.save_draft(
-            request_date=_request_date(args.get("request_date") or parsed.get("date")),
-            user_id=self.user_id,
-            dialog_id=self.dialog_id,
-            response_text=str(args.get("response_text") or ""),
-            parsed=parsed,
-            status=str(args.get("status") or "pending_confirmation"),
-        )
-        return ToolResult(status=ToolStatus.OK, tool="vehicle_usage_save_draft", data={"request_id": request_id})
-
-    def vehicle_usage_save_report(self, args: dict[str, Any]) -> ToolResult:
-        if self.store is None:
-            return ToolResult(
-                status=ToolStatus.NOT_CONFIGURED,
-                tool="vehicle_usage_save_report",
-                error="VehicleUsageStore is not injected",
-            )
-        parsed = args.get("parsed")
-        if not isinstance(parsed, dict):
-            return ToolResult(
-                status=ToolStatus.INVALID_TOOL_CALL, tool="vehicle_usage_save_report", error="parsed object is required"
-            )
-        saved = VehicleReportProcessor(self.store).save_report(
-            request_date=_request_date(args.get("request_date") or parsed.get("date")),
-            user_id=self.user_id,
-            dialog_id=self.dialog_id,
-            source_text=str(args.get("source_text") or ""),
-            parsed=parsed,
-        )
-        return ToolResult(status=ToolStatus.OK, tool="vehicle_usage_save_report", data=saved)
 
 
 async def fetch_staff_roster(

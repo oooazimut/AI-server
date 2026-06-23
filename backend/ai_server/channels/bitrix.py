@@ -28,9 +28,6 @@ from ai_server.registry import load_agent_manifests
 from ai_server.settings import Settings, get_settings
 from ai_server.specialists import SpecialistDeps, build_specialist_registry
 from ai_server.technical_footer import TechnicalFooterService, append_footer
-from ai_server.tools.bitrix import BitrixToolset
-from ai_server.tools.document_access import DocumentToolset
-from ai_server.tools.vehicle_usage import VehicleUsageToolset
 from ai_server.transcription import TranscriptionResult, build_transcriber
 
 logger = logging.getLogger(__name__)
@@ -42,25 +39,21 @@ _MARKETPLACE_PATH_RE = re.compile(r"(/marketplace/view/[A-Za-z0-9._-]+/?)")
 class BitrixTaskContext:
     bitrix_event_type: str
     dialog_key: str
+    dialog_id: str
     pending_action: dict[str, Any] | None
     dialog_history: list[dict[str, Any]]
     transcriptions: list[dict[str, Any]]
     attachment_errors: list[str]
-    bitrix_tools: BitrixToolset | None = None
-    pto_tools: DocumentToolset | None = None
-    vehicle_tools: VehicleUsageToolset | None = None
 
     def to_context(self) -> dict[str, Any]:
         return {
             "bitrix_event_type": self.bitrix_event_type,
             "dialog_key": self.dialog_key,
+            "dialog_id": self.dialog_id,
             "pending_action": self.pending_action,
             "dialog_history": self.dialog_history,
             "transcriptions": self.transcriptions,
             "attachment_errors": self.attachment_errors,
-            "_bitrix_tools": self.bitrix_tools,
-            "_pto_tools": self.pto_tools,
-            "_vehicle_tools": self.vehicle_tools,
         }
 
 
@@ -175,20 +168,17 @@ class BitrixWebhookProcessor:
         self, incoming: Any, attachment_context: dict[str, Any], dialog_state: Any, dialog_key: str
     ) -> AgentTask:
         pending_action = dialog_state.pending_action
-        toolsets = self._build_request_toolsets(incoming, dialog_key=dialog_key)
         # In PG mode each specialist loads its own dialog history from its schema.
         # In SQLite mode use the shared turns from DialogStateStore.
         shared_turns = [] if self._settings.database_url else dialog_state.turns[-8:]
         ctx = BitrixTaskContext(
             bitrix_event_type=incoming.event_type,
             dialog_key=dialog_key,
+            dialog_id=incoming.dialog_id or "",
             pending_action=asdict(pending_action) if pending_action is not None else None,
             dialog_history=shared_turns,
             transcriptions=attachment_context["transcriptions"],
             attachment_errors=attachment_context["errors"],
-            bitrix_tools=toolsets["_bitrix_tools"],
-            pto_tools=toolsets["_pto_tools"],
-            vehicle_tools=toolsets["_vehicle_tools"],
         )
         return AgentTask(
             task_id=str(uuid4()),
@@ -210,30 +200,6 @@ class BitrixWebhookProcessor:
             ],
             context=ctx.to_context(),
         )
-
-    def _build_request_toolsets(self, incoming: Any, *, dialog_key: str) -> dict[str, Any]:
-        return {
-            "_bitrix_tools": self._specialist_deps.bitrix_tools
-            or BitrixToolset(
-                client=self.bitrix,
-                portal_search=self.portal_search,
-                pending_actions=self.pending_actions,
-                dialog_key=dialog_key,
-                user_id=incoming.user_id,
-                bot=self.bitrix,
-            ),
-            "_pto_tools": DocumentToolset(
-                client=self.bitrix,
-                portal_search=self.portal_search,
-                user_id=incoming.user_id,
-                settings=self._settings,
-            ),
-            "_vehicle_tools": VehicleUsageToolset(
-                client=self.bitrix,
-                user_id=incoming.user_id,
-                dialog_id=incoming.dialog_id,
-            ),
-        }
 
     async def _finalize_message(
         self,
@@ -377,15 +343,10 @@ def _build_orchestrator(
     bot: Any = None,
 ) -> InternalOrchestrator:
     registry_kwargs = deps.as_registry_kwargs()
-    registry_kwargs.setdefault(
-        "bitrix_tools",
-        BitrixToolset(client=bitrix, portal_search=portal_search, pending_actions=pending_actions, bot=bot or bitrix),
-    )
-    registry_kwargs.setdefault(
-        "document_tools",
-        DocumentToolset(client=bitrix, portal_search=portal_search, settings=deps.settings),
-    )
-    registry_kwargs.setdefault("vehicle_usage_tools", VehicleUsageToolset(client=bitrix))
+    registry_kwargs.setdefault("bitrix_client", bitrix)
+    registry_kwargs.setdefault("portal_search_index", portal_search)
+    registry_kwargs.setdefault("pending_actions_service", pending_actions)
+    registry_kwargs.setdefault("bitrix_bot", bot or bitrix)
     return InternalOrchestrator(
         manifests,
         specialists=build_specialist_registry(manifests, audience="employee", **registry_kwargs),
