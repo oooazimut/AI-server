@@ -26,7 +26,7 @@ from ai_server.models import ActionRecord, AgentManifest, AgentTask, UserContext
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.registry import load_agent_manifests
 from ai_server.settings import Settings, get_settings
-from ai_server.specialists import SpecialistDeps, build_specialist_registry
+from ai_server.specialists import SpecialistDeps
 from ai_server.technical_footer import TechnicalFooterService, append_footer
 from ai_server.transcription import TranscriptionResult, build_transcriber
 
@@ -104,14 +104,7 @@ class BitrixWebhookProcessor:
             dry_run=self._settings.agent_dry_run,
             settings=self._settings,
         )
-        self._orchestrator: InternalOrchestrator = orchestrator or build_orchestrator(
-            self._manifests,
-            self._specialist_deps,
-            bitrix=self.bitrix,
-            portal_search=self.portal_search,
-            pending_actions=self.pending_actions,
-            bot=self.bitrix,
-        )
+        self._orchestrator: InternalOrchestrator = orchestrator or InternalOrchestrator(self._manifests)
 
     async def process(self, payload: dict[str, Any]) -> dict[str, Any]:
         event_type = payload_event_type(payload)
@@ -331,30 +324,6 @@ class BitrixWebhookProcessor:
         except Exception:
             logger.exception("Failed to record Bitrix learning event")
             return {"recorded": False, "reason": "unexpected_error"}
-
-
-def build_orchestrator(
-    manifests: list[AgentManifest],
-    deps: SpecialistDeps,
-    *,
-    bitrix: BitrixClient,
-    portal_search: PortalSearchIndex,
-    pending_actions: BitrixPendingActionService,
-    bot: Any = None,
-) -> InternalOrchestrator:
-    registry_kwargs = deps.as_registry_kwargs()
-    registry_kwargs.setdefault("bitrix_client", bitrix)
-    registry_kwargs.setdefault("portal_search_index", portal_search)
-    registry_kwargs.setdefault("pending_actions_service", pending_actions)
-    registry_kwargs.setdefault("bitrix_bot", bot or bitrix)
-    return InternalOrchestrator(
-        manifests,
-        specialists=build_specialist_registry(manifests, audience="employee", **registry_kwargs),
-        orchestrator_llm=deps.orchestrator_llm,
-        scheduler=deps.scheduler,
-        store=deps.orchestrator_store,
-        retriever=deps.orchestrator_retriever,
-    )
 
 
 def _pending_from_approval_action(

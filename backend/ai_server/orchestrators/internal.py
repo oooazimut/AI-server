@@ -41,6 +41,34 @@ class InternalOrchestrator:
         self.retriever = retriever
         self._manifest = manifest_by_id(manifests, "internal_orchestrator") or _dummy_manifest()
 
+    @classmethod
+    def build(
+        cls,
+        manifest: AgentManifest,
+        *,
+        manifests: list[AgentManifest] | None = None,
+        orchestrator_llm: OrchestratorLLM | None = None,
+        orchestrator_store: AgentDialogStorePort | None = None,
+        orchestrator_retriever: HybridKnowledgeRetriever | None = None,
+        **specialist_deps: Any,
+    ) -> InternalOrchestrator:
+        _manifests = manifests or []
+        if not specialist_deps.get("bitrix_bot"):
+            specialist_deps["bitrix_bot"] = specialist_deps.get("bitrix_client")
+        specialists = build_specialist_registry(
+            _manifests,
+            audience="employee",
+            **{k: v for k, v in specialist_deps.items() if v is not None},
+        )
+        return cls(
+            _manifests,
+            specialists=specialists,
+            orchestrator_llm=orchestrator_llm,
+            scheduler=specialist_deps.get("scheduler"),
+            store=orchestrator_store,
+            retriever=orchestrator_retriever,
+        )
+
     def tool_definitions(self) -> list[dict[str, Any]]:
         return [
             {

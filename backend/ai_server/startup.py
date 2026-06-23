@@ -11,7 +11,7 @@ from .agents.bitrix24 import BitrixLLMService
 from .agents.logistics import LogisticsLLMService
 from .agents.logistics.specialist import VehicleUsageSettings
 from .agents.pto import PtoLLMService
-from .channels.bitrix import BitrixWebhookProcessor, build_orchestrator
+from .channels.bitrix import BitrixWebhookProcessor
 from .integrations.bitrix.bitrix_store import BitrixAgentStore
 from .integrations.bitrix.client import BitrixClient
 from .integrations.bitrix.dialog_state import BitrixPendingActionService, DialogStateStore
@@ -26,6 +26,7 @@ from .integrations.postgres.pto_agent import PostgresPtoAgentStore
 from .integrations.postgres.vehicle_usage import PostgresVehicleUsageStore
 from .integrations.redis.event_queue import RedisEventQueue
 from .learning import LearningEventRecorder
+from .orchestrators.internal import InternalOrchestrator
 from .orchestrators.orchestrator_llm import OrchestratorLLMService
 from .registry import load_agent_manifests
 from .runtime import ensure_runtime_dirs
@@ -247,8 +248,21 @@ async def lifespan(app: FastAPI):
             if settings.vehicle_usage_enabled
             else None
         )
+        pending_actions = BitrixPendingActionService(
+            store=DialogStateStore(settings.dialog_state_path),
+            bitrix=bitrix,
+            bitrix_oauth=bitrix_oauth,
+            audit_log_path=settings.bitrix_write_audit_log_path,
+            dry_run=settings.agent_dry_run,
+            settings=settings,
+        )
         specialist_deps = SpecialistDeps(
             settings=settings,
+            manifests=manifests,
+            bitrix_client=bitrix,
+            portal_search_index=portal_search,
+            pending_actions_service=pending_actions,
+            bitrix_bot=bitrix,
             scheduler=scheduler,
             orchestrator_llm=OrchestratorLLMService(),
             orchestrator_store=orchestrator_store,
@@ -259,21 +273,10 @@ async def lifespan(app: FastAPI):
             vehicle_usage_store=vehicle_usage_store,
             logistics_vu_settings=vu_settings,
         )
-        pending_actions = BitrixPendingActionService(
-            store=DialogStateStore(settings.dialog_state_path),
-            bitrix=bitrix,
-            bitrix_oauth=bitrix_oauth,
-            audit_log_path=settings.bitrix_write_audit_log_path,
-            dry_run=settings.agent_dry_run,
-            settings=settings,
-        )
-        orchestrator = build_orchestrator(
-            manifests,
-            specialist_deps,
-            bitrix=bitrix,
-            portal_search=portal_search,
-            pending_actions=pending_actions,
-            bot=bitrix,
+        orch_manifest = next((m for m in manifests if m.kind == "orchestrator"), None)
+        orchestrator = InternalOrchestrator.build(
+            orch_manifest,
+            **specialist_deps.as_build_kwargs(),
         )
 
         if (logistics_spec := orchestrator.specialists.get("logistics")) is not None:

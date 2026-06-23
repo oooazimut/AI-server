@@ -13,38 +13,39 @@ class Specialist(Protocol):
 
 @dataclass
 class SpecialistDeps:
-    """Collected dependencies for specialist construction.
+    """Collected dependencies for all agent construction.
 
     To add specialist N: add its deps as a field here and populate in startup.py.
-    build_specialist_registry, _build_orchestrator, and BitrixWebhookProcessor need no changes.
+    build_specialist_registry and BitrixWebhookProcessor need no changes.
     """
 
     settings: Any  # Settings — typed as Any to avoid a circular import at module level
+    # channel infrastructure — passed through to Bitrix24Specialist and InternalOrchestrator.build()
+    manifests: Any = None  # list[AgentManifest] — needed by InternalOrchestrator.build()
+    bitrix_client: Any = None  # BitrixClient (HTTP REST)
+    portal_search_index: Any = None  # PortalSearchIndex
+    pending_actions_service: Any = None  # BitrixPendingActionService
+    bitrix_bot: Any = None  # BitrixBotPort; defaults to bitrix_client in InternalOrchestrator.build()
+    # orchestrator
     scheduler: Any = None  # SchedulerPort | None
     orchestrator_llm: Any = None
-    # bitrix24
+    orchestrator_store: Any = None  # AgentDialogStorePort | None
+    orchestrator_retriever: Any = None  # HybridKnowledgeRetriever | None
+    # bitrix24 specialist
     bitrix_llm: Any = None
     bitrix_retriever: Any = None
     bitrix_store: Any = None
-    # pto
+    # pto specialist
     pto_llm: Any = None
     pto_store: Any = None  # AgentDialogStorePort | None
-    # logistics
+    # logistics specialist
     vehicle_usage_store: Any = None  # VehicleUsageStorePort | None
     logistics_llm: Any = None
     logistics_vu_settings: Any = None  # VehicleUsageSettings | None
 
-    orchestrator_store: Any = None  # AgentDialogStorePort | None
-    orchestrator_retriever: Any = None  # HybridKnowledgeRetriever | None
-
-    def as_registry_kwargs(self) -> dict[str, Any]:
-        """Returns kwargs for build_specialist_registry.
-
-        Excludes orchestrator_llm, orchestrator_store, orchestrator_retriever
-        (passed directly to InternalOrchestrator) and None values.
-        """
-        excluded = {"orchestrator_llm", "orchestrator_store", "orchestrator_retriever"}
-        return {k: v for k, v in vars(self).items() if k not in excluded and v is not None}
+    def as_build_kwargs(self) -> dict[str, Any]:
+        """All non-None fields — pass to any agent build() method."""
+        return {k: v for k, v in vars(self).items() if v is not None}
 
 
 def build_specialist_registry(
