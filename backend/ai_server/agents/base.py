@@ -4,11 +4,12 @@ from datetime import datetime
 from typing import Any
 
 from ai_server.agents.ports import AgentDialogStorePort, SchedulerPort
+from ai_server.agents.tool import AgentTool
 from ai_server.knowledge import MarkdownKnowledgeBase
-from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult
+from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult, ToolStatus
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
-from ai_server.utils import unique
+from ai_server.utils import optional_int, unique
 
 _NOT_CONFIGURED_ANSWER = "Специалист временно недоступен: LLM не сконфигурирован."
 
@@ -32,7 +33,7 @@ class BaseSpecialist:
         knowledge_base: MarkdownKnowledgeBase | None = None,
         skill_store: SkillStore | None = None,
         retriever: HybridKnowledgeRetriever | None = None,
-        tools: Any = None,
+        agent_tools: list[AgentTool] | None = None,
         llm: Any = None,
         scheduler: SchedulerPort | None = None,
         store: AgentDialogStorePort | None = None,
@@ -41,7 +42,7 @@ class BaseSpecialist:
         self.knowledge_base = knowledge_base
         self.skill_store = skill_store
         self.retriever = retriever
-        self.tools = tools
+        self._tool_registry: dict[str, AgentTool] = {t.name: t for t in (agent_tools or [])}
         self.llm = llm
         self._scheduler = scheduler
         self.store = store
@@ -51,7 +52,7 @@ class BaseSpecialist:
     # ------------------------------------------------------------------
 
     def tool_definitions(self) -> list[dict]:
-        raise NotImplementedError
+        return [t.definition().model_dump() for t in self._tool_registry.values()]
 
     def _logs(self) -> list[str]:
         raise NotImplementedError
@@ -72,7 +73,22 @@ class BaseSpecialist:
         tool_call: Any,
         task: AgentTask,
     ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
-        raise NotImplementedError
+        if tool_call.name == "none":
+            return None, None, []
+        tool = self._tool_registry.get(tool_call.name)
+        if tool is None:
+            result = ToolResult(
+                status=ToolStatus.INVALID_TOOL_CALL,
+                tool=tool_call.name,
+                error=f"unknown tool: {tool_call.name}",
+            )
+            return result, ActionRecord(name=tool_call.name, status=result.status, details=result.model_dump()), []
+        user_id = optional_int(task.user.id) if task.user.id else None
+        dialog_key = str(task.context.get("dialog_key") or "") or None
+        dialog_id = str(task.context.get("dialog_id") or (task.user.raw or {}).get("dialog_id") or "") or None
+        result = await tool.execute(tool_call.args, user_id=user_id, dialog_key=dialog_key, dialog_id=dialog_id)
+        action = ActionRecord(name=tool_call.name, status=result.status, details=result.model_dump())
+        return result, action, []
 
     # ------------------------------------------------------------------
     # Lifecycle hooks (subclasses override as needed)

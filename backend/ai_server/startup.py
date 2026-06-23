@@ -10,6 +10,7 @@ from .agent_scheduler import AgentScheduler
 from .agents.bitrix24 import BitrixLLMService
 from .agents.logistics import LogisticsLLMService, LogisticsSpecialist
 from .agents.logistics.specialist import VehicleUsageSettings
+from .agents.logistics.tools import VehicleContextTool, VehicleSaveDraftTool, VehicleSaveReportTool
 from .agents.pto import PtoLLMService
 from .channels.bitrix import BitrixWebhookProcessor
 from .integrations.bitrix.bitrix_store import BitrixAgentStore
@@ -30,7 +31,7 @@ from .registry import load_agent_manifests
 from .runtime import ensure_runtime_dirs
 from .settings import Settings, get_settings
 from .specialists import SpecialistDeps, manifest_by_id
-from .tools.vehicle_usage import VehicleUsageStore, VehicleUsageToolset
+from .tools.vehicle_usage import VehicleUsageStore
 from .workers.bitrix.quality_control_adapter import QualityControlHandlerAdapter
 from .workers.bitrix.reconciler import reconcile_once, run_reconciler
 from .workers.bitrix.search_indexer import PortalSearchIndexerWorker
@@ -252,6 +253,7 @@ async def lifespan(app: FastAPI):
             pto_llm=PtoLLMService(),
             pto_store=pto_store,
             logistics_llm=logistics_llm_svc,
+            vehicle_usage_store=vehicle_usage_store,
         )
         search_webhook_handler = SearchWebhookHandlerAdapter(
             bitrix=bitrix,
@@ -305,11 +307,12 @@ async def lifespan(app: FastAPI):
                         request_time=settings.vehicle_usage_request_time,
                     ),
                     store=vehicle_usage_store,
-                    tools=VehicleUsageToolset(
-                        store=vehicle_usage_store,
-                        user_id=settings.vehicle_usage_manager_user_id,
-                        dialog_id=settings.vehicle_usage_dialog_id,
-                    ),
+                    vu_store=vehicle_usage_store,
+                    agent_tools=[
+                        VehicleContextTool(vehicle_usage_store),
+                        VehicleSaveDraftTool(vehicle_usage_store),
+                        VehicleSaveReportTool(vehicle_usage_store),
+                    ],
                 )
                 if not settings.redis_url:
                     logistics_specialist.start()

@@ -13,7 +13,10 @@ from ai_server.agents.logistics.llm import (
     LogisticsLLMToolCall,
     logistics_llm_failure_result,
 )
-from ai_server.agents.ports import SchedulerPort, SpecialistOutputPort, VehicleUsageToolsetPort
+from ai_server.agents.logistics.tools import VehicleContextTool, VehicleSaveDraftTool, VehicleSaveReportTool
+from ai_server.agents.ports import SchedulerPort, SpecialistOutputPort
+from ai_server.agents.tool import AgentTool
+from ai_server.integrations.ports import VehicleUsageStorePort
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentTask, ToolResult, ToolStatus, UserContext
 from ai_server.retrieval import HybridKnowledgeRetriever
@@ -46,12 +49,13 @@ class LogisticsSpecialist(BaseSpecialist):
         knowledge_base: MarkdownKnowledgeBase | None = None,
         skill_store: SkillStore | None = None,
         retriever: HybridKnowledgeRetriever | None = None,
-        tools: VehicleUsageToolsetPort | None = None,
+        agent_tools: list[AgentTool] | None = None,
         llm: LogisticsAgentLLM | None = None,
         scheduler: SchedulerPort | None = None,
         store: Any | None = None,
         output_fn: SpecialistOutputPort | None = None,
         vu_settings: VehicleUsageSettings | None = None,
+        vu_store: VehicleUsageStorePort | None = None,
     ) -> None:
         self._output_fn = output_fn
         self._vu_settings = vu_settings or VehicleUsageSettings(
@@ -60,12 +64,13 @@ class LogisticsSpecialist(BaseSpecialist):
             max_reminders=3,
             reminder_interval_minutes=60,
         )
+        self._vu_store = vu_store
         super().__init__(
             manifest,
             knowledge_base=knowledge_base,
             skill_store=skill_store,
             retriever=retriever,
-            tools=tools,
+            agent_tools=agent_tools,
             llm=llm,
             scheduler=scheduler,
             store=store,
@@ -76,17 +81,23 @@ class LogisticsSpecialist(BaseSpecialist):
         cls,
         manifest: AgentManifest,
         *,
-        vehicle_usage_tools: VehicleUsageToolsetPort | None = None,
+        vehicle_usage_store: VehicleUsageStorePort | None = None,
         logistics_retriever: HybridKnowledgeRetriever | None = None,
         logistics_llm: LogisticsAgentLLM | None = None,
         logistics_store: Any | None = None,
         scheduler: SchedulerPort | None = None,
         **_: Any,
     ) -> LogisticsSpecialist:
+        tools: list[AgentTool] = [
+            VehicleContextTool(vehicle_usage_store),
+            VehicleSaveDraftTool(vehicle_usage_store),
+            VehicleSaveReportTool(vehicle_usage_store),
+        ]
         return cls(
             manifest,
             retriever=logistics_retriever,
-            tools=vehicle_usage_tools,
+            agent_tools=tools,
+            vu_store=vehicle_usage_store,
             llm=logistics_llm or LogisticsLLMService(),
             scheduler=scheduler,
             store=logistics_store,
@@ -176,8 +187,8 @@ class LogisticsSpecialist(BaseSpecialist):
                         },
                     )
                 )
-                if self.tools is not None:
-                    self.tools.store.create_sent_request(
+                if self._vu_store is not None:
+                    self._vu_store.create_sent_request(
                         SentRequestData(
                             request_date=datetime.now(MOSCOW_TZ).date().isoformat(),
                             user_id=manager_user_id,
@@ -231,8 +242,8 @@ class LogisticsSpecialist(BaseSpecialist):
                 )
             )
 
-        if self.tools is not None:
-            self.tools.store.mark_escalated(
+        if self._vu_store is not None:
+            self._vu_store.mark_escalated(
                 request_date=datetime.now(MOSCOW_TZ).date().isoformat(),
                 user_id=vu.manager_user_id,
                 escalated_at=datetime.now(MOSCOW_TZ).isoformat(),
@@ -243,62 +254,17 @@ class LogisticsSpecialist(BaseSpecialist):
     # BaseSpecialist hooks
     # ------------------------------------------------------------------
 
-    def tool_definitions(self) -> list[dict]:
-        if self.tools is None:
-            return []
-        return [definition.model_dump() for definition in self.tools.definitions()]
-
     async def _execute_tool_call(
         self,
         tool_call: LogisticsLLMToolCall,
         task: AgentTask,
     ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
-        tools: VehicleUsageToolsetPort | None = task.context.get("_vehicle_tools") or self.tools
-        if tool_call.name == "none":
-            return None, None, []
-        if tools is None:
-            result = ToolResult(
-                status=ToolStatus.ERROR,
-                tool=tool_call.name,
-                error="Logistics toolset not configured",
-            )
-            return result, ActionRecord(name=tool_call.name, status=result.status, details=result.model_dump()), []
-        if tool_call.name == "vehicle_usage_context":
-            result = tools.vehicle_usage_context(tool_call.args)
-            return (
-                result,
-                ActionRecord(name="logistics_vehicle_usage_context", status=result.status, details=result.model_dump()),
-                [],
-            )
-        if tool_call.name == "vehicle_usage_save_draft":
-            result = tools.vehicle_usage_save_draft(tool_call.args)
-            return (
-                result,
-                ActionRecord(
-                    name="logistics_vehicle_usage_save_draft", status=result.status, details=result.model_dump()
-                ),
-                [],
-            )
-        if tool_call.name == "vehicle_usage_save_report":
-            result = tools.vehicle_usage_save_report(tool_call.args)
-            if result.status == "ok":
-                cancelled = self.cancel_jobs_by_prefix("reminder_")
-                if cancelled:
-                    logger.info("LogisticsSpecialist: cancelled %d reminder jobs after report saved", cancelled)
-            return (
-                result,
-                ActionRecord(
-                    name="logistics_vehicle_usage_save_report", status=result.status, details=result.model_dump()
-                ),
-                [],
-            )
-
-        result = ToolResult(
-            status=ToolStatus.INVALID_TOOL_CALL,
-            tool=tool_call.name,
-            error=f"unknown Logistics tool call: {tool_call.name}",
-        )
-        return result, ActionRecord(name=tool_call.name, status=result.status, details=result.model_dump()), []
+        result, action, approvals = await super()._execute_tool_call(tool_call, task)
+        if tool_call.name == "vehicle_usage_save_report" and result is not None and result.status == ToolStatus.OK:
+            cancelled = self.cancel_jobs_by_prefix("reminder_")
+            if cancelled:
+                logger.info("LogisticsSpecialist: cancelled %d reminder jobs after report saved", cancelled)
+        return result, action, approvals
 
     def _llm_failure_result(self, message: str):  # noqa: ANN201
         return logistics_llm_failure_result(message, agent_id=self.manifest.id)

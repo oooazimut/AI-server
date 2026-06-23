@@ -12,7 +12,6 @@ from ai_server.integrations.bitrix.ports import BitrixAgentStorePort
 from ai_server.models import AgentManifest
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import Settings
-from ai_server.tools.bitrix import BitrixToolset
 from ai_server.workers.bitrix.quality_control import handle_quality_control_webhook_event
 
 logger = logging.getLogger(__name__)
@@ -119,18 +118,16 @@ class QualityControlHandlerAdapter:
             else:
                 await self._bitrix.send_bot_message(user_id_str, message, bot_id=settings.bitrix_bot_id)
 
-        return Bitrix24Specialist(
+        return Bitrix24Specialist.build(
             bitrix24_manifest,
-            tools=BitrixToolset(
-                client=self._bitrix,
-                actor_client=actor_bitrix,
-                auto_execute=not settings.quality_control_dry_run,
-            ),
-            retriever=self._bitrix_retriever,
-            llm=self._bitrix_llm,
+            bitrix_client=self._bitrix,
+            actor_client=actor_bitrix,
+            auto_execute=not settings.quality_control_dry_run,
+            bitrix_retriever=self._bitrix_retriever,
+            bitrix_llm=self._bitrix_llm,
             scheduler=self._scheduler,
             bitrix_store=self._bitrix_store,
-            deliver_fn=_deliver,
+            bitrix_deliver_fn=_deliver,
             settings=settings,
         )
 

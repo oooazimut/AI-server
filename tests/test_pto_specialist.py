@@ -4,8 +4,6 @@ from ai_server.agents.pto import PtoLLMToolCall, PtoSpecialist
 from ai_server.models import AgentTask
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
-from ai_server.settings import get_settings
-from ai_server.tools.document_access import DocumentToolset
 from tests.fakes import FakeEmbeddingProvider, FakePtoLLM
 
 
@@ -15,7 +13,7 @@ def _pto_specialist(*, llm=None) -> PtoSpecialist:
     return PtoSpecialist(
         manifest,
         retriever=retriever,
-        tools=DocumentToolset(settings=get_settings()),
+        agent_tools=[],
         llm=llm or FakePtoLLM(),
     )
 

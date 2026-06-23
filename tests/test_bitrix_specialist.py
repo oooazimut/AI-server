@@ -2,14 +2,14 @@ import asyncio
 import json
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist, BitrixLLMDecision, BitrixLLMService, BitrixLLMToolCall
+from ai_server.agents.bitrix24.tools import CurrentUserProfileTool
 from ai_server.integrations.bitrix.bitrix_policy import decide_bitrix_method_policy
 from ai_server.knowledge import MarkdownKnowledgeBase
-from ai_server.models import AgentTask, ToolResult
+from ai_server.models import AgentTask, ToolDefinition, ToolResult
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import get_settings
 from ai_server.skills import SkillStore
-from ai_server.tools.bitrix import BitrixToolset
 from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, RecordingLLMClient
 
 
@@ -20,7 +20,7 @@ def _bitrix_specialist(*, tools=None, llm=None) -> Bitrix24Specialist:
         manifest,
         retriever=retriever,
         skill_store=SkillStore(),
-        tools=tools,
+        agent_tools=tools.agent_tools() if tools is not None else None,
         llm=llm or FakeBitrixLLM(),
     )
 
@@ -210,7 +210,7 @@ def test_bitrix_specialist_can_call_current_user_profile_tool():
     )
 
     assert result.status == "completed"
-    assert result.actions_taken[2].name == "bitrix_current_user_profile"
+    assert result.actions_taken[2].name == "current_user_profile"
     assert result.actions_taken[2].status == "ok"
 
 
@@ -538,7 +538,7 @@ def test_bitrix_current_user_profile_tool_compacts_user_fields():
                 "USER_TYPE": "employee",
             }
 
-    result = asyncio.run(BitrixToolset(client=ProfileClient(), user_id=9).current_user_profile({}))
+    result = asyncio.run(CurrentUserProfileTool(client=ProfileClient()).execute({}, user_id=9))
 
     assert result.status == "ok"
     profile = result.data["profile"]
@@ -548,39 +548,97 @@ def test_bitrix_current_user_profile_tool_compacts_user_fields():
     assert profile["work_position"] == "Монтажник"
 
 
+class _FakePortalSearchTool:
+    name = "portal_search"
+
+    def definition(self):
+        return ToolDefinition(name="portal_search", description="", parameters={})
+
+    async def execute(self, args, *, user_id=None, dialog_key=None, dialog_id=None):
+        return ToolResult(status="not_configured", tool="portal_search", data={"args": args})
+
+
+class _FakeBitrixApiTool:
+    name = "bitrix_api"
+
+    def __init__(self, result: ToolResult, calls: list):
+        self._result = result
+        self._calls = calls
+
+    def definition(self):
+        return ToolDefinition(name="bitrix_api", description="", parameters={})
+
+    async def execute(self, args, *, user_id=None, dialog_key=None, dialog_id=None):
+        self._calls.append(args)
+        return self._result
+
+
+class _FakeCurrentUserProfileTool:
+    name = "current_user_profile"
+
+    def __init__(self, result: ToolResult):
+        self._result = result
+
+    def definition(self):
+        return ToolDefinition(name="current_user_profile", description="", parameters={})
+
+    async def execute(self, args, *, user_id=None, dialog_key=None, dialog_id=None):
+        return self._result
+
+
+class _FakeResolveUserTool:
+    name = "resolve_user"
+
+    def __init__(self, users: dict):
+        self._users = users
+
+    def definition(self):
+        return ToolDefinition(name="resolve_user", description="", parameters={})
+
+    async def execute(self, args, *, user_id=None, dialog_key=None, dialog_id=None):
+        query = str(args.get("query") or "")
+        return _fake_resolution("resolve_user", query, self._users.get(query, []))
+
+
+class _FakeResolveProjectTool:
+    name = "resolve_project"
+
+    def __init__(self, projects: dict):
+        self._projects = projects
+
+    def definition(self):
+        return ToolDefinition(name="resolve_project", description="", parameters={})
+
+    async def execute(self, args, *, user_id=None, dialog_key=None, dialog_id=None):
+        query = str(args.get("query") or "")
+        return _fake_resolution("resolve_project", query, self._projects.get(query, []))
+
+
 class FakeResolverTools:
     def __init__(
         self,
         *,
-        users: dict[str, list[dict]] | None = None,
-        projects: dict[str, list[dict]] | None = None,
+        users: dict | None = None,
+        projects: dict | None = None,
         bitrix_api_result: ToolResult | None = None,
         profile_result: ToolResult | None = None,
     ) -> None:
-        self.users = users or {}
-        self.projects = projects or {}
-        self.bitrix_api_result = bitrix_api_result or ToolResult(status="not_configured", tool="bitrix_api")
-        self.profile_result = profile_result or ToolResult(status="not_available", tool="current_user_profile")
-        self.bitrix_api_calls: list[dict] = []
+        self.bitrix_api_calls: list = []
+        self._tools = [
+            _FakePortalSearchTool(),
+            _FakeBitrixApiTool(
+                bitrix_api_result or ToolResult(status="not_configured", tool="bitrix_api"),
+                self.bitrix_api_calls,
+            ),
+            _FakeCurrentUserProfileTool(
+                profile_result or ToolResult(status="not_available", tool="current_user_profile")
+            ),
+            _FakeResolveUserTool(users or {}),
+            _FakeResolveProjectTool(projects or {}),
+        ]
 
-    def definitions(self) -> list:
-        return []
-
-    async def resolve_user(self, query: str, *, limit: int = 5) -> ToolResult:
-        return _fake_resolution("resolve_user", query, self.users.get(query, []))
-
-    async def resolve_project(self, query: str, *, limit: int = 5) -> ToolResult:
-        return _fake_resolution("resolve_project", query, self.projects.get(query, []))
-
-    def portal_search_contract(self, args: dict) -> ToolResult:
-        return ToolResult(status="not_configured", tool="portal_search", data={"args": args})
-
-    async def bitrix_api(self, args: dict) -> ToolResult:
-        self.bitrix_api_calls.append(args)
-        return self.bitrix_api_result
-
-    async def current_user_profile(self, args: dict | None = None) -> ToolResult:
-        return self.profile_result
+    def agent_tools(self) -> list:
+        return self._tools
 
 
 def _fake_resolution(tool: str, query: str, candidates: list[dict]) -> ToolResult:

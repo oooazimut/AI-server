@@ -5,13 +5,37 @@ import sqlite3
 
 from ai_server.agents.logistics import LogisticsLLMService, LogisticsLLMToolCall, LogisticsSpecialist
 from ai_server.agents.logistics.specialist import VehicleUsageSettings
+from ai_server.agents.logistics.tools import VehicleContextTool, VehicleSaveDraftTool, VehicleSaveReportTool
 from ai_server.models import AgentResult, AgentTask, UserContext
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
-from ai_server.tools.vehicle_usage import SentRequestData, StaffMember, VehicleUsageStore, VehicleUsageToolset
+from ai_server.tools.vehicle_usage import SentRequestData, StaffMember, VehicleUsageStore
 from tests.fakes import FakeEmbeddingProvider, FakeLogisticsLLM, RecordingLLMClient
 
 _FAKE_RETRIEVER = HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider())
+
+
+def _specialist(
+    manifest,
+    store: VehicleUsageStore,
+    *,
+    llm=None,
+    output_fn=None,
+    vu_settings: VehicleUsageSettings | None = None,
+) -> LogisticsSpecialist:
+    return LogisticsSpecialist(
+        manifest,
+        retriever=_FAKE_RETRIEVER,
+        agent_tools=[
+            VehicleContextTool(store),
+            VehicleSaveDraftTool(store),
+            VehicleSaveReportTool(store),
+        ],
+        vu_store=store,
+        llm=llm or FakeLogisticsLLM(),
+        output_fn=output_fn,
+        vu_settings=vu_settings,
+    )
 
 
 def test_logistics_specialist_forwards_dialog_history_to_decide(monkeypatch, tmp_path):
@@ -24,13 +48,9 @@ def test_logistics_specialist_forwards_dialog_history_to_decide(monkeypatch, tmp
         {"role": "user", "content": "кто сегодня на смене"},
         {"role": "assistant", "content": "Уточните дату смены."},
     ]
+    store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
 
-    specialist = LogisticsSpecialist(
-        manifest,
-        retriever=_FAKE_RETRIEVER,
-        tools=VehicleUsageToolset(store=VehicleUsageStore(tmp_path / "vehicle_usage.sqlite"), user_id=9),
-        llm=llm,
-    )
+    specialist = _specialist(manifest, store, llm=llm)
     anyio_run(
         specialist.handle(
             AgentTask(
@@ -103,15 +123,9 @@ def test_logistics_specialist_saves_llm_parsed_draft(monkeypatch, tmp_path):
         ],
         final_answer="Сохранил черновик.",
     )
-    specialist = LogisticsSpecialist(
-        manifest,
-        retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
-        tools=VehicleUsageToolset(store=store, user_id=9, dialog_id="chat9"),
-        llm=fake_llm,
-    )
 
     result = anyio_run(
-        specialist.handle(
+        _specialist(manifest, store, llm=fake_llm).handle(
             AgentTask(
                 task_id="log-1",
                 request="Иван на Ларгусе, Олег в офисе",
@@ -121,8 +135,8 @@ def test_logistics_specialist_saves_llm_parsed_draft(monkeypatch, tmp_path):
     )
 
     assert result.answer == "Сохранил черновик."
-    assert any(action.name == "logistics_vehicle_usage_context" for action in result.actions_taken)
-    assert any(action.name == "logistics_vehicle_usage_save_draft" for action in result.actions_taken)
+    assert any(action.name == "vehicle_usage_context" for action in result.actions_taken)
+    assert any(action.name == "vehicle_usage_save_draft" for action in result.actions_taken)
     with sqlite3.connect(store.path) as db:
         row = db.execute("SELECT status, parsed_json FROM vehicle_usage_requests").fetchone()
     assert row[0] == "pending_confirmation"
@@ -157,14 +171,12 @@ def test_logistics_specialist_saves_confirmed_report(monkeypatch, tmp_path):
         ],
         final_answer="Сохранил утренний отчет.",
     )
-    specialist = LogisticsSpecialist(
-        manifest,
-        retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
-        tools=VehicleUsageToolset(store=store, user_id=9, dialog_id="chat9"),
-        llm=fake_llm,
-    )
 
-    result = anyio_run(specialist.handle(AgentTask(task_id="log-2", request="подтверждаю", user=UserContext(id="9"))))
+    result = anyio_run(
+        _specialist(manifest, store, llm=fake_llm).handle(
+            AgentTask(task_id="log-2", request="подтверждаю", user=UserContext(id="9"))
+        )
+    )
 
     assert result.answer == "Сохранил утренний отчет."
     with sqlite3.connect(store.path) as db:
@@ -193,10 +205,9 @@ def test_logistics_morning_handler_delivers_and_records_request(tmp_path):
 
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
-    specialist = LogisticsSpecialist(
+    specialist = _specialist(
         manifest,
-        retriever=_FAKE_RETRIEVER,
-        tools=VehicleUsageToolset(store=store, user_id=9, dialog_id="chat9"),
+        store,
         llm=fake_llm,
         output_fn=_output_fn,
         vu_settings=VehicleUsageSettings(
@@ -251,10 +262,9 @@ def test_logistics_escalates_after_max_reminders(tmp_path):
 
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
-    specialist = LogisticsSpecialist(
+    specialist = _specialist(
         manifest,
-        retriever=_FAKE_RETRIEVER,
-        tools=VehicleUsageToolset(store=store, user_id=9, dialog_id="chat9"),
+        store,
         llm=fake_llm,
         output_fn=_output_fn,
         vu_settings=VehicleUsageSettings(
