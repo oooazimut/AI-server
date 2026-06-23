@@ -110,14 +110,6 @@ class QualityControlHandlerAdapter:
             return None
 
         settings = self._settings
-
-        async def _deliver(user_id_str: str, message: str) -> None:
-            uid = int(user_id_str) if user_id_str.lstrip("-").isdigit() else None
-            if uid is not None:
-                await self._bitrix.notify_user(user_id=uid, message=message, tag="task_proposal")
-            else:
-                await self._bitrix.send_bot_message(user_id_str, message, bot_id=settings.bitrix_bot_id)
-
         return Bitrix24Specialist.build(
             bitrix24_manifest,
             bitrix_client=self._bitrix,
@@ -127,7 +119,7 @@ class QualityControlHandlerAdapter:
             bitrix_llm=self._bitrix_llm,
             scheduler=self._scheduler,
             bitrix_store=self._bitrix_store,
-            bitrix_deliver_fn=_deliver,
+            bitrix_bot=self._bitrix,
             settings=settings,
         )
 

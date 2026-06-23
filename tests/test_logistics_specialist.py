@@ -20,7 +20,7 @@ def _specialist(
     store: VehicleUsageStore,
     *,
     llm=None,
-    output_fn=None,
+    output_port=None,
     vu_settings: VehicleUsageSettings | None = None,
 ) -> LogisticsSpecialist:
     return LogisticsSpecialist(
@@ -33,7 +33,7 @@ def _specialist(
         ],
         vu_store=store,
         llm=llm or FakeLogisticsLLM(),
-        output_fn=output_fn,
+        output_port=output_port,
         vu_settings=vu_settings,
     )
 
@@ -209,7 +209,7 @@ def test_logistics_morning_handler_delivers_and_records_request(tmp_path):
         manifest,
         store,
         llm=fake_llm,
-        output_fn=_output_fn,
+        output_port=_output_fn,
         vu_settings=VehicleUsageSettings(
             dialog_id="chat9",
             manager_user_id=9,
@@ -222,7 +222,7 @@ def test_logistics_morning_handler_delivers_and_records_request(tmp_path):
 
     assert len(delivered_tasks) == 1
     t = delivered_tasks[0]
-    assert t.context["_intent"] == "deliver_to_dialog"
+    assert t.context["event"] == "vehicle_usage_delivery"
     assert t.context["dialog_id"] == "chat9"
     assert t.request == "Нужен утренний отчет."
     with sqlite3.connect(store.path) as db:
@@ -266,13 +266,12 @@ def test_logistics_escalates_after_max_reminders(tmp_path):
         manifest,
         store,
         llm=fake_llm,
-        output_fn=_output_fn,
+        output_port=_output_fn,
         vu_settings=VehicleUsageSettings(
             dialog_id="chat9",
             manager_user_id=9,
             max_reminders=3,
             reminder_interval_minutes=60,
-            admin_notify_user_ids=[1, 9],
             dry_run=False,
         ),
     )
@@ -280,8 +279,8 @@ def test_logistics_escalates_after_max_reminders(tmp_path):
 
     assert len(escalation_tasks) == 1
     t = escalation_tasks[0]
-    assert t.context["_intent"] == "escalate"
-    assert set(t.context["admin_user_ids"]) == {1, 9}
+    assert t.context["event"] == "vehicle_usage_escalation"
+    assert t.context["_source"] == "logistics"
     with sqlite3.connect(store.path) as db:
         row = db.execute("SELECT escalated_at FROM vehicle_usage_requests").fetchone()
     assert row[0]

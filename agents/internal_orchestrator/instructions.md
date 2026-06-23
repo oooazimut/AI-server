@@ -28,8 +28,8 @@
 Читай `context` и `request` чтобы понять что нужно сделать.
 
 Типичные случаи:
-- `_intent=deliver_to_dialog` — нужно отправить `request` как сообщение в `context.dialog_id`. Направляй в bitrix24.
-- `_intent=escalate` — нужно уведомить пользователей из `context.admin_user_ids`. Направляй в bitrix24.
+- `event=vehicle_usage_delivery` — нужно отправить `request` как сообщение в `context.dialog_id`. Направляй в bitrix24 (инструмент send_message).
+- `event=vehicle_usage_escalation` — нужно уведомить пользователей. Если в `context.notify_user_ids` есть ID — направляй в bitrix24 (инструмент notify_users). Если нет — отправь в dialog_id как обычное сообщение.
 
 Не хардкодь эти случаи — читай контекст и принимай решение сам. Перечисленное выше — примеры, не исчерпывающий список.
 

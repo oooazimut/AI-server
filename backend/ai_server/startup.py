@@ -8,13 +8,13 @@ from fastapi import FastAPI
 
 from .agent_scheduler import AgentScheduler
 from .agents.bitrix24 import BitrixLLMService
-from .agents.logistics import LogisticsLLMService, LogisticsSpecialist
+from .agents.logistics import LogisticsLLMService
 from .agents.logistics.specialist import VehicleUsageSettings
-from .agents.logistics.tools import VehicleContextTool, VehicleSaveDraftTool, VehicleSaveReportTool
 from .agents.pto import PtoLLMService
-from .channels.bitrix import BitrixWebhookProcessor
+from .channels.bitrix import BitrixWebhookProcessor, build_orchestrator
 from .integrations.bitrix.bitrix_store import BitrixAgentStore
 from .integrations.bitrix.client import BitrixClient
+from .integrations.bitrix.dialog_state import BitrixPendingActionService, DialogStateStore
 from .integrations.bitrix.oauth import BitrixOAuthService
 from .integrations.bitrix.portal_search import PortalSearchIndex
 from .integrations.bitrix.ports import BitrixAgentStorePort
@@ -30,7 +30,7 @@ from .orchestrators.orchestrator_llm import OrchestratorLLMService
 from .registry import load_agent_manifests
 from .runtime import ensure_runtime_dirs
 from .settings import Settings, get_settings
-from .specialists import SpecialistDeps, manifest_by_id
+from .specialists import SpecialistDeps
 from .tools.vehicle_usage import VehicleUsageStore
 from .workers.bitrix.quality_control_adapter import QualityControlHandlerAdapter
 from .workers.bitrix.reconciler import reconcile_once, run_reconciler
@@ -226,7 +226,6 @@ async def lifespan(app: FastAPI):
     supervisor_task: asyncio.Task | None = None
     reconciler_task: asyncio.Task | None = None
     staff_sync_task: asyncio.Task | None = None
-    logistics_specialist: LogisticsSpecialist | None = None
     vehicle_usage_store = None
     if settings.vehicle_usage_enabled:
         vehicle_usage_store = await _make_vehicle_store(settings)
@@ -236,25 +235,61 @@ async def lifespan(app: FastAPI):
     if settings.webhook_event_queue_enabled and settings.webhook_event_worker_enabled:
         bitrix_llm_svc = BitrixLLMService(settings=settings)
 
-        async def _bitrix_deliver(user_id_str: str, message: str) -> None:
-            uid = int(user_id_str) if user_id_str.lstrip("-").isdigit() else None
-            if uid is not None:
-                await bitrix.notify_user(user_id=uid, message=message, tag="task_proposal")
-            else:
-                await bitrix.send_bot_message(user_id_str, message, bot_id=settings.bitrix_bot_id)
-
+        vu_settings = (
+            VehicleUsageSettings(
+                dialog_id=settings.vehicle_usage_dialog_id or "",
+                manager_user_id=settings.vehicle_usage_manager_user_id,
+                max_reminders=settings.vehicle_usage_max_reminders,
+                reminder_interval_minutes=settings.vehicle_usage_reminder_interval_minutes,
+                dry_run=settings.vehicle_usage_dry_run,
+                request_time=settings.vehicle_usage_request_time,
+            )
+            if settings.vehicle_usage_enabled
+            else None
+        )
         specialist_deps = SpecialistDeps(
             settings=settings,
             scheduler=scheduler,
             orchestrator_llm=OrchestratorLLMService(),
             orchestrator_store=orchestrator_store,
             bitrix_llm=bitrix_llm_svc,
-            bitrix_deliver_fn=_bitrix_deliver,
             pto_llm=PtoLLMService(),
             pto_store=pto_store,
             logistics_llm=logistics_llm_svc,
             vehicle_usage_store=vehicle_usage_store,
+            logistics_vu_settings=vu_settings,
         )
+        pending_actions = BitrixPendingActionService(
+            store=DialogStateStore(settings.dialog_state_path),
+            bitrix=bitrix,
+            bitrix_oauth=bitrix_oauth,
+            audit_log_path=settings.bitrix_write_audit_log_path,
+            dry_run=settings.agent_dry_run,
+            settings=settings,
+        )
+        orchestrator = build_orchestrator(
+            manifests,
+            specialist_deps,
+            bitrix=bitrix,
+            portal_search=portal_search,
+            pending_actions=pending_actions,
+            bot=bitrix,
+        )
+
+        if (logistics_spec := orchestrator.specialists.get("logistics")) is not None:
+            admin_ids = settings.resolved_vehicle_usage_admin_notify_user_ids
+
+            async def _logistics_to_orchestrator(task):
+                enriched = task
+                if task.context.get("event") == "vehicle_usage_escalation" and admin_ids:
+                    enriched = task.model_copy(update={"context": {**task.context, "notify_user_ids": admin_ids}})
+                return await orchestrator.handle(enriched)
+
+            logistics_spec._output_port = _logistics_to_orchestrator
+            if settings.vehicle_usage_enabled and not settings.redis_url:
+                logistics_spec.start()
+            app.state.logistics_specialist = logistics_spec
+
         search_webhook_handler = SearchWebhookHandlerAdapter(
             bitrix=bitrix,
             index=portal_search,
@@ -275,6 +310,8 @@ async def lifespan(app: FastAPI):
             bitrix=bitrix,
             portal_search=portal_search,
             bitrix_oauth=bitrix_oauth,
+            pending_actions=pending_actions,
+            orchestrator=orchestrator,
             search_webhook_status=app.state.search_webhook_indexer_status,
             quality_control_status=app.state.quality_control_webhook_status,
             learning_recorder=learning_recorder,
@@ -285,45 +322,7 @@ async def lifespan(app: FastAPI):
             quality_control_handler=quality_control_handler,
         )
 
-        if vehicle_usage_store is not None:
-            logistics_manifest = manifest_by_id(manifests, "logistics")
-            if logistics_manifest is not None:
-
-                async def _logistics_output(task):
-                    return await processor._orchestrator.handle(task)
-
-                logistics_specialist = LogisticsSpecialist(
-                    logistics_manifest,
-                    llm=logistics_llm_svc,
-                    scheduler=scheduler,
-                    output_fn=_logistics_output,
-                    vu_settings=VehicleUsageSettings(
-                        dialog_id=settings.vehicle_usage_dialog_id or "",
-                        manager_user_id=settings.vehicle_usage_manager_user_id,
-                        max_reminders=settings.vehicle_usage_max_reminders,
-                        reminder_interval_minutes=settings.vehicle_usage_reminder_interval_minutes,
-                        admin_notify_user_ids=settings.resolved_vehicle_usage_admin_notify_user_ids,
-                        dry_run=settings.vehicle_usage_dry_run,
-                        request_time=settings.vehicle_usage_request_time,
-                    ),
-                    store=vehicle_usage_store,
-                    vu_store=vehicle_usage_store,
-                    agent_tools=[
-                        VehicleContextTool(vehicle_usage_store),
-                        VehicleSaveDraftTool(vehicle_usage_store),
-                        VehicleSaveReportTool(vehicle_usage_store),
-                    ],
-                )
-                if not settings.redis_url:
-                    logistics_specialist.start()
-                app.state.logistics_specialist = logistics_specialist
-
         async def _dispatch_processor(payload: dict) -> dict:
-            event_key = str(payload.get("event") or "")
-            if event_key == "vehicle_usage_morning_trigger" and logistics_specialist is not None:
-                reminder_count = int((payload.get("data") or {}).get("reminder_count", 0))
-                await logistics_specialist._run_and_deliver(reminder_count=reminder_count)
-                return {"handled": True, "event": event_key}
             return await processor.process(payload)
 
         webhook_worker_task = asyncio.create_task(
@@ -390,6 +389,6 @@ async def lifespan(app: FastAPI):
                 await staff_sync_task
             except asyncio.CancelledError:
                 pass
-        if logistics_specialist is not None:
-            logistics_specialist.stop()
+        if (spec := getattr(app.state, "logistics_specialist", None)) is not None:
+            spec.stop()
         scheduler.stop()

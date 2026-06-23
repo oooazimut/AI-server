@@ -104,7 +104,7 @@ class BitrixWebhookProcessor:
             dry_run=self._settings.agent_dry_run,
             settings=self._settings,
         )
-        self._orchestrator: InternalOrchestrator = orchestrator or _build_orchestrator(
+        self._orchestrator: InternalOrchestrator = orchestrator or build_orchestrator(
             self._manifests,
             self._specialist_deps,
             bitrix=self.bitrix,
@@ -333,7 +333,7 @@ class BitrixWebhookProcessor:
             return {"recorded": False, "reason": "unexpected_error"}
 
 
-def _build_orchestrator(
+def build_orchestrator(
     manifests: list[AgentManifest],
     deps: SpecialistDeps,
     *,

@@ -163,12 +163,22 @@ class BitrixProposalService:
         self,
         *,
         store: Any,
-        deliver_fn: Callable[[str, str], Awaitable[None]] | None = None,
+        bot: Any = None,
         settings: Settings,
     ) -> None:
         self._store = store
-        self._deliver_fn = deliver_fn
+        self._bot = bot
         self._settings = settings
+
+    async def _deliver(self, user_id_str: str, message: str) -> None:
+        if self._bot is None:
+            logger.warning("BitrixProposalService: bot not configured, cannot deliver")
+            return
+        uid = int(user_id_str) if user_id_str.lstrip("-").isdigit() else None
+        if uid is not None:
+            await self._bot.notify_user(user_id=uid, message=message, tag="task_proposal")
+        else:
+            await self._bot.send_bot_message(user_id_str, message, bot_id=self._settings.bitrix_bot_id)
 
     def save(self, proposal: IncompleteProposal, scheduled_for: datetime) -> int:
         return self._store.save_proposal(
@@ -190,7 +200,7 @@ class BitrixProposalService:
         return _make_proposal_deliver_handler(
             proposal_id,
             bitrix_store=self._store,
-            deliver_fn=self._deliver_fn,
+            deliver_fn=self._deliver,
             settings=self._settings,
         )
 
@@ -249,13 +259,12 @@ class Bitrix24Specialist(BaseSpecialist):
         bitrix_llm: BitrixAgentLLM | None = None,
         scheduler: SchedulerPort | None = None,
         bitrix_store: Any | None = None,
-        bitrix_deliver_fn: Callable[[str, str], Awaitable[None]] | None = None,
         settings: Settings | None = None,
         **_: object,
     ) -> Bitrix24Specialist:
         _settings = settings or get_settings()
         proposals = (
-            BitrixProposalService(store=bitrix_store, deliver_fn=bitrix_deliver_fn, settings=_settings)
+            BitrixProposalService(store=bitrix_store, bot=bitrix_bot, settings=_settings)
             if bitrix_store is not None
             else None
         )

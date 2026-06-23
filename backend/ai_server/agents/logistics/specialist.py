@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -33,7 +33,6 @@ class VehicleUsageSettings:
     manager_user_id: int | None
     max_reminders: int
     reminder_interval_minutes: int
-    admin_notify_user_ids: list[int] = field(default_factory=list)
     dry_run: bool = True
     request_time: str = "08:00"
 
@@ -53,11 +52,11 @@ class LogisticsSpecialist(BaseSpecialist):
         llm: LogisticsAgentLLM | None = None,
         scheduler: SchedulerPort | None = None,
         store: Any | None = None,
-        output_fn: SpecialistOutputPort | None = None,
+        output_port: SpecialistOutputPort | None = None,
         vu_settings: VehicleUsageSettings | None = None,
         vu_store: VehicleUsageStorePort | None = None,
     ) -> None:
-        self._output_fn = output_fn
+        self._output_port = output_port
         self._vu_settings = vu_settings or VehicleUsageSettings(
             dialog_id="",
             manager_user_id=None,
@@ -85,6 +84,7 @@ class LogisticsSpecialist(BaseSpecialist):
         logistics_retriever: HybridKnowledgeRetriever | None = None,
         logistics_llm: LogisticsAgentLLM | None = None,
         logistics_store: Any | None = None,
+        logistics_vu_settings: VehicleUsageSettings | None = None,
         scheduler: SchedulerPort | None = None,
         **_: Any,
     ) -> LogisticsSpecialist:
@@ -97,6 +97,7 @@ class LogisticsSpecialist(BaseSpecialist):
             manifest,
             retriever=logistics_retriever,
             agent_tools=tools,
+            vu_settings=logistics_vu_settings,
             vu_store=vehicle_usage_store,
             llm=logistics_llm or LogisticsLLMService(),
             scheduler=scheduler,
@@ -108,7 +109,7 @@ class LogisticsSpecialist(BaseSpecialist):
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        if self._output_fn and self._vu_settings.dialog_id:
+        if self._output_port and self._vu_settings.dialog_id:
             self._setup_morning_cron()
 
     # ------------------------------------------------------------------
@@ -172,16 +173,16 @@ class LogisticsSpecialist(BaseSpecialist):
         if answer is None:
             return
 
-        if answer and self._output_fn:
+        if answer and self._output_port:
             if not vu.dry_run:
-                await self._output_fn(
+                await self._output_port(
                     AgentTask(
                         task_id=f"logistics_deliver_{uuid.uuid4().hex[:8]}",
                         request=answer,
                         user=UserContext(id=str(manager_user_id) if manager_user_id else ""),
                         context={
                             "_source": "logistics",
-                            "_intent": "deliver_to_dialog",
+                            "event": "vehicle_usage_delivery",
                             "dialog_id": dialog_id,
                             "reminder_count": reminder_count,
                         },
@@ -212,11 +213,6 @@ class LogisticsSpecialist(BaseSpecialist):
 
     async def _escalate(self) -> None:
         vu = self._vu_settings
-        admin_ids = vu.admin_notify_user_ids
-        if not admin_ids:
-            logger.warning("LogisticsSpecialist: admin_notify_user_ids not set, skipping escalation")
-            return
-
         task = AgentTask(
             task_id=f"vehicle_usage_esc_{uuid.uuid4().hex[:8]}",
             request="Сформируй уведомление об отсутствии утреннего отчёта по служебным автомобилям.",
@@ -225,19 +221,18 @@ class LogisticsSpecialist(BaseSpecialist):
         message = await self._run_llm_task(task) or "Утренний отчёт по служебным автомобилям не получен."
 
         if vu.dry_run:
-            logger.info("LogisticsSpecialist: dry_run, escalation would notify %s", admin_ids)
+            logger.info("LogisticsSpecialist: dry_run, escalation skipped")
             return
 
-        if self._output_fn:
-            await self._output_fn(
+        if self._output_port:
+            await self._output_port(
                 AgentTask(
                     task_id=f"logistics_esc_{uuid.uuid4().hex[:8]}",
                     request=message,
                     user=UserContext(id=""),
                     context={
                         "_source": "logistics",
-                        "_intent": "escalate",
-                        "admin_user_ids": admin_ids,
+                        "event": "vehicle_usage_escalation",
                     },
                 )
             )
@@ -248,7 +243,7 @@ class LogisticsSpecialist(BaseSpecialist):
                 user_id=vu.manager_user_id,
                 escalated_at=datetime.now(MOSCOW_TZ).isoformat(),
             )
-        logger.info("LogisticsSpecialist: escalation sent to %s", admin_ids)
+        logger.info("LogisticsSpecialist: escalation dispatched via output_port")
 
     # ------------------------------------------------------------------
     # BaseSpecialist hooks

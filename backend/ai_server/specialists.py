@@ -26,13 +26,13 @@ class SpecialistDeps:
     bitrix_llm: Any = None
     bitrix_retriever: Any = None
     bitrix_store: Any = None
-    bitrix_deliver_fn: Any = None
     # pto
     pto_llm: Any = None
     pto_store: Any = None  # AgentDialogStorePort | None
     # logistics
     vehicle_usage_store: Any = None  # VehicleUsageStorePort | None
     logistics_llm: Any = None
+    logistics_vu_settings: Any = None  # VehicleUsageSettings | None
 
     orchestrator_store: Any = None  # AgentDialogStorePort | None
     orchestrator_retriever: Any = None  # HybridKnowledgeRetriever | None
