@@ -6,13 +6,20 @@ import sqlite3
 from ai_server.agents.logistics import LogisticsLLMService, LogisticsLLMToolCall, LogisticsSpecialist
 from ai_server.agents.logistics.specialist import VehicleUsageSettings
 from ai_server.agents.logistics.tools import VehicleContextTool, VehicleSaveDraftTool, VehicleSaveReportTool
-from ai_server.models import AgentResult, AgentTask, UserContext
+from ai_server.models import AgentTask, UserContext
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
-from ai_server.tools.vehicle_usage import SentRequestData, StaffMember, VehicleUsageStore
+from ai_server.tools.vehicle_usage import StaffMember, VehicleUsageStore
 from tests.fakes import FakeEmbeddingProvider, FakeLogisticsLLM, RecordingLLMClient
 
 _FAKE_RETRIEVER = HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider())
+
+_VU_SETTINGS = VehicleUsageSettings(
+    manager_user_id=5,
+    max_reminders=3,
+    reminder_interval_minutes=30,
+    dry_run=True,
+)
 
 
 def _specialist(
@@ -20,7 +27,6 @@ def _specialist(
     store: VehicleUsageStore,
     *,
     llm=None,
-    output_fn=None,
     vu_settings: VehicleUsageSettings | None = None,
 ) -> LogisticsSpecialist:
     return LogisticsSpecialist(
@@ -31,9 +37,7 @@ def _specialist(
             VehicleSaveDraftTool(store),
             VehicleSaveReportTool(store),
         ],
-        vu_store=store,
         llm=llm or FakeLogisticsLLM(),
-        output_fn=output_fn,
         vu_settings=vu_settings,
     )
 
@@ -188,103 +192,141 @@ def test_logistics_specialist_saves_confirmed_report(monkeypatch, tmp_path):
     assert assignment == (1, 1)
 
 
-def test_logistics_morning_handler_delivers_and_records_request(tmp_path):
-    store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
-    fake_llm = FakeLogisticsLLM(
-        tool_call_steps=[
-            [LogisticsLLMToolCall(name="vehicle_usage_context", args={"request_date": "2026-06-05"})],
-            [LogisticsLLMToolCall(name="none")],
-        ],
-        final_answer="Нужен утренний отчет.",
-    )
-    delivered_tasks: list[AgentTask] = []
-
-    async def _output_fn(task: AgentTask) -> AgentResult:
-        delivered_tasks.append(task)
-        return AgentResult(status="completed", agent_id="internal_orchestrator", answer="")
-
+def test_morning_task_schedules_reminder(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
-    specialist = _specialist(
-        manifest,
-        store,
-        llm=fake_llm,
-        output_fn=_output_fn,
-        vu_settings=VehicleUsageSettings(
-            dialog_id="chat9",
-            manager_user_id=9,
-            max_reminders=3,
-            reminder_interval_minutes=30,
-            dry_run=False,
-        ),
-    )
-    anyio_run(specialist._run_and_deliver(reminder_count=0))
-
-    assert len(delivered_tasks) == 1
-    t = delivered_tasks[0]
-    assert t.context["_intent"] == "deliver_to_dialog"
-    assert t.context["dialog_id"] == "chat9"
-    assert t.request == "Нужен утренний отчет."
-    with sqlite3.connect(store.path) as db:
-        row = db.execute("SELECT status, reminder_count, message FROM vehicle_usage_requests").fetchone()
-    assert row == ("sent", 1, "Нужен утренний отчет.")
-
-
-def test_logistics_escalates_after_max_reminders(tmp_path):
-    from datetime import datetime
-
-    from ai_server.utils import MOSCOW_TZ
-
-    today = datetime.now(MOSCOW_TZ).date().isoformat()
     store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
-    store.create_sent_request(
-        SentRequestData(
-            request_date=today,
-            user_id=9,
-            dialog_id="chat9",
-            message="Нужен отчет.",
-            sent_at=f"{today}T08:00:00+03:00",
-            reminder_count=3,
+    fake_llm = FakeLogisticsLLM(final_answer="Привет, заполните отчёт по автомобилям за сегодня.")
+
+    result = anyio_run(
+        _specialist(manifest, store, llm=fake_llm, vu_settings=_VU_SETTINGS).handle(
+            AgentTask(
+                task_id="morning-1",
+                request="Сгенерируй утренний отчёт.",
+                context={
+                    "channel_id": "bitrix24",
+                    "recipient_id": "chat77",
+                    "event": "vehicle_usage_morning",
+                    "request_date": "2026-06-23",
+                },
+            )
         )
     )
-    fake_llm = FakeLogisticsLLM(
-        tool_call_steps=[
-            [LogisticsLLMToolCall(name="vehicle_usage_context", args={"request_date": "2026-06-05"})],
-            [LogisticsLLMToolCall(name="none")],
-        ],
-        final_answer="Отчет по машинам не получен.",
-    )
-    escalation_tasks: list[AgentTask] = []
 
-    async def _output_fn(task: AgentTask) -> AgentResult:
-        escalation_tasks.append(task)
-        return AgentResult(status="completed", agent_id="internal_orchestrator", answer="")
+    assert result.answer == "Привет, заполните отчёт по автомобилям за сегодня."
+    assert len(result.scheduled_tasks) == 1
+    sched = result.scheduled_tasks[0]
+    assert sched.cancel is False
+    assert sched.agent_id == "logistics"
+    assert sched.job_id == "vu_reminder_2026-06-23"
+    assert sched.task is not None
+    assert sched.task.context["event"] == "vehicle_usage_reminder_due"
+    assert sched.task.context["channel_id"] == "bitrix24"
+    assert sched.task.context["recipient_id"] == "chat77"
+    assert sched.task.context["reminder_count"] == 1
 
+
+def test_reminder_increments_count(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
-    specialist = _specialist(
-        manifest,
-        store,
-        llm=fake_llm,
-        output_fn=_output_fn,
-        vu_settings=VehicleUsageSettings(
-            dialog_id="chat9",
-            manager_user_id=9,
-            max_reminders=3,
-            reminder_interval_minutes=60,
-            admin_notify_user_ids=[1, 9],
-            dry_run=False,
-        ),
-    )
-    anyio_run(specialist._run_and_deliver(reminder_count=3))
+    store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
 
-    assert len(escalation_tasks) == 1
-    t = escalation_tasks[0]
-    assert t.context["_intent"] == "escalate"
-    assert set(t.context["admin_user_ids"]) == {1, 9}
-    with sqlite3.connect(store.path) as db:
-        row = db.execute("SELECT escalated_at FROM vehicle_usage_requests").fetchone()
-    assert row[0]
+    result = anyio_run(
+        _specialist(manifest, store, vu_settings=_VU_SETTINGS).handle(
+            AgentTask(
+                task_id="reminder-2",
+                request="Напоминание.",
+                context={
+                    "channel_id": "bitrix24",
+                    "recipient_id": "chat77",
+                    "event": "vehicle_usage_reminder_due",
+                    "request_date": "2026-06-23",
+                    "reminder_count": 1,
+                },
+            )
+        )
+    )
+
+    if result.scheduled_tasks:
+        sched = result.scheduled_tasks[0]
+        assert sched.task is not None
+        assert sched.task.context["reminder_count"] == 2
+
+
+def test_max_reminders_stops_scheduling(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
+    manifest = get_agent_manifest("logistics")
+    assert manifest is not None
+    store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
+
+    result = anyio_run(
+        _specialist(manifest, store, vu_settings=_VU_SETTINGS).handle(
+            AgentTask(
+                task_id="reminder-max",
+                request="Напоминание.",
+                context={
+                    "event": "vehicle_usage_reminder_due",
+                    "request_date": "2026-06-23",
+                    "reminder_count": 3,  # already at max
+                },
+            )
+        )
+    )
+
+    assert result.scheduled_tasks == []
+
+
+def test_save_report_cancels_reminder(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
+    manifest = get_agent_manifest("logistics")
+    assert manifest is not None
+    store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
+    store.upsert_employees([StaffMember(order=1, user_id=15, name="Иван Петров")])
+    fake_llm = FakeLogisticsLLM(
+        tool_call_steps=[
+            [LogisticsLLMToolCall(name="vehicle_usage_context", args={"request_date": "2026-06-23"})],
+            [
+                LogisticsLLMToolCall(
+                    name="vehicle_usage_save_report",
+                    args={
+                        "request_date": "2026-06-23",
+                        "source_text": "подтверждаю",
+                        "parsed": {
+                            "date": "2026-06-23",
+                            "people": [{"staff_order": 1, "full_name": "Иван Петров", "status": "shift"}],
+                            "vehicles": [],
+                        },
+                    },
+                )
+            ],
+            [LogisticsLLMToolCall(name="none")],
+        ],
+        final_answer="Отчёт сохранён.",
+    )
+
+    result = anyio_run(
+        _specialist(manifest, store, llm=fake_llm, vu_settings=_VU_SETTINGS).handle(
+            AgentTask(
+                task_id="save-report-1",
+                request="подтверждаю",
+                user=UserContext(id="9"),
+                context={"request_date": "2026-06-23"},
+            )
+        )
+    )
+
+    assert result.answer == "Отчёт сохранён."
+    assert len(result.scheduled_tasks) == 1
+    cancel = result.scheduled_tasks[0]
+    assert cancel.cancel is True
+    assert cancel.job_id == "vu_reminder_2026-06-23"
+    assert cancel.agent_id == "logistics"
 
 
 def anyio_run(awaitable):
@@ -294,17 +336,3 @@ def anyio_run(awaitable):
         return await awaitable
 
     return anyio.run(runner)
-
-
-class FakeVehicleBitrix:
-    def __init__(self) -> None:
-        self.messages = []
-        self.notifications = []
-
-    async def send_bot_message(self, dialog_id, message, *, bot_id=None, keyboard=None):
-        self.messages.append({"dialog_id": dialog_id, "message": message, "bot_id": bot_id, "keyboard": keyboard})
-        return 1
-
-    async def notify_user(self, *, user_id, message, tag="ai_server", sub_tag=""):
-        self.notifications.append({"user_id": user_id, "message": message, "tag": tag, "sub_tag": sub_tag})
-        return 1

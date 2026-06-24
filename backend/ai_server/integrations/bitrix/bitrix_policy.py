@@ -1,4 +1,73 @@
+from __future__ import annotations
+
+from typing import Any, Protocol
+
 from ai_server.models import PolicyDecision
+
+# ---------------------------------------------------------------------------
+# Write-policy helpers (moved from dialog_state.py)
+# ---------------------------------------------------------------------------
+
+NO_DEADLINE_FIELD_NAMES = {
+    "NO_DEADLINE",
+    "WITHOUT_DEADLINE",
+    "noDeadline",
+    "withoutDeadline",
+}
+
+
+class _WritePolicy(Protocol):
+    def apply(self, params: dict[str, Any]) -> dict[str, Any]: ...
+
+
+class _NoDeadlinePolicy:
+    def apply(self, params: dict[str, Any]) -> dict[str, Any]:
+        fields = params.get("fields")
+        if isinstance(fields, dict) and no_deadline_requested(fields):
+            prepare_no_deadline_fields(fields)
+        return params
+
+
+_WRITE_POLICY_REGISTRY: dict[str, _WritePolicy] = {
+    "tasks.task.add": _NoDeadlinePolicy(),
+}
+
+
+def apply_write_policy(method: str, params: dict[str, Any]) -> dict[str, Any]:
+    policy = _WRITE_POLICY_REGISTRY.get(method.strip().lower())
+    return policy.apply(params) if policy else params
+
+
+def no_deadline_requested(fields: dict[str, Any]) -> bool:
+    from ai_server.utils import truthy
+
+    for key in NO_DEADLINE_FIELD_NAMES:
+        if truthy(fields.get(key)):
+            return True
+    for key, value in fields.items():
+        if key.lower() != "deadline":
+            continue
+        if value is None:
+            return True
+        if isinstance(value, str) and value.strip().lower() in {
+            "",
+            "none",
+            "null",
+            "no",
+            "n",
+            "без срока",
+            "бессрочно",
+        }:
+            return True
+    return False
+
+
+def prepare_no_deadline_fields(fields: dict[str, Any]) -> None:
+    for key in list(fields):
+        if key in NO_DEADLINE_FIELD_NAMES or key.lower() == "deadline":
+            fields.pop(key, None)
+    fields["DEADLINE"] = ""
+
 
 READ_METHODS = {
     "batch",

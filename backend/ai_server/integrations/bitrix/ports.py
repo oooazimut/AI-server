@@ -136,7 +136,7 @@ class BitrixFileDownloadPort(Protocol):
 
 
 class BitrixWritePort(Protocol):
-    """Minimal write interface required by BitrixPendingActionService."""
+    """Minimal write interface for executing Bitrix write operations."""
 
     async def call(self, method: str, payload: dict[str, Any]) -> dict[str, Any]: ...
 

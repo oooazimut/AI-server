@@ -172,55 +172,6 @@ def test_orchestrator_all_specialists_fail_returns_failed():
     assert result.status == "failed"
 
 
-# Маршрутизация pending action
-def test_orchestrator_routes_pending_action_to_specialist_id():
-    manifests = load_agent_manifests()
-    result = asyncio.run(
-        InternalOrchestrator(
-            manifests,
-            specialists={
-                "bitrix24": _bitrix_specialist(manifests, final_answer="Действие выполнено."),
-                "pto": _pto_specialist(manifests),
-            },
-            orchestrator_llm=FakeInternalOrchestratorLLM(),
-        ).handle(
-            AgentTask(
-                task_id="t1",
-                request="да",
-                context={"pending_action": {"specialist_id": "bitrix24", "method": "tasks.task.add", "params": {}}},
-            )
-        )
-    )
-
-    assert result.answer == "Действие выполнено."
-    assert result.handoff_to == ["bitrix24"]
-    pending_actions = [a for a in result.actions_taken if a.name == "orchestrator_pending_route"]
-    assert len(pending_actions) == 1
-    assert pending_actions[0].details["handoff_to"] == "bitrix24"
-    assert pending_actions[0].details["reason"] == "pending_action"
-
-
-def test_orchestrator_pending_action_uses_default_specialist_when_no_id():
-    manifests = load_agent_manifests()
-    result = asyncio.run(
-        InternalOrchestrator(
-            manifests,
-            specialists={
-                "bitrix24": _bitrix_specialist(manifests, final_answer="Дефолтный специалист."),
-            },
-            orchestrator_llm=FakeInternalOrchestratorLLM(),
-        ).handle(
-            AgentTask(
-                task_id="t1",
-                request="да",
-                context={"pending_action": {"method": "tasks.task.add", "params": {}}},
-            )
-        )
-    )
-
-    assert result.answer == "Дефолтный специалист."
-
-
 def test_orchestrator_no_matching_specialists_returns_direct_answer():
     manifests = load_agent_manifests()
     result = asyncio.run(

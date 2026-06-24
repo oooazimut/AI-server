@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from ai_server.agents.base import BaseSpecialist
-from ai_server.agents.ports import SchedulerPort
+from ai_server.agents.ports import PortalSearchPort, SchedulerPort
 from ai_server.agents.pto.llm import PtoAgentLLM, PtoLLMService, pto_llm_failure_result
 from ai_server.agents.pto.tools import (
     DocumentDraftCreateTool,
@@ -14,7 +14,6 @@ from ai_server.agents.pto.tools import (
     SpreadsheetPreviewTool,
 )
 from ai_server.agents.tool import AgentTool
-from ai_server.integrations.bitrix.portal_search import PortalSearchIndex
 from ai_server.integrations.bitrix.ports import BitrixFileDownloadPort
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import AgentManifest
@@ -56,7 +55,7 @@ class PtoSpecialist(BaseSpecialist):
         manifest: AgentManifest,
         *,
         bitrix_client: BitrixFileDownloadPort | None = None,
-        portal_search_index: PortalSearchIndex | None = None,
+        portal_search_index: PortalSearchPort | None = None,
         settings: Settings | None = None,
         pto_retriever: HybridKnowledgeRetriever | None = None,
         pto_llm: PtoAgentLLM | None = None,

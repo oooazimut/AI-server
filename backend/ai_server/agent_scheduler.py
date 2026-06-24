@@ -148,6 +148,18 @@ class AgentScheduler:
             return None
         return await self._task_runner(agent_id, task_description, context or {})
 
+    def schedule_callback(
+        self,
+        agent_id: str,
+        job_id: str,
+        trigger_data: dict[str, Any],
+        callback: Callable[[], Awaitable[Any]],
+        *,
+        replace_existing: bool = True,
+    ) -> Job:
+        """Schedule an arbitrary async callback using a trigger descriptor dict."""
+        return self.add_job(agent_id, job_id, callback, _build_trigger(trigger_data), replace_existing=replace_existing)
+
     def schedule_task(
         self,
         agent_id: str,
@@ -159,25 +171,26 @@ class AgentScheduler:
         replace_existing: bool = True,
     ) -> Job:
         """Schedule a task_runner call for the given agent using a trigger descriptor dict."""
-        trigger_type = str(trigger_data.get("type") or "date").strip()
-        if trigger_type == "cron":
-            kwargs = {k: v for k, v in trigger_data.items() if k != "type"}
-            trigger = CronTrigger(timezone=MOSCOW_TZ, **kwargs)
-        elif trigger_type == "date":
-            trigger = DateTrigger(run_date=trigger_data.get("run_date"), timezone=MOSCOW_TZ)
-        else:
-            raise ValueError(f"Unknown trigger type: {trigger_type!r}")
-
         ctx = context or {}
 
         async def _run() -> None:
             await self.run_task(agent_id, task_description, ctx)
 
-        return self.add_job(agent_id, job_id, _run, trigger, replace_existing=replace_existing)
+        return self.add_job(agent_id, job_id, _run, _build_trigger(trigger_data), replace_existing=replace_existing)
 
 
 def _full_id(agent_id: str, job_id: str) -> str:
     return f"{agent_id}:{job_id}"
+
+
+def _build_trigger(trigger_data: dict[str, Any]) -> CronTrigger | DateTrigger:
+    trigger_type = str(trigger_data.get("type") or "date").strip()
+    if trigger_type == "cron":
+        kwargs = {k: v for k, v in trigger_data.items() if k != "type"}
+        return CronTrigger(timezone=MOSCOW_TZ, **kwargs)
+    if trigger_type == "date":
+        return DateTrigger(run_date=trigger_data.get("run_date"), timezone=MOSCOW_TZ)
+    raise ValueError(f"Unknown trigger type: {trigger_type!r}")
 
 
 def next_run_times(scheduler: AgentScheduler, agent_id: str) -> list[datetime]:

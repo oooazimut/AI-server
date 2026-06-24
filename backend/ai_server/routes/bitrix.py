@@ -7,7 +7,6 @@ from urllib.parse import parse_qsl
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from ..channels.bitrix import BitrixWebhookProcessor
 from ..integrations.bitrix.events import payload_event_type
 from ..integrations.bitrix.portal_search import (
     PortalSearchIndex,
@@ -192,18 +191,7 @@ async def bitrix_events(
             "event_id": event_id,
         }
 
-    processor = BitrixWebhookProcessor(
-        settings=settings,
-        manifests=request.app.state.manifests,
-        bitrix=request.app.state.bitrix,
-        portal_search=request.app.state.portal_search,
-        bitrix_oauth=request.app.state.bitrix_oauth,
-        search_webhook_status=request.app.state.search_webhook_indexer_status,
-        quality_control_status=request.app.state.quality_control_webhook_status,
-        learning_recorder=request.app.state.learning_recorder,
-    )
-    result = await processor.process(payload)
-    return {"ok": True, **result}
+    return {"ok": True, "skipped": True, "reason": "webhook_queue_disabled"}
 
 
 # ---------------------------------------------------------------------------

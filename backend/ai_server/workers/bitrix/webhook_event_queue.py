@@ -3,12 +3,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Awaitable, Callable, Collection
+from collections.abc import Collection
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from ai_server.agent_store import AgentStore
+from ai_server.agents.ports import AgentQueuePort
+from ai_server.attachments import AttachmentService
+from ai_server.integrations.bitrix.chat_parser import (
+    build_agent_task_from_bitrix_chat,
+    build_agent_task_from_task_event,
+)
+from ai_server.integrations.bitrix.events import MESSAGE_EVENTS
 from ai_server.integrations.webhook_utils import (
     sanitize_webhook_payload,
     webhook_event_key,
@@ -16,10 +23,20 @@ from ai_server.integrations.webhook_utils import (
 )
 from ai_server.settings import Settings
 from ai_server.utils import MOSCOW_TZ
+from ai_server.workers.bitrix.search_webhook_indexer import DISK_FILE_EVENT_MARKERS
 from ai_server.workers.ports import WebhookConsumePort
 
 logger = logging.getLogger(__name__)
-WebhookProcessor = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+
+_TASK_EVENT_PREFIXES = ("ONTASKUPDATE", "ONTASKCOMPLETE", "ONTASKADD")
+
+
+def _is_task_event(event_type: str) -> bool:
+    return any(event_type.startswith(p) for p in _TASK_EVENT_PREFIXES)
+
+
+def _is_disk_event(event_type: str) -> bool:
+    return all(marker in event_type for marker in DISK_FILE_EVENT_MARKERS)
 
 
 class WebhookEventQueue(AgentStore):
@@ -289,8 +306,10 @@ class WebhookEventQueue(AgentStore):
 
 async def run_webhook_event_worker(
     queue: WebhookConsumePort,
-    processor: WebhookProcessor,
     *,
+    agent_queue: AgentQueuePort,
+    attachment_service: AttachmentService,
+    transcriber: Any,
     status: dict[str, Any],
     settings: Settings,
 ) -> None:
@@ -318,7 +337,9 @@ async def run_webhook_event_worker(
             _run_webhook_event_worker_loop(
                 worker_id=index + 1,
                 queue=queue,
-                processor=processor,
+                agent_queue=agent_queue,
+                attachment_service=attachment_service,
+                transcriber=transcriber,
                 status=status,
                 active_partition_keys=active_partition_keys,
                 active_lock=active_lock,
@@ -341,7 +362,9 @@ async def _run_webhook_event_worker_loop(
     *,
     worker_id: int,
     queue: WebhookConsumePort,
-    processor: WebhookProcessor,
+    agent_queue: AgentQueuePort,
+    attachment_service: AttachmentService,
+    transcriber: Any,
     status: dict[str, Any],
     active_partition_keys: set[str],
     active_lock: asyncio.Lock,
@@ -362,11 +385,18 @@ async def _run_webhook_event_worker_loop(
                 await asyncio.sleep(settings.webhook_event_queue_interval_seconds)
                 continue
             event_id = int(event["id"])
-            event_type = str(event.get("event_type") or "")
+            event_type = str(event.get("event_type") or "").upper()
             status["last_event_id"] = event_id
             status["last_event"] = event_type
             status["last_worker_id"] = worker_id
-            result = await processor(dict(event.get("payload") or {}))
+            result = await _route_event(
+                event_type=event_type,
+                payload=dict(event.get("payload") or {}),
+                agent_queue=agent_queue,
+                attachment_service=attachment_service,
+                transcriber=transcriber,
+                settings=settings,
+            )
             await queue.mark_done(event_id, result)
             status["last_error"] = None
             status["processed"] = int(status.get("processed") or 0) + 1
@@ -385,6 +415,59 @@ async def _run_webhook_event_worker_loop(
                 async with active_lock:
                     active_partition_keys.discard(partition_key)
                     _update_active_status(status, active_partition_keys)
+
+
+async def _route_event(
+    *,
+    event_type: str,
+    payload: dict[str, Any],
+    agent_queue: AgentQueuePort,
+    attachment_service: AttachmentService,
+    transcriber: Any,
+    settings: Settings,
+) -> dict[str, Any]:
+    """Route a Bitrix webhook event to the appropriate agent queue."""
+    if event_type in MESSAGE_EVENTS:
+        task = await build_agent_task_from_bitrix_chat(
+            payload,
+            attachment_service=attachment_service,
+            transcriber=transcriber,
+            settings=settings,
+        )
+        await agent_queue.publish(
+            {
+                "to": "orchestrator",
+                "from": "webhook_worker",
+                "type": "bitrix_chat",
+                "payload": task.model_dump(),
+            }
+        )
+        return {"handled": True, "routed_to": "orchestrator", "event": event_type}
+
+    if _is_task_event(event_type):
+        task = build_agent_task_from_task_event(payload)
+        await agent_queue.publish(
+            {
+                "to": "bitrix24",
+                "from": "webhook_worker",
+                "type": "bitrix_event",
+                "payload": task.model_dump(),
+            }
+        )
+        return {"handled": True, "routed_to": "bitrix24", "event": event_type}
+
+    if _is_disk_event(event_type):
+        await agent_queue.publish(
+            {
+                "to": "index_refresher",
+                "from": "webhook_worker",
+                "type": "bitrix_event",
+                "payload": payload,
+            }
+        )
+        return {"handled": True, "routed_to": "index_refresher", "event": event_type}
+
+    return {"handled": False, "reason": "unsupported_event", "event": event_type}
 
 
 def _update_active_status(status: dict[str, Any], active_partition_keys: set[str]) -> None:

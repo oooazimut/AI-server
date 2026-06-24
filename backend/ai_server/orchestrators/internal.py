@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
-from ai_server.agents.ports import AgentDialogStorePort, SchedulerPort
-from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult, ToolStatus
+from pydantic import ValidationError
+
+from ai_server.agents.ports import AgentDialogStorePort, AgentQueuePort, ChannelPort, SchedulerPort
+from ai_server.learning import LearningEventRecorder
+from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ScheduledTask, ToolResult, ToolStatus
 from ai_server.orchestrators.orchestrator_llm import (
     OrchestratorDecision,
     OrchestratorDecisionResult,
@@ -16,6 +20,7 @@ from ai_server.orchestrators.orchestrator_llm import (
 )
 from ai_server.retrieval import HybridKnowledgeRetriever, RetrievalHit
 from ai_server.specialists import Specialist, build_specialist_registry, manifest_by_id
+from ai_server.technical_footer import TechnicalFooterService, append_footer
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +37,9 @@ class InternalOrchestrator:
         scheduler: SchedulerPort | None = None,
         store: AgentDialogStorePort | None = None,
         retriever: HybridKnowledgeRetriever | None = None,
+        channels: dict[str, ChannelPort] | None = None,
+        footer_service: TechnicalFooterService | None = None,
+        learning_recorder: LearningEventRecorder | None = None,
     ) -> None:
         self.manifests = manifests
         self.specialists = specialists or build_specialist_registry(manifests)
@@ -39,7 +47,44 @@ class InternalOrchestrator:
         self.scheduler = scheduler
         self.store = store
         self.retriever = retriever
+        self._channels: dict[str, ChannelPort] = channels or {}
+        self._footer_svc = footer_service
+        self._learning_recorder = learning_recorder
         self._manifest = manifest_by_id(manifests, "internal_orchestrator") or _dummy_manifest()
+
+    @classmethod
+    def build(
+        cls,
+        manifest: AgentManifest,
+        *,
+        manifests: list[AgentManifest] | None = None,
+        orchestrator_llm: OrchestratorLLM | None = None,
+        orchestrator_store: AgentDialogStorePort | None = None,
+        orchestrator_retriever: HybridKnowledgeRetriever | None = None,
+        channels: dict[str, ChannelPort] | None = None,
+        footer_service: TechnicalFooterService | None = None,
+        learning_recorder: LearningEventRecorder | None = None,
+        **specialist_deps: Any,
+    ) -> InternalOrchestrator:
+        _manifests = manifests or []
+        if not specialist_deps.get("bitrix_bot"):
+            specialist_deps["bitrix_bot"] = specialist_deps.get("bitrix_client")
+        specialists = build_specialist_registry(
+            _manifests,
+            audience="employee",
+            **{k: v for k, v in specialist_deps.items() if v is not None},
+        )
+        return cls(
+            _manifests,
+            specialists=specialists,
+            orchestrator_llm=orchestrator_llm,
+            scheduler=specialist_deps.get("scheduler"),
+            store=orchestrator_store,
+            retriever=orchestrator_retriever,
+            channels=channels,
+            footer_service=footer_service,
+            learning_recorder=learning_recorder,
+        )
 
     def tool_definitions(self) -> list[dict[str, Any]]:
         return [
@@ -93,6 +138,7 @@ class InternalOrchestrator:
                     ),
                     [],
                 )
+            self._apply_agent_scheduled_tasks(sr.scheduled_tasks)
             result = ToolResult(
                 status=ToolStatus.OK,
                 tool=tool_call.name,
@@ -115,17 +161,20 @@ class InternalOrchestrator:
         return result, ActionRecord(name=tool_call.name, status="error", details={"error": result.error}), []
 
     async def handle(self, task: AgentTask) -> AgentResult:
-        if task.context.get("pending_action"):
-            return await self._handle_pending_action(task)
+        t_start = time.monotonic()
+        result = await self._handle_core(task)
+        elapsed_ms = {"total_ms": round((time.monotonic() - t_start) * 1000, 1)}
+        await self._send_to_channel(task, result)
+        self._record_learning(task, result, elapsed_ms=elapsed_ms)
+        return result
 
-        # Загрузить историю диалога
+    async def _handle_core(self, task: AgentTask) -> AgentResult:
         dialog_key: str = task.context.get("dialog_key") or ""
         if self.store is not None and dialog_key:
             dialog_history: list[dict] = await self.store.load_turns(dialog_key, limit=20)
         else:
             dialog_history = list(task.context.get("dialog_history") or [])
 
-        # RAG — поиск по базе знаний оркестратора
         retrieval_hits: list[RetrievalHit] = []
         if self.retriever is not None:
             retrieval_hits = self.retriever.search(self._manifest, task.request, limit=3)
@@ -185,7 +234,6 @@ class InternalOrchestrator:
             if not executable:
                 break
 
-            # Параллельное выполнение инструментов (специалистов)
             raw = await asyncio.gather(
                 *[self._execute_tool_call(tc, task) for tc in executable],
                 return_exceptions=True,
@@ -218,7 +266,6 @@ class InternalOrchestrator:
                 confidence=0.0,
             )
 
-        # Финальный ответ
         try:
             final = await self.orchestrator_llm.compose(
                 manifest=self._manifest,
@@ -256,7 +303,6 @@ class InternalOrchestrator:
         if self.store is not None and dialog_key and final.answer:
             await self.store.append_turn(dialog_key, task.request, final.answer)
 
-        # Если любой специалист требует подтверждения — итоговый статус needs_human
         effective_status = "needs_human" if approval_actions else final.status
 
         return AgentResult(
@@ -270,49 +316,116 @@ class InternalOrchestrator:
             confidence=decision.confidence,
         )
 
-    async def _handle_pending_action(self, task: AgentTask) -> AgentResult:
-        pending_data = task.context["pending_action"]
-        default_specialist_id = next((m.id for m in self.manifests if m.kind == "specialist"), "")
-        specialist_id = (
-            pending_data.get("specialist_id") or default_specialist_id
-            if isinstance(pending_data, dict)
-            else default_specialist_id
-        )
-        specialist = self.specialists.get(specialist_id)
-        if specialist is not None:
-            sr = await specialist.handle(task)
-            return AgentResult(
-                status=sr.status,
-                agent_id="internal_orchestrator",
-                answer=sr.answer,
-                artifacts=sr.artifacts,
-                actions_taken=[
-                    ActionRecord(
-                        name="orchestrator_pending_route",
-                        status="completed",
-                        details={"handoff_to": specialist_id, "reason": "pending_action"},
-                    ),
-                    *sr.actions_taken,
-                ],
-                actions_requiring_approval=sr.actions_requiring_approval,
-                model_usage=sr.model_usage,
-                handoff_to=[specialist_id],
-                confidence=sr.confidence,
-                logs=sr.logs,
-            )
-        return AgentResult(
-            status="failed",
-            agent_id="internal_orchestrator",
-            answer="Специалист для обработки ожидающего действия не найден.",
-            actions_taken=[
-                ActionRecord(
-                    name="orchestrator_pending_route",
-                    status="error",
-                    details={"handoff_to": specialist_id, "reason": "specialist_not_found"},
+    async def _send_to_channel(self, task: AgentTask, result: AgentResult) -> None:
+        channel_id = task.context.get("channel_id", "")
+        recipient_id = task.context.get("recipient_id", "")
+        if not channel_id or not recipient_id:
+            return
+        channel = self._channels.get(channel_id)
+        if channel is None:
+            return
+        footer = ""
+        if self._footer_svc and result.answer:
+            user_id_raw = task.user.id if task.user else None
+            user_id = int(user_id_raw) if user_id_raw and str(user_id_raw).isdigit() else None
+            try:
+                footer = await self._footer_svc.build_for_agent_result(
+                    result, user_id=user_id, channel=f"{channel_id}_chat"
                 )
-            ],
-            confidence=0.0,
-        )
+            except Exception:
+                logger.exception("Footer build failed")
+        body = append_footer(result.answer, footer) if result.answer else ""
+        if body:
+            try:
+                await channel.send(recipient_id, body)
+            except Exception:
+                logger.exception("Channel send failed for channel=%s recipient=%s", channel_id, recipient_id)
+
+    def _record_learning(
+        self, task: AgentTask, result: AgentResult, *, elapsed_ms: dict[str, float] | None = None
+    ) -> None:
+        if self._learning_recorder is None:
+            return
+        try:
+            self._learning_recorder.record_agent_result(
+                task,
+                result,
+                metadata={"dialog_key": task.context.get("dialog_key", "")},
+                elapsed_ms=elapsed_ms,
+            )
+        except Exception:
+            logger.exception("Learning recording failed")
+
+    def _apply_agent_scheduled_tasks(self, tasks: list[ScheduledTask]) -> None:
+        if not tasks or self.scheduler is None:
+            return
+        _orch = self
+        for sched in tasks:
+            if sched.cancel:
+                self.scheduler.remove_job(sched.agent_id, sched.job_id)
+            elif sched.task is not None:
+                _task = sched.task
+
+                async def _run(_t: AgentTask = _task, _o: InternalOrchestrator = _orch) -> None:
+                    await _o.handle(_t)
+
+                try:
+                    self.scheduler.schedule_callback(sched.agent_id, sched.job_id, sched.trigger, _run)
+                except Exception:
+                    logger.exception("Failed to schedule task job_id=%s agent=%s", sched.job_id, sched.agent_id)
+
+    async def run(self, queue: AgentQueuePort) -> None:
+        """Queue consumer loop for the orchestrator.
+
+        Handles two message types:
+        - "task"   — new request from channel or scheduler → handle(task) → _send_to_channel()
+        - "result" — proactive result from a specialist (e.g. morning_proposals) → _send_to_channel()
+
+        Sprint 21: internal dispatch to specialists remains synchronous (direct calls in handle()).
+        Sprint 22 will introduce async specialist dispatch via correlation_id.
+        """
+        _poll_interval = 0.1
+        while True:
+            message = await queue.claim_next("orchestrator")
+            if message is None:
+                await asyncio.sleep(_poll_interval)
+                continue
+            msg_id = str(message.get("id") or "")
+            try:
+                msg_type = str(message.get("type") or "")
+                if msg_type in ("task", "bitrix_chat"):
+                    try:
+                        task = AgentTask.model_validate(message["payload"])
+                    except (KeyError, ValidationError) as exc:
+                        logger.warning("Orchestrator: invalid task message %s: %s", msg_id, exc)
+                        await queue.nack(msg_id, error=f"invalid message: {exc}")
+                        continue
+                    await self.handle(task)
+                elif msg_type == "result":
+                    try:
+                        result = AgentResult.model_validate(message["payload"])
+                    except (KeyError, ValidationError) as exc:
+                        logger.warning("Orchestrator: invalid result message %s: %s", msg_id, exc)
+                        await queue.nack(msg_id, error=f"invalid message: {exc}")
+                        continue
+                    routing = message.get("routing") or {}
+                    if routing.get("channel_id") and routing.get("recipient_id"):
+                        stub_task = AgentTask(
+                            task_id="",
+                            request="",
+                            context={
+                                "channel_id": routing["channel_id"],
+                                "recipient_id": routing["recipient_id"],
+                                "dialog_key": routing.get("dialog_key") or "",
+                            },
+                        )
+                        await self._send_to_channel(stub_task, result)
+                await queue.ack(msg_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Orchestrator failed processing message %s", msg_id)
+                await queue.nack(msg_id, error=f"{type(exc).__name__}: {exc}")
 
 
 def _dummy_manifest() -> AgentManifest:
