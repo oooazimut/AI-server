@@ -24,7 +24,7 @@ class SpecialistDeps:
     manifests: Any = None  # list[AgentManifest] — needed by InternalOrchestrator.build()
     bitrix_client: Any = None  # BitrixClient (HTTP REST)
     portal_search_index: Any = None  # PortalSearchIndex
-    pending_actions_service: Any = None  # BitrixPendingActionService
+    bitrix_oauth: Any = None  # BitrixOAuthService | None — for OAuth-based Bitrix writes
     bitrix_bot: Any = None  # BitrixBotPort; defaults to bitrix_client in InternalOrchestrator.build()
     # orchestrator
     scheduler: Any = None  # SchedulerPort | None
@@ -42,6 +42,10 @@ class SpecialistDeps:
     vehicle_usage_store: Any = None  # VehicleUsageStorePort | None
     logistics_llm: Any = None
     logistics_vu_settings: Any = None  # VehicleUsageSettings | None
+    # channel delivery + telemetry (captured by InternalOrchestrator.build, not passed to specialists)
+    channels: Any = None  # dict[str, ChannelPort]
+    footer_service: Any = None  # TechnicalFooterService | None
+    learning_recorder: Any = None  # LearningEventRecorder | None
 
     def as_build_kwargs(self) -> dict[str, Any]:
         """All non-None fields — pass to any agent build() method."""

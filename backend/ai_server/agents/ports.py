@@ -3,13 +3,25 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Protocol
 
-from ai_server.models import AgentResult, AgentTask
+
+class AgentQueuePort(Protocol):
+    """Per-agent event queue: publish messages, claim next message, ack/nack."""
+
+    async def publish(self, message: dict[str, Any]) -> None: ...
+
+    async def claim_next(self, agent_id: str) -> dict[str, Any] | None: ...
+
+    async def ack(self, message_id: str) -> None: ...
+
+    async def nack(self, message_id: str, *, error: str) -> None: ...
 
 
-class SpecialistOutputPort(Protocol):
-    """Outbound port for specialist-initiated tasks. All outgoing specialist communication goes through this."""
+class ChannelPort(Protocol):
+    """Outbound port for delivering messages to a communication channel."""
 
-    async def __call__(self, task: AgentTask) -> AgentResult: ...
+    channel_id: str
+
+    async def send(self, recipient_id: str, body: str) -> None: ...
 
 
 class AgentDialogStorePort(Protocol):
@@ -20,6 +32,14 @@ class AgentDialogStorePort(Protocol):
     async def load_turns(self, dialog_key: str, *, limit: int = 20) -> list[dict[str, str]]: ...
 
     async def append_turn(self, dialog_key: str, user_text: str, agent_response: str) -> None: ...
+
+
+class PortalSearchPort(Protocol):
+    """Abstract port for querying the portal search index."""
+
+    def search(self, query: str, *, entity_types: list[str] | None = None, limit: int = 20) -> list[Any]: ...
+
+    def get_item(self, *, entity_type: str, entity_id: str) -> Any | None: ...
 
 
 class SchedulerPort(Protocol):

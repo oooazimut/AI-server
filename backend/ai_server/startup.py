@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
+from uuid import uuid4
 
 from fastapi import FastAPI
 
@@ -11,35 +14,41 @@ from .agents.bitrix24 import BitrixLLMService
 from .agents.logistics import LogisticsLLMService
 from .agents.logistics.specialist import VehicleUsageSettings
 from .agents.pto import PtoLLMService
-from .channels.bitrix import BitrixWebhookProcessor
+from .attachments import AttachmentService
+from .channels.bitrix import BitrixChatChannel
 from .integrations.bitrix.bitrix_store import BitrixAgentStore
 from .integrations.bitrix.client import BitrixClient
-from .integrations.bitrix.dialog_state import BitrixPendingActionService, DialogStateStore
 from .integrations.bitrix.oauth import BitrixOAuthService
 from .integrations.bitrix.portal_search import PortalSearchIndex
 from .integrations.bitrix.ports import BitrixAgentStorePort
+from .integrations.memory.agent_queue import InMemoryAgentQueue
 from .integrations.ports import VehicleUsageStorePort
 from .integrations.postgres.bitrix_agent import PostgresBitrixAgentStore
 from .integrations.postgres.orchestrator_agent import PostgresOrchestratorStore
 from .integrations.postgres.portal_search import PostgresPortalSearchIndex
 from .integrations.postgres.pto_agent import PostgresPtoAgentStore
 from .integrations.postgres.vehicle_usage import PostgresVehicleUsageStore
+from .integrations.redis.agent_queue import RedisAgentQueue
 from .integrations.redis.event_queue import RedisEventQueue
 from .learning import LearningEventRecorder
+from .models import AgentTask
 from .orchestrators.internal import InternalOrchestrator
 from .orchestrators.orchestrator_llm import OrchestratorLLMService
 from .registry import load_agent_manifests
 from .runtime import ensure_runtime_dirs
 from .settings import Settings, get_settings
 from .specialists import SpecialistDeps
-from .tools.vehicle_usage import VehicleUsageStore
-from .workers.bitrix.quality_control_adapter import QualityControlHandlerAdapter
+from .technical_footer import TechnicalFooterService
+from .tools.vehicle_usage import SentRequestData, VehicleUsageStore
+from .transcription import build_transcriber
+from .utils import MOSCOW_TZ
 from .workers.bitrix.reconciler import reconcile_once, run_reconciler
 from .workers.bitrix.search_indexer import PortalSearchIndexerWorker
-from .workers.bitrix.search_webhook_adapter import SearchWebhookHandlerAdapter
 from .workers.bitrix.supervisor import run_task_supervisor, run_task_supervisor_once
 from .workers.bitrix.webhook_event_queue import WebhookEventQueue, run_webhook_event_worker
 from .workers.logistics.staff_sync import run_staff_sync
+
+logger = logging.getLogger(__name__)
 
 
 async def _make_portal_search(settings: Settings) -> PortalSearchIndex:
@@ -58,6 +67,12 @@ def _make_event_queue(settings: Settings) -> WebhookEventQueue | RedisEventQueue
     queue = WebhookEventQueue(settings.webhook_event_queue_path, settings=settings)
     queue.ensure_schema()
     return queue
+
+
+def _make_agent_queue(settings: Settings) -> RedisAgentQueue | InMemoryAgentQueue:
+    if settings.redis_url:
+        return RedisAgentQueue(settings.redis_url)
+    return InMemoryAgentQueue()
 
 
 async def _make_vehicle_store(settings: Settings) -> VehicleUsageStorePort:
@@ -94,6 +109,14 @@ async def _make_orchestrator_store(settings: Settings) -> Any:
     store = PostgresOrchestratorStore(settings.database_url)
     await store.ensure_schema()
     return store
+
+
+def _parse_hhmm(value: str) -> tuple[int, int]:
+    parts = value.strip().split(":")
+    try:
+        return int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+    except (ValueError, IndexError):
+        return 8, 0
 
 
 @asynccontextmanager
@@ -227,6 +250,7 @@ async def lifespan(app: FastAPI):
     supervisor_task: asyncio.Task | None = None
     reconciler_task: asyncio.Task | None = None
     staff_sync_task: asyncio.Task | None = None
+    agent_worker_tasks: list[asyncio.Task] = []
     vehicle_usage_store = None
     if settings.vehicle_usage_enabled:
         vehicle_usage_store = await _make_vehicle_store(settings)
@@ -238,7 +262,6 @@ async def lifespan(app: FastAPI):
 
         vu_settings = (
             VehicleUsageSettings(
-                dialog_id=settings.vehicle_usage_dialog_id or "",
                 manager_user_id=settings.vehicle_usage_manager_user_id,
                 max_reminders=settings.vehicle_usage_max_reminders,
                 reminder_interval_minutes=settings.vehicle_usage_reminder_interval_minutes,
@@ -248,20 +271,16 @@ async def lifespan(app: FastAPI):
             if settings.vehicle_usage_enabled
             else None
         )
-        pending_actions = BitrixPendingActionService(
-            store=DialogStateStore(settings.dialog_state_path),
-            bitrix=bitrix,
-            bitrix_oauth=bitrix_oauth,
-            audit_log_path=settings.bitrix_write_audit_log_path,
-            dry_run=settings.agent_dry_run,
-            settings=settings,
-        )
+
+        bitrix_channel = BitrixChatChannel(settings=settings, bitrix=bitrix)
+        app.state.bitrix_channel = bitrix_channel
+
         specialist_deps = SpecialistDeps(
             settings=settings,
             manifests=manifests,
             bitrix_client=bitrix,
             portal_search_index=portal_search,
-            pending_actions_service=pending_actions,
+            bitrix_oauth=bitrix_oauth,
             bitrix_bot=bitrix,
             scheduler=scheduler,
             orchestrator_llm=OrchestratorLLMService(),
@@ -272,72 +291,125 @@ async def lifespan(app: FastAPI):
             logistics_llm=logistics_llm_svc,
             vehicle_usage_store=vehicle_usage_store,
             logistics_vu_settings=vu_settings,
+            channels={"bitrix24": bitrix_channel},
+            footer_service=TechnicalFooterService(settings=settings),
+            learning_recorder=learning_recorder,
         )
         orch_manifest = next((m for m in manifests if m.kind == "orchestrator"), None)
         orchestrator = InternalOrchestrator.build(
             orch_manifest,
             **specialist_deps.as_build_kwargs(),
         )
+        app.state.orchestrator = orchestrator
 
-        if (logistics_spec := orchestrator.specialists.get("logistics")) is not None:
-            admin_ids = settings.resolved_vehicle_usage_admin_notify_user_ids
+        agent_queue = _make_agent_queue(settings)
+        app.state.agent_queue = agent_queue
 
-            async def _logistics_to_orchestrator(task):
-                enriched = task
-                if task.context.get("event") == "vehicle_usage_escalation" and admin_ids:
-                    enriched = task.model_copy(update={"context": {**task.context, "notify_user_ids": admin_ids}})
-                return await orchestrator.handle(enriched)
+        # Morning vehicle-usage cron
+        if settings.vehicle_usage_enabled and not settings.redis_url:
+            dialog_id = settings.vehicle_usage_dialog_id or ""
 
-            logistics_spec._output_port = _logistics_to_orchestrator
-            if settings.vehicle_usage_enabled and not settings.redis_url:
-                logistics_spec.start()
-            app.state.logistics_specialist = logistics_spec
+            _vu_store_ref = vehicle_usage_store
+            _orch_ref = orchestrator
+            _mgr_id = settings.vehicle_usage_manager_user_id
+            _dry_run = settings.vehicle_usage_dry_run
 
-        search_webhook_handler = SearchWebhookHandlerAdapter(
-            bitrix=bitrix,
-            index=portal_search,
-            settings=settings,
-        )
-        quality_control_handler = QualityControlHandlerAdapter(
-            bitrix=bitrix,
-            bitrix_oauth=bitrix_oauth,
-            manifests=manifests,
-            bitrix_llm=bitrix_llm_svc,
-            scheduler=scheduler,
-            bitrix_store=bitrix_store,
-            settings=settings,
-        )
-        processor = BitrixWebhookProcessor(
-            settings=settings,
-            manifests=manifests,
-            bitrix=bitrix,
-            portal_search=portal_search,
-            bitrix_oauth=bitrix_oauth,
-            pending_actions=pending_actions,
-            orchestrator=orchestrator,
-            search_webhook_status=app.state.search_webhook_indexer_status,
-            quality_control_status=app.state.quality_control_webhook_status,
-            learning_recorder=learning_recorder,
-            bitrix_store=bitrix_store,
-            search_webhook_handler=search_webhook_handler,
-            quality_control_handler=quality_control_handler,
-        )
+            async def _run_morning() -> None:
+                task = AgentTask(
+                    task_id=f"scheduled_vu_{uuid4().hex[:8]}",
+                    request="Сгенерируй утренний отчёт по использованию служебных автомобилей.",
+                    context={
+                        "channel_id": "bitrix24",
+                        "recipient_id": dialog_id,
+                        "event": "vehicle_usage_morning",
+                    },
+                )
+                result = await _orch_ref.handle(task)
+                if result.answer and _vu_store_ref is not None and not _dry_run:
+                    _vu_store_ref.create_sent_request(
+                        SentRequestData(
+                            request_date=datetime.now(MOSCOW_TZ).date().isoformat(),
+                            user_id=_mgr_id,
+                            dialog_id=dialog_id,
+                            message=result.answer,
+                            sent_at=datetime.now(MOSCOW_TZ).isoformat(),
+                            reminder_count=1,
+                        )
+                    )
 
-        async def _dispatch_processor(payload: dict) -> dict:
-            return await processor.process(payload)
+            hour, minute = _parse_hhmm(settings.vehicle_usage_request_time)
+            scheduler.add_job_cron(
+                "logistics",
+                "morning_report",
+                _run_morning,
+                hour,
+                minute,
+                replace_existing=False,
+            )
+            logger.info("Morning vehicle-usage cron scheduled at %02d:%02d МСК", hour, minute)
+
+        # Morning proposals cron: publishes trigger to bitrix24 queue at 08:30
+        if bitrix_store is not None:
+            manager_id = settings.task_proposal_manager_bitrix_id
+
+            _aq_ref = agent_queue
+
+            async def _run_morning_proposals() -> None:
+                if not manager_id:
+                    return
+                proposal_task = AgentTask(
+                    task_id=f"morning_proposals_{uuid4().hex[:8]}",
+                    request="morning_proposals",
+                    context={
+                        "channel_id": "bitrix24",
+                        "recipient_id": str(manager_id),
+                    },
+                )
+                await _aq_ref.publish(
+                    {
+                        "to": "bitrix24",
+                        "from": "scheduler",
+                        "type": "task",
+                        "payload": proposal_task.model_dump(),
+                        "reply_to": "orchestrator",
+                    }
+                )
+
+            scheduler.add_job_cron(
+                "bitrix24",
+                "morning_proposals",
+                _run_morning_proposals,
+                8,
+                30,
+                replace_existing=False,
+            )
+
+        attachment_service = AttachmentService(bitrix)
+        transcriber = build_transcriber()
 
         webhook_worker_task = asyncio.create_task(
             run_webhook_event_worker(
                 webhook_event_queue,
-                _dispatch_processor,
+                agent_queue=agent_queue,
+                attachment_service=attachment_service,
+                transcriber=transcriber,
                 status=app.state.webhook_event_queue_status,
                 settings=settings,
             )
         )
+
+        # Start per-agent run() loops
+        agent_worker_tasks = [
+            asyncio.create_task(orchestrator.run(agent_queue)),
+            *[asyncio.create_task(specialist.run(agent_queue)) for specialist in orchestrator.specialists.values()],
+            asyncio.create_task(portal_search_indexer.run(agent_queue)),
+        ]
+        app.state.search_webhook_indexer_status = portal_search_indexer.event_status
+
     if settings.vehicle_usage_enabled and vehicle_usage_store is not None:
         staff_sync_task = asyncio.create_task(run_staff_sync(bitrix, vehicle_usage_store, settings=settings))
     if settings.search_background_indexer_enabled:
-        search_indexer_task = asyncio.create_task(portal_search_indexer.run())
+        search_indexer_task = asyncio.create_task(portal_search_indexer.run_periodic())
     if settings.supervisor_enabled:
         supervisor_task = asyncio.create_task(
             run_task_supervisor(bitrix, status=app.state.task_supervisor_status, settings=settings)
@@ -363,6 +435,10 @@ async def lifespan(app: FastAPI):
                 await webhook_worker_task
             except asyncio.CancelledError:
                 pass
+        for agent_task in agent_worker_tasks:
+            agent_task.cancel()
+        if agent_worker_tasks:
+            await asyncio.gather(*agent_worker_tasks, return_exceptions=True)
         if search_indexer_task:
             app.state.portal_search_indexer.status["running"] = False
             search_indexer_task.cancel()
@@ -390,6 +466,4 @@ async def lifespan(app: FastAPI):
                 await staff_sync_task
             except asyncio.CancelledError:
                 pass
-        if (spec := getattr(app.state, "logistics_specialist", None)) is not None:
-            spec.stop()
         scheduler.stop()

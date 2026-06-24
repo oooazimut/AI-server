@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -12,6 +11,10 @@ from ai_server.agents.bitrix24.llm import (
     BitrixLLMService,
     BitrixLLMToolCall,
     llm_failure_result,
+)
+from ai_server.agents.bitrix24.quality_control import (
+    TASK_QUALITY_WEBHOOK_EVENTS,
+    handle_quality_control_task,
 )
 from ai_server.agents.bitrix24.task_create import (
     BitrixTaskCreateDraft,
@@ -25,15 +28,13 @@ from ai_server.agents.bitrix24.tools import (
     PortalSearchTool,
     ResolveProjectTool,
     ResolveUserTool,
-    SendMessageTool,
 )
-from ai_server.agents.ports import SchedulerPort
+from ai_server.agents.ports import PortalSearchPort, SchedulerPort
 from ai_server.agents.tool import AgentTool
-from ai_server.integrations.bitrix.dialog_state import BitrixPendingActionService
-from ai_server.integrations.bitrix.portal_search import PortalSearchIndex
-from ai_server.integrations.bitrix.ports import BitrixBotPort, BitrixRestPort, BitrixToolClientPort
+from ai_server.integrations.bitrix.oauth import BitrixOAuthService
+from ai_server.integrations.bitrix.ports import BitrixTaskPort, BitrixToolClientPort
 from ai_server.knowledge import MarkdownKnowledgeBase
-from ai_server.models import ActionRecord, AgentManifest, AgentTask, ToolResult, ToolStatus
+from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult, ToolStatus
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import Settings, get_settings
 from ai_server.skills import SkillStore
@@ -142,9 +143,7 @@ _BITRIX_TOOL_DEFINITIONS: list[dict[str, Any]] = [
 ]
 
 # Tools in the registry that the LLM can call directly.
-_LLM_TOOL_NAMES = frozenset(
-    {"portal_search", "bitrix_api", "current_user_profile", "bitrix_send_message", "bitrix_notify_users"}
-)
+_LLM_TOOL_NAMES = frozenset({"portal_search", "bitrix_api", "current_user_profile", "bitrix_notify_users"})
 
 
 @dataclass(frozen=True)
@@ -157,28 +156,21 @@ class IncompleteProposal:
 
 
 class BitrixProposalService:
-    """Owns proposal persistence, delivery scheduling handler creation, and context loading."""
+    """Owns proposal persistence and context loading.
+
+    Delivery is now handled by the orchestrator via AgentQueue — the morning proposals
+    trigger is published by the scheduler to the bitrix24 queue and the specialist
+    builds/sends the message through the orchestrator's channel.
+    """
 
     def __init__(
         self,
         *,
         store: Any,
-        bot: Any = None,
         settings: Settings,
     ) -> None:
         self._store = store
-        self._bot = bot
         self._settings = settings
-
-    async def _deliver(self, user_id_str: str, message: str) -> None:
-        if self._bot is None:
-            logger.warning("BitrixProposalService: bot not configured, cannot deliver")
-            return
-        uid = int(user_id_str) if user_id_str.lstrip("-").isdigit() else None
-        if uid is not None:
-            await self._bot.notify_user(user_id=uid, message=message, tag="task_proposal")
-        else:
-            await self._bot.send_bot_message(user_id_str, message, bot_id=self._settings.bitrix_bot_id)
 
     def save(self, proposal: IncompleteProposal, scheduled_for: datetime) -> int:
         return self._store.save_proposal(
@@ -195,14 +187,6 @@ class BitrixProposalService:
 
     def update_response(self, proposal_id: int, response_text: str) -> None:
         self._store.update_responsible_response(proposal_id, response_text)
-
-    def make_delivery_handler(self, proposal_id: int) -> Callable[[], Awaitable[None]]:
-        return _make_proposal_deliver_handler(
-            proposal_id,
-            bitrix_store=self._store,
-            deliver_fn=self._deliver,
-            settings=self._settings,
-        )
 
     def context_for(self, user_id: int | None) -> dict[str, Any]:
         manager_id = self._settings.task_proposal_manager_bitrix_id
@@ -231,8 +215,12 @@ class Bitrix24Specialist(BaseSpecialist):
         scheduler: SchedulerPort | None = None,
         store: Any | None = None,
         proposals: BitrixProposalService | None = None,
+        bitrix_task_client: BitrixTaskPort | None = None,
+        settings: Settings | None = None,
     ) -> None:
         self._proposals = proposals
+        self._bitrix_task_client = bitrix_task_client
+        self._settings_for_qc = settings
         super().__init__(
             manifest,
             knowledge_base=knowledge_base,
@@ -250,11 +238,8 @@ class Bitrix24Specialist(BaseSpecialist):
         manifest: AgentManifest,
         *,
         bitrix_client: BitrixToolClientPort | None = None,
-        portal_search_index: PortalSearchIndex | None = None,
-        pending_actions_service: BitrixPendingActionService | None = None,
-        bitrix_bot: BitrixBotPort | None = None,
-        actor_client: BitrixRestPort | None = None,
-        auto_execute: bool = False,
+        portal_search_index: PortalSearchPort | None = None,
+        bitrix_oauth: BitrixOAuthService | None = None,
         bitrix_retriever: HybridKnowledgeRetriever | None = None,
         bitrix_llm: BitrixAgentLLM | None = None,
         scheduler: SchedulerPort | None = None,
@@ -263,21 +248,16 @@ class Bitrix24Specialist(BaseSpecialist):
         **_: object,
     ) -> Bitrix24Specialist:
         _settings = settings or get_settings()
-        proposals = (
-            BitrixProposalService(store=bitrix_store, bot=bitrix_bot, settings=_settings)
-            if bitrix_store is not None
-            else None
-        )
+        proposals = BitrixProposalService(store=bitrix_store, settings=_settings) if bitrix_store is not None else None
         tools: list[AgentTool] = [
             PortalSearchTool(portal_search=portal_search_index),
             BitrixApiTool(
                 client=bitrix_client,
-                pending_actions=pending_actions_service,
-                actor_client=actor_client,
-                auto_execute=auto_execute,
+                write_client=bitrix_client,
+                bitrix_oauth=bitrix_oauth,
+                dry_run=_settings.agent_dry_run,
             ),
             CurrentUserProfileTool(client=bitrix_client),
-            SendMessageTool(bot=bitrix_bot),
             NotifyUsersTool(client=bitrix_client),
             ResolveUserTool(client=bitrix_client),
             ResolveProjectTool(client=bitrix_client),
@@ -290,7 +270,26 @@ class Bitrix24Specialist(BaseSpecialist):
             scheduler=scheduler,
             proposals=proposals,
             store=bitrix_store,
+            bitrix_task_client=bitrix_client,
+            settings=_settings,
         )
+
+    async def handle(self, task: AgentTask) -> AgentResult:
+        """Dispatch quality-control events to internal handler; all else goes to LLM loop."""
+        bitrix_event_type = str(task.context.get("bitrix_event_type") or "").upper()
+        if (
+            task.request == "quality_control"
+            and bitrix_event_type in TASK_QUALITY_WEBHOOK_EVENTS
+            and self._bitrix_task_client is not None
+            and self._settings_for_qc is not None
+        ):
+            return await handle_quality_control_task(
+                self,
+                task,
+                bitrix=self._bitrix_task_client,
+                settings=self._settings_for_qc,
+            )
+        return await super().handle(task)
 
     def tool_definitions(self) -> list[dict]:
         # Expose only LLM-facing registry tools; resolve_user/resolve_project are internal.
@@ -358,12 +357,6 @@ class Bitrix24Specialist(BaseSpecialist):
                 tool="save_incomplete_proposal",
                 error="proposals service is not configured",
             )
-        if self._scheduler is None:
-            return ToolResult(
-                status=ToolStatus.NOT_CONFIGURED,
-                tool="save_incomplete_proposal",
-                error="scheduler is not configured — cannot schedule morning delivery",
-            )
         task_id = optional_int(args.get("task_id"))
         if task_id is None:
             return ToolResult(
@@ -385,7 +378,6 @@ class Bitrix24Specialist(BaseSpecialist):
         )
         run_date = _next_morning_830()
         proposal_id = self._proposals.save(proposal, run_date)
-        self._schedule_proposal_job(proposal_id, run_date)
         return ToolResult(
             status=ToolStatus.OK,
             tool="save_incomplete_proposal",
@@ -436,13 +428,6 @@ class Bitrix24Specialist(BaseSpecialist):
             tool="save_responsible_response",
             data={"proposal_id": proposal_id},
         )
-
-    def _schedule_proposal_job(self, proposal_id: int, run_date: datetime) -> None:
-        if self._proposals is None:
-            return
-        handler = self._proposals.make_delivery_handler(proposal_id)
-        self.schedule_job_at(f"proposal_{proposal_id}", handler, run_date)
-        logger.info("Bitrix24Specialist: scheduled morning proposal job %d at %s", proposal_id, run_date.isoformat())
 
     async def _load_extra_context(self, task: AgentTask) -> tuple[AgentTask, dict]:
         permission_context = await self._load_permission_context(task)
@@ -574,35 +559,6 @@ class Bitrix24Specialist(BaseSpecialist):
             "Bitrix24 specialist is an LLM subagent; backend tools only execute and validate selected tool calls.",
             "Knowledge context is selected through hybrid retrieval over the agent package.",
         ]
-
-
-def _make_proposal_deliver_handler(
-    proposal_id: int,
-    *,
-    bitrix_store: Any,
-    deliver_fn: Callable[[str, str], Awaitable[None]],
-    settings: Settings,
-) -> Callable[[], Awaitable[None]]:
-    async def _handler() -> None:
-        proposal = bitrix_store.get_proposal_by_id(proposal_id)
-        if proposal is None:
-            logger.info("Bitrix24Specialist: proposal %d not found, skipping morning delivery", proposal_id)
-            return
-        if proposal.get("status") not in ("awaiting_response", "proposed"):
-            return
-        manager_id = settings.task_proposal_manager_bitrix_id
-        if manager_id is None:
-            logger.warning("Bitrix24Specialist: TASK_PROPOSAL_MANAGER_BITRIX_ID not set, skipping proposal delivery")
-            return
-        message = _format_proposal_message(proposal)
-        try:
-            await deliver_fn(str(manager_id), message)
-            bitrix_store.mark_status(proposal_id, "proposed")
-            logger.info("Bitrix24Specialist: delivered morning proposal %d to manager %d", proposal_id, manager_id)
-        except Exception:
-            logger.exception("Bitrix24Specialist: failed to deliver morning proposal %d", proposal_id)
-
-    return _handler
 
 
 def _format_proposal_message(proposal: dict[str, Any]) -> str:

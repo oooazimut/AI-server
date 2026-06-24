@@ -1,10 +1,11 @@
 import anyio
 from fastapi.testclient import TestClient
 
-from ai_server.channels.bitrix import BitrixWebhookProcessor
-from ai_server.learning import LearningEventRecorder
+from ai_server.learning import EventStream, LearningEventRecorder
 from ai_server.main import app
 from ai_server.models import ActionRecord, AgentResult, AgentTask, ModelUsageRecord, UserContext
+from ai_server.orchestrators.internal import InternalOrchestrator
+from ai_server.registry import load_agent_manifests
 
 
 def test_learning_recorder_records_agent_result_and_feedback(tmp_path):
@@ -86,30 +87,61 @@ def test_learning_recorder_can_disable_text_capture(tmp_path):
     assert event["privacy"]["text_captured"] is False
 
 
-def test_bitrix_webhook_processor_records_learning_event(monkeypatch, tmp_path):
+def test_orchestrator_records_learning_event(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_DRY_RUN", "true")
     monkeypatch.setenv("AI_SERVER_TECH_FOOTER_ENABLED", "false")
     recorder = LearningEventRecorder(path=tmp_path / "learning_events.jsonl", enabled=True)
 
-    class FakeOrchestrator:
-        async def handle(self, task):
-            return AgentResult(
+    class FakeOrchestratorLLM:
+        async def decide(self, **kwargs):
+            from ai_server.models import ModelUsageRecord
+            from ai_server.orchestrators.orchestrator_llm import OrchestratorDecision, OrchestratorDecisionResult
+
+            decision = OrchestratorDecision(
                 status="completed",
-                agent_id="internal_orchestrator",
-                answer="Готово",
-                handoff_to=["bitrix24"],
+                answer="",
+                tool_calls=[],
+                scheduled_tasks=[],
                 confidence=0.9,
             )
+            return OrchestratorDecisionResult(
+                decision=decision,
+                model_usage=ModelUsageRecord(agent_id="internal_orchestrator", provider="test", model="test"),
+            )
 
-    processor = BitrixWebhookProcessor(
-        orchestrator=FakeOrchestrator(),
+        async def compose(self, **kwargs):
+            from ai_server.models import ModelUsageRecord
+            from ai_server.orchestrators.orchestrator_llm import OrchestratorFinalResult
+
+            return OrchestratorFinalResult(
+                answer="Готово",
+                status="completed",
+                model_usage=ModelUsageRecord(agent_id="internal_orchestrator", provider="test", model="test"),
+            )
+
+    manifests = load_agent_manifests()
+    orchestrator = InternalOrchestrator(
+        manifests,
+        specialists={},
+        orchestrator_llm=FakeOrchestratorLLM(),
         learning_recorder=recorder,
     )
 
-    result = anyio.run(processor.process, _bitrix_v2_message_payload())
+    task = AgentTask(
+        task_id="test-task",
+        source="bitrix24_chat",
+        request="Покажи задачи в Битриксе",
+        user=UserContext(id="9", channel="bitrix24_chat", raw={"dialog_id": "chat99"}),
+        context={
+            "dialog_key": "chat:77:user:9",
+            "dialog_id": "chat99",
+            "channel_id": "bitrix24",
+            "recipient_id": "chat99",
+        },
+    )
+    anyio.run(orchestrator.handle, task)
     event = recorder.latest(limit=1)[0]
 
-    assert result["learning_event"]["recorded"] is True
     assert event["source"] == "bitrix24_chat"
     assert event["agent_id"] == "internal_orchestrator"
     assert event["request"] == "Покажи задачи в Битриксе"
@@ -157,6 +189,51 @@ def test_learning_events_endpoint_requires_secret_when_configured(monkeypatch, t
 
     assert forbidden.status_code == 403
     assert allowed.status_code == 200
+
+
+def test_event_stream_subscriber_called(tmp_path):
+    stream = EventStream(path=tmp_path / "events.jsonl", enabled=True)
+    received: list[dict] = []
+    stream.subscribe(received.append)
+
+    stream.record_event(
+        event_type="agent_result",
+        source="test",
+        agent_id="internal_orchestrator",
+        request="тест",
+        response="ответ",
+        status="completed",
+    )
+
+    assert len(received) == 1
+    assert received[0]["event_type"] == "agent_result"
+    assert received[0]["agent_id"] == "internal_orchestrator"
+
+
+def test_event_stream_unsubscribe(tmp_path):
+    stream = EventStream(path=tmp_path / "events.jsonl", enabled=True)
+    received: list[dict] = []
+    stream.subscribe(received.append)
+    stream.unsubscribe(received.append)
+
+    stream.record_event(event_type="agent_result", source="test", status="completed")
+
+    assert received == []
+
+
+def test_event_stream_elapsed_ms_in_metadata(tmp_path):
+    stream = EventStream(path=tmp_path / "events.jsonl", enabled=True, capture_text=True)
+    task = AgentTask(task_id="t1", request="запрос")
+    result = AgentResult(status="completed", agent_id="test_agent", answer="ответ")
+
+    stream.record_agent_result(task, result, elapsed_ms={"total_ms": 123.4})
+
+    events = stream.latest(limit=1)
+    assert events[0]["metadata"]["elapsed_ms"] == {"total_ms": 123.4}
+
+
+def test_learning_event_recorder_alias(tmp_path):
+    assert LearningEventRecorder is EventStream
 
 
 def _bitrix_v2_message_payload() -> dict:

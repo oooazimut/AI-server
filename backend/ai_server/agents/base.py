@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import datetime
 from typing import Any
 
-from ai_server.agents.ports import AgentDialogStorePort, SchedulerPort
+from pydantic import ValidationError
+
+from ai_server.agents.ports import AgentDialogStorePort, AgentQueuePort, SchedulerPort
 from ai_server.agents.tool import AgentTool
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult, ToolStatus
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
 from ai_server.utils import optional_int, unique
+
+logger = logging.getLogger(__name__)
 
 _NOT_CONFIGURED_ANSWER = "Специалист временно недоступен: LLM не сконфигурирован."
 
@@ -25,6 +31,7 @@ class BaseSpecialist:
 
     max_steps: int = 5
     action_prefix: str = ""
+    _queue_poll_interval: float = 0.1
 
     def __init__(
         self,
@@ -319,3 +326,47 @@ class BaseSpecialist:
             confidence=decision.confidence,
             logs=self._logs(),
         )
+
+    async def run(self, queue: AgentQueuePort) -> None:
+        """Queue consumer loop: claim → handle → publish result → ack/nack.
+
+        Specialists never call queue.publish() directly inside handle().
+        run() is the only place that touches the queue; handle() stays pure business logic.
+        """
+        agent_id = self.manifest.id
+        while True:
+            message = await queue.claim_next(agent_id)
+            if message is None:
+                await asyncio.sleep(self._queue_poll_interval)
+                continue
+            msg_id = str(message.get("id") or "")
+            try:
+                try:
+                    task = AgentTask.model_validate(message["payload"])
+                except (KeyError, ValidationError) as exc:
+                    logger.warning("Agent %s: invalid message %s: %s", agent_id, msg_id, exc)
+                    await queue.nack(msg_id, error=f"invalid message: {exc}")
+                    continue
+                result = await self.handle(task)
+                reply_to = message.get("reply_to") or ""
+                if reply_to:
+                    await queue.publish(
+                        {
+                            "to": reply_to,
+                            "from": agent_id,
+                            "type": "result",
+                            "correlation_id": message.get("correlation_id") or "",
+                            "payload": result.model_dump(),
+                            "routing": {
+                                "channel_id": task.context.get("channel_id") or "",
+                                "recipient_id": task.context.get("recipient_id") or "",
+                                "dialog_key": task.context.get("dialog_key") or "",
+                            },
+                        }
+                    )
+                await queue.ack(msg_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Agent %s failed processing message %s", agent_id, msg_id)
+                await queue.nack(msg_id, error=f"{type(exc).__name__}: {exc}")

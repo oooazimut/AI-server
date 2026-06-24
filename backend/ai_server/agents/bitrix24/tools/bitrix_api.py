@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from ai_server.integrations.bitrix.bitrix_policy import decide_bitrix_method_policy
+from ai_server.integrations.bitrix.bitrix_policy import apply_write_policy, decide_bitrix_method_policy
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
-from ai_server.integrations.bitrix.dialog_state import BitrixPendingActionService, PendingBitrixAction
-from ai_server.integrations.bitrix.ports import BitrixRestPort, BitrixToolClientPort
+from ai_server.integrations.bitrix.oauth import BitrixOAuthService
+from ai_server.integrations.bitrix.ports import BitrixToolClientPort, BitrixWritePort
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 
 
@@ -16,31 +16,31 @@ class BitrixApiTool:
         self,
         client: BitrixToolClientPort | None = None,
         *,
-        pending_actions: BitrixPendingActionService | None = None,
-        actor_client: BitrixRestPort | None = None,
-        auto_execute: bool = False,
+        write_client: BitrixWritePort | None = None,
+        bitrix_oauth: BitrixOAuthService | None = None,
+        dry_run: bool = False,
     ) -> None:
         self._client = client
-        self._pending_actions = pending_actions
-        self._actor_client = actor_client
-        self._auto_execute = auto_execute
+        self._write_client = write_client
+        self._bitrix_oauth = bitrix_oauth
+        self._dry_run = dry_run
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="bitrix_api",
             description=(
                 "Bitrix24 REST API access. Read methods (ending in .get/.list/.search) execute immediately. "
-                "Write methods require user confirmation. Dangerous methods (user management, bots) are denied."
+                "Write methods execute after explicit user confirmation in the conversation. "
+                "Dangerous methods (user management, bots) are denied."
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["call", "confirm_pending", "cancel_pending"]},
                     "method": {"type": "string"},
                     "params": {"type": "object"},
                     "summary": {"type": "string"},
                 },
-                "required": ["action", "method", "params"],
+                "required": ["method", "params"],
             },
         )
 
@@ -52,38 +52,13 @@ class BitrixApiTool:
         dialog_key: str | None = None,
         dialog_id: str | None = None,
     ) -> ToolResult:
-        action = str(args.get("action") or "call").strip().lower()
         method = str(args.get("method") or "").strip()
         params = args.get("params") if isinstance(args.get("params"), dict) else {}
         summary = str(args.get("summary") or method).strip()
+        return await self._call_api(method, params, summary, user_id=user_id)
 
-        if action in {"confirm_pending", "cancel_pending"}:
-            return await self._handle_pending_action(action, dialog_key=dialog_key, user_id=user_id)
-        if action != "call":
-            return ToolResult(status=ToolStatus.INVALID_TOOL_CALL, tool="bitrix_api", error=f"unknown action: {action}")
-        return await self._call_api(method, params, summary, dialog_key=dialog_key, user_id=user_id)
-
-    async def _handle_pending_action(self, action: str, *, dialog_key: str | None, user_id: int | None) -> ToolResult:
-        if not self._pending_actions or not dialog_key:
-            return ToolResult(
-                status=ToolStatus.NOT_CONFIGURED,
-                tool="bitrix_api",
-                data={"action": action, "message": "Pending-action store is not bound to this tool call."},
-            )
-        if action == "cancel_pending":
-            result = self._pending_actions.cancel(dialog_key)
-        else:
-            result = await self._pending_actions.confirm(dialog_key, user_id=user_id)
-        return ToolResult(
-            status=result.status,
-            tool="bitrix_api",
-            data={"action": action, "message": result.message, **result.data},
-        )
-
-    async def _call_api(
-        self, method: str, params: dict[str, Any], summary: str, *, dialog_key: str | None, user_id: int | None
-    ) -> ToolResult:
-        if self._client is None:
+    async def _call_api(self, method: str, params: dict[str, Any], summary: str, *, user_id: int | None) -> ToolResult:
+        if self._client is None and self._write_client is None:
             return ToolResult(status=ToolStatus.NOT_CONFIGURED, tool="bitrix_api", error="BitrixClient is not injected")
         decision = decide_bitrix_method_policy(method)
         if decision.decision == "deny":
@@ -93,9 +68,9 @@ class BitrixApiTool:
                 data={"method": method, "policy_reason": decision.reason},
             )
         if decision.decision == "confirm":
-            return await self._confirm_or_queue(
-                method, params, summary, policy_reason=decision.reason, dialog_key=dialog_key, user_id=user_id
-            )
+            return await self._execute_write(method, params, summary, user_id=user_id)
+        if self._client is None:
+            return ToolResult(status=ToolStatus.NOT_CONFIGURED, tool="bitrix_api", error="BitrixClient is not injected")
         try:
             result = await self._client.result(method, params)
         except (BitrixApiError, BitrixConfigError) as exc:
@@ -109,20 +84,35 @@ class BitrixApiTool:
             status=ToolStatus.OK, tool="bitrix_api", data={"method": method, "params": params, "result": result}
         )
 
-    async def _confirm_or_queue(
-        self,
-        method: str,
-        params: dict[str, Any],
-        summary: str,
-        *,
-        policy_reason: str,
-        dialog_key: str | None,
-        user_id: int | None,
+    async def _execute_write(
+        self, method: str, params: dict[str, Any], summary: str, *, user_id: int | None
     ) -> ToolResult:
-        if self._auto_execute:
-            execute_client = self._actor_client or self._client
+        if not params:
+            return ToolResult(
+                status=ToolStatus.INVALID_TOOL_CALL,
+                tool="bitrix_api",
+                error="Write methods require non-empty params.",
+                data={"method": method},
+            )
+        if self._dry_run:
+            return ToolResult(
+                status=ToolStatus.DRY_RUN,
+                tool="bitrix_api",
+                data={"method": method, "summary": summary, "dry_run": True},
+            )
+        params = apply_write_policy(method, params)
+
+        # Attempt OAuth per-user write
+        if self._bitrix_oauth is not None and user_id is not None:
             try:
-                result = await execute_client.result(method, params)
+                oauth_client = await self._bitrix_oauth.client_for_user(user_id)
+                raw = await oauth_client.call(method, params)
+                result = raw.get("result") if isinstance(raw, dict) else raw
+                return ToolResult(
+                    status=ToolStatus.OK,
+                    tool="bitrix_api",
+                    data={"method": method, "params": params, "result": result},
+                )
             except (BitrixApiError, BitrixConfigError) as exc:
                 return ToolResult(
                     status=ToolStatus.NOT_CONFIGURED if isinstance(exc, BitrixConfigError) else ToolStatus.ERROR,
@@ -130,28 +120,28 @@ class BitrixApiTool:
                     error=str(exc),
                     data={"method": method, "params": params},
                 )
+            except Exception:
+                pass  # OAuth unavailable — fall through to write_client
+
+        # Fallback: dedicated write client (BitrixWritePort)
+        write_cl = self._write_client
+        if write_cl is None:
             return ToolResult(
-                status=ToolStatus.OK, tool="bitrix_api", data={"method": method, "params": params, "result": result}
-            )
-        if not params:
-            return ToolResult(
-                status=ToolStatus.INVALID_TOOL_CALL,
+                status=ToolStatus.NOT_CONFIGURED,
                 tool="bitrix_api",
-                error="Bitrix write methods require real params before confirmation.",
+                error="No write client configured for Bitrix write operations.",
                 data={"method": method},
             )
-        if self._pending_actions and dialog_key:
-            self._pending_actions.save_pending(
-                dialog_key,
-                PendingBitrixAction(
-                    method=method,
-                    params=params,
-                    summary=summary,
-                    created_by=user_id,
-                ),
+        try:
+            raw = await write_cl.call(method, params)
+            result = raw.get("result") if isinstance(raw, dict) else raw
+        except (BitrixApiError, BitrixConfigError) as exc:
+            return ToolResult(
+                status=ToolStatus.NOT_CONFIGURED if isinstance(exc, BitrixConfigError) else ToolStatus.ERROR,
+                tool="bitrix_api",
+                error=str(exc),
+                data={"method": method, "params": params},
             )
         return ToolResult(
-            status=ToolStatus.CONFIRMATION_REQUIRED,
-            tool="bitrix_api",
-            data={"method": method, "params": params, "summary": summary, "policy_reason": policy_reason},
+            status=ToolStatus.OK, tool="bitrix_api", data={"method": method, "params": params, "result": result}
         )

@@ -1,4 +1,4 @@
-"""Tests for Bitrix24 agent tools: send_message, notify_users, resolve_user, resolve_project."""
+"""Tests for Bitrix24 agent tools: notify_users, resolve_user, resolve_project."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock
 from ai_server.agents.bitrix24.tools.notify_users import NotifyUsersTool
 from ai_server.agents.bitrix24.tools.resolve_project import ResolveProjectTool
 from ai_server.agents.bitrix24.tools.resolve_user import ResolveUserTool
-from ai_server.agents.bitrix24.tools.send_message import SendMessageTool
 from ai_server.models import ToolStatus
 
 
@@ -18,72 +17,6 @@ def anyio_run(coro):
         return await coro
 
     return anyio.run(_runner)
-
-
-# ---------------------------------------------------------------------------
-# SendMessageTool
-# ---------------------------------------------------------------------------
-
-
-def test_send_message_missing_dialog_id():
-    tool = SendMessageTool()
-    result = anyio_run(tool.execute({"dialog_id": "", "message": "привет"}))
-    assert result.status == ToolStatus.INVALID_TOOL_CALL
-
-
-def test_send_message_missing_message():
-    tool = SendMessageTool()
-    result = anyio_run(tool.execute({"dialog_id": "chat1", "message": ""}))
-    assert result.status == ToolStatus.INVALID_TOOL_CALL
-
-
-def test_send_message_not_configured():
-    tool = SendMessageTool(bot=None)
-    result = anyio_run(tool.execute({"dialog_id": "chat1", "message": "привет"}))
-    assert result.status == ToolStatus.NOT_CONFIGURED
-
-
-def test_send_message_ok():
-    bot = AsyncMock()
-    bot.send_bot_message = AsyncMock(return_value=123)
-    tool = SendMessageTool(bot=bot)
-
-    result = anyio_run(tool.execute({"dialog_id": "chat1", "message": "Готово!"}))
-
-    assert result.status == ToolStatus.OK
-    assert result.data["result"] == 123
-    assert result.data["dialog_id"] == "chat1"
-    bot.send_bot_message.assert_called_once_with("chat1", "Готово!")
-
-
-def test_send_message_api_error():
-    from ai_server.integrations.bitrix.client import BitrixApiError
-
-    bot = AsyncMock()
-    bot.send_bot_message = AsyncMock(side_effect=BitrixApiError("imbot.message.add", "ACCESS_DENIED"))
-    tool = SendMessageTool(bot=bot)
-
-    result = anyio_run(tool.execute({"dialog_id": "chat1", "message": "тест"}))
-    assert result.status == ToolStatus.ERROR
-
-
-def test_send_message_config_error():
-    from ai_server.integrations.bitrix.client import BitrixConfigError
-
-    bot = AsyncMock()
-    bot.send_bot_message = AsyncMock(side_effect=BitrixConfigError("no token"))
-    tool = SendMessageTool(bot=bot)
-
-    result = anyio_run(tool.execute({"dialog_id": "chat1", "message": "тест"}))
-    assert result.status == ToolStatus.NOT_CONFIGURED
-
-
-def test_send_message_definition():
-    tool = SendMessageTool()
-    defn = tool.definition()
-    assert defn.name == "bitrix_send_message"
-    assert "dialog_id" in defn.parameters["properties"]
-    assert "message" in defn.parameters["properties"]
 
 
 # ---------------------------------------------------------------------------

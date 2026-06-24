@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from collections import Counter, deque
+from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,9 +18,11 @@ from ai_server.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
+_Subscriber = Callable[[dict[str, Any]], None]
 
-class LearningEventRecorder:
-    """Append-only local journal for future evals, reviews, and fine-tuning datasets."""
+
+class EventStream:
+    """Append-only event journal with in-process subscriber support."""
 
     schema_version = "learning_event.v1"
 
@@ -36,6 +40,21 @@ class LearningEventRecorder:
         self.enabled = _settings.learning_events_enabled if enabled is None else enabled
         self.capture_text = _settings.learning_events_capture_text if capture_text is None else capture_text
         self.max_text_chars = max_text_chars or _settings.learning_events_max_text_chars
+        self._subscribers: list[_Subscriber] = []
+
+    def subscribe(self, callback: _Subscriber) -> None:
+        self._subscribers.append(callback)
+
+    def unsubscribe(self, callback: _Subscriber) -> None:
+        with contextlib.suppress(ValueError):
+            self._subscribers.remove(callback)
+
+    def _notify_subscribers(self, event: dict[str, Any]) -> None:
+        for cb in self._subscribers:
+            try:
+                cb(event)
+            except Exception:
+                logger.exception("EventStream subscriber error")
 
     def record_event(
         self,
@@ -93,6 +112,7 @@ class LearningEventRecorder:
                 "error": f"{type(exc).__name__}: {exc}",
             }
 
+        self._notify_subscribers(event)
         return {"recorded": True, "event_id": event["id"], "path": str(self.path)}
 
     def record_agent_result(
@@ -102,19 +122,22 @@ class LearningEventRecorder:
         *,
         event_type: str = "agent_result",
         metadata: dict[str, Any] | None = None,
+        elapsed_ms: dict[str, float] | None = None,
     ) -> dict[str, Any]:
         actions = [{"kind": "taken", **action.model_dump()} for action in result.actions_taken] + [
             {"kind": "approval_required", **action.model_dump()} for action in result.actions_requiring_approval
         ]
         user_id = task.user.id if task.user else None
         channel = task.user.channel if task.user and task.user.channel else task.source
-        event_metadata = {
+        event_metadata: dict[str, Any] = {
             "confidence": result.confidence,
             "task_context": task.context,
             "files": task.files,
             "logs": result.logs,
             **(metadata or {}),
         }
+        if elapsed_ms:
+            event_metadata["elapsed_ms"] = elapsed_ms
         return self.record_event(
             event_type=event_type,
             source=task.source,
@@ -250,3 +273,6 @@ def _truncate_text(value: str, max_chars: int) -> str:
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+LearningEventRecorder = EventStream
