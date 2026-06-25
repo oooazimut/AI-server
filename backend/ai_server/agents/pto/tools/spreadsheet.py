@@ -7,13 +7,10 @@ from typing import Any
 from ai_server.integrations.bitrix.ports import BitrixFileDownloadPort
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.settings import Settings
-from ai_server.tools.document_access.access_control import can_user_see_portal_item
-from ai_server.tools.document_access.formatting import format_document_comparison_report
 from ai_server.tools.document_access.spreadsheet import (
     _is_spreadsheet,
     _spreadsheet_compare_schema_from_args,
     _spreadsheet_preview,
-    compare_spreadsheets_by_query,
 )
 from ai_server.utils import optional_int
 
@@ -27,10 +24,9 @@ class _SpreadsheetBase(BaseDocumentTool):
         self,
         client: BitrixFileDownloadPort | None = None,
         *,
-        portal_search: Any | None = None,
         settings: Settings,
     ) -> None:
-        super().__init__(client, portal_search=portal_search, settings=settings)
+        super().__init__(client, settings=settings)
 
 
 class SpreadsheetPreviewTool(_SpreadsheetBase):
@@ -63,11 +59,11 @@ class SpreadsheetPreviewTool(_SpreadsheetBase):
         dialog_key: str | None = None,
         dialog_id: str | None = None,
     ) -> ToolResult:
-        if self._portal_search is None or self._client is None:
+        if self._client is None:
             return ToolResult(
                 status=ToolStatus.NOT_CONFIGURED,
                 tool="spreadsheet_preview",
-                data={"message": "Portal search or Bitrix client not configured."},
+                data={"message": "Bitrix client not configured."},
             )
         resolved = self._resolve_document(args, user_id=user_id)
         if resolved is None:
@@ -163,7 +159,6 @@ class SpreadsheetCompareTool(_SpreadsheetBase):
     ) -> ToolResult:
         first_query = str(args.get("first_query") or "").strip()
         second_query = str(args.get("second_query") or "").strip()
-        limit = max(1, min(optional_int(args.get("limit")) or 20, 50))
         if not first_query or not second_query:
             return ToolResult(
                 status=ToolStatus.INVALID_TOOL_CALL,
@@ -174,24 +169,9 @@ class SpreadsheetCompareTool(_SpreadsheetBase):
         if schema_error is not None:
             return schema_error
 
-        _settings = self._settings
-        report = await compare_spreadsheets_by_query(
-            self._client,
-            self._portal_search,
-            first_query=first_query,
-            second_query=second_query,
-            schema=schema,
-            limit=limit,
-            item_filter=lambda item: can_user_see_portal_item(item, user_id=user_id, settings=_settings),
-            settings=_settings,
-        )
         return ToolResult(
-            status=ToolStatus.OK if not report.errors else ToolStatus.ERROR,
+            status=ToolStatus.NOT_FOUND,
             tool="spreadsheet_compare",
-            data={
-                "summary": format_document_comparison_report(report, limit=limit),
-                "report": report.as_dict(),
-                "schema": schema.as_dict(),
-            },
-            error="; ".join(report.errors) if report.errors else None,
+            data={"first_query": first_query, "second_query": second_query, "candidates": []},
+            error="document resolution is not yet implemented for PTO specialist",
         )

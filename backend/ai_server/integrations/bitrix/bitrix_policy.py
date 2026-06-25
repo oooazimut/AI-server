@@ -129,6 +129,9 @@ WRITE_METHODS_WITH_CONFIRMATION = {
     "disk.folder.addsubfolder",
     "disk.folder.uploadfile",
 }
+WRITE_METHODS_DIRECT = {
+    "im.notify.system.add",  # системное уведомление — всегда разрешено без подтверждения
+}
 DENIED_PREFIXES = ("user.", "department.", "humanresources.", "imbot.", "im.", "rest.")
 DENIED_METHODS = {"user.add", "user.update", "user.delete", "user.dismiss", "imbot.bot.unregister"}
 
@@ -147,6 +150,8 @@ def decide_bitrix_method_policy(method: str) -> PolicyDecision:
         return PolicyDecision(decision="allow", reason="known read method")
     if normalized in WRITE_METHODS_WITH_CONFIRMATION:
         return PolicyDecision(decision="confirm", reason="known write method requires confirmation")
+    if normalized in WRITE_METHODS_DIRECT:
+        return PolicyDecision(decision="allow", reason="system notification — always allowed")
     if normalized.startswith(DENIED_PREFIXES):
         return PolicyDecision(decision="deny", reason="method prefix is denied")
     if normalized.endswith(READ_SUFFIXES):

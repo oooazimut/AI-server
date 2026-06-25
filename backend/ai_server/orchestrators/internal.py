@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from ai_server.agents.ports import AgentDialogStorePort, AgentQueuePort, ChannelPort, SchedulerPort
+from ai_server.agents.ports import AgentQueuePort, AgentStorePort, ChannelPort, SchedulerPort
 from ai_server.learning import LearningEventRecorder
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ScheduledTask, ToolResult, ToolStatus
 from ai_server.orchestrators.orchestrator_llm import (
@@ -35,7 +35,7 @@ class InternalOrchestrator:
         *,
         orchestrator_llm: OrchestratorLLM | None = None,
         scheduler: SchedulerPort | None = None,
-        store: AgentDialogStorePort | None = None,
+        store: AgentStorePort | None = None,
         retriever: HybridKnowledgeRetriever | None = None,
         channels: dict[str, ChannelPort] | None = None,
         footer_service: TechnicalFooterService | None = None,
@@ -59,7 +59,7 @@ class InternalOrchestrator:
         *,
         manifests: list[AgentManifest] | None = None,
         orchestrator_llm: OrchestratorLLM | None = None,
-        orchestrator_store: AgentDialogStorePort | None = None,
+        orchestrator_store: AgentStorePort | None = None,
         orchestrator_retriever: HybridKnowledgeRetriever | None = None,
         channels: dict[str, ChannelPort] | None = None,
         footer_service: TechnicalFooterService | None = None,

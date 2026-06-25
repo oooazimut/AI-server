@@ -3,13 +3,12 @@ from __future__ import annotations
 from typing import Any
 
 from ai_server.agents.base import BaseSpecialist
-from ai_server.agents.ports import PortalSearchPort, SchedulerPort
+from ai_server.agents.ports import SchedulerPort
 from ai_server.agents.pto.llm import PtoAgentLLM, PtoLLMService, pto_llm_failure_result
 from ai_server.agents.pto.tools import (
     DocumentDraftCreateTool,
     DocumentDraftListTool,
     DocumentReadTool,
-    DocumentSearchTool,
     SpreadsheetCompareTool,
     SpreadsheetPreviewTool,
 )
@@ -55,7 +54,6 @@ class PtoSpecialist(BaseSpecialist):
         manifest: AgentManifest,
         *,
         bitrix_client: BitrixFileDownloadPort | None = None,
-        portal_search_index: PortalSearchPort | None = None,
         settings: Settings | None = None,
         pto_retriever: HybridKnowledgeRetriever | None = None,
         pto_llm: PtoAgentLLM | None = None,
@@ -67,10 +65,9 @@ class PtoSpecialist(BaseSpecialist):
 
         _settings = settings or get_settings()
         tools: list[AgentTool] = [
-            DocumentSearchTool(portal_search=portal_search_index, settings=_settings),
-            DocumentReadTool(bitrix_client, portal_search=portal_search_index, settings=_settings),
-            SpreadsheetPreviewTool(bitrix_client, portal_search=portal_search_index, settings=_settings),
-            SpreadsheetCompareTool(bitrix_client, portal_search=portal_search_index, settings=_settings),
+            DocumentReadTool(bitrix_client, settings=_settings),
+            SpreadsheetPreviewTool(bitrix_client, settings=_settings),
+            SpreadsheetCompareTool(bitrix_client, settings=_settings),
             DocumentDraftCreateTool(_settings),
             DocumentDraftListTool(_settings),
         ]

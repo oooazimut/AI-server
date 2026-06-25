@@ -25,7 +25,6 @@ from .integrations.memory.agent_queue import InMemoryAgentQueue
 from .integrations.ports import VehicleUsageStorePort
 from .integrations.postgres.bitrix_agent import PostgresBitrixAgentStore
 from .integrations.postgres.orchestrator_agent import PostgresOrchestratorStore
-from .integrations.postgres.portal_search import PostgresPortalSearchIndex
 from .integrations.postgres.pto_agent import PostgresPtoAgentStore
 from .integrations.postgres.vehicle_usage import PostgresVehicleUsageStore
 from .integrations.redis.agent_queue import RedisAgentQueue
@@ -49,16 +48,6 @@ from .workers.bitrix.webhook_event_queue import WebhookEventQueue, run_webhook_e
 from .workers.logistics.staff_sync import run_staff_sync
 
 logger = logging.getLogger(__name__)
-
-
-async def _make_portal_search(settings: Settings) -> PortalSearchIndex:
-    if settings.database_url:
-        index = PostgresPortalSearchIndex(settings.database_url)
-        await index.ensure_schema()
-        return index  # type: ignore[return-value]
-    index = PortalSearchIndex()
-    index.ensure_schema()
-    return index
 
 
 def _make_event_queue(settings: Settings) -> WebhookEventQueue | RedisEventQueue:
@@ -127,11 +116,15 @@ async def lifespan(app: FastAPI):
     bitrix_oauth = BitrixOAuthService()
     bitrix = BitrixClient(settings=settings, oauth_service=bitrix_oauth)
     bitrix_oauth.ensure_schema()
-    portal_search = await _make_portal_search(settings)
+    bitrix_store = await _make_bitrix_store(settings)
+    if settings.database_url:
+        portal_search = bitrix_store
+    else:
+        portal_search = PortalSearchIndex()
+        portal_search.ensure_schema()
     portal_search_indexer = PortalSearchIndexerWorker(bitrix, portal_search, settings=settings)
     learning_recorder = LearningEventRecorder()
     webhook_event_queue = _make_event_queue(settings)
-    bitrix_store = await _make_bitrix_store(settings)
     pto_store = await _make_pto_store(settings)
     orchestrator_store = await _make_orchestrator_store(settings)
 

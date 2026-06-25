@@ -20,10 +20,9 @@ class DocumentReadTool(BaseDocumentTool):
         self,
         client: BitrixFileDownloadPort | None = None,
         *,
-        portal_search: Any | None = None,
         settings: Settings,
     ) -> None:
-        super().__init__(client, portal_search=portal_search, settings=settings)
+        super().__init__(client, settings=settings)
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -48,11 +47,11 @@ class DocumentReadTool(BaseDocumentTool):
         dialog_key: str | None = None,
         dialog_id: str | None = None,
     ) -> ToolResult:
-        if self._portal_search is None or self._client is None:
+        if self._client is None:
             return ToolResult(
                 status=ToolStatus.NOT_CONFIGURED,
                 tool="document_read",
-                data={"message": "Portal search or Bitrix client not configured."},
+                data={"message": "Bitrix client not configured."},
             )
         resolved = self._resolve_document(args, user_id=user_id)
         if resolved is None:

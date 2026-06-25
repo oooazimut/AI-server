@@ -17,7 +17,7 @@ def _now() -> str:
 class PostgresVehicleUsageStore(PostgresAgentSchema):
     """Vehicle usage store: dialog_history + operational tables in the 'logistics' schema.
 
-    Async methods (ensure_schema, load_turns, append_turn) satisfy AgentDialogStorePort.
+    Async methods (ensure_schema, load_turns, append_turn) satisfy AgentStorePort.
     Sync vehicle methods satisfy VehicleUsageStorePort via structural typing.
     """
 

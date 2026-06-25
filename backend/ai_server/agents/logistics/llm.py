@@ -8,6 +8,7 @@ from typing import Any, Protocol
 
 from ai_server.agents.specialist_llm_shared import (
     DIALOG_HISTORY_PROMPT_FRAGMENT,
+    SKILLS_PROMPT_FRAGMENT,
     allowed_tool_definitions,
     compact_tool_result,
     decision_status,
@@ -15,6 +16,7 @@ from ai_server.agents.specialist_llm_shared import (
     result_status,
     retrieval_context,
     safe_context,
+    skills_context,
 )
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
@@ -41,6 +43,7 @@ class LogisticsAgentLLM(Protocol):
         tool_definitions: list[dict[str, Any]],
         tool_results: list[ToolResult] | None = None,
         dialog_history: list[dict[str, str]] | None = None,
+        available_skills: list | None = None,
     ) -> LogisticsLLMDecisionResult:
         pass
 
@@ -99,6 +102,7 @@ class LogisticsLLMService:
         tool_definitions: list[dict[str, Any]],
         tool_results: list[ToolResult] | None = None,
         dialog_history: list[dict[str, str]] | None = None,
+        available_skills: list | None = None,
     ) -> LogisticsLLMDecisionResult:
         instructions = load_instructions(manifest)
         completion = await self.client.complete(
@@ -118,6 +122,7 @@ class LogisticsLLMService:
                             "user": task.user.model_dump(),
                             "context": safe_context(task.context),
                             "current_datetime": datetime.now(UTC).astimezone().isoformat(),
+                            "available_skills": skills_context(available_skills or []),
                             "dialog_history": dialog_history or [],
                             "retrieval_context": retrieval_context(retrieval_hits),
                             "tools": allowed_tool_definitions(tool_definitions, ALLOWED_TOOL_NAMES),
@@ -195,6 +200,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Ты не вызываешь Bitrix напрямую, не пишешь в чат сам и не пишешь в SQLite сам: выбирай vehicle_usage tools. "
         "Backend-tools только читают/пишут структурированные данные; "
         "они не решают, что имел в виду человек. "
+        f"{SKILLS_PROMPT_FRAGMENT}"
         f"{DIALOG_HISTORY_PROMPT_FRAGMENT}"
         "Сначала получи vehicle_usage_context, если в tool_results еще нет roster/vehicles/latest_request. "
         "Сам распознавай естественный язык: кто работает, кто в отпуске/болеет/на объекте, какая машина за кем, "
