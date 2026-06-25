@@ -15,8 +15,6 @@ class BitrixTaskCreateDraft:
     summary: str = ""
     contract_errors: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
-    responsible_query: str = ""
-    project_query: str = ""
 
     @property
     def is_ready(self) -> bool:
@@ -29,36 +27,16 @@ class BitrixTaskCreateDraft:
             "summary": self.summary,
             "contract_errors": self.contract_errors,
             "notes": self.notes,
-            "responsible_query": self.responsible_query,
-            "project_query": self.project_query,
         }
 
 
-@dataclass(frozen=True)
-class BitrixTaskCreateResolution:
-    responsible_id: int | None = None
-    responsible_note: str = ""
-    group_id: int | None = None
-    group_note: str = ""
-    notes: list[str] = field(default_factory=list)
-
-
-def build_task_create_draft_from_args(
-    task: AgentTask,
-    args: dict[str, Any],
-    *,
-    resolution: BitrixTaskCreateResolution | None = None,
-) -> BitrixTaskCreateDraft:
-    resolution = resolution or BitrixTaskCreateResolution()
+def build_task_create_draft_from_args(task: AgentTask, args: dict[str, Any]) -> BitrixTaskCreateDraft:
     args = args or {}
     title = compact_text(str(args.get("title") or "")).strip(" .,:;-")
     description = compact_text(str(args.get("description") or ""))
     responsible_id = optional_int(args.get("responsible_id"))
-    responsible_query = compact_text(str(args.get("responsible_query") or ""))
     responsible_note = ""
     group_id = optional_int(args.get("group_id"))
-    project_query = compact_text(str(args.get("project_query") or ""))
-    group_note = ""
 
     if responsible_id is None and _truthy(args.get("responsible_self")):
         responsible_id = optional_int(task.user.id)
@@ -67,17 +45,10 @@ def build_task_create_draft_from_args(
         else:
             responsible_note = "LLM выбрала текущего пользователя, но канал не передал Bitrix user id."
 
-    if responsible_id is None and resolution.responsible_id is not None:
-        responsible_id = resolution.responsible_id
-        responsible_note = resolution.responsible_note or f"Ответственный найден по запросу `{responsible_query}`."
-    if group_id is None and resolution.group_id is not None:
-        group_id = resolution.group_id
-        group_note = resolution.group_note or f"Проект найден по запросу `{project_query}`."
-
     deadline, deadline_note, no_deadline, deadline_error = _deadline_from_args(args)
 
     contract_errors: list[str] = []
-    notes = [note for note in (responsible_note, group_note, deadline_note, *resolution.notes) if note]
+    notes = [note for note in (responsible_note, deadline_note) if note]
     fields: dict[str, Any] = {}
     current_user_id = optional_int(task.user.id)
     if title:
@@ -90,17 +61,11 @@ def build_task_create_draft_from_args(
     if responsible_id is not None:
         fields["RESPONSIBLE_ID"] = responsible_id
     else:
-        if responsible_query:
-            contract_errors.append("task_create_draft.responsible_query was not resolved to a unique Bitrix user")
-        elif _truthy(args.get("responsible_self")):
+        if _truthy(args.get("responsible_self")):
             contract_errors.append("task_create_draft.responsible_self requires channel user id")
         else:
-            contract_errors.append(
-                "task_create_draft requires one of responsible_id, responsible_query, or responsible_self"
-            )
+            contract_errors.append("task_create_draft requires one of responsible_id or responsible_self")
 
-    if project_query and group_id is None:
-        contract_errors.append("task_create_draft.project_query was not resolved to a unique Bitrix project")
     if deadline_error:
         contract_errors.append(deadline_error)
 
@@ -118,8 +83,6 @@ def build_task_create_draft_from_args(
         summary=_summary(title=title, responsible_id=responsible_id, deadline=deadline, group_id=group_id),
         contract_errors=unique(contract_errors),
         notes=notes,
-        responsible_query=responsible_query,
-        project_query=project_query,
     )
 
 

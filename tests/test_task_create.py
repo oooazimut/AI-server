@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from ai_server.agents.bitrix24.task_create import (
     BitrixTaskCreateDraft,
-    BitrixTaskCreateResolution,
     build_task_create_draft_from_args,
 )
 from ai_server.models import AgentTask, UserContext
@@ -92,29 +91,6 @@ def test_draft_responsible_self():
     assert draft.params["fields"]["RESPONSIBLE_ID"] == 15
 
 
-def test_draft_resolution_sets_responsible():
-    resolution = BitrixTaskCreateResolution(responsible_id=42, responsible_note="найден по запросу")
-    draft = build_task_create_draft_from_args(
-        _task(),
-        {"title": "Задача", "responsible_query": "Иван", "no_deadline": True},
-        resolution=resolution,
-    )
-    assert draft.is_ready
-    assert draft.params["fields"]["RESPONSIBLE_ID"] == 42
-    assert any("найден" in note for note in draft.notes)
-
-
-def test_draft_resolution_sets_group():
-    resolution = BitrixTaskCreateResolution(responsible_id=9, group_id=17, group_note="Склад")
-    draft = build_task_create_draft_from_args(
-        _task(),
-        {"title": "Задача", "no_deadline": True, "project_query": "Склад"},
-        resolution=resolution,
-    )
-    assert draft.is_ready
-    assert draft.params["fields"]["GROUP_ID"] == 17
-
-
 def test_draft_description_included():
     draft = build_task_create_draft_from_args(
         _task(),
@@ -170,24 +146,6 @@ def test_draft_invalid_deadline_format():
     )
     assert not draft.is_ready
     assert any("ISO 8601" in e for e in draft.contract_errors)
-
-
-def test_draft_unresolved_responsible_query():
-    draft = build_task_create_draft_from_args(
-        _task(),
-        {"title": "Задача", "responsible_query": "НетТакого", "no_deadline": True},
-    )
-    assert not draft.is_ready
-    assert any("responsible_query" in e for e in draft.contract_errors)
-
-
-def test_draft_unresolved_project_query():
-    draft = build_task_create_draft_from_args(
-        _task(),
-        {"title": "Задача", "responsible_id": 9, "no_deadline": True, "project_query": "НетТакого"},
-    )
-    assert not draft.is_ready
-    assert any("project_query" in e for e in draft.contract_errors)
 
 
 # ---------------------------------------------------------------------------

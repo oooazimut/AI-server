@@ -1,8 +1,8 @@
 # Контроль качества закрытия задач
 
 Источник переноса: `BitrixAIAgent/app/agent/quality_control.py`.
-Чатовая часть старого `task_closure.py` перенесена отдельно как tool
-`task_closure` Битрикс-субагента.
+Чатовая часть закрытия задачи по просьбе человека обрабатывается напрямую через
+`bitrix_api → tasks.task.result.add` + `tasks.task.complete` без отдельного инструмента.
 
 ## Роль
 
@@ -37,5 +37,4 @@ state. Автоматические write-действия требуют слу
 политики.
 
 Закрытие задачи по просьбе человека из чата проходит не через этот worker, а
-через цепочку `оркестратор -> LLM Bitrix24 -> task_closure -> pending
-confirmation -> LLM Bitrix24 task_closure skill -> Bitrix tools`.
+через цепочку `оркестратор -> LLM Bitrix24 -> bitrix_api(tasks.task.result.add + tasks.task.complete) -> pending confirmation -> Bitrix`.

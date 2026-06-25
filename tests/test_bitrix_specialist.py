@@ -2,7 +2,6 @@ import asyncio
 import json
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist, BitrixLLMDecision, BitrixLLMService, BitrixLLMToolCall
-from ai_server.agents.bitrix24.tools import CurrentUserProfileTool
 from ai_server.integrations.bitrix.bitrix_policy import decide_bitrix_method_policy
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import AgentTask, ToolDefinition, ToolResult
@@ -21,6 +20,7 @@ def _bitrix_specialist(*, tools=None, llm=None) -> Bitrix24Specialist:
         retriever=retriever,
         skill_store=SkillStore(),
         agent_tools=tools.agent_tools() if tools is not None else None,
+        bitrix_user_client=tools.make_user_client() if tools is not None else None,
         llm=llm or FakeBitrixLLM(),
     )
 
@@ -159,22 +159,16 @@ def test_bitrix_specialist_searches_my_open_tasks():
 def test_bitrix_specialist_passes_user_profile_and_permission_rag_to_llm():
     llm = FakeBitrixLLM()
     tools = FakeResolverTools(
-        profile_result=ToolResult(
-            status="ok",
-            tool="current_user_profile",
-            data={
-                "user_id": 9,
-                "profile": {
-                    "id": 9,
-                    "label": "Иванов Иван",
-                    "active": True,
-                    "is_admin": False,
-                    "department_ids": [77],
-                    "work_position": "Монтажник",
-                    "user_type": "employee",
-                },
-            },
-        )
+        raw_user={
+            "ID": "9",
+            "ACTIVE": "Y",
+            "NAME": "Иван",
+            "LAST_NAME": "Иванов",
+            "WORK_POSITION": "Монтажник",
+            "UF_DEPARTMENT": ["77"],
+            "IS_ADMIN": "N",
+            "USER_TYPE": "employee",
+        }
     )
 
     result = asyncio.run(
@@ -190,28 +184,6 @@ def test_bitrix_specialist_passes_user_profile_and_permission_rag_to_llm():
     assert context["permission_policy_context"]
     assert {item["topic"] for item in context["permission_policy_context"]} == {"user_permissions"}
     assert "user_permissions" in result.actions_taken[0].details["permission_policy_topics"]
-
-
-def test_bitrix_specialist_can_call_current_user_profile_tool():
-    result = asyncio.run(
-        _bitrix_specialist(
-            tools=FakeResolverTools(
-                profile_result=ToolResult(
-                    status="ok",
-                    tool="current_user_profile",
-                    data={"user_id": 9, "profile": {"id": 9, "work_position": "Монтажник"}},
-                )
-            ),
-            llm=FakeBitrixLLM(
-                tool_calls=[BitrixLLMToolCall(name="current_user_profile")],
-                final_answer="Профиль пользователя проверен.",
-            ),
-        ).handle(AgentTask(task_id="t1", request="Кто я в Битриксе?", user={"id": "9"}))
-    )
-
-    assert result.status == "completed"
-    assert result.actions_taken[2].name == "current_user_profile"
-    assert result.actions_taken[2].status == "ok"
 
 
 def test_bitrix_specialist_marks_write_for_approval():
@@ -283,7 +255,7 @@ def test_bitrix_specialist_rejects_incomplete_task_create_tool_call():
     assert action.name == "bitrix_task_create_draft"
     assert action.status == "contract_violation"
     assert action.details["contract_errors"] == [
-        "task_create_draft requires one of responsible_id, responsible_query, or responsible_self",
+        "task_create_draft requires one of responsible_id or responsible_self",
         "task_create_draft requires deadline_iso or no_deadline=true",
     ]
 
@@ -321,125 +293,6 @@ def test_bitrix_specialist_task_create_uses_explicit_ids():
     assert params["fields"]["RESPONSIBLE_ID"] == 15
     assert params["fields"]["GROUP_ID"] == 44
     assert params["fields"]["DEADLINE"].startswith("2026-06-05T19:00:00")
-
-
-def test_bitrix_specialist_resolves_responsible_name():
-    result = asyncio.run(
-        _bitrix_specialist(
-            tools=FakeResolverTools(
-                users={
-                    "Иванову": [
-                        {"id": 15, "label": "Иванов Иван"},
-                    ]
-                }
-            ),
-            llm=FakeBitrixLLM(
-                tool_calls=[
-                    BitrixLLMToolCall(
-                        name="task_create_draft",
-                        args={
-                            "title": "проверить IP-камеру",
-                            "responsible_query": "Иванову",
-                            "deadline_iso": "2026-06-05T19:00:00+03:00",
-                        },
-                    )
-                ],
-                final_status="needs_human",
-                final_answer="Подготовил черновик задачи, нужно подтверждение.",
-            ),
-        ).handle(
-            AgentTask(
-                task_id="t1",
-                request="Создай задачу Иванову проверить IP-камеру завтра",
-                user={"id": "9"},
-            )
-        )
-    )
-
-    assert result.status == "needs_human"
-    params = result.actions_requiring_approval[0].details["params"]
-    assert params["fields"]["TITLE"] == "проверить IP-камеру"
-    assert params["fields"]["RESPONSIBLE_ID"] == 15
-
-
-def test_bitrix_specialist_resolves_project_name():
-    result = asyncio.run(
-        _bitrix_specialist(
-            tools=FakeResolverTools(
-                projects={
-                    "Монтаж": [
-                        {"id": 44, "label": "Монтаж"},
-                    ]
-                }
-            ),
-            llm=FakeBitrixLLM(
-                tool_calls=[
-                    BitrixLLMToolCall(
-                        name="task_create_draft",
-                        args={
-                            "title": "проверить камеру",
-                            "responsible_self": True,
-                            "project_query": "Монтаж",
-                            "deadline_iso": "2026-06-05T19:00:00+03:00",
-                        },
-                    )
-                ],
-                final_status="needs_human",
-                final_answer="Подготовил черновик задачи, нужно подтверждение.",
-            ),
-        ).handle(
-            AgentTask(
-                task_id="t1",
-                request="Создай задачу на меня проверить камеру в проекте Монтаж завтра",
-                user={"id": "9"},
-            )
-        )
-    )
-
-    assert result.status == "needs_human"
-    params = result.actions_requiring_approval[0].details["params"]
-    assert params["fields"]["TITLE"] == "проверить камеру"
-    assert params["fields"]["RESPONSIBLE_ID"] == 9
-    assert params["fields"]["GROUP_ID"] == 44
-
-
-def test_bitrix_specialist_asks_when_responsible_name_is_ambiguous():
-    result = asyncio.run(
-        _bitrix_specialist(
-            tools=FakeResolverTools(
-                users={
-                    "Иванову": [
-                        {"id": 15, "label": "Иванов Иван"},
-                        {"id": 16, "label": "Иванов Пётр"},
-                    ]
-                }
-            ),
-            llm=FakeBitrixLLM(
-                tool_calls=[
-                    BitrixLLMToolCall(
-                        name="task_create_draft",
-                        args={
-                            "title": "проверить камеру",
-                            "responsible_query": "Иванову",
-                            "deadline_iso": "2026-06-05T19:00:00+03:00",
-                        },
-                    )
-                ],
-                final_status="needs_clarification",
-                final_answer="Нашёл несколько сотрудников Ивановых. Уточните ответственного.",
-            ),
-        ).handle(
-            AgentTask(
-                task_id="t1",
-                request="Создай задачу Иванову проверить камеру",
-                user={"id": "9"},
-            )
-        )
-    )
-
-    assert result.status == "needs_clarification"
-    assert result.actions_requiring_approval == []
-    assert "несколько сотрудников" in result.answer
 
 
 def test_bitrix_llm_decision_payload_includes_permission_context(monkeypatch):
@@ -523,31 +376,6 @@ def test_bitrix_skills_and_knowledge_loaded():
     assert "user_permissions" in topic_ids
 
 
-def test_bitrix_current_user_profile_tool_compacts_user_fields():
-    class ProfileClient:
-        async def get_user(self, user_id: int):
-            assert user_id == 9
-            return {
-                "ID": "9",
-                "ACTIVE": "Y",
-                "NAME": "Иван",
-                "LAST_NAME": "Иванов",
-                "WORK_POSITION": "Монтажник",
-                "UF_DEPARTMENT": ["77", "88"],
-                "IS_ADMIN": "N",
-                "USER_TYPE": "employee",
-            }
-
-    result = asyncio.run(CurrentUserProfileTool(client=ProfileClient()).execute({}, user_id=9))
-
-    assert result.status == "ok"
-    profile = result.data["profile"]
-    assert profile["id"] == 9
-    assert profile["label"] == "Иванов Иван"
-    assert profile["department_ids"] == [77, 88]
-    assert profile["work_position"] == "Монтажник"
-
-
 class _FakePortalSearchTool:
     name = "portal_search"
 
@@ -573,79 +401,31 @@ class _FakeBitrixApiTool:
         return self._result
 
 
-class _FakeCurrentUserProfileTool:
-    name = "current_user_profile"
-
-    def __init__(self, result: ToolResult):
-        self._result = result
-
-    def definition(self):
-        return ToolDefinition(name="current_user_profile", description="", parameters={})
-
-    async def execute(self, args, *, user_id=None, dialog_key=None, dialog_id=None):
-        return self._result
-
-
-class _FakeResolveUserTool:
-    name = "resolve_user"
-
-    def __init__(self, users: dict):
-        self._users = users
-
-    def definition(self):
-        return ToolDefinition(name="resolve_user", description="", parameters={})
-
-    async def execute(self, args, *, user_id=None, dialog_key=None, dialog_id=None):
-        query = str(args.get("query") or "")
-        return _fake_resolution("resolve_user", query, self._users.get(query, []))
-
-
-class _FakeResolveProjectTool:
-    name = "resolve_project"
-
-    def __init__(self, projects: dict):
-        self._projects = projects
-
-    def definition(self):
-        return ToolDefinition(name="resolve_project", description="", parameters={})
-
-    async def execute(self, args, *, user_id=None, dialog_key=None, dialog_id=None):
-        query = str(args.get("query") or "")
-        return _fake_resolution("resolve_project", query, self._projects.get(query, []))
-
-
 class FakeResolverTools:
     def __init__(
         self,
         *,
-        users: dict | None = None,
-        projects: dict | None = None,
         bitrix_api_result: ToolResult | None = None,
-        profile_result: ToolResult | None = None,
+        raw_user: dict | None = None,
     ) -> None:
         self.bitrix_api_calls: list = []
+        self._raw_user = raw_user
         self._tools = [
             _FakePortalSearchTool(),
             _FakeBitrixApiTool(
                 bitrix_api_result or ToolResult(status="not_configured", tool="bitrix_api"),
                 self.bitrix_api_calls,
             ),
-            _FakeCurrentUserProfileTool(
-                profile_result or ToolResult(status="not_available", tool="current_user_profile")
-            ),
-            _FakeResolveUserTool(users or {}),
-            _FakeResolveProjectTool(projects or {}),
         ]
 
     def agent_tools(self) -> list:
         return self._tools
 
+    def make_user_client(self):
+        raw_user = self._raw_user
 
-def _fake_resolution(tool: str, query: str, candidates: list[dict]) -> ToolResult:
-    if not candidates:
-        return ToolResult(status="not_found", tool=tool, data={"query": query, "candidates": []})
-    if len(candidates) == 1:
-        return ToolResult(
-            status="ok", tool=tool, data={"query": query, "candidate": candidates[0], "candidates": candidates}
-        )
-    return ToolResult(status="ambiguous", tool=tool, data={"query": query, "candidates": candidates})
+        class _FakeUserClient:
+            async def get_user(self, user_id: int):
+                return raw_user
+
+        return _FakeUserClient()

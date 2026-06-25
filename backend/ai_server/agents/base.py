@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from ai_server.agents.ports import AgentDialogStorePort, AgentQueuePort, SchedulerPort
+from ai_server.agents.ports import AgentQueuePort, AgentStorePort, SchedulerPort
 from ai_server.agents.tool import AgentTool
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult, ToolStatus
@@ -43,7 +43,7 @@ class BaseSpecialist:
         agent_tools: list[AgentTool] | None = None,
         llm: Any = None,
         scheduler: SchedulerPort | None = None,
-        store: AgentDialogStorePort | None = None,
+        store: AgentStorePort | None = None,
     ) -> None:
         self.manifest = manifest
         self.knowledge_base = knowledge_base
@@ -162,7 +162,9 @@ class BaseSpecialist:
         else:
             dialog_history = list(task.context.get("dialog_history") or [])
 
-        available_skills = self.skill_store.list_skills(self.manifest) if self.skill_store is not None else []
+        available_skills = (
+            self.skill_store.list_skills_with_content(self.manifest) if self.skill_store is not None else []
+        )
         task, extra_context_details = await self._load_extra_context(task)
         retrieval_hits = (
             self.retriever.search(self.manifest, task.request, limit=5) if self.retriever is not None else []
@@ -206,6 +208,7 @@ class BaseSpecialist:
                     tool_definitions=self.tool_definitions(),
                     tool_results=list(tool_results),
                     dialog_history=dialog_history or None,
+                    available_skills=available_skills,
                 )
             except Exception as exc:
                 failure = self._llm_failure_result(f"{type(exc).__name__}: {exc}")

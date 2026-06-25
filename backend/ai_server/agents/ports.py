@@ -24,22 +24,14 @@ class ChannelPort(Protocol):
     async def send(self, recipient_id: str, body: str) -> None: ...
 
 
-class AgentDialogStorePort(Protocol):
-    """Per-specialist async dialog history store backed by PostgreSQL."""
+class AgentStorePort(Protocol):
+    """Per-specialist async dialog history store."""
 
     async def ensure_schema(self) -> None: ...
 
     async def load_turns(self, dialog_key: str, *, limit: int = 20) -> list[dict[str, str]]: ...
 
     async def append_turn(self, dialog_key: str, user_text: str, agent_response: str) -> None: ...
-
-
-class PortalSearchPort(Protocol):
-    """Abstract port for querying the portal search index."""
-
-    def search(self, query: str, *, entity_types: list[str] | None = None, limit: int = 20) -> list[Any]: ...
-
-    def get_item(self, *, entity_type: str, entity_id: str) -> Any | None: ...
 
 
 class SchedulerPort(Protocol):

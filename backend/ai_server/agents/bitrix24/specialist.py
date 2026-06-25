@@ -18,21 +18,15 @@ from ai_server.agents.bitrix24.quality_control import (
 )
 from ai_server.agents.bitrix24.task_create import (
     BitrixTaskCreateDraft,
-    BitrixTaskCreateResolution,
     build_task_create_draft_from_args,
 )
-from ai_server.agents.bitrix24.tools import (
-    BitrixApiTool,
-    CurrentUserProfileTool,
-    NotifyUsersTool,
-    PortalSearchTool,
-    ResolveProjectTool,
-    ResolveUserTool,
-)
-from ai_server.agents.ports import PortalSearchPort, SchedulerPort
+from ai_server.agents.bitrix24.tools import BitrixApiTool, PortalSearchTool
+from ai_server.agents.ports import SchedulerPort
 from ai_server.agents.tool import AgentTool
+from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService
 from ai_server.integrations.bitrix.ports import BitrixTaskPort, BitrixToolClientPort
+from ai_server.integrations.bitrix.profile import compact_user_profile
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult, ToolStatus
 from ai_server.retrieval import HybridKnowledgeRetriever
@@ -56,10 +50,8 @@ _TASK_CREATE_DRAFT_DEF: dict[str, Any] = {
             "title": {"type": "string"},
             "description": {"type": "string"},
             "responsible_id": {"type": "integer"},
-            "responsible_query": {"type": "string"},
             "responsible_self": {"type": "boolean"},
             "group_id": {"type": "integer"},
-            "project_query": {"type": "string"},
             "deadline_iso": {"type": "string"},
             "no_deadline": {"type": "boolean"},
         },
@@ -68,7 +60,6 @@ _TASK_CREATE_DRAFT_DEF: dict[str, Any] = {
             {
                 "anyOf": [
                     {"required": ["responsible_id"]},
-                    {"required": ["responsible_query"]},
                     {"required": ["responsible_self"]},
                 ]
             },
@@ -143,7 +134,7 @@ _BITRIX_TOOL_DEFINITIONS: list[dict[str, Any]] = [
 ]
 
 # Tools in the registry that the LLM can call directly.
-_LLM_TOOL_NAMES = frozenset({"portal_search", "bitrix_api", "current_user_profile", "bitrix_notify_users"})
+_LLM_TOOL_NAMES = frozenset({"portal_search", "bitrix_api"})
 
 
 @dataclass(frozen=True)
@@ -216,10 +207,12 @@ class Bitrix24Specialist(BaseSpecialist):
         store: Any | None = None,
         proposals: BitrixProposalService | None = None,
         bitrix_task_client: BitrixTaskPort | None = None,
+        bitrix_user_client: BitrixToolClientPort | None = None,
         settings: Settings | None = None,
     ) -> None:
         self._proposals = proposals
         self._bitrix_task_client = bitrix_task_client
+        self._bitrix_user_client = bitrix_user_client
         self._settings_for_qc = settings
         super().__init__(
             manifest,
@@ -238,7 +231,7 @@ class Bitrix24Specialist(BaseSpecialist):
         manifest: AgentManifest,
         *,
         bitrix_client: BitrixToolClientPort | None = None,
-        portal_search_index: PortalSearchPort | None = None,
+        portal_search_index: Any | None = None,
         bitrix_oauth: BitrixOAuthService | None = None,
         bitrix_retriever: HybridKnowledgeRetriever | None = None,
         bitrix_llm: BitrixAgentLLM | None = None,
@@ -257,10 +250,6 @@ class Bitrix24Specialist(BaseSpecialist):
                 bitrix_oauth=bitrix_oauth,
                 dry_run=_settings.agent_dry_run,
             ),
-            CurrentUserProfileTool(client=bitrix_client),
-            NotifyUsersTool(client=bitrix_client),
-            ResolveUserTool(client=bitrix_client),
-            ResolveProjectTool(client=bitrix_client),
         ]
         return cls(
             manifest,
@@ -271,6 +260,7 @@ class Bitrix24Specialist(BaseSpecialist):
             proposals=proposals,
             store=bitrix_store,
             bitrix_task_client=bitrix_client,
+            bitrix_user_client=bitrix_client,
             settings=_settings,
         )
 
@@ -297,11 +287,7 @@ class Bitrix24Specialist(BaseSpecialist):
         return [*toolset_defs, *_BITRIX_TOOL_DEFINITIONS]
 
     async def _task_create_draft(self, task: AgentTask, args: dict) -> BitrixTaskCreateDraft:
-        draft = build_task_create_draft_from_args(task, args)
-        resolution = await self._resolve_task_create_draft(draft)
-        if resolution is None:
-            return draft
-        return build_task_create_draft_from_args(task, args, resolution=resolution)
+        return build_task_create_draft_from_args(task, args)
 
     async def _execute_tool_call(
         self,
@@ -347,7 +333,7 @@ class Bitrix24Specialist(BaseSpecialist):
                 [],
             )
 
-        # Registry tools: portal_search, bitrix_api, current_user_profile, send_message, notify_users
+        # Registry tools: portal_search, bitrix_api
         return await super()._execute_tool_call(tool_call, task)
 
     def _save_incomplete_proposal(self, args: dict[str, Any]) -> ToolResult:
@@ -474,81 +460,27 @@ class Bitrix24Specialist(BaseSpecialist):
 
     async def _current_user_profile_result(self, task: AgentTask) -> ToolResult:
         user_id = optional_int(task.user.id)
-        tool = self._tool_registry.get("current_user_profile")
-        if user_id is None or tool is None:
+        if user_id is None or self._bitrix_user_client is None:
             return ToolResult(
                 status=ToolStatus.NOT_AVAILABLE,
                 tool="current_user_profile",
                 error="current Bitrix user id is not available",
             )
         try:
-            return await tool.execute({}, user_id=user_id)
-        except Exception as exc:
+            user = await self._bitrix_user_client.get_user(user_id)
+        except (BitrixApiError, BitrixConfigError) as exc:
             return ToolResult(
-                status=ToolStatus.ERROR,
+                status=ToolStatus.NOT_CONFIGURED if isinstance(exc, BitrixConfigError) else ToolStatus.ERROR,
                 tool="current_user_profile",
-                error=f"{type(exc).__name__}: {exc}",
+                error=str(exc),
                 data={"user_id": user_id},
             )
-
-    async def _resolve_user_field(self, query: str, fields: dict[str, Any]) -> tuple[int | None, str, list[str]]:
-        if not query or "RESPONSIBLE_ID" in fields:
-            return None, "", []
-        tool = self._tool_registry.get("resolve_user")
-        if tool is None:
-            return None, "", ["Bitrix API недоступен для поиска сотрудника."]
-        result = await tool.execute({"query": query})
-        if result.status == "ok":
-            candidate = result.data.get("candidate") if isinstance(result.data, dict) else None
-            if isinstance(candidate, dict):
-                return (
-                    optional_int(candidate.get("id")),
-                    f"Ответственный найден в Bitrix: {candidate.get('label') or query}.",
-                    [],
-                )
-        if result.status == "ambiguous":
-            return None, "", [_format_ambiguous_note("Найдено несколько сотрудников", result.data.get("candidates"))]
-        if result.status == "not_found":
-            return None, "", [f"Не нашёл сотрудника в Bitrix по запросу `{query}`."]
-        return None, "", [f"Не смог проверить сотрудника через Bitrix: {result.status}."]
-
-    async def _resolve_project_field(self, query: str, fields: dict[str, Any]) -> tuple[int | None, str, list[str]]:
-        if not query or "GROUP_ID" in fields:
-            return None, "", []
-        tool = self._tool_registry.get("resolve_project")
-        if tool is None:
-            return None, "", ["Bitrix API недоступен для поиска проекта."]
-        result = await tool.execute({"query": query})
-        if result.status == "ok":
-            candidate = result.data.get("candidate") if isinstance(result.data, dict) else None
-            if isinstance(candidate, dict):
-                return (
-                    optional_int(candidate.get("id")),
-                    f"Проект найден в Bitrix: {candidate.get('label') or query}.",
-                    [],
-                )
-        if result.status == "ambiguous":
-            return None, "", [_format_ambiguous_note("Найдено несколько проектов", result.data.get("candidates"))]
-        if result.status == "not_found":
-            return None, "", [f"Не нашёл проект в Bitrix по запросу `{query}`."]
-        return None, "", [f"Не смог проверить проект через Bitrix: {result.status}."]
-
-    async def _resolve_task_create_draft(
-        self,
-        draft: BitrixTaskCreateDraft,
-    ) -> BitrixTaskCreateResolution | None:
-        fields = _draft_fields(draft)
-        responsible_id, responsible_note, user_notes = await self._resolve_user_field(draft.responsible_query, fields)
-        group_id, group_note, project_notes = await self._resolve_project_field(draft.project_query, fields)
-        notes = user_notes + project_notes
-        if responsible_id is None and group_id is None and not notes:
-            return None
-        return BitrixTaskCreateResolution(
-            responsible_id=responsible_id,
-            responsible_note=responsible_note,
-            group_id=group_id,
-            group_note=group_note,
-            notes=notes,
+        if user is None:
+            return ToolResult(status=ToolStatus.NOT_FOUND, tool="current_user_profile", data={"user_id": user_id})
+        return ToolResult(
+            status=ToolStatus.OK,
+            tool="current_user_profile",
+            data={"user_id": user_id, "profile": compact_user_profile(user)},
         )
 
     def _llm_failure_result(self, message: str):
@@ -582,20 +514,6 @@ def _next_morning_830() -> datetime:
     if now >= target:
         target += timedelta(days=1)
     return target
-
-
-def _format_ambiguous_note(prefix: str, candidates: object) -> str:
-    if not isinstance(candidates, list):
-        return prefix + "; нужно уточнение."
-    labels = []
-    for candidate in candidates[:5]:
-        if isinstance(candidate, dict):
-            label = candidate.get("label") or candidate.get("id")
-            if label:
-                labels.append(str(label))
-    if not labels:
-        return prefix + "; нужно уточнение."
-    return prefix + ": " + "; ".join(labels) + ". Уточни нужный вариант."
 
 
 def _permission_policy_query(request: str, profile_result: ToolResult) -> str:
@@ -651,8 +569,3 @@ def _approval_actions_from_task_create_draft(
             },
         )
     ]
-
-
-def _draft_fields(draft: BitrixTaskCreateDraft) -> dict:
-    fields = draft.params.get("fields")
-    return fields if isinstance(fields, dict) else {}
