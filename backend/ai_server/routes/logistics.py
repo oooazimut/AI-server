@@ -9,12 +9,11 @@ router = APIRouter()
 
 @router.get("/logistics/vehicle-usage/status")
 def logistics_vehicle_usage_status(request: Request) -> dict[str, Any]:
-    from ..tools.vehicle_usage import VehicleUsageStore
-
-    store = VehicleUsageStore(request.app.state.settings.vehicle_usage_db_path)
+    store = getattr(request.app.state, "vehicle_usage_store", None)
+    latest_requests = store.latest_requests(limit=10) if store is not None else []
     return {
         "status": dict(request.app.state.vehicle_usage_status),
-        "latest_requests": store.latest_requests(limit=10),
+        "latest_requests": latest_requests,
     }
 
 

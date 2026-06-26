@@ -22,7 +22,7 @@ from ai_server.utils import MOSCOW_TZ
 
 if TYPE_CHECKING:
     from ai_server.agents.bitrix24.specialist import Bitrix24Specialist
-    from ai_server.integrations.bitrix.ports import BitrixTaskPort
+    from ai_server.tools.bitrix_ports import BitrixTaskPort
 
 logger = logging.getLogger(__name__)
 

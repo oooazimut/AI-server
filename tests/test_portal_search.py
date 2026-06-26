@@ -1,4 +1,5 @@
-import json
+from __future__ import annotations
+
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -6,7 +7,6 @@ from fastapi.testclient import TestClient
 from ai_server.agents.bitrix24 import Bitrix24Specialist, BitrixLLMToolCall
 from ai_server.agents.bitrix24.tools import PortalSearchTool
 from ai_server.integrations.bitrix.portal_search import (
-    PortalSearchIndex,
     sync_disk_delta_index,
     sync_portal_content_index,
     sync_portal_index,
@@ -20,60 +20,32 @@ from ai_server.workers.bitrix.search_webhook_indexer import (
     prepare_search_webhook_job,
     process_search_webhook_job,
 )
-from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider
+from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, FakePortalSearchIndex
 
 
-def _create_index(path: Path) -> PortalSearchIndex:
-    index = PortalSearchIndex(path)
-    index.ensure_schema()
-    with index._connect() as connection:
-        connection.execute(
-            """
-            INSERT INTO portal_search_items (
-                entity_type, entity_id, title, body, url, search_text,
-                metadata_json, source_updated_at, last_seen_at, indexed_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "disk_file",
-                "101",
-                "Договор транзит экспресс.docx",
-                "Текст договора с компанией Транзит-Экспресс и приложениями.",
-                "https://example.test/docs/101",
-                "disk_file 101 договор транзит экспресс.docx текст договора с компанией транзит-экспресс и приложениями.",
-                json.dumps({"content_index_status": "indexed", "path": "/Договоры"}, ensure_ascii=False),
-                "2026-06-01T10:00:00+03:00",
-                "2026-06-01T10:00:00+03:00",
-                "2026-06-01T10:00:00+03:00",
-            ),
-        )
-        connection.execute(
-            """
-            INSERT INTO portal_search_items (
-                entity_type, entity_id, title, body, url, search_text,
-                metadata_json, source_updated_at, last_seen_at, indexed_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "task",
-                "202",
-                "Проверить камеру",
-                "Задача по IP-камере на складе.",
-                "https://example.test/tasks/202",
-                "task 202 проверить камеру задача по ip-камере на складе.",
-                "{}",
-                "2026-06-01T10:00:00+03:00",
-                "2026-06-01T10:00:00+03:00",
-                "2026-06-01T10:00:00+03:00",
-            ),
-        )
+def _create_index() -> FakePortalSearchIndex:
+    index = FakePortalSearchIndex()
+    index.upsert_item(
+        entity_type="disk_file",
+        entity_id="101",
+        title="Договор транзит экспресс.docx",
+        body="Текст договора с компанией Транзит-Экспресс и приложениями.",
+        url="https://example.test/docs/101",
+        metadata={"content_index_status": "indexed", "path": "/Договоры"},
+    )
+    index.upsert_item(
+        entity_type="task",
+        entity_id="202",
+        title="Проверить камеру",
+        body="Задача по IP-камере на складе.",
+        url="https://example.test/tasks/202",
+        metadata={},
+    )
     return index
 
 
-def test_portal_search_index_searches_old_schema(tmp_path):
-    index = _create_index(tmp_path / "search_index.sqlite")
+def test_portal_search_index_searches_old_schema():
+    index = _create_index()
 
     results = index.search("транзит договор", limit=5)
     stats = index.stats()
@@ -86,10 +58,10 @@ def test_portal_search_index_searches_old_schema(tmp_path):
     assert stats.content_by_status["indexed"] == 1
 
 
-def test_portal_search_tool_returns_results(tmp_path):
+def test_portal_search_tool_returns_results():
     import asyncio
 
-    index = _create_index(tmp_path / "search_index.sqlite")
+    index = _create_index()
     tool = PortalSearchTool(portal_search=index)
 
     result = asyncio.run(tool.execute({"query": "транзит договор", "scope": "documents", "limit": 5}))
@@ -99,10 +71,10 @@ def test_portal_search_tool_returns_results(tmp_path):
     assert "Нашёл по порталу" in result.data["summary"]
 
 
-def test_portal_search_tool_reports_missing_index(tmp_path):
+def test_portal_search_tool_reports_missing_index():
     import asyncio
 
-    tool = PortalSearchTool(portal_search=PortalSearchIndex(tmp_path / "missing.sqlite"))
+    tool = PortalSearchTool(portal_search=FakePortalSearchIndex(exists=False))
 
     result = asyncio.run(tool.execute({"query": "договор", "scope": "documents"}))
 
@@ -110,12 +82,12 @@ def test_portal_search_tool_reports_missing_index(tmp_path):
     assert "missing" in result.data["message"].lower()
 
 
-def test_bitrix_search_endpoint(monkeypatch, tmp_path):
-    var_dir = tmp_path / "var"
-    _create_index(var_dir / "search_index.sqlite")
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(var_dir))
+def test_bitrix_search_endpoint(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    index = _create_index()
 
     with TestClient(app) as client:
+        app.state.portal_search = index
         response = client.get("/bitrix/search", params={"q": "транзит договор", "scope": "documents"})
         status = client.get("/bitrix/search/status")
 
@@ -124,10 +96,10 @@ def test_bitrix_search_endpoint(monkeypatch, tmp_path):
     assert status.json()["total_items"] == 2
 
 
-def test_bitrix_specialist_uses_portal_search_for_document_requests(tmp_path):
+def test_bitrix_specialist_uses_portal_search_for_document_requests():
     manifest = get_agent_manifest("bitrix24")
     assert manifest is not None
-    index = _create_index(tmp_path / "search_index.sqlite")
+    index = _create_index()
     specialist = Bitrix24Specialist(
         manifest,
         retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
@@ -149,9 +121,10 @@ def test_bitrix_specialist_uses_portal_search_for_document_requests(tmp_path):
     assert action.details["data"]["results"][0]["entity_id"] == "101"
 
 
-def test_portal_metadata_sync_indexes_tasks_projects_and_disk(monkeypatch, tmp_path):
+def test_portal_metadata_sync_indexes_tasks_projects_and_disk(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("SEARCH_INDEX_MAX_TASK_ATTACHMENTS", "10")
-    index = PortalSearchIndex(tmp_path / "search_index.sqlite")
+    index = FakePortalSearchIndex()
     bitrix = FakePortalBitrix()
 
     stats = anyio_run(sync_portal_index(bitrix, index, settings=get_settings()))
@@ -166,8 +139,9 @@ def test_portal_metadata_sync_indexes_tasks_projects_and_disk(monkeypatch, tmp_p
     assert index.search("план склад", entity_types={"disk_file"})
 
 
-def test_portal_delta_sync_updates_folder_and_deletes_missing_children(tmp_path):
-    index = PortalSearchIndex(tmp_path / "search_index.sqlite")
+def test_portal_delta_sync_updates_folder_and_deletes_missing_children(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    index = FakePortalSearchIndex()
     index.upsert_item(
         entity_type="disk_storage",
         entity_id=10,
@@ -201,9 +175,10 @@ def test_portal_delta_sync_updates_folder_and_deletes_missing_children(tmp_path)
 
 
 def test_portal_content_sync_indexes_downloaded_text(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     monkeypatch.setenv("SEARCH_CONTENT_MAX_FILES", "10")
-    index = PortalSearchIndex(tmp_path / "search_index.sqlite")
+    index = FakePortalSearchIndex()
     index.upsert_item(
         entity_type="disk_file",
         entity_id=501,
@@ -223,12 +198,12 @@ def test_portal_content_sync_indexes_downloaded_text(monkeypatch, tmp_path):
     assert index.search("альфа", entity_types={"disk_file"})
 
 
-def test_search_webhook_indexer_upserts_and_deletes_file(monkeypatch, tmp_path):
+def test_search_webhook_indexer_upserts_and_deletes_file(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("SEARCH_WEBHOOK_INDEXER_ENABLED", "true")
     monkeypatch.setenv("SEARCH_WEBHOOK_CONTENT_ENABLED", "false")
     settings = get_settings()
-    index = PortalSearchIndex(tmp_path / "search_index.sqlite")
+    index = FakePortalSearchIndex()
     status: dict[str, object] = {}
 
     job, prepared = prepare_search_webhook_job(

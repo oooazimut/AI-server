@@ -16,9 +16,9 @@ from ai_server.integrations.bitrix.portal_search import (
     delete_portal_file_cache_path,
     entity_types_for_scope,
 )
-from ai_server.integrations.bitrix.ports import BitrixFileDownloadPort
 from ai_server.models import ToolResult, ToolStatus
 from ai_server.settings import Settings
+from ai_server.tools.bitrix_ports import BitrixFileDownloadPort
 from ai_server.tools.document_access.download import _ensure_local_document
 from ai_server.tools.document_access.types import (
     CellValue,

@@ -1,17 +1,18 @@
 from __future__ import annotations
 
-import sqlite3
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 import httpx
+import redis.asyncio as aioredis
 
-from ai_server.agent_store import SqliteStore
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixClient, BitrixConfigError
 from ai_server.settings import Settings, get_settings
 from ai_server.utils import optional_int
+
+_KEY_PREFIX = "oauth:bitrix:"
 
 
 class BitrixOAuthError(RuntimeError):
@@ -52,43 +53,14 @@ class BitrixOAuthSaveResult:
     source: str
 
 
-class BitrixOAuthService(SqliteStore):
-    def __init__(self, settings: Settings | None = None, db_path: Path | str | None = None) -> None:
+class BitrixOAuthService:
+    def __init__(self, settings: Settings | None = None, redis_url: str | None = None) -> None:
         self._settings = settings or get_settings()
-        self.path = Path(db_path or self._settings.bitrix_oauth_db_path)
-
-    def ensure_schema(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS bitrix_oauth_tokens (
-                    user_id INTEGER PRIMARY KEY,
-                    domain TEXT NOT NULL,
-                    member_id TEXT NOT NULL,
-                    client_endpoint TEXT NOT NULL,
-                    server_endpoint TEXT NOT NULL,
-                    access_token TEXT NOT NULL,
-                    refresh_token TEXT NOT NULL,
-                    scope TEXT NOT NULL DEFAULT '',
-                    expires_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    source TEXT NOT NULL DEFAULT ''
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS bitrix_oauth_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    event_type TEXT NOT NULL,
-                    source TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL,
-                    details TEXT NOT NULL DEFAULT ''
-                )
-                """
-            )
+        self._redis = aioredis.from_url(
+            redis_url or self._settings.redis_url,
+            encoding="utf-8",
+            decode_responses=True,
+        )
 
     async def save_from_payload(
         self,
@@ -115,7 +87,7 @@ class BitrixOAuthService(SqliteStore):
             expires_at=auth.expires_at,
             updated_at=datetime.now(UTC),
         )
-        self.save_token(token, source=source)
+        await self.save_token(token, source=source)
         return BitrixOAuthSaveResult(
             user_id=user_id,
             domain=token.domain,
@@ -144,22 +116,18 @@ class BitrixOAuthService(SqliteStore):
         )
         return await self.save_from_payload({"auth": payload}, source=source)
 
-    def get_token(self, user_id: int) -> BitrixOAuthToken | None:
-        self.ensure_schema()
-        with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT user_id, domain, member_id, client_endpoint, server_endpoint,
-                       access_token, refresh_token, scope, expires_at, updated_at
-                FROM bitrix_oauth_tokens
-                WHERE user_id = ?
-                """,
-                (user_id,),
-            ).fetchone()
-        return _row_to_token(row) if row else None
+    async def get_token(self, user_id: int) -> BitrixOAuthToken | None:
+        raw = await self._redis.get(f"{_KEY_PREFIX}{user_id}")
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return _dict_to_token(data)
 
     async def client_for_user(self, user_id: int) -> BitrixClient:
-        token = self.get_token(user_id)
+        token = await self.get_token(user_id)
         if token is None:
             raise BitrixOAuthTokenMissing(user_id)
         if token.expires_soon:
@@ -194,88 +162,52 @@ class BitrixOAuthService(SqliteStore):
             expires_at=normalized.expires_at,
             updated_at=datetime.now(UTC),
         )
-        self.save_token(refreshed, source="refresh")
+        await self.save_token(refreshed, source="refresh")
         return refreshed
 
-    def save_token(self, token: BitrixOAuthToken, *, source: str) -> None:
-        self.ensure_schema()
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO bitrix_oauth_tokens (
-                    user_id, domain, member_id, client_endpoint, server_endpoint,
-                    access_token, refresh_token, scope, expires_at, updated_at, source
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    domain = excluded.domain,
-                    member_id = excluded.member_id,
-                    client_endpoint = excluded.client_endpoint,
-                    server_endpoint = excluded.server_endpoint,
-                    access_token = excluded.access_token,
-                    refresh_token = excluded.refresh_token,
-                    scope = excluded.scope,
-                    expires_at = excluded.expires_at,
-                    updated_at = excluded.updated_at,
-                    source = excluded.source
-                """,
-                (
-                    token.user_id,
-                    token.domain,
-                    token.member_id,
-                    token.client_endpoint,
-                    token.server_endpoint,
-                    token.access_token,
-                    token.refresh_token,
-                    token.scope,
-                    token.expires_at.isoformat(),
-                    token.updated_at.isoformat(),
-                    source,
-                ),
-            )
-            connection.execute(
-                """
-                INSERT INTO bitrix_oauth_events (user_id, event_type, source, created_at, details)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    token.user_id,
-                    "token_saved",
-                    source,
-                    datetime.now(UTC).isoformat(),
-                    f"domain={token.domain}; scope={token.scope}",
-                ),
-            )
+    async def save_token(self, token: BitrixOAuthToken, *, source: str) -> None:
+        data = {
+            "user_id": token.user_id,
+            "access_token": token.access_token,
+            "refresh_token": token.refresh_token,
+            "client_endpoint": token.client_endpoint,
+            "server_endpoint": token.server_endpoint,
+            "domain": token.domain,
+            "member_id": token.member_id,
+            "scope": token.scope,
+            "expires_at": token.expires_at.isoformat(),
+            "updated_at": token.updated_at.isoformat(),
+            "source": source,
+        }
+        await self._redis.set(f"{_KEY_PREFIX}{token.user_id}", json.dumps(data, ensure_ascii=False))
 
-    def public_status(self) -> dict[str, Any]:
+    async def public_status(self) -> dict[str, Any]:
         settings = self._settings
-        self.ensure_schema()
-        with self._connect() as connection:
-            count = int(connection.execute("SELECT COUNT(*) FROM bitrix_oauth_tokens").fetchone()[0])
-            rows = connection.execute(
-                """
-                SELECT user_id, domain, scope, expires_at, updated_at
-                FROM bitrix_oauth_tokens
-                ORDER BY updated_at DESC
-                LIMIT 20
-                """
-            ).fetchall()
+        keys = await self._redis.keys(f"{_KEY_PREFIX}*")
+        linked_users = []
+        for key in sorted(keys)[:20]:
+            raw = await self._redis.get(key)
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            linked_users.append(
+                {
+                    "user_id": int(data.get("user_id", 0)),
+                    "domain": data.get("domain", ""),
+                    "scope": data.get("scope", ""),
+                    "expires_at": data.get("expires_at", ""),
+                    "updated_at": data.get("updated_at", ""),
+                }
+            )
         return {
             "enabled": settings.bitrix_oauth_enabled,
             "configured": settings.bitrix_oauth_configured,
             "required_for_writes": settings.bitrix_oauth_required_for_writes,
-            "db_path": str(self.path),
-            "linked_users_count": count,
-            "linked_users": [
-                {
-                    "user_id": int(row["user_id"]),
-                    "domain": row["domain"],
-                    "scope": row["scope"],
-                    "expires_at": row["expires_at"],
-                    "updated_at": row["updated_at"],
-                }
-                for row in rows
-            ],
+            "linked_users_count": len(keys),
+            "linked_users": linked_users,
             "authorization": self.authorization_hint(),
         }
 
@@ -327,18 +259,18 @@ class BitrixOAuthService(SqliteStore):
         return payload
 
 
-def _row_to_token(row: sqlite3.Row) -> BitrixOAuthToken:
+def _dict_to_token(data: dict[str, Any]) -> BitrixOAuthToken:
     return BitrixOAuthToken(
-        user_id=int(row["user_id"]),
-        access_token=str(row["access_token"]),
-        refresh_token=str(row["refresh_token"]),
-        client_endpoint=str(row["client_endpoint"]),
-        server_endpoint=str(row["server_endpoint"]),
-        domain=str(row["domain"]),
-        member_id=str(row["member_id"]),
-        scope=str(row["scope"] or ""),
-        expires_at=_parse_datetime(str(row["expires_at"])),
-        updated_at=_parse_datetime(str(row["updated_at"])),
+        user_id=int(data["user_id"]),
+        access_token=str(data["access_token"]),
+        refresh_token=str(data["refresh_token"]),
+        client_endpoint=str(data["client_endpoint"]),
+        server_endpoint=str(data["server_endpoint"]),
+        domain=str(data["domain"]),
+        member_id=str(data.get("member_id") or ""),
+        scope=str(data.get("scope") or ""),
+        expires_at=_parse_datetime(str(data["expires_at"])),
+        updated_at=_parse_datetime(str(data["updated_at"])),
     )
 
 
@@ -412,19 +344,6 @@ def _parse_datetime(value: str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
-
-
-def _expires_at(expires: Any, expires_in: Any) -> datetime:
-    now = datetime.now(UTC)
-    if expires:
-        try:
-            return datetime.fromtimestamp(int(expires), tz=UTC)
-        except (TypeError, ValueError, OSError):
-            pass
-    try:
-        return now + timedelta(seconds=int(expires_in))
-    except (TypeError, ValueError):
-        return now + timedelta(hours=1)
 
 
 def _token_endpoint_from_server(server_endpoint: str, settings: Settings) -> str:

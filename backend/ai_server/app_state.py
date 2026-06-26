@@ -19,7 +19,6 @@ class WebhookEventStatus(TypedDict):
 class WebhookEventQueueStatus(TypedDict):
     enabled: bool
     running: bool
-    path: str
     worker_enabled: bool
     worker_count: int
     last_enqueued_at: str | None

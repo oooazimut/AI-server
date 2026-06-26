@@ -1,12 +1,8 @@
-import sqlite3
-from datetime import UTC, datetime, timedelta
-
 from fastapi.testclient import TestClient
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist
 from ai_server.agents.bitrix24.tools import BitrixApiTool
 from ai_server.attachments import StoredAttachment
-from ai_server.integrations.bitrix.bitrix_policy import apply_write_policy
 from ai_server.integrations.bitrix.chat_parser import build_agent_task_from_bitrix_chat
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.events import parse_incoming_message
@@ -15,8 +11,8 @@ from ai_server.main import app
 from ai_server.models import AgentTask, ToolResult, ToolStatus
 from ai_server.registry import get_agent_manifest
 from ai_server.settings import get_settings
+from ai_server.tools.bitrix_policy import apply_write_policy
 from ai_server.transcription import TranscriptionResult
-from ai_server.workers.bitrix.webhook_event_queue import WebhookEventQueue
 from scripts.create_bitrix_dev_chat import chat_reference, sanitize_result
 from tests.fakes import FakeBitrixLLM
 
@@ -45,32 +41,8 @@ def test_parse_bitrix_v2_message():
     assert incoming.text == "Покажи задачи в Битриксе"
 
 
-def test_webhook_event_queue_is_compatible_and_sanitizes_payload(monkeypatch, tmp_path):
+def test_bitrix_events_endpoint_enqueues_payload(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    queue = WebhookEventQueue(tmp_path / "webhook_event_queue.sqlite", settings=get_settings())
-    queue.ensure_schema()
-
-    event_id, inserted = anyio_run(queue.enqueue(_bitrix_v2_message_payload(), event_type="ONIMBOTV2MESSAGEADD"))
-    duplicate_id, duplicate_inserted = anyio_run(
-        queue.enqueue(_bitrix_v2_message_payload(), event_type="ONIMBOTV2MESSAGEADD")
-    )
-
-    assert inserted is True
-    assert duplicate_inserted is False
-    assert duplicate_id == event_id
-    assert anyio_run(queue.stats())["pending"] == 1
-
-    event = anyio_run(queue.claim_next())
-    assert event is not None
-    assert event["partition_key"] == "dialog:chat99"
-    assert "auth" not in event["payload"]
-
-    anyio_run(queue.mark_done(event_id, {"handled": True}))
-    assert anyio_run(queue.stats())["done"] == 1
-
-
-def test_bitrix_events_endpoint_enqueues_payload(monkeypatch, tmp_path):
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
     monkeypatch.setenv("AGENT_DRY_RUN", "true")
 
@@ -92,8 +64,8 @@ def test_bitrix_events_endpoint_enqueues_payload(monkeypatch, tmp_path):
     assert status.json()["queue"]["pending"] == 1
 
 
-def test_bitrix_events_endpoint_rejects_wrong_secret(monkeypatch, tmp_path):
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
+def test_bitrix_events_endpoint_rejects_wrong_secret(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
 
     with TestClient(app) as client:
@@ -317,49 +289,11 @@ def test_create_bitrix_dev_chat_helpers_extract_reference_and_redact_tokens():
     assert sanitize_result(raw)["access_token"] == "<redacted>"
 
 
-def test_bitrix_oauth_service_reads_migrated_sqlite(tmp_path):
-    db_path = tmp_path / "bitrix_oauth.sqlite"
-    service = BitrixOAuthService(db_path=db_path)
-    service.ensure_schema()
-    expires_at = datetime.now(UTC) + timedelta(hours=2)
-    with sqlite3.connect(db_path) as connection:
-        connection.execute(
-            """
-            INSERT INTO bitrix_oauth_tokens (
-                user_id, domain, member_id, client_endpoint, server_endpoint,
-                access_token, refresh_token, scope, expires_at, updated_at, source
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                9,
-                "example.bitrix24.ru",
-                "member",
-                "https://example.bitrix24.ru/rest/",
-                "https://example.bitrix24.ru",
-                "access",
-                "refresh",
-                "tasks,user",
-                expires_at.isoformat(),
-                datetime.now(UTC).isoformat(),
-                "test",
-            ),
-        )
-
-    status = service.public_status()
-    token = service.get_token(9)
-
-    assert status["linked_users_count"] == 1
-    assert token is not None
-    assert token.user_id == 9
-    assert token.access_token == "access"
-
-
-def test_bitrix_oauth_service_saves_token_from_app_payload(monkeypatch, tmp_path):
+def test_bitrix_oauth_service_saves_token_from_app_payload(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("BITRIX_DOMAIN", "example.bitrix24.ru")
-    db_path = tmp_path / "bitrix_oauth.sqlite"
-    service = BitrixOAuthService(db_path=db_path)
+    # redis.asyncio.from_url is patched by conftest to return fakeredis
+    service = BitrixOAuthService(redis_url="redis://localhost/15")
 
     result = anyio_run(
         service.save_from_payload(
@@ -377,13 +311,14 @@ def test_bitrix_oauth_service_saves_token_from_app_payload(monkeypatch, tmp_path
             source="bitrix_app",
         )
     )
-    token = service.get_token(9)
+    token = anyio_run(service.get_token(9))
+    status = anyio_run(service.public_status())
 
     assert result.user_id == 9
     assert token is not None
     assert token.access_token == "access"
-    assert service.public_status()["linked_users_count"] == 1
-    assert service.public_status()["authorization"]["message"]
+    assert status["linked_users_count"] == 1
+    assert status["authorization"]["message"]
 
 
 def test_bitrix_oauth_token_endpoint_handles_rest_server_endpoint(monkeypatch):

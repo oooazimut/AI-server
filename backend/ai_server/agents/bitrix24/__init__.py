@@ -7,16 +7,14 @@ from ai_server.agents.bitrix24.llm import (
     BitrixLLMToolCall,
     llm_failure_result,
 )
-from ai_server.agents.bitrix24.specialist import Bitrix24Specialist, BitrixProposalService, IncompleteProposal
-from ai_server.agents.bitrix24.task_create import (
+from ai_server.agents.bitrix24.specialist import Bitrix24Specialist
+from ai_server.agents.bitrix24.tools.task_create import (
     BitrixTaskCreateDraft,
     build_task_create_draft_from_args,
 )
 
 __all__ = [
     "Bitrix24Specialist",
-    "BitrixProposalService",
-    "IncompleteProposal",
     "BitrixAgentLLM",
     "BitrixLLMDecision",
     "BitrixLLMDecisionResult",

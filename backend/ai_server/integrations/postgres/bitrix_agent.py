@@ -86,6 +86,15 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
             db.execute(f"CREATE INDEX IF NOT EXISTS idx_psi_type    ON {_TABLE}(entity_type)")
             db.execute(f"CREATE INDEX IF NOT EXISTS idx_psi_indexed ON {_TABLE}(indexed_at)")
             db.execute(f"CREATE INDEX IF NOT EXISTS idx_psi_seen    ON {_TABLE}(last_seen_at)")
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bitrix24.pending_task_draft (
+                    dialog_key TEXT PRIMARY KEY,
+                    params_json TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
 
     def save_proposal(
         self,
@@ -163,6 +172,40 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
     def delete_proposal(self, proposal_id: int) -> None:
         with self._sync_connect() as db:
             db.execute("DELETE FROM bitrix24.incomplete_proposals WHERE id = %s", (proposal_id,))
+
+    # ------------------------------------------------------------------
+    # Pending task draft
+    # ------------------------------------------------------------------
+
+    async def save_task_draft(self, dialog_key: str, params: dict[str, Any]) -> None:
+        async with await self._connect() as db:
+            await db.execute(
+                """
+                INSERT INTO bitrix24.pending_task_draft (dialog_key, params_json)
+                VALUES (%s, %s)
+                ON CONFLICT (dialog_key) DO UPDATE SET params_json = EXCLUDED.params_json
+                """,
+                (dialog_key, json.dumps(params, ensure_ascii=False)),
+            )
+
+    async def get_task_draft(self, dialog_key: str) -> dict[str, Any] | None:
+        async with await self._connect() as db:
+            cur = await db.execute(
+                "SELECT params_json FROM bitrix24.pending_task_draft WHERE dialog_key = %s",
+                (dialog_key,),
+            )
+            row = await cur.fetchone()
+        if not row:
+            return None
+        raw = row["params_json"]
+        return json.loads(raw) if isinstance(raw, str) else raw
+
+    async def delete_task_draft(self, dialog_key: str) -> None:
+        async with await self._connect() as db:
+            await db.execute(
+                "DELETE FROM bitrix24.pending_task_draft WHERE dialog_key = %s",
+                (dialog_key,),
+            )
 
     # ------------------------------------------------------------------
     # Portal search index

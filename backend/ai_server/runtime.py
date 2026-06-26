@@ -16,10 +16,6 @@ class RuntimePaths:
         return self.root / "attachments"
 
     @property
-    def bitrix_oauth_db(self) -> Path:
-        return self.root / "bitrix_oauth.sqlite"
-
-    @property
     def bitrix_write_audit_log(self) -> Path:
         return self.root / "bitrix_write_audit.jsonl"
 
@@ -48,10 +44,6 @@ class RuntimePaths:
         return self.root / "search_content"
 
     @property
-    def search_index_db(self) -> Path:
-        return self.root / "search_index.sqlite"
-
-    @property
     def search_indexer_lock(self) -> Path:
         return self.root / "search_indexer.lock"
 
@@ -66,14 +58,6 @@ class RuntimePaths:
     @property
     def tmp_dir(self) -> Path:
         return self.root / "tmp"
-
-    @property
-    def vehicle_usage_db(self) -> Path:
-        return self.root / "vehicle_usage.sqlite"
-
-    @property
-    def webhook_event_queue_db(self) -> Path:
-        return self.root / "webhook_event_queue.sqlite"
 
 
 def runtime_var_dir() -> Path:

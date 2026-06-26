@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 
 from ai_server.agents.logistics import LogisticsLLMService, LogisticsLLMToolCall, LogisticsSpecialist
 from ai_server.agents.logistics.specialist import VehicleUsageSettings
@@ -9,8 +8,8 @@ from ai_server.agents.logistics.tools import VehicleContextTool, VehicleSaveDraf
 from ai_server.models import AgentTask, UserContext
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
-from ai_server.tools.vehicle_usage import StaffMember, VehicleUsageStore
-from tests.fakes import FakeEmbeddingProvider, FakeLogisticsLLM, RecordingLLMClient
+from ai_server.tools.vehicle_usage import StaffMember
+from tests.fakes import FakeEmbeddingProvider, FakeLogisticsLLM, FakeVehicleUsageStore, RecordingLLMClient
 
 _FAKE_RETRIEVER = HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider())
 
@@ -24,7 +23,7 @@ _VU_SETTINGS = VehicleUsageSettings(
 
 def _specialist(
     manifest,
-    store: VehicleUsageStore,
+    store: FakeVehicleUsageStore,
     *,
     llm=None,
     vu_settings: VehicleUsageSettings | None = None,
@@ -42,9 +41,8 @@ def _specialist(
     )
 
 
-def test_logistics_specialist_forwards_dialog_history_to_decide(monkeypatch, tmp_path):
+def test_logistics_specialist_forwards_dialog_history_to_decide(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
     llm = FakeLogisticsLLM()
@@ -52,7 +50,7 @@ def test_logistics_specialist_forwards_dialog_history_to_decide(monkeypatch, tmp
         {"role": "user", "content": "кто сегодня на смене"},
         {"role": "assistant", "content": "Уточните дату смены."},
     ]
-    store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
+    store = FakeVehicleUsageStore()
 
     specialist = _specialist(manifest, store, llm=llm)
     anyio_run(
@@ -70,7 +68,8 @@ def test_logistics_specialist_forwards_dialog_history_to_decide(monkeypatch, tmp
     assert llm.decide_calls[0]["task"].context == {"dialog_history": history}
 
 
-def test_logistics_llm_decide_payload_includes_dialog_history_and_raw_context():
+def test_logistics_llm_decide_payload_includes_dialog_history_and_raw_context(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
     client = RecordingLLMClient(
@@ -94,12 +93,11 @@ def test_logistics_llm_decide_payload_includes_dialog_history_and_raw_context():
     assert payload["context"] == scheduler_context
 
 
-def test_logistics_specialist_saves_llm_parsed_draft(monkeypatch, tmp_path):
+def test_logistics_specialist_saves_llm_parsed_draft(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
-    store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
+    store = FakeVehicleUsageStore()
     store.upsert_employees(
         [StaffMember(order=1, user_id=15, name="Иван Петров"), StaffMember(order=2, user_id=16, name="Олег Сидоров")]
     )
@@ -141,18 +139,18 @@ def test_logistics_specialist_saves_llm_parsed_draft(monkeypatch, tmp_path):
     assert result.answer == "Сохранил черновик."
     assert any(action.name == "vehicle_usage_context" for action in result.actions_taken)
     assert any(action.name == "vehicle_usage_save_draft" for action in result.actions_taken)
-    with sqlite3.connect(store.path) as db:
-        row = db.execute("SELECT status, parsed_json FROM vehicle_usage_requests").fetchone()
-    assert row[0] == "pending_confirmation"
-    assert "Иван Петров" in row[1]
+    assert store._requests
+    saved = store._requests[-1]
+    assert saved["status"] == "pending_confirmation"
+    people = saved["parsed"].get("people", [])
+    assert any(p.get("full_name") == "Иван Петров" for p in people)
 
 
-def test_logistics_specialist_saves_confirmed_report(monkeypatch, tmp_path):
+def test_logistics_specialist_saves_confirmed_report(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
-    store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
+    store = FakeVehicleUsageStore()
     store.upsert_employees([StaffMember(order=1, user_id=15, name="Иван Петров")])
     fake_llm = FakeLogisticsLLM(
         tool_call_steps=[
@@ -183,21 +181,21 @@ def test_logistics_specialist_saves_confirmed_report(monkeypatch, tmp_path):
     )
 
     assert result.answer == "Сохранил утренний отчет."
-    with sqlite3.connect(store.path) as db:
-        request = db.execute("SELECT status FROM vehicle_usage_requests").fetchone()
-        status = db.execute("SELECT status FROM employee_daily_statuses").fetchone()
-        assignment = db.execute("SELECT vehicle_id, employee_id FROM vehicle_daily_assignments").fetchone()
-    assert request[0] == "answered"
-    assert status[0] == "shift"
-    assert assignment == (1, 1)
+    assert store._requests
+    assert store._requests[-1]["status"] == "answered"
+    assert store._day_reports
+    report = store._day_reports[-1]
+    assert report["employee_statuses"]
+    assert report["employee_statuses"][0][1] == "shift"
+    assert report["vehicle_assignments"]
+    assert report["vehicle_assignments"][0][0] == 1
 
 
-def test_morning_task_schedules_reminder(monkeypatch, tmp_path):
+def test_morning_task_schedules_reminder(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
-    store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
+    store = FakeVehicleUsageStore()
     fake_llm = FakeLogisticsLLM(final_answer="Привет, заполните отчёт по автомобилям за сегодня.")
 
     result = anyio_run(
@@ -228,12 +226,11 @@ def test_morning_task_schedules_reminder(monkeypatch, tmp_path):
     assert sched.task.context["reminder_count"] == 1
 
 
-def test_reminder_increments_count(monkeypatch, tmp_path):
+def test_reminder_increments_count(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
-    store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
+    store = FakeVehicleUsageStore()
 
     result = anyio_run(
         _specialist(manifest, store, vu_settings=_VU_SETTINGS).handle(
@@ -257,12 +254,11 @@ def test_reminder_increments_count(monkeypatch, tmp_path):
         assert sched.task.context["reminder_count"] == 2
 
 
-def test_max_reminders_stops_scheduling(monkeypatch, tmp_path):
+def test_max_reminders_stops_scheduling(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
-    store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
+    store = FakeVehicleUsageStore()
 
     result = anyio_run(
         _specialist(manifest, store, vu_settings=_VU_SETTINGS).handle(
@@ -281,12 +277,11 @@ def test_max_reminders_stops_scheduling(monkeypatch, tmp_path):
     assert result.scheduled_tasks == []
 
 
-def test_save_report_cancels_reminder(monkeypatch, tmp_path):
+def test_save_report_cancels_reminder(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
-    store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
+    store = FakeVehicleUsageStore()
     store.upsert_employees([StaffMember(order=1, user_id=15, name="Иван Петров")])
     fake_llm = FakeLogisticsLLM(
         tool_call_steps=[

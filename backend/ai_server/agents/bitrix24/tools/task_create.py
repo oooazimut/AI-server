@@ -1,0 +1,295 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+
+from ai_server.agents.bitrix24.ports import TaskDraftStorePort
+from ai_server.models import ToolDefinition, ToolResult, ToolStatus
+from ai_server.tools.bitrix_policy import apply_write_policy
+from ai_server.tools.bitrix_ports import BitrixWritePort
+from ai_server.utils import compact_text, optional_int, unique
+
+
+@dataclass(frozen=True)
+class BitrixTaskCreateDraft:
+    method: str = "tasks.task.add"
+    params: dict[str, Any] = field(default_factory=dict)
+    summary: str = ""
+    contract_errors: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def is_ready(self) -> bool:
+        return not self.contract_errors and bool(self.params.get("fields"))
+
+    def as_action_details(self) -> dict[str, Any]:
+        return {
+            "method": self.method,
+            "params": self.params,
+            "summary": self.summary,
+            "contract_errors": self.contract_errors,
+            "notes": self.notes,
+        }
+
+
+def build_task_create_draft_from_args(args: dict[str, Any], *, user_id: int | None = None) -> BitrixTaskCreateDraft:
+    args = args or {}
+    title = compact_text(str(args.get("title") or "")).strip(" .,:;-")
+    description = compact_text(str(args.get("description") or ""))
+    responsible_id = optional_int(args.get("responsible_id"))
+    responsible_note = ""
+    group_id = optional_int(args.get("group_id"))
+
+    if responsible_id is None and _truthy(args.get("responsible_self")):
+        responsible_id = user_id
+        if responsible_id is not None:
+            responsible_note = "Ответственным выбран текущий пользователь."
+        else:
+            responsible_note = "LLM выбрала текущего пользователя, но канал не передал Bitrix user id."
+
+    deadline, deadline_note, no_deadline, deadline_error = _deadline_from_args(args)
+
+    contract_errors: list[str] = []
+    notes = [note for note in (responsible_note, deadline_note) if note]
+    fields: dict[str, Any] = {}
+
+    if title:
+        fields["TITLE"] = title
+        if description:
+            fields["DESCRIPTION"] = description
+    else:
+        contract_errors.append("task_create_draft.title is required")
+
+    if responsible_id is not None:
+        fields["RESPONSIBLE_ID"] = responsible_id
+    else:
+        if _truthy(args.get("responsible_self")):
+            contract_errors.append("task_create_draft.responsible_self requires channel user id")
+        else:
+            contract_errors.append("task_create_draft requires one of responsible_id or responsible_self")
+
+    if deadline_error:
+        contract_errors.append(deadline_error)
+
+    if user_id is not None:
+        fields["CREATED_BY"] = user_id
+    if group_id is not None:
+        fields["GROUP_ID"] = group_id
+    if deadline:
+        fields["DEADLINE"] = deadline
+    elif no_deadline:
+        fields["NO_DEADLINE"] = True
+
+    return BitrixTaskCreateDraft(
+        params={"fields": fields} if fields else {},
+        summary=_summary(title=title, responsible_id=responsible_id, deadline=deadline, group_id=group_id),
+        contract_errors=unique(contract_errors),
+        notes=notes,
+    )
+
+
+class TaskCreateDraftTool:
+    name = "task_create_draft"
+
+    def __init__(self, store: TaskDraftStorePort) -> None:
+        self._store = store
+
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="task_create_draft",
+            description=(
+                "Prepare a Bitrix task creation draft from fields already understood by the LLM. "
+                "Call only after all required fields are collected. "
+                "The draft is saved and will be shown back on the next turn for confirmation."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "description": {"type": "string"},
+                    "responsible_id": {"type": "integer"},
+                    "responsible_self": {"type": "boolean"},
+                    "group_id": {"type": "integer"},
+                    "deadline_iso": {"type": "string"},
+                    "no_deadline": {"type": "boolean"},
+                },
+                "required": ["title"],
+                "allOf": [
+                    {"anyOf": [{"required": ["responsible_id"]}, {"required": ["responsible_self"]}]},
+                    {"anyOf": [{"required": ["deadline_iso"]}, {"required": ["no_deadline"]}]},
+                ],
+            },
+        )
+
+    async def execute(
+        self,
+        args: dict[str, Any],
+        *,
+        user_id: int | None = None,
+        dialog_key: str | None = None,
+        dialog_id: str | None = None,
+    ) -> ToolResult:
+        draft = build_task_create_draft_from_args(args, user_id=user_id)
+        if not draft.is_ready:
+            return ToolResult(
+                status=ToolStatus.CONTRACT_VIOLATION,
+                tool=self.name,
+                error=f"task_create_draft called outside contract: {'; '.join(draft.contract_errors)}",
+                data=draft.as_action_details(),
+            )
+        if dialog_key:
+            await self._store.save_task_draft(dialog_key, draft.params)
+        return ToolResult(
+            status=ToolStatus.OK,
+            tool=self.name,
+            data={"summary": draft.summary, "params": draft.params, "notes": draft.notes},
+        )
+
+
+class TaskCreateConfirmTool:
+    name = "task_create_confirm"
+
+    def __init__(
+        self,
+        store: TaskDraftStorePort,
+        write_client: BitrixWritePort | None = None,
+        *,
+        dry_run: bool = False,
+    ) -> None:
+        self._store = store
+        self._write_client = write_client
+        self._dry_run = dry_run
+
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="task_create_confirm",
+            description=(
+                "Confirm and execute the pending task creation draft. "
+                "Call this after the user explicitly confirms they want to create the task."
+            ),
+            parameters={"type": "object", "properties": {}, "required": []},
+        )
+
+    async def execute(
+        self,
+        args: dict[str, Any],
+        *,
+        user_id: int | None = None,
+        dialog_key: str | None = None,
+        dialog_id: str | None = None,
+    ) -> ToolResult:
+        if not dialog_key:
+            return ToolResult(
+                status=ToolStatus.INVALID_TOOL_CALL,
+                tool=self.name,
+                error="task_create_confirm requires dialog_key",
+            )
+        draft_params = await self._store.get_task_draft(dialog_key)
+        if not draft_params:
+            return ToolResult(
+                status=ToolStatus.NOT_FOUND,
+                tool=self.name,
+                error="no pending task draft found for this dialog",
+            )
+        if self._dry_run:
+            return ToolResult(
+                status=ToolStatus.DRY_RUN,
+                tool=self.name,
+                data={"params": draft_params},
+            )
+        if self._write_client is None:
+            return ToolResult(
+                status=ToolStatus.NOT_CONFIGURED,
+                tool=self.name,
+                error="write_client is not configured",
+            )
+        sanitized = apply_write_policy("tasks.task.add", draft_params)
+        try:
+            result = await self._write_client.call("tasks.task.add", sanitized)
+        except Exception as exc:
+            return ToolResult(
+                status=ToolStatus.ERROR,
+                tool=self.name,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        await self._store.delete_task_draft(dialog_key)
+        return ToolResult(
+            status=ToolStatus.OK,
+            tool=self.name,
+            data={"result": result, "params": sanitized},
+        )
+
+
+class TaskDraftDiscardTool:
+    name = "task_draft_discard"
+
+    def __init__(self, store: TaskDraftStorePort) -> None:
+        self._store = store
+
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="task_draft_discard",
+            description="Discard the pending task creation draft. Call when the user cancels or abandons the task.",
+            parameters={"type": "object", "properties": {}, "required": []},
+        )
+
+    async def execute(
+        self,
+        args: dict[str, Any],
+        *,
+        user_id: int | None = None,
+        dialog_key: str | None = None,
+        dialog_id: str | None = None,
+    ) -> ToolResult:
+        if dialog_key:
+            await self._store.delete_task_draft(dialog_key)
+        return ToolResult(
+            status=ToolStatus.OK,
+            tool=self.name,
+            data={"discarded": bool(dialog_key)},
+        )
+
+
+def _deadline_from_args(args: dict[str, Any]) -> tuple[str | None, str, bool, str]:
+    if _truthy(args.get("no_deadline")):
+        return None, "LLM explicitly selected no_deadline.", True, ""
+    raw_deadline = str(args.get("deadline") or args.get("deadline_iso") or "").strip()
+    if not raw_deadline:
+        return None, "", False, "task_create_draft requires deadline_iso or no_deadline=true"
+    try:
+        datetime.fromisoformat(raw_deadline.replace("Z", "+00:00"))
+    except ValueError:
+        return None, "", False, "task_create_draft.deadline_iso must be ISO 8601"
+    return raw_deadline, "LLM provided deadline_iso.", False, ""
+
+
+def _summary(*, title: str, responsible_id: int | None, deadline: str | None, group_id: int | None) -> str:
+    title_part = title or "задача без названия"
+    parts = [f"создать задачу `{title_part}`"]
+    if responsible_id is not None:
+        parts.append(f"ответственный #{responsible_id}")
+    if group_id is not None:
+        parts.append(f"проект/группа #{group_id}")
+    if deadline:
+        parts.append(f"срок {deadline}")
+    return ", ".join(parts)
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().casefold() in {"1", "true", "yes", "y", "да", "on"}
+    return bool(value)
+
+
+__all__ = [
+    "BitrixTaskCreateDraft",
+    "build_task_create_draft_from_args",
+    "TaskCreateDraftTool",
+    "TaskCreateConfirmTool",
+    "TaskDraftDiscardTool",
+]

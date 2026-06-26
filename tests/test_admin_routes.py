@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from ai_server.main import app
@@ -66,6 +67,7 @@ def test_agent_knowledge_topics():
 
 
 def test_agent_knowledge_search():
+    pytest.importorskip("fastembed")
     with TestClient(app) as client:
         response = client.get("/agents/bitrix24/knowledge/search", params={"q": "задача"})
     assert response.status_code == 200
