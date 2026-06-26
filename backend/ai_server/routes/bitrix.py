@@ -35,7 +35,7 @@ async def bitrix_status(request: Request) -> dict[str, Any]:
         "bot_id": settings.bitrix_bot_id,
         "bot_auth_mode": settings.bitrix_bot_auth_mode,
         "webhook_url_configured": bool(settings.resolved_bot_webhook_url),
-        "oauth": request.app.state.bitrix_oauth.public_status(),
+        "oauth": await request.app.state.bitrix_oauth.public_status(),
         "portal_search": _portal_search_status(request.app.state.portal_search, request.app.state.settings),
         "portal_search_indexer": request.app.state.portal_search_indexer.public_status(),
         "search_webhook_indexer": dict(request.app.state.search_webhook_indexer_status),
@@ -60,8 +60,8 @@ async def legacy_agent_status(request: Request) -> dict[str, Any]:
 
 
 @router.get("/bitrix/oauth/status")
-def bitrix_oauth_status(request: Request) -> dict[str, Any]:
-    return request.app.state.bitrix_oauth.public_status()
+async def bitrix_oauth_status(request: Request) -> dict[str, Any]:
+    return await request.app.state.bitrix_oauth.public_status()
 
 
 # ---------------------------------------------------------------------------

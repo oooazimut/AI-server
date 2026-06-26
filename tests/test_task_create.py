@@ -2,16 +2,10 @@
 
 from __future__ import annotations
 
-from ai_server.agents.bitrix24.task_create import (
+from ai_server.agents.bitrix24.tools.task_create import (
     BitrixTaskCreateDraft,
     build_task_create_draft_from_args,
 )
-from ai_server.models import AgentTask, UserContext
-
-
-def _task(user_id: str = "9") -> AgentTask:
-    return AgentTask(task_id="t1", request="создай задачу", user=UserContext(id=user_id))
-
 
 # ---------------------------------------------------------------------------
 # BitrixTaskCreateDraft.is_ready
@@ -40,8 +34,8 @@ def test_draft_not_ready_without_fields():
 
 def test_draft_complete_with_no_deadline():
     draft = build_task_create_draft_from_args(
-        _task(),
         {"title": "Проверить камеру", "responsible_id": 9, "no_deadline": True},
+        user_id=9,
     )
     assert draft.is_ready
     assert draft.params["fields"]["TITLE"] == "Проверить камеру"
@@ -51,24 +45,24 @@ def test_draft_complete_with_no_deadline():
 
 def test_draft_strips_title_punctuation():
     draft = build_task_create_draft_from_args(
-        _task(),
         {"title": "  Задача.  ", "responsible_id": 9, "no_deadline": True},
+        user_id=9,
     )
     assert draft.params["fields"]["TITLE"] == "Задача"
 
 
 def test_draft_sets_created_by_from_user():
     draft = build_task_create_draft_from_args(
-        _task(user_id="15"),
         {"title": "Задача", "responsible_id": 9, "no_deadline": True},
+        user_id=15,
     )
     assert draft.params["fields"]["CREATED_BY"] == 15
 
 
 def test_draft_deadline_iso():
     draft = build_task_create_draft_from_args(
-        _task(),
         {"title": "Задача", "responsible_id": 9, "deadline_iso": "2026-07-01T09:00:00+03:00"},
+        user_id=9,
     )
     assert draft.is_ready
     assert draft.params["fields"]["DEADLINE"] == "2026-07-01T09:00:00+03:00"
@@ -76,16 +70,16 @@ def test_draft_deadline_iso():
 
 def test_draft_deadline_z_suffix():
     draft = build_task_create_draft_from_args(
-        _task(),
         {"title": "Задача", "responsible_id": 9, "deadline_iso": "2026-07-01T09:00:00Z"},
+        user_id=9,
     )
     assert draft.is_ready
 
 
 def test_draft_responsible_self():
     draft = build_task_create_draft_from_args(
-        _task(user_id="15"),
         {"title": "Задача", "responsible_self": True, "no_deadline": True},
+        user_id=15,
     )
     assert draft.is_ready
     assert draft.params["fields"]["RESPONSIBLE_ID"] == 15
@@ -93,8 +87,8 @@ def test_draft_responsible_self():
 
 def test_draft_description_included():
     draft = build_task_create_draft_from_args(
-        _task(),
         {"title": "Задача", "description": "Подробное описание", "responsible_id": 9, "no_deadline": True},
+        user_id=9,
     )
     assert draft.params["fields"]["DESCRIPTION"] == "Подробное описание"
 
@@ -106,8 +100,8 @@ def test_draft_description_included():
 
 def test_draft_missing_title():
     draft = build_task_create_draft_from_args(
-        _task(),
         {"title": "", "responsible_id": 9, "no_deadline": True},
+        user_id=9,
     )
     assert not draft.is_ready
     assert any("title" in e for e in draft.contract_errors)
@@ -115,8 +109,8 @@ def test_draft_missing_title():
 
 def test_draft_missing_responsible():
     draft = build_task_create_draft_from_args(
-        _task(),
         {"title": "Задача", "no_deadline": True},
+        user_id=9,
     )
     assert not draft.is_ready
     assert any("responsible" in e for e in draft.contract_errors)
@@ -124,16 +118,16 @@ def test_draft_missing_responsible():
 
 def test_draft_responsible_self_without_user_id():
     draft = build_task_create_draft_from_args(
-        _task(user_id=""),
         {"title": "Задача", "responsible_self": True, "no_deadline": True},
+        user_id=None,
     )
     assert not draft.is_ready
 
 
 def test_draft_missing_deadline():
     draft = build_task_create_draft_from_args(
-        _task(),
         {"title": "Задача", "responsible_id": 9},
+        user_id=9,
     )
     assert not draft.is_ready
     assert any("deadline" in e for e in draft.contract_errors)
@@ -141,8 +135,8 @@ def test_draft_missing_deadline():
 
 def test_draft_invalid_deadline_format():
     draft = build_task_create_draft_from_args(
-        _task(),
         {"title": "Задача", "responsible_id": 9, "deadline_iso": "01.07.2026"},
+        user_id=9,
     )
     assert not draft.is_ready
     assert any("ISO 8601" in e for e in draft.contract_errors)
@@ -155,24 +149,24 @@ def test_draft_invalid_deadline_format():
 
 def test_draft_summary_contains_title():
     draft = build_task_create_draft_from_args(
-        _task(),
         {"title": "Сводка теста", "responsible_id": 9, "no_deadline": True},
+        user_id=9,
     )
     assert "Сводка теста" in draft.summary
 
 
 def test_draft_summary_contains_responsible_id():
     draft = build_task_create_draft_from_args(
-        _task(),
         {"title": "Задача", "responsible_id": 9, "no_deadline": True},
+        user_id=9,
     )
     assert "#9" in draft.summary
 
 
 def test_draft_as_action_details_keys():
     draft = build_task_create_draft_from_args(
-        _task(),
         {"title": "Задача", "responsible_id": 9, "no_deadline": True},
+        user_id=9,
     )
     details = draft.as_action_details()
     assert "method" in details

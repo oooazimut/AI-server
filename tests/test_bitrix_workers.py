@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import fakeredis.aioredis
+
+from ai_server.integrations.redis.event_queue import RedisEventQueue
 from ai_server.settings import get_settings
 from ai_server.workers.bitrix.reconciler import reconcile_once
 from ai_server.workers.bitrix.supervisor import run_task_supervisor_once
-from ai_server.workers.bitrix.webhook_event_queue import WebhookEventQueue
 
 
 def anyio_run(awaitable):
@@ -31,14 +33,15 @@ def test_task_supervisor_dry_run_does_not_notify(monkeypatch, tmp_path):
     assert bitrix.notifications == []
 
 
-def test_reconciler_enqueues_task_updates_with_dedupe(monkeypatch, tmp_path):
+def test_reconciler_enqueues_task_updates_with_dedupe(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     monkeypatch.setenv("RECONCILE_TASKS_ENABLED", "true")
     monkeypatch.setenv("RECONCILE_DISK_DELTA_ENABLED", "false")
     settings = get_settings()
-    queue = WebhookEventQueue(tmp_path / "webhook_event_queue.sqlite", settings=settings)
-    queue.ensure_schema()
+    # redis.asyncio.from_url is patched by conftest to return fakeredis;
+    # override _client directly to share the same in-memory instance for this test
+    queue = RedisEventQueue("redis://localhost/15")
+    queue._client = fakeredis.aioredis.FakeRedis(decode_responses=True)
     bitrix = FakeReconcileBitrix()
 
     first = anyio_run(reconcile_once(bitrix, queue, FakeSearchIndexer(), settings=settings))
@@ -49,7 +52,6 @@ def test_reconciler_enqueues_task_updates_with_dedupe(monkeypatch, tmp_path):
     assert second.tasks["duplicates"] == 1
     stats = anyio_run(queue.stats())
     assert stats["pending"] == 1
-    assert stats["done"] == 0
 
 
 class FakeSupervisorBitrix:

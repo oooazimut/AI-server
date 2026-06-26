@@ -13,12 +13,12 @@ from ai_server.agents.pto.tools import (
     SpreadsheetPreviewTool,
 )
 from ai_server.agents.tool import AgentTool
-from ai_server.integrations.bitrix.ports import BitrixFileDownloadPort
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import AgentManifest
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import Settings
 from ai_server.skills import SkillStore
+from ai_server.tools.bitrix_ports import BitrixFileDownloadPort
 
 
 class PtoSpecialist(BaseSpecialist):

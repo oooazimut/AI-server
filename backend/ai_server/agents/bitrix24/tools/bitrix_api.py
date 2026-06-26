@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from ai_server.integrations.bitrix.bitrix_policy import apply_write_policy, decide_bitrix_method_policy
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService
-from ai_server.integrations.bitrix.ports import BitrixToolClientPort, BitrixWritePort
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
+from ai_server.tools.bitrix_policy import apply_write_policy, decide_bitrix_method_policy
+from ai_server.tools.bitrix_ports import BitrixToolClientPort, BitrixWritePort
 
 
 class BitrixApiTool:

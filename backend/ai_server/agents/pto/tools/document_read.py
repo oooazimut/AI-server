@@ -5,9 +5,9 @@ from pathlib import Path
 from typing import Any
 
 from ai_server.document_text import extract_text_from_file
-from ai_server.integrations.bitrix.ports import BitrixFileDownloadPort
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.settings import Settings
+from ai_server.tools.bitrix_ports import BitrixFileDownloadPort
 from ai_server.utils import optional_int
 
 from .base import BaseDocumentTool, _document_dict

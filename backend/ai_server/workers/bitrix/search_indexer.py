@@ -130,7 +130,6 @@ class PortalSearchIndexerWorker:
             "enabled": self._settings.search_background_indexer_enabled,
             "lock_path": str(self._settings.search_background_lock_path),
             "state_path": str(self._settings.search_background_state_path),
-            "index_path": str(self._settings.search_index_path),
         }
 
     async def run(self, queue: AgentQueuePort) -> None:
@@ -514,7 +513,6 @@ class PortalSearchIndexerWorker:
             "started_at": existing.get("started_at") if existing else now,
             "heartbeat_at": now,
             "state_path": str(self._settings.search_background_state_path),
-            "index_path": str(self._settings.search_index_path),
         }
 
     def _set_lock_status(self, *, acquired: bool, owner: dict[str, Any] | None) -> None:

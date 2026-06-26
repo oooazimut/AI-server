@@ -6,9 +6,9 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from ai_server.integrations.bitrix.ports import BitrixTaskPort
 from ai_server.integrations.ports import WebhookEnqueuePort
 from ai_server.settings import Settings
+from ai_server.tools.bitrix_ports import BitrixTaskPort
 from ai_server.utils import MOSCOW_TZ, optional_int
 from ai_server.workers.bitrix.search_indexer import PortalSearchIndexerWorker
 

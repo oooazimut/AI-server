@@ -4,7 +4,6 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any
 from uuid import uuid4
 
 from fastapi import FastAPI
@@ -16,13 +15,8 @@ from .agents.logistics.specialist import VehicleUsageSettings
 from .agents.pto import PtoLLMService
 from .attachments import AttachmentService
 from .channels.bitrix import BitrixChatChannel
-from .integrations.bitrix.bitrix_store import BitrixAgentStore
 from .integrations.bitrix.client import BitrixClient
 from .integrations.bitrix.oauth import BitrixOAuthService
-from .integrations.bitrix.portal_search import PortalSearchIndex
-from .integrations.bitrix.ports import BitrixAgentStorePort
-from .integrations.memory.agent_queue import InMemoryAgentQueue
-from .integrations.ports import VehicleUsageStorePort
 from .integrations.postgres.bitrix_agent import PostgresBitrixAgentStore
 from .integrations.postgres.orchestrator_agent import PostgresOrchestratorStore
 from .integrations.postgres.pto_agent import PostgresPtoAgentStore
@@ -38,63 +32,45 @@ from .runtime import ensure_runtime_dirs
 from .settings import Settings, get_settings
 from .specialists import SpecialistDeps
 from .technical_footer import TechnicalFooterService
-from .tools.vehicle_usage import SentRequestData, VehicleUsageStore
+from .tools.vehicle_usage import SentRequestData
 from .transcription import build_transcriber
 from .utils import MOSCOW_TZ
 from .workers.bitrix.reconciler import reconcile_once, run_reconciler
 from .workers.bitrix.search_indexer import PortalSearchIndexerWorker
 from .workers.bitrix.supervisor import run_task_supervisor, run_task_supervisor_once
-from .workers.bitrix.webhook_event_queue import WebhookEventQueue, run_webhook_event_worker
+from .workers.bitrix.webhook_event_queue import run_webhook_event_worker
 from .workers.logistics.staff_sync import run_staff_sync
 
 logger = logging.getLogger(__name__)
 
 
-def _make_event_queue(settings: Settings) -> WebhookEventQueue | RedisEventQueue:
-    if settings.redis_url:
-        return RedisEventQueue(settings.redis_url)
-    queue = WebhookEventQueue(settings.webhook_event_queue_path, settings=settings)
-    queue.ensure_schema()
-    return queue
+def _make_event_queue(settings: Settings) -> RedisEventQueue:
+    return RedisEventQueue(settings.redis_url)
 
 
-def _make_agent_queue(settings: Settings) -> RedisAgentQueue | InMemoryAgentQueue:
-    if settings.redis_url:
-        return RedisAgentQueue(settings.redis_url)
-    return InMemoryAgentQueue()
+def _make_agent_queue(settings: Settings) -> RedisAgentQueue:
+    return RedisAgentQueue(settings.redis_url)
 
 
-async def _make_vehicle_store(settings: Settings) -> VehicleUsageStorePort:
-    if settings.database_url:
-        store = PostgresVehicleUsageStore(settings.database_url)
-        await store.ensure_schema()
-        return store
-    store = VehicleUsageStore(settings.vehicle_usage_db_path)
-    store.bootstrap_reference_data()
+async def _make_vehicle_store(settings: Settings) -> PostgresVehicleUsageStore:
+    store = PostgresVehicleUsageStore(settings.database_url)
+    await store.ensure_schema()
     return store
 
 
-async def _make_bitrix_store(settings: Settings) -> BitrixAgentStorePort:
-    if settings.database_url:
-        store = PostgresBitrixAgentStore(settings.database_url)
-        await store.ensure_schema()
-        return store
-    store = BitrixAgentStore()
-    store.ensure_schema()
+async def _make_bitrix_store(settings: Settings) -> PostgresBitrixAgentStore:
+    store = PostgresBitrixAgentStore(settings.database_url)
+    await store.ensure_schema()
     return store
 
 
-async def _make_pto_store(settings: Settings) -> Any:
-    if not settings.database_url:
-        return None
+async def _make_pto_store(settings: Settings) -> PostgresPtoAgentStore:
     store = PostgresPtoAgentStore(settings.database_url)
     await store.ensure_schema()
     return store
 
 
-async def _make_orchestrator_store(settings: Settings) -> Any:
-    if not settings.database_url:
-        return None
+async def _make_orchestrator_store(settings: Settings) -> PostgresOrchestratorStore:
     store = PostgresOrchestratorStore(settings.database_url)
     await store.ensure_schema()
     return store
@@ -111,17 +87,17 @@ def _parse_hhmm(value: str) -> tuple[int, int]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
+    if not settings.database_url:
+        raise RuntimeError("DATABASE_URL is required — SQLite support has been removed")
+    if not settings.redis_url:
+        raise RuntimeError("REDIS_URL is required — in-memory/SQLite fallbacks have been removed")
+
     ensure_runtime_dirs()
     manifests = load_agent_manifests()
-    bitrix_oauth = BitrixOAuthService()
+    bitrix_oauth = BitrixOAuthService(settings=settings)
     bitrix = BitrixClient(settings=settings, oauth_service=bitrix_oauth)
-    bitrix_oauth.ensure_schema()
     bitrix_store = await _make_bitrix_store(settings)
-    if settings.database_url:
-        portal_search = bitrix_store
-    else:
-        portal_search = PortalSearchIndex()
-        portal_search.ensure_schema()
+    portal_search = bitrix_store
     portal_search_indexer = PortalSearchIndexerWorker(bitrix, portal_search, settings=settings)
     learning_recorder = LearningEventRecorder()
     webhook_event_queue = _make_event_queue(settings)
@@ -149,7 +125,6 @@ async def lifespan(app: FastAPI):
     app.state.webhook_event_queue_status = {
         "enabled": settings.webhook_event_queue_enabled,
         "running": False,
-        "path": str(settings.webhook_event_queue_path),
         "worker_enabled": settings.webhook_event_worker_enabled,
         "worker_count": settings.webhook_event_queue_worker_count,
         "last_enqueued_at": None,
@@ -248,6 +223,8 @@ async def lifespan(app: FastAPI):
     if settings.vehicle_usage_enabled:
         vehicle_usage_store = await _make_vehicle_store(settings)
 
+    app.state.vehicle_usage_store = vehicle_usage_store
+
     logistics_llm_svc = LogisticsLLMService()
 
     if settings.webhook_event_queue_enabled and settings.webhook_event_worker_enabled:
@@ -299,7 +276,7 @@ async def lifespan(app: FastAPI):
         app.state.agent_queue = agent_queue
 
         # Morning vehicle-usage cron
-        if settings.vehicle_usage_enabled and not settings.redis_url:
+        if settings.vehicle_usage_enabled:
             dialog_id = settings.vehicle_usage_dialog_id or ""
 
             _vu_store_ref = vehicle_usage_store
@@ -342,40 +319,39 @@ async def lifespan(app: FastAPI):
             logger.info("Morning vehicle-usage cron scheduled at %02d:%02d МСК", hour, minute)
 
         # Morning proposals cron: publishes trigger to bitrix24 queue at 08:30
-        if bitrix_store is not None:
-            manager_id = settings.task_proposal_manager_bitrix_id
+        manager_id = settings.task_proposal_manager_bitrix_id
 
-            _aq_ref = agent_queue
+        _aq_ref = agent_queue
 
-            async def _run_morning_proposals() -> None:
-                if not manager_id:
-                    return
-                proposal_task = AgentTask(
-                    task_id=f"morning_proposals_{uuid4().hex[:8]}",
-                    request="morning_proposals",
-                    context={
-                        "channel_id": "bitrix24",
-                        "recipient_id": str(manager_id),
-                    },
-                )
-                await _aq_ref.publish(
-                    {
-                        "to": "bitrix24",
-                        "from": "scheduler",
-                        "type": "task",
-                        "payload": proposal_task.model_dump(),
-                        "reply_to": "orchestrator",
-                    }
-                )
-
-            scheduler.add_job_cron(
-                "bitrix24",
-                "morning_proposals",
-                _run_morning_proposals,
-                8,
-                30,
-                replace_existing=False,
+        async def _run_morning_proposals() -> None:
+            if not manager_id:
+                return
+            proposal_task = AgentTask(
+                task_id=f"morning_proposals_{uuid4().hex[:8]}",
+                request="morning_proposals",
+                context={
+                    "channel_id": "bitrix24",
+                    "recipient_id": str(manager_id),
+                },
             )
+            await _aq_ref.publish(
+                {
+                    "to": "bitrix24",
+                    "from": "scheduler",
+                    "type": "task",
+                    "payload": proposal_task.model_dump(),
+                    "reply_to": "orchestrator",
+                }
+            )
+
+        scheduler.add_job_cron(
+            "bitrix24",
+            "morning_proposals",
+            _run_morning_proposals,
+            8,
+            30,
+            replace_existing=False,
+        )
 
         attachment_service = AttachmentService(bitrix)
         transcriber = build_transcriber()

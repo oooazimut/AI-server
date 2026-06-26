@@ -8,8 +8,8 @@ from ai_server.integrations.bitrix.portal_search import (
     delete_portal_file_cache_path,
     portal_file_cache_path,
 )
-from ai_server.integrations.bitrix.ports import BitrixFileDownloadPort
 from ai_server.settings import Settings
+from ai_server.tools.bitrix_ports import BitrixFileDownloadPort
 from ai_server.tools.document_access.download import resolve_portal_file_download_url
 from ai_server.tools.document_access.types import ResolvedDocument
 
