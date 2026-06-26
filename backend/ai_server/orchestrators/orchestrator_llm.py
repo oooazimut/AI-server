@@ -17,6 +17,7 @@ from ai_server.agents.specialist_llm_shared import (
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import ActionRecord, AgentManifest, AgentTask, ModelUsageRecord, ToolResult
 from ai_server.retrieval import RetrievalHit
+from ai_server.rule_loader import format_loaded_rules, load_rules_for_task
 from ai_server.utils import confidence
 
 logger = logging.getLogger(__name__)
@@ -115,10 +116,12 @@ class OrchestratorLLMService:
         tool_results: list[ToolResult] | None = None,
     ) -> OrchestratorDecisionResult:
         instructions = load_instructions(manifest)
+        loaded_rules = load_rules_for_task(manifest, request=task.request, context=task.context)
+        rules_prompt = format_loaded_rules(loaded_rules)
         completion = await self.client.complete(
             agent_id=manifest.id,
             messages=[
-                {"role": "system", "content": _decide_system_prompt(instructions)},
+                {"role": "system", "content": _decide_system_prompt(instructions, rules_prompt)},
                 {
                     "role": "user",
                     "content": json.dumps(
@@ -130,6 +133,18 @@ class OrchestratorLLMService:
                             "current_datetime": datetime.now(UTC).astimezone().isoformat(),
                             "dialog_history": dialog_history or [],
                             "retrieval_context": retrieval_context(retrieval_hits),
+                            "loaded_rules": [
+                                {
+                                    "id": rule.id,
+                                    "title": rule.title,
+                                    "file": rule.file,
+                                    "reason": rule.reason,
+                                    "matched_context_keys": rule.matched_context_keys,
+                                    "matched_keywords": rule.matched_keywords,
+                                    "priority": rule.priority,
+                                }
+                                for rule in loaded_rules
+                            ],
                             "tools": tool_definitions,
                             "tool_results": [compact_tool_result(r) for r in (tool_results or [])],
                         },
@@ -236,8 +251,9 @@ def orchestrator_llm_failure_result(message: str) -> OrchestratorFinalResult:
 # ---------------------------------------------------------------------------
 
 
-def _decide_system_prompt(instructions: str = "") -> str:
+def _decide_system_prompt(instructions: str = "", loaded_rules: str = "") -> str:
     extra = f"\n\n{instructions}" if instructions else ""
+    rules_extra = f"\n\n{loaded_rules}" if loaded_rules else ""
     return (
         "Ты Переговорщик — старший AI-агент корпоративного AI-server. "
         "Ты посредник между людьми и специалистами-субагентами. "
@@ -255,7 +271,7 @@ def _decide_system_prompt(instructions: str = "") -> str:
         '"tool_calls":[{"name":"call_<id>|none","args":{"request":"задача для специалиста"},"summary":""}],'
         '"scheduled_tasks":[],'
         '"confidence":0.0}.'
-        f"{extra}"
+        f"{extra}{rules_extra}"
     )
 
 

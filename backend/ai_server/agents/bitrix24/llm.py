@@ -19,6 +19,7 @@ from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
 from ai_server.retrieval import RetrievalHit
 from ai_server.settings import Settings
+from ai_server.skill_loader import format_loaded_skills, load_skills_for_task
 from ai_server.utils import confidence, optional_int
 
 logger = logging.getLogger(__name__)
@@ -108,10 +109,12 @@ class BitrixLLMService:
         dialog_history: list[dict[str, str]] | None = None,
     ) -> BitrixLLMDecisionResult:
         instructions = load_instructions(manifest)
+        loaded_skills = load_skills_for_task(manifest, request=task.request, context=task.context)
+        skills_prompt = format_loaded_skills(loaded_skills)
         completion = await self.client.complete(
             agent_id=manifest.id,
             messages=[
-                {"role": "system", "content": _decision_system_prompt(instructions)},
+                {"role": "system", "content": _decision_system_prompt(instructions, skills_prompt)},
                 {
                     "role": "user",
                     "content": json.dumps(
@@ -128,6 +131,18 @@ class BitrixLLMService:
                             "dialog_history": dialog_history or [],
                             "permission_context": _permission_context(task, self.settings),
                             "retrieval_context": retrieval_context(retrieval_hits),
+                            "loaded_skills": [
+                                {
+                                    "id": skill.id,
+                                    "title": skill.title,
+                                    "file": skill.file,
+                                    "reason": skill.reason,
+                                    "matched_context_keys": skill.matched_context_keys,
+                                    "matched_keywords": skill.matched_keywords,
+                                    "priority": skill.priority,
+                                }
+                                for skill in loaded_skills
+                            ],
                             "tools": allowed_tool_definitions(tool_definitions, ALLOWED_TOOL_NAMES),
                             "tool_results": [compact_tool_result(result) for result in (tool_results or [])],
                         },
@@ -198,8 +213,9 @@ def llm_failure_result(message: str, agent_id: str = "bitrix24") -> BitrixLLMFin
     )
 
 
-def _decision_system_prompt(instructions: str = "") -> str:
+def _decision_system_prompt(instructions: str = "", loaded_skills: str = "") -> str:
     extra = f"\n\nДополнительные инструкции:\n{instructions}" if instructions else ""
+    skills_extra = f"\n\n{loaded_skills}" if loaded_skills else ""
     return (
         "Ты LLM-субагент Bitrix24 внутри корпоративного AI-server. "
         "Оркестратор уже передал тебе запрос человека. "
@@ -238,7 +254,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Закрытие задачи постановщиком: вызови tasks.task.approve напрямую — STATUS=5, без проверки результата. "
         "Все Bitrix-методы (approve/disapprove/complete/result.add/commentitem.add) вызывай через bitrix_api. "
         "Для поиска документов/файлов используй portal_search. Если данных не хватает, status=needs_clarification."
-        f"{extra}"
+        f"{extra}{skills_extra}"
     )
 
 

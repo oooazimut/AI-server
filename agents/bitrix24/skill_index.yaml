@@ -1,0 +1,128 @@
+schema_version: 1
+agent_id: bitrix24
+purpose: >
+  Индекс скилов Bitrix Agent. Кодовый skill-loader использует этот файл,
+  чтобы подгружать только те skills/*.md, которые нужны для конкретной задачи.
+
+always_load:
+  - file: instructions.md
+    reason: "Короткое ядро Bitrix Agent, обязательное для каждого запроса."
+
+trace:
+  event_name: bitrix_skills_retrieved
+  record_fields:
+    - skill_id
+    - file
+    - reason
+    - matched_context_keys
+    - matched_keywords
+    - priority
+
+skills:
+  - id: catalog
+    title: "Складской учёт и каталог товаров"
+    file: skills/catalog.md
+    priority: 100
+    use_when:
+      request_topics:
+        - "товар"
+        - "товары"
+        - "номенклатур"
+        - "каталог"
+        - "склад"
+        - "остат"
+        - "налич"
+        - "цена"
+        - "артикул"
+        - "запчаст"
+        - "датчик"
+    load_reason: "Запрос относится к товарам, остаткам, складам или каталогу."
+
+  - id: tasks_search
+    title: "Поиск задач и заявок"
+    file: skills/tasks_search.md
+    priority: 95
+    use_when:
+      request_topics:
+        - "задач"
+        - "заявк"
+        - "найди задачу"
+        - "покажи задачу"
+        - "статус задачи"
+        - "просроч"
+    load_reason: "Запрос относится к поиску или проверке задач/заявок."
+
+  - id: tasks_create_edit
+    title: "Создание и изменение задач"
+    file: skills/tasks_create_edit.md
+    priority: 95
+    use_when:
+      request_topics:
+        - "создай задачу"
+        - "поставь задачу"
+        - "измени задачу"
+        - "закрой задачу"
+        - "заверши задачу"
+        - "добавь комментарий"
+    load_reason: "Запрос относится к созданию, изменению или закрытию задачи."
+
+  - id: safe_bitrix_write
+    title: "Безопасные изменения в Bitrix24"
+    file: skills/safe_bitrix_write.md
+    priority: 90
+    use_when:
+      request_topics:
+        - "создай"
+        - "измени"
+        - "удали"
+        - "закрой"
+        - "заверши"
+        - "отправь"
+        - "добавь"
+        - "напиши"
+      context_keys:
+        - "permission_policy_context"
+        - "bitrix_current_user_profile"
+    load_reason: "Запрос может привести к изменению данных или отправке сообщения."
+
+  - id: portal_document_search
+    title: "Поиск документов портала"
+    file: skills/portal_document_search.md
+    priority: 85
+    use_when:
+      request_topics:
+        - "документ"
+        - "файл"
+        - "диск"
+        - "вложение"
+        - "найди файл"
+        - "найди документ"
+    load_reason: "Запрос относится к поиску документов, файлов или вложений портала."
+
+  - id: projects_crm
+    title: "Проекты и CRM"
+    file: skills/projects_crm.md
+    priority: 80
+    use_when:
+      request_topics:
+        - "проект"
+        - "группа"
+        - "crm"
+        - "лид"
+        - "сделк"
+        - "контакт"
+        - "компан"
+    load_reason: "Запрос относится к проектам, рабочим группам или CRM."
+
+  - id: portal_links
+    title: "Ссылки на портал в листингах"
+    file: skills/portal_links.md
+    priority: 70
+    use_when:
+      request_topics:
+        - "ссылк"
+        - "пришли ссылку"
+        - "дай ссылку"
+        - "покажи ссылкой"
+        - "открой"
+    load_reason: "В ответе нужно оформить найденные сущности ссылками на портал."
