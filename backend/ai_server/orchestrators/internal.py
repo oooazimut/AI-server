@@ -15,6 +15,7 @@ from ai_server.orchestrators.orchestrator_llm import (
     OrchestratorDecisionResult,
     OrchestratorLLM,
     OrchestratorLLMService,
+    OrchestratorToolCall,
     apply_scheduled_tasks,
     orchestrator_llm_failure_result,
 )
@@ -187,73 +188,105 @@ class InternalOrchestrator:
         decision: OrchestratorDecision | None = None
         decision_results: list[OrchestratorDecisionResult] = []
 
-        for step in range(1, _MAX_AGENT_STEPS + 1):
-            try:
-                dr = await self.orchestrator_llm.decide(
-                    manifest=self._manifest,
-                    task=task,
-                    dialog_history=dialog_history,
-                    retrieval_hits=retrieval_hits,
-                    tool_definitions=self.tool_definitions(),
-                    tool_results=list(tool_results),
-                )
-            except Exception as exc:
-                return AgentResult(
-                    status="failed",
-                    agent_id="internal_orchestrator",
-                    answer=f"Не смог обработать запрос через LLM-оркестратор: {type(exc).__name__}: {exc}",
-                    actions_taken=[
-                        *all_actions,
-                        ActionRecord(
-                            name="orchestrator_llm_decision",
-                            status="error",
-                            details={"step": step, "error": f"{type(exc).__name__}: {exc}"},
-                        ),
-                    ],
-                    model_usage=all_model_usage,
-                    confidence=0.0,
-                )
-
-            decision_results.append(dr)
-            decision = dr.decision
-            all_model_usage.append(dr.model_usage)
-            all_actions.append(
-                ActionRecord(
-                    name="orchestrator_llm_decision",
-                    status=decision.status,
-                    details={
-                        "step": step,
-                        "tool_calls": [{"name": tc.name, "summary": tc.summary} for tc in decision.tool_calls],
-                        "confidence": decision.confidence,
-                    },
-                )
-            )
-            all_actions.extend(apply_scheduled_tasks(decision.scheduled_tasks, self.scheduler))
-
-            executable = [tc for tc in decision.tool_calls if tc.name != "none"]
-            if not executable:
-                break
-
-            raw = await asyncio.gather(
-                *[self._execute_tool_call(tc, task) for tc in executable],
-                return_exceptions=True,
-            )
-            for tc, item in zip(executable, raw, strict=False):
-                if isinstance(item, Exception):
-                    all_actions.append(
-                        ActionRecord(
-                            name="delegate_to_specialist",
-                            status="error",
-                            details={"error": f"{type(item).__name__}: {item}"},
-                        )
-                    )
+        # Deterministic routing: if a specialist is mid-clarification, skip LLM routing.
+        if self.store is not None and dialog_key and hasattr(self.store, "get_kv"):
+            pending = await self.store.get_kv(dialog_key, "pending_specialist")  # type: ignore[attr-defined]
+            if pending and pending in self.specialists:
+                tc = OrchestratorToolCall(name=f"call_{pending}", args={"request": task.request})
+                tr, action, approvals = await self._execute_tool_call(tc, task)
+                tool_results.append(tr)
+                all_actions.append(action)
+                approval_actions.extend(approvals)
+                if tr.status == ToolStatus.OK:
+                    specialist_ids.append(pending)
+                    specialist_status = (tr.data or {}).get("status", "")
+                    if specialist_status != "needs_clarification":
+                        await self.store.delete_kv(dialog_key, "pending_specialist")  # type: ignore[attr-defined]
                 else:
-                    tr, action, approvals = item
-                    tool_results.append(tr)
-                    all_actions.append(action)
-                    approval_actions.extend(approvals)
-                    if tr.status == ToolStatus.OK and tc.name.startswith("call_"):
-                        specialist_ids.append(tc.name[len("call_") :])
+                    await self.store.delete_kv(dialog_key, "pending_specialist")  # type: ignore[attr-defined]
+                # Use a no-op decision so the compose step has something to work with.
+                decision = OrchestratorDecision(
+                    status="completed",
+                    answer="",
+                    tool_calls=[tc],
+                )
+                # Jump straight to compose — skip LLM routing.
+
+        if decision is None:
+            for step in range(1, _MAX_AGENT_STEPS + 1):
+                try:
+                    dr = await self.orchestrator_llm.decide(
+                        manifest=self._manifest,
+                        task=task,
+                        dialog_history=dialog_history,
+                        retrieval_hits=retrieval_hits,
+                        tool_definitions=self.tool_definitions(),
+                        tool_results=list(tool_results),
+                    )
+                except Exception as exc:
+                    return AgentResult(
+                        status="failed",
+                        agent_id="internal_orchestrator",
+                        answer=f"Не смог обработать запрос через LLM-оркестратор: {type(exc).__name__}: {exc}",
+                        actions_taken=[
+                            *all_actions,
+                            ActionRecord(
+                                name="orchestrator_llm_decision",
+                                status="error",
+                                details={"step": step, "error": f"{type(exc).__name__}: {exc}"},
+                            ),
+                        ],
+                        model_usage=all_model_usage,
+                        confidence=0.0,
+                    )
+
+                decision_results.append(dr)
+                decision = dr.decision
+                all_model_usage.append(dr.model_usage)
+                all_actions.append(
+                    ActionRecord(
+                        name="orchestrator_llm_decision",
+                        status=decision.status,
+                        details={
+                            "step": step,
+                            "tool_calls": [{"name": tc.name, "summary": tc.summary} for tc in decision.tool_calls],
+                            "confidence": decision.confidence,
+                        },
+                    )
+                )
+                all_actions.extend(apply_scheduled_tasks(decision.scheduled_tasks, self.scheduler))
+
+                executable = [tc for tc in decision.tool_calls if tc.name != "none"]
+                if not executable:
+                    break
+
+                raw = await asyncio.gather(
+                    *[self._execute_tool_call(tc, task) for tc in executable],
+                    return_exceptions=True,
+                )
+                for tc, item in zip(executable, raw, strict=False):
+                    if isinstance(item, Exception):
+                        all_actions.append(
+                            ActionRecord(
+                                name="delegate_to_specialist",
+                                status="error",
+                                details={"error": f"{type(item).__name__}: {item}"},
+                            )
+                        )
+                    else:
+                        tr, action, approvals = item
+                        tool_results.append(tr)
+                        all_actions.append(action)
+                        approval_actions.extend(approvals)
+                        if tr.status == ToolStatus.OK and tc.name.startswith("call_"):
+                            sid = tc.name[len("call_") :]
+                            specialist_ids.append(sid)
+                            if dialog_key and self.store is not None and hasattr(self.store, "set_kv"):
+                                specialist_status = (tr.data or {}).get("status", "")
+                                if specialist_status == "needs_clarification":
+                                    await self.store.set_kv(dialog_key, "pending_specialist", sid)  # type: ignore[attr-defined]
+                                else:
+                                    await self.store.delete_kv(dialog_key, "pending_specialist")  # type: ignore[attr-defined]
 
         if decision is None:
             failure = orchestrator_llm_failure_result("пустой цикл решений оркестратора")
