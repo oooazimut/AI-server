@@ -1,0 +1,97 @@
+schema_version: 1
+agent_id: diagnostic_agent
+purpose: >
+  Индекс правил Агента диагностики. Кодовый rule-loader использует этот файл,
+  чтобы подгружать только те главы мини-книги, которые нужны для конкретного разбора.
+
+always_load:
+  - file: instructions.md
+    reason: "Короткое ядро диагностического агента, обязательное для каждого разбора."
+
+trace:
+  event_name: diagnostic_rules_retrieved
+  record_fields:
+    - rule_id
+    - file
+    - reason
+    - matched_context_keys
+    - matched_keywords
+    - priority
+
+rules:
+  - id: feedback_triage
+    title: "Разбор feedback"
+    file: knowledge/feedback_triage.md
+    type: knowledge
+    priority: 100
+    use_when:
+      request_topics:
+        - "feedback"
+        - "оценка"
+        - "не выполнено"
+        - "плохой ответ"
+        - "ошибка"
+      context_keys:
+        - "feedback"
+        - "rating"
+        - "comment"
+        - "corrected_answer"
+    load_reason: "Нужно понять, что именно человек считает ошибкой."
+
+  - id: trace_analysis
+    title: "Анализ trace"
+    file: knowledge/trace_analysis.md
+    type: knowledge
+    priority: 95
+    use_when:
+      request_topics:
+        - "trace"
+        - "трассировка"
+        - "actions_taken"
+        - "tool_calls"
+        - "tool_results"
+      context_keys:
+        - "trace_id"
+        - "actions"
+        - "tool_results"
+        - "model_usage"
+    load_reason: "Нужно восстановить шаги выполнения и найти этап сбоя."
+
+  - id: patch_recommendations
+    title: "Рекомендации исправлений"
+    file: knowledge/patch_recommendations.md
+    type: knowledge
+    priority: 90
+    use_when:
+      request_topics:
+        - "исправить"
+        - "патч"
+        - "правило"
+        - "skill"
+        - "routing"
+        - "tool"
+        - "код"
+        - "тест"
+      context_keys:
+        - "loaded_rules"
+        - "loaded_skills"
+        - "called_agents"
+    load_reason: "Нужно предложить конкретную правку и regression test."
+
+  - id: batch_patterns
+    title: "Группировка однотипных ошибок"
+    file: knowledge/batch_patterns.md
+    type: knowledge
+    priority: 80
+    use_when:
+      request_topics:
+        - "группа ошибок"
+        - "однотипные"
+        - "batch"
+        - "повторяется"
+        - "накопление"
+      context_keys:
+        - "events"
+        - "batch"
+        - "similar_failures"
+    load_reason: "Нужно сгруппировать похожие ошибки и предложить общий патч."

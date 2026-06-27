@@ -111,6 +111,18 @@ class BitrixLLMService:
         instructions = load_instructions(manifest)
         loaded_skills = load_skills_for_task(manifest, request=task.request, context=task.context)
         skills_prompt = format_loaded_skills(loaded_skills)
+        loaded_skills_meta = [
+            {
+                "id": skill.id,
+                "title": skill.title,
+                "file": skill.file,
+                "reason": skill.reason,
+                "matched_context_keys": skill.matched_context_keys,
+                "matched_keywords": skill.matched_keywords,
+                "priority": skill.priority,
+            }
+            for skill in loaded_skills
+        ]
         completion = await self.client.complete(
             agent_id=manifest.id,
             messages=[
@@ -131,18 +143,7 @@ class BitrixLLMService:
                             "dialog_history": dialog_history or [],
                             "permission_context": _permission_context(task, self.settings),
                             "retrieval_context": retrieval_context(retrieval_hits),
-                            "loaded_skills": [
-                                {
-                                    "id": skill.id,
-                                    "title": skill.title,
-                                    "file": skill.file,
-                                    "reason": skill.reason,
-                                    "matched_context_keys": skill.matched_context_keys,
-                                    "matched_keywords": skill.matched_keywords,
-                                    "priority": skill.priority,
-                                }
-                                for skill in loaded_skills
-                            ],
+                            "loaded_skills": loaded_skills_meta,
                             "tools": allowed_tool_definitions(tool_definitions, ALLOWED_TOOL_NAMES),
                             "tool_results": [compact_tool_result(result) for result in (tool_results or [])],
                         },
@@ -155,7 +156,7 @@ class BitrixLLMService:
         return BitrixLLMDecisionResult(
             decision=_parse_decision(completion.json_content()),
             model_usage=completion.model_usage,
-            raw=completion.raw,
+            raw={**completion.raw, "loaded_skills": loaded_skills_meta},
         )
 
     async def compose(

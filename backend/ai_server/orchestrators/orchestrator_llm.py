@@ -118,6 +118,18 @@ class OrchestratorLLMService:
         instructions = load_instructions(manifest)
         loaded_rules = load_rules_for_task(manifest, request=task.request, context=task.context)
         rules_prompt = format_loaded_rules(loaded_rules)
+        loaded_rules_meta = [
+            {
+                "id": rule.id,
+                "title": rule.title,
+                "file": rule.file,
+                "reason": rule.reason,
+                "matched_context_keys": rule.matched_context_keys,
+                "matched_keywords": rule.matched_keywords,
+                "priority": rule.priority,
+            }
+            for rule in loaded_rules
+        ]
         completion = await self.client.complete(
             agent_id=manifest.id,
             messages=[
@@ -133,18 +145,7 @@ class OrchestratorLLMService:
                             "current_datetime": datetime.now(UTC).astimezone().isoformat(),
                             "dialog_history": dialog_history or [],
                             "retrieval_context": retrieval_context(retrieval_hits),
-                            "loaded_rules": [
-                                {
-                                    "id": rule.id,
-                                    "title": rule.title,
-                                    "file": rule.file,
-                                    "reason": rule.reason,
-                                    "matched_context_keys": rule.matched_context_keys,
-                                    "matched_keywords": rule.matched_keywords,
-                                    "priority": rule.priority,
-                                }
-                                for rule in loaded_rules
-                            ],
+                            "loaded_rules": loaded_rules_meta,
                             "tools": tool_definitions,
                             "tool_results": [compact_tool_result(r) for r in (tool_results or [])],
                         },
@@ -157,7 +158,7 @@ class OrchestratorLLMService:
         return OrchestratorDecisionResult(
             decision=_parse_decision(completion.json_content(), tool_definitions),
             model_usage=completion.model_usage,
-            raw=completion.raw,
+            raw={**completion.raw, "loaded_rules": loaded_rules_meta},
         )
 
     async def compose(

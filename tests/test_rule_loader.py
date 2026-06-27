@@ -87,7 +87,7 @@ rules:
         '{"status":"completed","answer":"ok","confidence":0.7,"tool_calls":[{"name":"none","args":{},"summary":""}]}'
     )
 
-    asyncio.run(
+    result = asyncio.run(
         OrchestratorLLMService(client).decide(
             manifest=_manifest(str(instructions)),
             task=AgentTask(task_id="t1", request="найди датчик коленвала"),
@@ -104,3 +104,4 @@ rules:
     assert "routing chapter for current task" in system_prompt
     assert payload["loaded_rules"][0]["id"] == "routing"
     assert payload["loaded_rules"][0]["file"] == "knowledge/routing.md"
+    assert result.raw["loaded_rules"][0]["id"] == "routing"

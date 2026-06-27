@@ -30,7 +30,7 @@ def test_bitrix_llm_payload_includes_loaded_skills(monkeypatch):
     )
     manifest = get_agent_manifest("bitrix24")
 
-    asyncio.run(
+    result = asyncio.run(
         BitrixLLMService(client, settings=get_settings()).decide(
             manifest=manifest,
             task=AgentTask(task_id="t1", request="найди датчик коленвала"),
@@ -46,3 +46,4 @@ def test_bitrix_llm_payload_includes_loaded_skills(monkeypatch):
     assert "Складской учёт и каталог товаров" in system_prompt
     assert payload["loaded_skills"][0]["id"] == "catalog"
     assert payload["loaded_skills"][0]["file"] == "skills/catalog.md"
+    assert result.raw["loaded_skills"][0]["id"] == "catalog"

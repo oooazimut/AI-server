@@ -240,6 +240,8 @@ class BaseSpecialist:
                             for call in decision.tool_calls
                         ],
                         "confidence": decision.confidence,
+                        "loaded_rules": decision_result.raw.get("loaded_rules", []),
+                        "loaded_skills": decision_result.raw.get("loaded_skills", []),
                     },
                 )
             )

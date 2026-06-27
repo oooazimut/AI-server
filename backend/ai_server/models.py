@@ -216,6 +216,12 @@ class LearningFeedbackRequest(BaseModel):
     channel: str = "manual"
 
 
+class LearningDiagnosticRequest(BaseModel):
+    event_id: str
+    feedback_event_id: str | None = None
+    comment: str = ""
+
+
 class ToolDefinition(BaseModel):
     name: str
     description: str

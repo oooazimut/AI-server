@@ -42,7 +42,7 @@ class InternalOrchestrator:
         learning_recorder: LearningEventRecorder | None = None,
     ) -> None:
         self.manifests = manifests
-        self.specialists = specialists or build_specialist_registry(manifests)
+        self.specialists = specialists or build_specialist_registry(manifests, audience="employee")
         self.orchestrator_llm = orchestrator_llm or OrchestratorLLMService()
         self.scheduler = scheduler
         self.store = store
@@ -225,6 +225,7 @@ class InternalOrchestrator:
                         "step": step,
                         "tool_calls": [{"name": tc.name, "summary": tc.summary} for tc in decision.tool_calls],
                         "confidence": decision.confidence,
+                        "loaded_rules": dr.raw.get("loaded_rules", []),
                     },
                 )
             )
