@@ -256,6 +256,7 @@ async def lifespan(app: FastAPI):
             orchestrator_llm=OrchestratorLLMService(),
             orchestrator_store=orchestrator_store,
             bitrix_llm=bitrix_llm_svc,
+            bitrix_store=bitrix_store,
             pto_llm=PtoLLMService(),
             pto_store=pto_store,
             logistics_llm=logistics_llm_svc,

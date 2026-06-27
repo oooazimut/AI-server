@@ -546,6 +546,38 @@ class FakePortalSearchIndex:
             self._items[key]["metadata"] = metadata
 
 
+class FakeOrchestratorStore:
+    """In-memory orchestrator store with KV support for pending_specialist tests."""
+
+    def __init__(self) -> None:
+        self._kv: dict[tuple[str, str], str] = {}
+        self._turns: dict[str, list[dict[str, str]]] = {}
+
+    def set_pending(self, dialog_key: str, specialist_id: str) -> None:
+        self._kv[(dialog_key, "pending_specialist")] = specialist_id
+
+    async def ensure_schema(self) -> None:
+        pass
+
+    async def load_turns(self, dialog_key: str, *, limit: int = 20) -> list[dict[str, str]]:
+        return self._turns.get(dialog_key, [])[-limit:]
+
+    async def append_turn(self, dialog_key: str, user_text: str, agent_response: str) -> None:
+        self._turns.setdefault(dialog_key, []).extend([
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": agent_response},
+        ])
+
+    async def get_kv(self, dialog_key: str, field: str) -> str | None:
+        return self._kv.get((dialog_key, field))
+
+    async def set_kv(self, dialog_key: str, field: str, value: str) -> None:
+        self._kv[(dialog_key, field)] = value
+
+    async def delete_kv(self, dialog_key: str, field: str) -> None:
+        self._kv.pop((dialog_key, field), None)
+
+
 def _fake_usage(*, agent_id: str = "bitrix24") -> ModelUsageRecord:
     return ModelUsageRecord(
         agent_id=agent_id,

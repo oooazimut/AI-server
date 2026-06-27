@@ -457,3 +457,40 @@ class FakeResolverTools:
                 return raw_user
 
         return _FakeUserClient()
+
+
+def test_specialist_preserves_needs_clarification_when_compose_returns_completed():
+    """Если decide вернул needs_clarification, а compose вернул completed — status должен остаться needs_clarification.
+
+    Воспроизводит баг: deepseek-chat в compose-шаге часто возвращает "completed"
+    даже когда специалист задаёт уточняющий вопрос. base.py должен доверять decide-статусу.
+    """
+    llm = FakeBitrixLLM(
+        decision_status="needs_clarification",
+        decision_answer="Укажите срок выполнения задачи.",
+        final_status="completed",  # LLM-баг: compose говорит completed вместо needs_clarification
+        final_answer="Укажите срок выполнения задачи.",
+    )
+    result = asyncio.run(
+        _bitrix_specialist(llm=llm).handle(
+            AgentTask(task_id="t1", request="создай задачу в тестовом проекте")
+        )
+    )
+
+    assert result.status == "needs_clarification"
+
+
+def test_specialist_uses_compose_failed_even_if_decide_was_needs_clarification():
+    """Если compose вернул failed — это перебивает decide-статус needs_clarification."""
+    llm = FakeBitrixLLM(
+        decision_status="needs_clarification",
+        final_status="failed",
+        final_answer="Ошибка при обработке.",
+    )
+    result = asyncio.run(
+        _bitrix_specialist(llm=llm).handle(
+            AgentTask(task_id="t1", request="создай задачу")
+        )
+    )
+
+    assert result.status == "failed"

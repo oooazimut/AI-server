@@ -314,7 +314,18 @@ class BaseSpecialist:
                 details={},
             )
         )
-        status = "needs_human" if approval_actions else final_result.status
+        # Decide status is authoritative for needs_clarification/needs_human:
+        # compose only formats the answer text, not the conversational state.
+        # If decide said needs_clarification but compose returned completed, trust decide.
+        if (
+            decision is not None
+            and decision.status in ("needs_clarification", "needs_human")
+            and final_result.status == "completed"
+        ):
+            effective_status = decision.status
+        else:
+            effective_status = final_result.status
+        status = "needs_human" if approval_actions else effective_status
 
         if self.store is not None and dialog_key and final_result.answer:
             await self.store.append_turn(dialog_key, task.request, final_result.answer)
