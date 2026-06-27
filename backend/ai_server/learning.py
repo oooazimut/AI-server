@@ -162,6 +162,8 @@ class EventStream:
         *,
         event_id: str,
         rating: int | None = None,
+        rating_scale: int | None = None,
+        outcome: str = "",
         corrected_answer: str = "",
         comment: str = "",
         tags: list[str] | None = None,
@@ -171,7 +173,7 @@ class EventStream:
         target_event = self.get_event(event_id)
         target_metadata = target_event.get("metadata") if isinstance(target_event, dict) else {}
         trace_id = target_metadata.get("trace_id") if isinstance(target_metadata, dict) else ""
-        return self.record_event(
+        feedback_result = self.record_event(
             event_type="human_feedback",
             source="manual_feedback",
             agent_id="human_reviewer",
@@ -185,7 +187,78 @@ class EventStream:
                 "target_event_id": event_id,
                 "trace_id": trace_id or "",
                 "rating": rating,
+                "rating_scale": rating_scale,
+                "outcome": outcome,
                 "tags": tags or [],
+            },
+        )
+        if feedback_result.get("recorded") is True and _feedback_should_create_incident(
+            rating=rating,
+            rating_scale=rating_scale,
+            outcome=outcome,
+            tags=tags or [],
+        ):
+            incident_result = self.record_incident(
+                target_event_id=event_id,
+                feedback_event_id=str(feedback_result.get("event_id") or ""),
+                rating=rating,
+                rating_scale=rating_scale,
+                outcome=outcome,
+                comment=comment,
+                tags=tags or [],
+                user_id=user_id,
+                channel=channel,
+            )
+            feedback_result = {**feedback_result, "incident": incident_result}
+        return feedback_result
+
+    def record_incident(
+        self,
+        *,
+        target_event_id: str,
+        feedback_event_id: str,
+        rating: int | None = None,
+        rating_scale: int | None = None,
+        outcome: str = "",
+        comment: str = "",
+        tags: list[str] | None = None,
+        user_id: str | int | None = None,
+        channel: str = "manual",
+    ) -> dict[str, Any]:
+        target_event = self.get_event(target_event_id)
+        feedback_event = self.get_event(feedback_event_id)
+        if not isinstance(target_event, dict):
+            return {"recorded": False, "reason": "target_event_not_found"}
+        target_metadata = target_event.get("metadata") if isinstance(target_event.get("metadata"), dict) else {}
+        trace_id = str(target_metadata.get("trace_id") or "")
+        reason = _incident_reason(rating=rating, rating_scale=rating_scale, outcome=outcome, tags=tags or [])
+        return self.record_event(
+            event_type="incident",
+            source="feedback_incident",
+            agent_id="incident_recorder",
+            task_id=str(target_event.get("task_id") or target_event_id),
+            user_id=user_id,
+            channel=channel,
+            request=str(target_event.get("request") or ""),
+            response=str(target_event.get("response") or ""),
+            status="open",
+            handoff_to=_strings(target_event.get("handoff_to")),
+            actions=target_event.get("actions") if isinstance(target_event.get("actions"), list) else [],
+            model_usage=target_event.get("model_usage") if isinstance(target_event.get("model_usage"), list) else [],
+            metadata={
+                "target_event_id": target_event_id,
+                "feedback_event_id": feedback_event_id,
+                "trace_id": trace_id,
+                "reason": reason,
+                "rating": rating,
+                "rating_scale": rating_scale,
+                "outcome": outcome,
+                "comment": comment,
+                "tags": tags or [],
+                "target_status": target_event.get("status") or "",
+                "target_agent_id": target_event.get("agent_id") or "",
+                "diagnostic_trace": target_metadata.get("diagnostic_trace") or {},
+                "feedback_event": feedback_event if isinstance(feedback_event, dict) else {},
             },
         )
 
@@ -240,6 +313,22 @@ class EventStream:
                     and (event.get("metadata") or {}).get("target_event_id") == event_id
                 ):
                     matches.append(event)
+        return list(matches)
+
+    def incidents(self, *, limit: int = 50, status: str = "") -> list[dict[str, Any]]:
+        events = self._latest_by_type("incident", limit=max(limit * 3, limit))
+        if status:
+            events = [event for event in events if str(event.get("status") or "") == status]
+        return events[-limit:]
+
+    def incidents_for(self, event_id: str, *, limit: int = 10) -> list[dict[str, Any]]:
+        if not event_id or limit <= 0:
+            return []
+        matches: deque[dict[str, Any]] = deque(maxlen=limit)
+        for event in self._latest_by_type("incident", limit=max(limit * 10, limit)):
+            metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+            if metadata.get("target_event_id") == event_id:
+                matches.append(event)
         return list(matches)
 
     def diagnostic_groups(self, *, limit: int = 100, detailed: bool = False) -> dict[str, Any]:
@@ -326,6 +415,7 @@ class EventStream:
             "total_events": total,
             "invalid_lines": invalid,
             "by_event_type": dict(by_event_type),
+            "open_incidents": by_event_type.get("incident", 0),
             "by_source": dict(by_source),
             "by_status": dict(by_status),
             "last_event_at": last_event_at,
@@ -435,6 +525,61 @@ def _diagnostic_group_keys(event: dict[str, Any]) -> list[str]:
     for agent_id in _strings(trace.get("called_agents")):
         keys.append(f"diagnostic_agent:{agent_id}")
     return sorted(set(keys)) or ["ungrouped"]
+
+
+def _feedback_should_create_incident(
+    *,
+    rating: int | None,
+    rating_scale: int | None,
+    outcome: str,
+    tags: list[str],
+) -> bool:
+    normalized_outcome = _normalize_marker(outcome)
+    normalized_tags = {_normalize_marker(tag) for tag in tags}
+    bad_markers = {
+        "not_done",
+        "not_completed",
+        "failed",
+        "incorrect",
+        "bad_result",
+        "ne_vypolneno",
+        "не_выполнено",
+        "не выполнено",
+        "ошибка",
+    }
+    if normalized_outcome in bad_markers or normalized_tags.intersection(bad_markers):
+        return True
+    if rating is None:
+        return False
+    if rating_scale and rating_scale >= 5:
+        return rating <= max(1, rating_scale // 2)
+    if rating <= 0:
+        return True
+    # Backward compatibility: old scale used 1 as good. Values 2..6 are treated as low 10-point scores.
+    return 2 <= rating <= 6
+
+
+def _incident_reason(
+    *,
+    rating: int | None,
+    rating_scale: int | None,
+    outcome: str,
+    tags: list[str],
+) -> str:
+    if outcome:
+        return f"feedback_outcome:{outcome}"
+    normalized_tags = {_normalize_marker(tag) for tag in tags}
+    for marker in ("not_done", "not_completed", "failed", "incorrect", "bad_result", "не_выполнено", "ошибка"):
+        if marker in normalized_tags:
+            return f"feedback_tag:{marker}"
+    if rating is not None:
+        suffix = f"/{rating_scale}" if rating_scale else ""
+        return f"low_rating:{rating}{suffix}"
+    return "feedback_requires_review"
+
+
+def _normalize_marker(value: str) -> str:
+    return str(value or "").strip().casefold().replace("-", "_")
 
 
 def _diagnostic_group_diagnosis(key: str) -> dict[str, str]:

@@ -66,7 +66,7 @@ feature/secure-org-data-agent
 Текущая активная ветка:
 
 ```text
-feature/trace-recorder
+feature/learning-incidents
 ```
 
 По TraceRecorder уже заложен минимальный слой:
@@ -78,6 +78,15 @@ feature/trace-recorder
 - связь `learning_events` с `trace_id`;
 - endpoint чтения trace: `GET /learning/traces`;
 - `/learning/diagnose` получает полные `trace_events` для Diagnostic Agent.
+
+По Feedback -> incidents заложен первый слой:
+
+- низкая оценка, статус "не выполнено" или проблемный тег создают `incident`;
+- incident хранится в `learning_events.jsonl` как отдельное событие `event_type=incident`;
+- incident связан с `target_event_id`, `feedback_event_id` и `trace_id`;
+- incident сохраняет исходный ответ, actions и model_usage;
+- incidents можно смотреть через `GET /learning/incidents`;
+- Diagnostic Agent получает связанные `incident_events` при разборе.
 
 Оставить на конец текущих этапов:
 

@@ -208,7 +208,9 @@ class AgentTestRequest(BaseModel):
 
 class LearningFeedbackRequest(BaseModel):
     event_id: str
-    rating: int | None = Field(default=None, ge=-1, le=1)
+    rating: int | None = Field(default=None, ge=-1, le=10)
+    rating_scale: int | None = Field(default=None, ge=1, le=10)
+    outcome: str = ""
     corrected_answer: str = ""
     comment: str = ""
     tags: list[str] = Field(default_factory=list)

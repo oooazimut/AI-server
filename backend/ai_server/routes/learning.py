@@ -42,6 +42,21 @@ def learning_diagnostic_groups(
     return recorder.diagnostic_groups(limit=limit, detailed=detailed)
 
 
+@router.get("/learning/incidents")
+def learning_incidents(
+    request: Request,
+    x_agent_secret: Annotated[str | None, Header(alias="X-Agent-Secret")] = None,
+    event_id: str = Query(default=""),
+    status: str = Query(default=""),
+    limit: int = Query(default=50, ge=1, le=500),
+) -> dict[str, Any]:
+    validate_webhook_secret(request.app.state.settings, request_secret(request, x_agent_secret))
+    recorder: LearningEventRecorder = request.app.state.learning_recorder
+    if event_id:
+        return {"event_id": event_id, "incidents": recorder.incidents_for(event_id, limit=limit)}
+    return {"incidents": recorder.incidents(limit=limit, status=status), "status": recorder.stats()}
+
+
 @router.get("/learning/traces")
 def learning_traces(
     request: Request,
@@ -67,6 +82,8 @@ def learning_feedback(
     return recorder.record_feedback(
         event_id=body.event_id,
         rating=body.rating,
+        rating_scale=body.rating_scale,
+        outcome=body.outcome,
         corrected_answer=body.corrected_answer,
         comment=body.comment,
         tags=body.tags,
@@ -90,6 +107,7 @@ async def learning_diagnose(
     feedback_events = recorder.feedback_for(body.event_id, limit=10)
     if body.feedback_event_id:
         feedback_events = [event for event in feedback_events if event.get("id") == body.feedback_event_id]
+    incident_events = recorder.incidents_for(body.event_id, limit=10)
 
     manifest = manifest_by_id(request.app.state.manifests, "diagnostic_agent")
     if manifest is None:
@@ -115,6 +133,7 @@ async def learning_diagnose(
             "trace_id": trace_id,
             "trace_events": trace_events,
             "feedback_events": feedback_events,
+            "incident_events": incident_events,
             "feedback": feedback_events[-1] if feedback_events else {},
             "rating": (feedback_events[-1].get("metadata") or {}).get("rating") if feedback_events else None,
             "comment": body.comment,
@@ -129,6 +148,7 @@ async def learning_diagnose(
             "target_event_id": body.event_id,
             "feedback_event_ids": [event.get("id") for event in feedback_events],
             "feedback_event_id": body.feedback_event_id or "",
+            "incident_event_ids": [event.get("id") for event in incident_events],
         },
     )
     return {
@@ -136,6 +156,7 @@ async def learning_diagnose(
         "answer": result.answer,
         "event_id": body.event_id,
         "feedback_events": [event.get("id") for event in feedback_events],
+        "incident_events": [event.get("id") for event in incident_events],
         "diagnostic_event": diagnostic_record,
         "diagnostic_agent": result.model_dump(),
     }

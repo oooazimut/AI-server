@@ -69,6 +69,75 @@ def test_learning_recorder_records_agent_result_and_feedback(tmp_path):
     assert latest[1]["metadata"]["target_event_id"] == write_result["event_id"]
 
 
+def test_learning_feedback_low_rating_creates_incident(tmp_path):
+    recorder = LearningEventRecorder(path=tmp_path / "learning_events.jsonl", enabled=True)
+    target = recorder.record_event(
+        event_type="agent_result",
+        source="local_test",
+        agent_id="internal_orchestrator",
+        task_id="task-incident",
+        request="найди товар",
+        response="товара нет",
+        status="completed",
+        handoff_to=["bitrix24"],
+        actions=[
+            {
+                "name": "delegate_to_specialist",
+                "status": "completed",
+                "details": {"specialist": "bitrix24"},
+            }
+        ],
+        model_usage=[{"agent_id": "bitrix24", "provider": "fake", "model": "fake"}],
+        metadata={"trace_id": "trace-1"},
+    )
+
+    feedback = recorder.record_feedback(
+        event_id=target["event_id"],
+        rating=3,
+        rating_scale=10,
+        outcome="not_completed",
+        comment="товар есть, но агент сказал что нет",
+        tags=["catalog"],
+    )
+
+    incidents = recorder.incidents_for(target["event_id"])
+    latest = recorder.latest(limit=5)
+
+    assert feedback["recorded"] is True
+    assert feedback["incident"]["recorded"] is True
+    assert len(incidents) == 1
+    assert incidents[0]["event_type"] == "incident"
+    assert incidents[0]["status"] == "open"
+    assert incidents[0]["metadata"]["target_event_id"] == target["event_id"]
+    assert incidents[0]["metadata"]["feedback_event_id"] == feedback["event_id"]
+    assert incidents[0]["metadata"]["trace_id"] == "trace-1"
+    assert incidents[0]["metadata"]["reason"] == "feedback_outcome:not_completed"
+    assert incidents[0]["actions"][0]["name"] == "delegate_to_specialist"
+    assert latest[-1]["event_type"] == "incident"
+
+
+def test_learning_feedback_positive_rating_does_not_create_incident(tmp_path):
+    recorder = LearningEventRecorder(path=tmp_path / "learning_events.jsonl", enabled=True)
+    target = recorder.record_event(
+        event_type="agent_result",
+        source="local_test",
+        agent_id="internal_orchestrator",
+        request="создай задачу",
+        response="готово",
+        status="completed",
+    )
+
+    feedback = recorder.record_feedback(
+        event_id=target["event_id"],
+        rating=1,
+        comment="все хорошо",
+    )
+
+    assert feedback["recorded"] is True
+    assert "incident" not in feedback
+    assert recorder.incidents_for(target["event_id"]) == []
+
+
 def test_learning_recorder_can_disable_text_capture(tmp_path):
     recorder = LearningEventRecorder(
         path=tmp_path / "learning_events.jsonl",
@@ -313,6 +382,46 @@ def test_learning_diagnostic_groups_endpoint(monkeypatch, tmp_path):
     assert detailed_response.json()["mode"] == "detailed"
     assert "skill `catalog`" in catalog_diagnosis["problem"]
     assert "fix_proposal" in catalog_diagnosis
+
+
+def test_learning_incidents_endpoint(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
+    monkeypatch.setenv("WEBHOOK_SECRET", "")
+    monkeypatch.setenv("LEARNING_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("LEARNING_EVENTS_CAPTURE_TEXT", "true")
+
+    with TestClient(app) as client:
+        recorder = client.app.state.learning_recorder
+        target = recorder.record_event(
+            event_type="agent_result",
+            source="local_test",
+            agent_id="internal_orchestrator",
+            request="найди датчик",
+            response="не найдено",
+            status="completed",
+            metadata={"trace_id": "trace-endpoint"},
+        )
+        feedback = client.post(
+            "/learning/feedback",
+            json={
+                "event_id": target["event_id"],
+                "rating": 3,
+                "rating_scale": 10,
+                "outcome": "not_completed",
+                "comment": "датчик есть",
+                "tags": ["catalog"],
+            },
+        )
+        incidents = client.get("/learning/incidents")
+        target_incidents = client.get(f"/learning/incidents?event_id={target['event_id']}")
+
+    assert feedback.status_code == 200
+    assert feedback.json()["incident"]["recorded"] is True
+    assert incidents.status_code == 200
+    assert incidents.json()["incidents"][0]["event_type"] == "incident"
+    assert target_incidents.status_code == 200
+    assert target_incidents.json()["incidents"][0]["metadata"]["target_event_id"] == target["event_id"]
 
 
 def test_learning_events_endpoint_requires_secret_when_configured(monkeypatch, tmp_path):
