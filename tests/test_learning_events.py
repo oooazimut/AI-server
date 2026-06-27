@@ -424,6 +424,98 @@ def test_learning_incidents_endpoint(monkeypatch, tmp_path):
     assert target_incidents.json()["incidents"][0]["metadata"]["target_event_id"] == target["event_id"]
 
 
+def test_learning_incident_groups(tmp_path):
+    recorder = LearningEventRecorder(path=tmp_path / "learning_events.jsonl", enabled=True)
+    for index in range(2):
+        target = recorder.record_event(
+            event_type="agent_result",
+            source="local_test",
+            agent_id="internal_orchestrator",
+            request=f"найди датчик {index}",
+            response="не найдено",
+            status="completed",
+            handoff_to=["bitrix24"],
+            metadata={
+                "trace_id": f"trace-{index}",
+                "diagnostic_trace": {
+                    "called_agents": ["bitrix24"],
+                    "loaded_rules": [],
+                    "loaded_skills": [{"id": "catalog", "file": "skills/catalog.md"}],
+                    "tool_calls": [{"name": "bitrix_api"}],
+                    "errors": [],
+                },
+            },
+        )
+        recorder.record_feedback(
+            event_id=target["event_id"],
+            rating=3,
+            rating_scale=10,
+            outcome="not_completed",
+            comment="товар есть",
+            tags=["catalog"],
+        )
+
+    brief = recorder.incident_groups()
+    detailed = recorder.incident_groups(detailed=True)
+
+    brief_groups = {group["key"]: group for group in brief["groups"]}
+    detailed_groups = {group["key"]: group for group in detailed["groups"]}
+
+    assert brief["mode"] == "brief"
+    assert brief["total_incidents"] == 2
+    assert brief_groups["loaded_skill:catalog"]["count"] == 2
+    assert brief_groups["tool_call:bitrix_api"]["count"] == 2
+    assert brief_groups["target_agent:bitrix24"]["count"] == 2
+    assert brief_groups["incident_reason:feedback_outcome:not_completed"]["count"] == 2
+    assert "diagnosis" not in brief_groups["loaded_skill:catalog"]
+
+    assert detailed["mode"] == "detailed"
+    assert "fix_proposal" in detailed_groups["loaded_skill:catalog"]["diagnosis"]
+    assert "Повторяется причина" in detailed_groups["incident_reason:feedback_outcome:not_completed"]["diagnosis"][
+        "problem"
+    ]
+
+
+def test_learning_incident_groups_endpoint(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
+    monkeypatch.setenv("WEBHOOK_SECRET", "")
+    monkeypatch.setenv("LEARNING_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("LEARNING_EVENTS_CAPTURE_TEXT", "true")
+
+    with TestClient(app) as client:
+        recorder = client.app.state.learning_recorder
+        target = recorder.record_event(
+            event_type="agent_result",
+            source="local_test",
+            agent_id="internal_orchestrator",
+            request="найди датчик",
+            response="не найдено",
+            status="completed",
+            metadata={
+                "diagnostic_trace": {
+                    "called_agents": ["bitrix24"],
+                    "loaded_skills": [{"id": "catalog"}],
+                    "tool_calls": [{"name": "bitrix_api"}],
+                }
+            },
+        )
+        recorder.record_feedback(
+            event_id=target["event_id"],
+            rating=-1,
+            comment="датчик есть",
+            tags=["catalog"],
+        )
+        response = client.get("/learning/incidents/groups?detailed=true")
+
+    assert response.status_code == 200
+    payload = response.json()
+    groups = {group["key"]: group for group in payload["groups"]}
+    assert payload["mode"] == "detailed"
+    assert groups["loaded_skill:catalog"]["count"] == 1
+    assert "fix_proposal" in groups["loaded_skill:catalog"]["diagnosis"]
+
+
 def test_learning_events_endpoint_requires_secret_when_configured(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))

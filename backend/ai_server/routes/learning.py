@@ -57,6 +57,18 @@ def learning_incidents(
     return {"incidents": recorder.incidents(limit=limit, status=status), "status": recorder.stats()}
 
 
+@router.get("/learning/incidents/groups")
+def learning_incident_groups(
+    request: Request,
+    x_agent_secret: Annotated[str | None, Header(alias="X-Agent-Secret")] = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    detailed: bool = Query(default=False),
+) -> dict[str, Any]:
+    validate_webhook_secret(request.app.state.settings, request_secret(request, x_agent_secret))
+    recorder: LearningEventRecorder = request.app.state.learning_recorder
+    return recorder.incident_groups(limit=limit, detailed=detailed)
+
+
 @router.get("/learning/traces")
 def learning_traces(
     request: Request,

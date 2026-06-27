@@ -331,6 +331,36 @@ class EventStream:
                 matches.append(event)
         return list(matches)
 
+    def incident_groups(self, *, limit: int = 100, detailed: bool = False) -> dict[str, Any]:
+        events = self._latest_by_type("incident", limit=limit)
+        groups: dict[str, dict[str, Any]] = {}
+        for event in events:
+            for key in _incident_group_keys(event):
+                group = groups.setdefault(key, {"key": key, "count": 0, "incident_ids": [], "examples": []})
+                group["count"] += 1
+                group["incident_ids"].append(event.get("id"))
+                if len(group["examples"]) < 3:
+                    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+                    group["examples"].append(
+                        {
+                            "id": event.get("id"),
+                            "target_event_id": metadata.get("target_event_id"),
+                            "reason": metadata.get("reason"),
+                            "request": event.get("request"),
+                            "response": event.get("response"),
+                        }
+                    )
+
+        ordered = sorted(groups.values(), key=lambda item: (-int(item["count"]), str(item["key"])))
+        if detailed:
+            for group in ordered:
+                group["diagnosis"] = _incident_group_diagnosis(str(group["key"]))
+        return {
+            "total_incidents": len(events),
+            "mode": "detailed" if detailed else "brief",
+            "groups": ordered,
+        }
+
     def diagnostic_groups(self, *, limit: int = 100, detailed: bool = False) -> dict[str, Any]:
         events = self._latest_by_type("diagnostic_report", limit=limit)
         groups: dict[str, dict[str, Any]] = {}
@@ -527,6 +557,43 @@ def _diagnostic_group_keys(event: dict[str, Any]) -> list[str]:
     return sorted(set(keys)) or ["ungrouped"]
 
 
+def _incident_group_keys(event: dict[str, Any]) -> list[str]:
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    diagnostic_trace = metadata.get("diagnostic_trace") if isinstance(metadata.get("diagnostic_trace"), dict) else {}
+    keys: list[str] = []
+
+    reason = str(metadata.get("reason") or "")
+    if reason:
+        keys.append(f"incident_reason:{reason}")
+
+    target_agent_id = str(metadata.get("target_agent_id") or "")
+    if target_agent_id:
+        keys.append(f"target_agent:{target_agent_id}")
+
+    target_status = str(metadata.get("target_status") or "")
+    if target_status:
+        keys.append(f"target_status:{target_status}")
+
+    for agent_id in _strings(diagnostic_trace.get("called_agents")):
+        keys.append(f"target_agent:{agent_id}")
+    for rule in _list_of_dicts(diagnostic_trace.get("loaded_rules")):
+        if rule.get("id"):
+            keys.append(f"loaded_rule:{rule['id']}")
+    for skill in _list_of_dicts(diagnostic_trace.get("loaded_skills")):
+        if skill.get("id"):
+            keys.append(f"loaded_skill:{skill['id']}")
+    for tool_call in _list_of_dicts(diagnostic_trace.get("tool_calls")):
+        if tool_call.get("name"):
+            keys.append(f"tool_call:{tool_call['name']}")
+    for error in _list_of_dicts(diagnostic_trace.get("errors")):
+        if error.get("action"):
+            keys.append(f"error_action:{error['action']}")
+    for tag in _strings(metadata.get("tags")):
+        keys.append(f"tag:{tag}")
+
+    return sorted(set(keys)) or ["ungrouped"]
+
+
 def _feedback_should_create_incident(
     *,
     rating: int | None,
@@ -625,6 +692,23 @@ def _diagnostic_group_diagnosis(key: str) -> dict[str, str]:
         "likely_reason": "Недостаточно структурированных признаков в diagnostic_trace или feedback.",
         "fix_proposal": "Улучшить трассировку и добавить более точные tags/loaded_rules/loaded_skills/tool_calls.",
     }
+
+
+def _incident_group_diagnosis(key: str) -> dict[str, str]:
+    prefix, _, value = key.partition(":")
+    if prefix == "incident_reason":
+        return {
+            "problem": f"Повторяется причина incident `{value}`.",
+            "likely_reason": "Пользователи одинаково помечают сбой или система одинаково классифицирует плохой feedback.",
+            "fix_proposal": "Посмотреть примеры группы, найти общий сценарий и добавить общий patch plan с regression tests.",
+        }
+    if prefix == "target_status":
+        return {
+            "problem": f"Incidents часто связаны со статусом ответа `{value}`.",
+            "likely_reason": "Финальный статус может не отражать реальную успешность задачи для человека.",
+            "fix_proposal": "Проверить правила финального ответа и условия, когда ответ считается completed/needs_human/failed.",
+        }
+    return _diagnostic_group_diagnosis(key)
 
 
 def _strings(value: Any) -> list[str]:

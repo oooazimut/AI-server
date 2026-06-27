@@ -66,7 +66,7 @@ feature/secure-org-data-agent
 Текущая активная ветка:
 
 ```text
-feature/learning-incidents
+feature/batch-incident-analysis
 ```
 
 По TraceRecorder уже заложен минимальный слой:
@@ -87,6 +87,13 @@ feature/learning-incidents
 - incident сохраняет исходный ответ, actions и model_usage;
 - incidents можно смотреть через `GET /learning/incidents`;
 - Diagnostic Agent получает связанные `incident_events` при разборе.
+
+По batch-анализу incidents заложен первый read-only слой:
+
+- incidents группируются по причине, агенту, статусу, skill, rule, tool и тегам;
+- краткий режим показывает повторяющиеся группы и примеры;
+- detailed-режим добавляет вероятную причину и общий fix proposal;
+- endpoint чтения групп: `GET /learning/incidents/groups`.
 
 Оставить на конец текущих этапов:
 
