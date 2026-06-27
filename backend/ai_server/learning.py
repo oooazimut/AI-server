@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from ai_server.models import AgentResult, AgentTask
 from ai_server.settings import Settings, get_settings
+from ai_server.tracing import trace_id_from_task
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,7 @@ class EventStream:
         channel = task.user.channel if task.user and task.user.channel else task.source
         event_metadata: dict[str, Any] = {
             "confidence": result.confidence,
+            "trace_id": trace_id_from_task(task),
             "task_context": task.context,
             "files": task.files,
             "logs": result.logs,
@@ -166,6 +168,9 @@ class EventStream:
         user_id: str | int | None = None,
         channel: str = "manual",
     ) -> dict[str, Any]:
+        target_event = self.get_event(event_id)
+        target_metadata = target_event.get("metadata") if isinstance(target_event, dict) else {}
+        trace_id = target_metadata.get("trace_id") if isinstance(target_metadata, dict) else ""
         return self.record_event(
             event_type="human_feedback",
             source="manual_feedback",
@@ -178,6 +183,7 @@ class EventStream:
             status="reviewed",
             metadata={
                 "target_event_id": event_id,
+                "trace_id": trace_id or "",
                 "rating": rating,
                 "tags": tags or [],
             },

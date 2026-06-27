@@ -21,6 +21,7 @@ from ai_server.orchestrators.orchestrator_llm import (
 from ai_server.retrieval import HybridKnowledgeRetriever, RetrievalHit
 from ai_server.specialists import Specialist, build_specialist_registry, manifest_by_id
 from ai_server.technical_footer import TechnicalFooterService, append_footer
+from ai_server.tracing import TraceRecorder, parent_span_id_from_task, span_id_from_task, trace_id_from_task
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ class InternalOrchestrator:
         channels: dict[str, ChannelPort] | None = None,
         footer_service: TechnicalFooterService | None = None,
         learning_recorder: LearningEventRecorder | None = None,
+        trace_recorder: TraceRecorder | None = None,
     ) -> None:
         self.manifests = manifests
         self.specialists = specialists or build_specialist_registry(manifests, audience="employee")
@@ -50,6 +52,7 @@ class InternalOrchestrator:
         self._channels: dict[str, ChannelPort] = channels or {}
         self._footer_svc = footer_service
         self._learning_recorder = learning_recorder
+        self._trace_recorder = trace_recorder
         self._manifest = manifest_by_id(manifests, "internal_orchestrator") or _dummy_manifest()
 
     @classmethod
@@ -64,6 +67,7 @@ class InternalOrchestrator:
         channels: dict[str, ChannelPort] | None = None,
         footer_service: TechnicalFooterService | None = None,
         learning_recorder: LearningEventRecorder | None = None,
+        trace_recorder: TraceRecorder | None = None,
         **specialist_deps: Any,
     ) -> InternalOrchestrator:
         _manifests = manifests or []
@@ -84,6 +88,7 @@ class InternalOrchestrator:
             channels=channels,
             footer_service=footer_service,
             learning_recorder=learning_recorder,
+            trace_recorder=trace_recorder,
         )
 
     def tool_definitions(self) -> list[dict[str, Any]]:
@@ -124,10 +129,36 @@ class InternalOrchestrator:
                 user=task.user,
                 context=task.context,
             )
+            trace_id = trace_id_from_task(task)
+            call_span_id = ""
+            if self._trace_recorder is not None:
+                trace_id, call_span_id, child_context = self._trace_recorder.child_context(task)
+                sub_task = sub_task.model_copy(update={"context": child_context})
+                self._trace_recorder.record(
+                    event_name="specialist_called",
+                    trace_id=trace_id,
+                    span_id=call_span_id,
+                    parent_span_id=span_id_from_task(task),
+                    agent_id="internal_orchestrator",
+                    task_id=task.task_id,
+                    status="started",
+                    payload={"specialist": specialist_id, "tool": tool_call.name},
+                )
             try:
                 sr = await specialist.handle(sub_task)
             except Exception as exc:
                 err = f"{type(exc).__name__}: {exc}"
+                if self._trace_recorder is not None:
+                    self._trace_recorder.record(
+                        event_name="specialist_final_answer",
+                        trace_id=trace_id,
+                        span_id=call_span_id,
+                        parent_span_id=span_id_from_task(task),
+                        agent_id=specialist_id,
+                        task_id=task.task_id,
+                        status="error",
+                        payload={"error": err},
+                    )
                 result = ToolResult(status=ToolStatus.ERROR, tool=tool_call.name, error=err)
                 return (
                     result,
@@ -139,6 +170,17 @@ class InternalOrchestrator:
                     [],
                 )
             self._apply_agent_scheduled_tasks(sr.scheduled_tasks)
+            if self._trace_recorder is not None:
+                self._trace_recorder.record(
+                    event_name="specialist_final_answer",
+                    trace_id=trace_id,
+                    span_id=call_span_id,
+                    parent_span_id=span_id_from_task(task),
+                    agent_id=specialist_id,
+                    task_id=task.task_id,
+                    status=sr.status,
+                    payload={"answer_present": bool(sr.answer), "actions": len(sr.actions_taken)},
+                )
             result = ToolResult(
                 status=ToolStatus.OK,
                 tool=tool_call.name,
@@ -161,6 +203,22 @@ class InternalOrchestrator:
         return result, ActionRecord(name=tool_call.name, status="error", details={"error": result.error}), []
 
     async def handle(self, task: AgentTask) -> AgentResult:
+        if self._trace_recorder is not None:
+            trace_id, span_id = self._trace_recorder.ensure_task_context(task)
+            self._trace_recorder.record(
+                event_name="user_message_received",
+                trace_id=trace_id,
+                span_id=span_id,
+                parent_span_id=parent_span_id_from_task(task),
+                agent_id="internal_orchestrator",
+                task_id=task.task_id,
+                status="received",
+                payload={
+                    "source": task.source,
+                    "channel": task.user.channel if task.user else "",
+                    "request": task.request,
+                },
+            )
         t_start = time.monotonic()
         result = await self._handle_core(task)
         elapsed_ms = {"total_ms": round((time.monotonic() - t_start) * 1000, 1)}
@@ -178,6 +236,39 @@ class InternalOrchestrator:
         retrieval_hits: list[RetrievalHit] = []
         if self.retriever is not None:
             retrieval_hits = self.retriever.search(self._manifest, task.request, limit=3)
+
+        if self._trace_recorder is not None:
+            trace_id, span_id = self._trace_recorder.ensure_task_context(task)
+            self._trace_recorder.record(
+                event_name="orchestrator_context_loaded",
+                trace_id=trace_id,
+                span_id=span_id,
+                parent_span_id=parent_span_id_from_task(task),
+                agent_id="internal_orchestrator",
+                task_id=task.task_id,
+                status="completed",
+                payload={
+                    "dialog_history_count": len(dialog_history),
+                    "retrieval_hits": len(retrieval_hits),
+                    "retrieval_topics": [hit.chunk.topic for hit in retrieval_hits],
+                },
+            )
+            if retrieval_hits:
+                self._trace_recorder.record(
+                    event_name="orchestrator_rules_retrieved",
+                    trace_id=trace_id,
+                    span_id=span_id,
+                    parent_span_id=parent_span_id_from_task(task),
+                    agent_id="internal_orchestrator",
+                    task_id=task.task_id,
+                    status="completed",
+                    payload={
+                        "rules": [
+                            {"topic": hit.chunk.topic, "section": hit.chunk.section, "score": hit.score}
+                            for hit in retrieval_hits
+                        ],
+                    },
+                )
 
         all_actions: list[ActionRecord] = []
         all_model_usage = []
@@ -229,6 +320,23 @@ class InternalOrchestrator:
                     },
                 )
             )
+            if self._trace_recorder is not None:
+                trace_id, span_id = self._trace_recorder.ensure_task_context(task)
+                self._trace_recorder.record(
+                    event_name="orchestrator_decision",
+                    trace_id=trace_id,
+                    span_id=span_id,
+                    parent_span_id=parent_span_id_from_task(task),
+                    agent_id="internal_orchestrator",
+                    task_id=task.task_id,
+                    status=decision.status,
+                    payload={
+                        "step": step,
+                        "tool_calls": [{"name": tc.name, "summary": tc.summary} for tc in decision.tool_calls],
+                        "confidence": decision.confidence,
+                        "loaded_rules": dr.raw.get("loaded_rules", []),
+                    },
+                )
             all_actions.extend(apply_scheduled_tasks(decision.scheduled_tasks, self.scheduler))
 
             executable = [tc for tc in decision.tool_calls if tc.name != "none"]
@@ -300,6 +408,18 @@ class InternalOrchestrator:
                 details={"specialists_used": specialist_ids},
             )
         )
+        if self._trace_recorder is not None:
+            trace_id, span_id = self._trace_recorder.ensure_task_context(task)
+            self._trace_recorder.record(
+                event_name="orchestrator_compose",
+                trace_id=trace_id,
+                span_id=span_id,
+                parent_span_id=parent_span_id_from_task(task),
+                agent_id="internal_orchestrator",
+                task_id=task.task_id,
+                status=final.status,
+                payload={"specialists_used": specialist_ids, "answer_present": bool(final.answer)},
+            )
 
         if self.store is not None and dialog_key and final.answer:
             await self.store.append_turn(dialog_key, task.request, final.answer)
@@ -321,9 +441,11 @@ class InternalOrchestrator:
         channel_id = task.context.get("channel_id", "")
         recipient_id = task.context.get("recipient_id", "")
         if not channel_id or not recipient_id:
+            self._record_message_sent_trace(task, result, status="skipped", reason="no_channel")
             return
         channel = self._channels.get(channel_id)
         if channel is None:
+            self._record_message_sent_trace(task, result, status="skipped", reason="unknown_channel")
             return
         footer = ""
         if self._footer_svc and result.answer:
@@ -339,8 +461,31 @@ class InternalOrchestrator:
         if body:
             try:
                 await channel.send(recipient_id, body)
+                self._record_message_sent_trace(task, result, status="sent", reason="")
             except Exception:
                 logger.exception("Channel send failed for channel=%s recipient=%s", channel_id, recipient_id)
+                self._record_message_sent_trace(task, result, status="error", reason="channel_send_failed")
+        else:
+            self._record_message_sent_trace(task, result, status="skipped", reason="empty_body")
+
+    def _record_message_sent_trace(self, task: AgentTask, result: AgentResult, *, status: str, reason: str) -> None:
+        if self._trace_recorder is None:
+            return
+        trace_id, span_id = self._trace_recorder.ensure_task_context(task)
+        self._trace_recorder.record(
+            event_name="message_sent_to_user",
+            trace_id=trace_id,
+            span_id=span_id,
+            parent_span_id=parent_span_id_from_task(task),
+            agent_id="internal_orchestrator",
+            task_id=task.task_id,
+            status=status,
+            payload={
+                "reason": reason,
+                "answer_present": bool(result.answer),
+                "channel_id": task.context.get("channel_id", ""),
+            },
+        )
 
     def _record_learning(
         self, task: AgentTask, result: AgentResult, *, elapsed_ms: dict[str, float] | None = None

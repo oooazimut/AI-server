@@ -42,6 +42,20 @@ def learning_diagnostic_groups(
     return recorder.diagnostic_groups(limit=limit, detailed=detailed)
 
 
+@router.get("/learning/traces")
+def learning_traces(
+    request: Request,
+    x_agent_secret: Annotated[str | None, Header(alias="X-Agent-Secret")] = None,
+    trace_id: str = Query(default=""),
+    limit: int = Query(default=50, ge=1, le=500),
+) -> dict[str, Any]:
+    validate_webhook_secret(request.app.state.settings, request_secret(request, x_agent_secret))
+    trace_recorder = request.app.state.trace_recorder
+    if trace_id:
+        return {"trace_id": trace_id, "events": trace_recorder.for_trace(trace_id, limit=limit)}
+    return {"events": trace_recorder.latest(limit=limit), "status": trace_recorder.stats()}
+
+
 @router.post("/learning/feedback")
 def learning_feedback(
     request: Request,
@@ -82,7 +96,14 @@ async def learning_diagnose(
         raise HTTPException(status_code=404, detail="Diagnostic Agent manifest not found")
 
     diagnostic_llm = getattr(request.app.state, "diagnostic_llm", None)
-    diagnostic_agent = DiagnosticAgent.build(manifest, diagnostic_llm=diagnostic_llm)
+    target_metadata = target_event.get("metadata") if isinstance(target_event.get("metadata"), dict) else {}
+    trace_id = str(target_metadata.get("trace_id") or "")
+    trace_events = request.app.state.trace_recorder.for_trace(trace_id, limit=500) if trace_id else []
+    diagnostic_agent = DiagnosticAgent.build(
+        manifest,
+        diagnostic_llm=diagnostic_llm,
+        trace_recorder=request.app.state.trace_recorder,
+    )
     task = AgentTask(
         task_id=str(uuid4()),
         source="learning_diagnose",
@@ -91,6 +112,8 @@ async def learning_diagnose(
         context={
             "event_id": body.event_id,
             "target_event": target_event,
+            "trace_id": trace_id,
+            "trace_events": trace_events,
             "feedback_events": feedback_events,
             "feedback": feedback_events[-1] if feedback_events else {},
             "rating": (feedback_events[-1].get("metadata") or {}).get("rating") if feedback_events else None,

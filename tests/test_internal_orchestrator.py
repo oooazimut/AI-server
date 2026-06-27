@@ -17,6 +17,7 @@ from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.registry import load_agent_manifests
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.specialists import manifest_by_id
+from ai_server.tracing import TraceRecorder
 from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, FakeInternalOrchestratorLLM, FakeLogisticsLLM, FakePtoLLM
 
 
@@ -147,6 +148,61 @@ def test_internal_orchestrator_delegates_secure_org_data_open_search(tmp_path):
     assert result.answer == "Нашел: Инструкция TL-WR820N по настройке роутеров wi-fi.docx"
     assert result.actions_taken[1].name == "delegate_to_specialist"
     assert result.actions_taken[1].details["specialist"] == "secure_org_data"
+
+
+def test_internal_orchestrator_records_trace_for_secure_org_data_chain(tmp_path):
+    metadata_dir = tmp_path / "kb_data"
+    index_dir = metadata_dir / "content_index"
+    index_dir.mkdir(parents=True)
+    (index_dir / "stage1_open_chunks.jsonl").write_text(
+        json.dumps(
+            {
+                "relativePath": "office/router.docx",
+                "name": "Инструкция TL-WR820N по настройке роутеров wi-fi.docx",
+                "access": "internal",
+                "text": "Настройка wi-fi роутеров TL-WR820N.",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (index_dir / "stage1_protected_chunks.jsonl").write_text("", encoding="utf-8")
+    manifests = load_agent_manifests()
+    trace_recorder = TraceRecorder(path=tmp_path / "traces.jsonl", enabled=True)
+    task = AgentTask(task_id="trace-t1", request="Найди инструкцию TL-WR820N")
+
+    result = asyncio.run(
+        InternalOrchestrator(
+            manifests,
+            specialists={
+                "secure_org_data": SecureOrgDataAgent(
+                    manifest_by_id(manifests, "secure_org_data"),
+                    store=SecureOrgDataStore(metadata_dir=metadata_dir),
+                    llm=_FakeSecureOrgDataLLM(),
+                    trace_recorder=trace_recorder,
+                ),
+            },
+            orchestrator_llm=FakeInternalOrchestratorLLM(call_specialists=["secure_org_data"]),
+            trace_recorder=trace_recorder,
+        ).handle(task)
+    )
+
+    trace_id = task.context["trace_id"]
+    events = trace_recorder.for_trace(trace_id)
+    event_names = [event["event_name"] for event in events]
+
+    assert result.status == "completed"
+    assert "user_message_received" in event_names
+    assert "orchestrator_decision" in event_names
+    assert "specialist_called" in event_names
+    assert "specialist_llm_decision" in event_names
+    assert "tool_called" in event_names
+    assert "tool_result" in event_names
+    assert "specialist_final_answer" in event_names
+    assert "orchestrator_compose" in event_names
+    assert "message_sent_to_user" in event_names
+    assert {event["trace_id"] for event in events} == {trace_id}
 
 
 class _FakeSecureOrgDataLLM:

@@ -20,6 +20,7 @@ from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import AgentManifest, AgentResult, AgentTask, ScheduledTask
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
+from ai_server.tracing import TraceRecorder
 from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,7 @@ class LogisticsSpecialist(BaseSpecialist):
         scheduler: SchedulerPort | None = None,
         store: Any | None = None,
         vu_settings: VehicleUsageSettings | None = None,
+        trace_recorder: TraceRecorder | None = None,
     ) -> None:
         self._vu_settings = vu_settings
         super().__init__(
@@ -61,6 +63,7 @@ class LogisticsSpecialist(BaseSpecialist):
             llm=llm,
             scheduler=scheduler,
             store=store,
+            trace_recorder=trace_recorder,
         )
 
     @classmethod
@@ -74,6 +77,7 @@ class LogisticsSpecialist(BaseSpecialist):
         logistics_store: Any | None = None,
         scheduler: SchedulerPort | None = None,
         logistics_vu_settings: VehicleUsageSettings | None = None,
+        trace_recorder: TraceRecorder | None = None,
         **_: Any,
     ) -> LogisticsSpecialist:
         tools: list[AgentTool] = [
@@ -89,6 +93,7 @@ class LogisticsSpecialist(BaseSpecialist):
             scheduler=scheduler,
             store=logistics_store,
             vu_settings=logistics_vu_settings,
+            trace_recorder=trace_recorder,
         )
 
     # ------------------------------------------------------------------

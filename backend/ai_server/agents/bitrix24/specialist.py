@@ -38,6 +38,7 @@ from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import Settings, get_settings
 from ai_server.skills import SkillStore
+from ai_server.tracing import TraceRecorder
 from ai_server.utils import MOSCOW_TZ, optional_int
 
 logger = logging.getLogger(__name__)
@@ -217,6 +218,7 @@ class Bitrix24Specialist(BaseSpecialist):
         proposals: BitrixProposalService | None = None,
         bitrix_task_client: BitrixTaskPort | None = None,
         settings: Settings | None = None,
+        trace_recorder: TraceRecorder | None = None,
     ) -> None:
         self._proposals = proposals
         self._bitrix_task_client = bitrix_task_client
@@ -230,6 +232,7 @@ class Bitrix24Specialist(BaseSpecialist):
             llm=llm,
             scheduler=scheduler,
             store=store,
+            trace_recorder=trace_recorder,
         )
 
     @classmethod
@@ -245,6 +248,7 @@ class Bitrix24Specialist(BaseSpecialist):
         scheduler: SchedulerPort | None = None,
         bitrix_store: Any | None = None,
         settings: Settings | None = None,
+        trace_recorder: TraceRecorder | None = None,
         **_: object,
     ) -> Bitrix24Specialist:
         _settings = settings or get_settings()
@@ -272,6 +276,7 @@ class Bitrix24Specialist(BaseSpecialist):
             store=bitrix_store,
             bitrix_task_client=bitrix_client,
             settings=_settings,
+            trace_recorder=trace_recorder,
         )
 
     async def handle(self, task: AgentTask) -> AgentResult:

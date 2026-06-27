@@ -13,6 +13,7 @@ from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import AgentManifest
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
+from ai_server.tracing import TraceRecorder
 
 
 class DiagnosticAgent(BaseSpecialist):
@@ -29,6 +30,7 @@ class DiagnosticAgent(BaseSpecialist):
         llm: DiagnosticAgentLLM | None = None,
         scheduler: SchedulerPort | None = None,
         store: Any | None = None,
+        trace_recorder: TraceRecorder | None = None,
     ) -> None:
         super().__init__(
             manifest,
@@ -39,6 +41,7 @@ class DiagnosticAgent(BaseSpecialist):
             llm=llm,
             scheduler=scheduler,
             store=store,
+            trace_recorder=trace_recorder,
         )
 
     @classmethod
@@ -50,6 +53,7 @@ class DiagnosticAgent(BaseSpecialist):
         diagnostic_llm: DiagnosticAgentLLM | None = None,
         diagnostic_store: Any | None = None,
         scheduler: SchedulerPort | None = None,
+        trace_recorder: TraceRecorder | None = None,
         **_: Any,
     ) -> DiagnosticAgent:
         return cls(
@@ -58,6 +62,7 @@ class DiagnosticAgent(BaseSpecialist):
             llm=diagnostic_llm or DiagnosticLLMService(),
             scheduler=scheduler,
             store=diagnostic_store,
+            trace_recorder=trace_recorder,
         )
 
     def _llm_failure_result(self, message: str):  # noqa: ANN201

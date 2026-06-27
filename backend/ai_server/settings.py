@@ -46,6 +46,9 @@ class Settings:
     learning_events_enabled: bool
     learning_events_capture_text: bool
     learning_events_max_text_chars: int
+    trace_events_enabled: bool
+    trace_events_capture_payload: bool
+    trace_events_max_payload_chars: int
     webhook_event_queue_enabled: bool
     webhook_event_worker_enabled: bool
     webhook_event_queue_interval_seconds: int
@@ -241,6 +244,10 @@ class Settings:
         return runtime_paths(self.var_dir).learning_events_log
 
     @property
+    def trace_events_path(self) -> Path:
+        return runtime_paths(self.var_dir).trace_events_log
+
+    @property
     def quality_control_state_path(self) -> Path:
         return runtime_paths(self.var_dir).quality_control_state
 
@@ -375,6 +382,9 @@ def get_settings() -> Settings:
         learning_events_enabled=_env_bool("LEARNING_EVENTS_ENABLED", True),
         learning_events_capture_text=_env_bool("LEARNING_EVENTS_CAPTURE_TEXT", True),
         learning_events_max_text_chars=_env_int("LEARNING_EVENTS_MAX_TEXT_CHARS", 8000) or 8000,
+        trace_events_enabled=_env_bool("TRACE_EVENTS_ENABLED", True),
+        trace_events_capture_payload=_env_bool("TRACE_EVENTS_CAPTURE_PAYLOAD", True),
+        trace_events_max_payload_chars=_env_int("TRACE_EVENTS_MAX_PAYLOAD_CHARS", 8000) or 8000,
         webhook_event_queue_enabled=_env_bool("WEBHOOK_EVENT_QUEUE_ENABLED", True),
         webhook_event_worker_enabled=_env_bool("AI_SERVER_WEBHOOK_EVENT_WORKER_ENABLED", False),
         webhook_event_queue_interval_seconds=_env_int("WEBHOOK_EVENT_QUEUE_INTERVAL_SECONDS", 2) or 2,

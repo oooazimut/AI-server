@@ -16,6 +16,7 @@ from ai_server.models import AgentManifest
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import Settings, get_settings
 from ai_server.skills import SkillStore
+from ai_server.tracing import TraceRecorder
 
 
 class SecureOrgDataAgent(BaseSpecialist):
@@ -33,6 +34,7 @@ class SecureOrgDataAgent(BaseSpecialist):
         llm: SecureOrgDataLLM | None = None,
         scheduler: SchedulerPort | None = None,
         store: SecureOrgDataStore | None = None,
+        trace_recorder: TraceRecorder | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.secure_store = store or SecureOrgDataStore(settings=self.settings)
@@ -45,6 +47,7 @@ class SecureOrgDataAgent(BaseSpecialist):
             llm=llm,
             scheduler=scheduler,
             store=None,
+            trace_recorder=trace_recorder,
         )
 
     @classmethod
@@ -57,6 +60,7 @@ class SecureOrgDataAgent(BaseSpecialist):
         secure_org_data_llm: SecureOrgDataLLM | None = None,
         secure_org_data_store: SecureOrgDataStore | None = None,
         scheduler: SchedulerPort | None = None,
+        trace_recorder: TraceRecorder | None = None,
         **_: Any,
     ) -> SecureOrgDataAgent:
         return cls(
@@ -66,6 +70,7 @@ class SecureOrgDataAgent(BaseSpecialist):
             llm=secure_org_data_llm or SecureOrgDataLLMService(),
             scheduler=scheduler,
             store=secure_org_data_store,
+            trace_recorder=trace_recorder,
         )
 
     async def _load_extra_context(self, task):  # noqa: ANN001, ANN201

@@ -46,15 +46,13 @@ AI-server - FastAPI backend с multi-agent схемой.
 
 ## Текущее состояние на 2026-06-27
 
-Активная ветка:
+Последняя закрытая ветка:
 
 ```text
 feature/secure-org-data-agent
 ```
 
-Сейчас добавляется отдельный агент `secure_org_data`.
-
-Уже сделано:
+По `secure_org_data` сделано:
 
 - агент оформлен отдельным модулем в `agents/secure_org_data/` и `backend/ai_server/agents/secure_org_data/`;
 - правила агента оформлены как мини-книга: `instructions.md`, `rule_index.yaml`, `knowledge/*.md`;
@@ -65,7 +63,23 @@ feature/secure-org-data-agent
 - Переговорщик знает минимальную routing-информацию о `secure_org_data`;
 - тестовая backend-цепочка прошла: пользователь -> Переговорщик -> `secure_org_data` -> Переговорщик -> ответ.
 
-Оставить на конец текущего этапа:
+Текущая активная ветка:
+
+```text
+feature/trace-recorder
+```
+
+По TraceRecorder уже заложен минимальный слой:
+
+- отдельный append-only журнал `var/traces.jsonl`;
+- общий `trace_id` для цепочки выполнения;
+- `span_id` и `parent_span_id` для связи шагов;
+- запись ключевых событий Переговорщика, специалистов и tools;
+- связь `learning_events` с `trace_id`;
+- endpoint чтения trace: `GET /learning/traces`;
+- `/learning/diagnose` получает полные `trace_events` для Diagnostic Agent.
+
+Оставить на конец текущих этапов:
 
 - реальный чатовый прогон через пользовательский интерфейс;
 - расширение write-сценариев;

@@ -40,6 +40,7 @@ from .settings import Settings, get_settings
 from .specialists import SpecialistDeps
 from .technical_footer import TechnicalFooterService
 from .tools.vehicle_usage import SentRequestData, VehicleUsageStore
+from .tracing import TraceRecorder
 from .transcription import build_transcriber
 from .utils import MOSCOW_TZ
 from .workers.bitrix.reconciler import reconcile_once, run_reconciler
@@ -130,6 +131,7 @@ async def lifespan(app: FastAPI):
     portal_search = await _make_portal_search(settings)
     portal_search_indexer = PortalSearchIndexerWorker(bitrix, portal_search, settings=settings)
     learning_recorder = LearningEventRecorder()
+    trace_recorder = TraceRecorder()
     webhook_event_queue = _make_event_queue(settings)
     bitrix_store = await _make_bitrix_store(settings)
     pto_store = await _make_pto_store(settings)
@@ -142,6 +144,7 @@ async def lifespan(app: FastAPI):
     app.state.portal_search = portal_search
     app.state.portal_search_indexer = portal_search_indexer
     app.state.learning_recorder = learning_recorder
+    app.state.trace_recorder = trace_recorder
     app.state.webhook_event_queue = webhook_event_queue
     app.state.webhook_event_status = {
         "enabled": True,
@@ -294,6 +297,7 @@ async def lifespan(app: FastAPI):
             channels={"bitrix24": bitrix_channel},
             footer_service=TechnicalFooterService(settings=settings),
             learning_recorder=learning_recorder,
+            trace_recorder=trace_recorder,
         )
         orch_manifest = next((m for m in manifests if m.kind == "orchestrator"), None)
         orchestrator = InternalOrchestrator.build(

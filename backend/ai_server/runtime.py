@@ -44,6 +44,10 @@ class RuntimePaths:
         return self.root / "learning_events.jsonl"
 
     @property
+    def trace_events_log(self) -> Path:
+        return self.root / "traces.jsonl"
+
+    @property
     def search_content_dir(self) -> Path:
         return self.root / "search_content"
 

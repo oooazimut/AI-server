@@ -60,12 +60,14 @@ def test_build_specialist_registry_customer_audience_returns_empty():
     assert registry == {}
 
 
-def test_build_specialist_registry_no_audience_filter_matches_employee(monkeypatch):
+def test_build_specialist_registry_no_audience_filter_includes_internal_specialists(monkeypatch):
     monkeypatch.setattr(_specialists_module, "_load_entrypoint", lambda ep: _FakeSpecialist)
     manifests = load_agent_manifests()
     without_filter = build_specialist_registry(manifests)
     with_employee = build_specialist_registry(manifests, audience="employee")
-    assert set(without_filter.keys()) == set(with_employee.keys())
+    assert set(with_employee.keys()).issubset(set(without_filter.keys()))
+    assert "diagnostic_agent" in without_filter
+    assert "diagnostic_agent" not in with_employee
 
 
 def test_build_specialist_registry_skips_non_specialists(monkeypatch):

@@ -20,6 +20,7 @@ from ai_server.models import AgentManifest
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import Settings
 from ai_server.skills import SkillStore
+from ai_server.tracing import TraceRecorder
 
 
 class PtoSpecialist(BaseSpecialist):
@@ -37,6 +38,7 @@ class PtoSpecialist(BaseSpecialist):
         llm: PtoAgentLLM | None = None,
         scheduler: SchedulerPort | None = None,
         store: Any | None = None,
+        trace_recorder: TraceRecorder | None = None,
     ) -> None:
         super().__init__(
             manifest,
@@ -47,6 +49,7 @@ class PtoSpecialist(BaseSpecialist):
             llm=llm,
             scheduler=scheduler,
             store=store,
+            trace_recorder=trace_recorder,
         )
 
     @classmethod
@@ -61,6 +64,7 @@ class PtoSpecialist(BaseSpecialist):
         pto_llm: PtoAgentLLM | None = None,
         pto_store: Any | None = None,
         scheduler: SchedulerPort | None = None,
+        trace_recorder: TraceRecorder | None = None,
         **_: Any,
     ) -> PtoSpecialist:
         from ai_server.settings import get_settings
@@ -81,6 +85,7 @@ class PtoSpecialist(BaseSpecialist):
             llm=pto_llm or PtoLLMService(),
             scheduler=scheduler,
             store=pto_store,
+            trace_recorder=trace_recorder,
         )
 
     def _llm_failure_result(self, message: str):
