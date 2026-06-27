@@ -48,6 +48,10 @@ class RuntimePaths:
         return self.root / "search_content"
 
     @property
+    def secure_org_data_db(self) -> Path:
+        return self.root / "secure_org_data" / "secure_org_data.sqlite"
+
+    @property
     def search_index_db(self) -> Path:
         return self.root / "search_index.sqlite"
 
@@ -94,6 +98,7 @@ def ensure_runtime_dirs(paths: RuntimePaths | None = None) -> None:
         selected.document_drafts_dir,
         selected.embedding_models_dir,
         selected.search_content_dir,
+        selected.secure_org_data_db.parent,
         selected.tmp_dir,
     ):
         directory.mkdir(parents=True, exist_ok=True)

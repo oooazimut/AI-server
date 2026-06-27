@@ -9,9 +9,11 @@ stage_scope:
   active_flow:
     - internal_orchestrator
     - bitrix24
+    - secure_org_data
     - diagnostic_agent
   ordinary_dialog_agents:
     - bitrix24
+    - secure_org_data
   diagnostic_only_agents:
     - diagnostic_agent
   out_of_scope_for_this_stage:
@@ -52,6 +54,14 @@ rules:
         - "проект"
         - "CRM"
         - "документ"
+        - "настройки"
+        - "инструкция"
+        - "оборудование"
+        - "объект"
+        - "пароль"
+        - "логин"
+        - "IP"
+        - "сеть"
       context_keys: []
     load_reason: "Нужно определить, какой специалист должен обработать запрос."
 

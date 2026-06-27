@@ -139,6 +139,11 @@ class Settings:
     agent_shell_timeout_seconds: float
     agent_shell_max_command_chars: int
     agent_shell_max_output_chars: int
+    secure_org_data_root: str
+    secure_org_data_metadata_dir: str
+    secure_org_data_index_dir: str
+    secure_org_data_protected_user_ids: str
+    secure_org_data_secret_user_ids: str
     database_url: str
     redis_url: str
     var_dir: Path
@@ -310,6 +315,10 @@ class Settings:
         return runtime_paths(self.var_dir).search_content_dir
 
     @property
+    def secure_org_data_db_path(self) -> Path:
+        return runtime_paths(self.var_dir).secure_org_data_db
+
+    @property
     def resolved_search_content_allowed_extensions(self) -> set[str]:
         return {
             extension if extension.startswith(".") else f".{extension}"
@@ -465,6 +474,11 @@ def get_settings() -> Settings:
         agent_shell_timeout_seconds=_env_float("AGENT_SHELL_TIMEOUT_SECONDS", 30.0) or 30.0,
         agent_shell_max_command_chars=_env_int("AGENT_SHELL_MAX_COMMAND_CHARS", 500) or 500,
         agent_shell_max_output_chars=_env_int("AGENT_SHELL_MAX_OUTPUT_CHARS", 4000) or 4000,
+        secure_org_data_root=_env("SECURE_ORG_DATA_ROOT"),
+        secure_org_data_metadata_dir=_env("SECURE_ORG_DATA_METADATA_DIR"),
+        secure_org_data_index_dir=_env("SECURE_ORG_DATA_INDEX_DIR"),
+        secure_org_data_protected_user_ids=_env("SECURE_ORG_DATA_PROTECTED_USER_IDS"),
+        secure_org_data_secret_user_ids=_env("SECURE_ORG_DATA_SECRET_USER_IDS"),
         database_url=_env("DATABASE_URL"),
         redis_url=_env("REDIS_URL"),
         var_dir=paths.root,
