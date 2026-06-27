@@ -472,9 +472,7 @@ def test_specialist_preserves_needs_clarification_when_compose_returns_completed
         final_answer="Укажите срок выполнения задачи.",
     )
     result = asyncio.run(
-        _bitrix_specialist(llm=llm).handle(
-            AgentTask(task_id="t1", request="создай задачу в тестовом проекте")
-        )
+        _bitrix_specialist(llm=llm).handle(AgentTask(task_id="t1", request="создай задачу в тестовом проекте"))
     )
 
     assert result.status == "needs_clarification"
@@ -487,10 +485,6 @@ def test_specialist_uses_compose_failed_even_if_decide_was_needs_clarification()
         final_status="failed",
         final_answer="Ошибка при обработке.",
     )
-    result = asyncio.run(
-        _bitrix_specialist(llm=llm).handle(
-            AgentTask(task_id="t1", request="создай задачу")
-        )
-    )
+    result = asyncio.run(_bitrix_specialist(llm=llm).handle(AgentTask(task_id="t1", request="создай задачу")))
 
     assert result.status == "failed"

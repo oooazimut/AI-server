@@ -563,10 +563,12 @@ class FakeOrchestratorStore:
         return self._turns.get(dialog_key, [])[-limit:]
 
     async def append_turn(self, dialog_key: str, user_text: str, agent_response: str) -> None:
-        self._turns.setdefault(dialog_key, []).extend([
-            {"role": "user", "content": user_text},
-            {"role": "assistant", "content": agent_response},
-        ])
+        self._turns.setdefault(dialog_key, []).extend(
+            [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": agent_response},
+            ]
+        )
 
     async def get_kv(self, dialog_key: str, field: str) -> str | None:
         return self._kv.get((dialog_key, field))
