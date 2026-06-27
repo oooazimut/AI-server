@@ -7,6 +7,7 @@ import os
 from datetime import datetime, timedelta
 from typing import Any
 
+from ai_server.agents.ports import AgentQueuePort
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.portal_search import (
     PortalContentSyncStats,
@@ -22,6 +23,7 @@ from ai_server.integrations.bitrix.portal_search import (
 )
 from ai_server.settings import Settings
 from ai_server.utils import MOSCOW_TZ
+from ai_server.workers.bitrix.search_webhook_indexer import prepare_search_webhook_job, process_search_webhook_job
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +116,13 @@ class PortalSearchIndexerWorker:
             "lock_retry_at": None,
         }
         self._load_state()
+        self.event_status: dict[str, Any] = {
+            "running": False,
+            "processed": 0,
+            "errors": 0,
+            "last_event": None,
+            "last_error": None,
+        }
 
     def public_status(self) -> dict[str, Any]:
         return {
@@ -121,10 +130,44 @@ class PortalSearchIndexerWorker:
             "enabled": self._settings.search_background_indexer_enabled,
             "lock_path": str(self._settings.search_background_lock_path),
             "state_path": str(self._settings.search_background_state_path),
-            "index_path": str(self._settings.search_index_path),
         }
 
-    async def run(self) -> None:
+    async def run(self, queue: AgentQueuePort) -> None:
+        """Event-driven loop: consume disk-file events from the agent queue."""
+        _poll_interval = 0.5
+        self.event_status["running"] = True
+        while True:
+            message = await queue.claim_next("index_refresher")
+            if message is None:
+                await asyncio.sleep(_poll_interval)
+                continue
+            msg_id = str(message.get("id") or "")
+            payload = message.get("payload") or {}
+            try:
+                job, result = prepare_search_webhook_job(payload, settings=self._settings)
+                if job:
+                    await process_search_webhook_job(
+                        self.bitrix,
+                        self.index,
+                        job,
+                        status=self.event_status,
+                        settings=self._settings,
+                    )
+                    self.event_status["processed"] = int(self.event_status.get("processed") or 0) + 1
+                else:
+                    self.event_status["last_event"] = result.get("event")
+                await queue.ack(msg_id)
+            except asyncio.CancelledError:
+                self.event_status["running"] = False
+                raise
+            except Exception as exc:
+                logger.exception("PortalSearchIndexerWorker: failed processing event message %s", msg_id)
+                self.event_status["errors"] = int(self.event_status.get("errors") or 0) + 1
+                self.event_status["last_error"] = f"{type(exc).__name__}: {exc}"
+                await queue.nack(msg_id, error=f"{type(exc).__name__}: {exc}")
+
+    async def run_periodic(self) -> None:
+        """Periodic background sync loop (metadata / content / delta on configurable intervals)."""
         self.status["running"] = True
         initial_delay = timedelta(seconds=self._settings.search_background_initial_delay_seconds)
         now = _now()
@@ -470,7 +513,6 @@ class PortalSearchIndexerWorker:
             "started_at": existing.get("started_at") if existing else now,
             "heartbeat_at": now,
             "state_path": str(self._settings.search_background_state_path),
-            "index_path": str(self._settings.search_index_path),
         }
 
     def _set_lock_status(self, *, acquired: bool, owner: dict[str, Any] | None) -> None:

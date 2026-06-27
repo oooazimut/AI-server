@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import datetime
 from typing import Any
 
-from ai_server.agent_store import AgentStore
-from ai_server.agents.ports import SchedulerPort
+from pydantic import ValidationError
+
+from ai_server.agents.ports import AgentQueuePort, AgentStorePort, SchedulerPort
+from ai_server.agents.tool import AgentTool
 from ai_server.knowledge import MarkdownKnowledgeBase
-from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult
+from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult, ToolStatus
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
-from ai_server.utils import unique
+from ai_server.utils import optional_int, unique
+
+logger = logging.getLogger(__name__)
 
 _NOT_CONFIGURED_ANSWER = "Специалист временно недоступен: LLM не сконфигурирован."
 
@@ -25,6 +31,7 @@ class BaseSpecialist:
 
     max_steps: int = 5
     action_prefix: str = ""
+    _queue_poll_interval: float = 0.1
 
     def __init__(
         self,
@@ -33,16 +40,16 @@ class BaseSpecialist:
         knowledge_base: MarkdownKnowledgeBase | None = None,
         skill_store: SkillStore | None = None,
         retriever: HybridKnowledgeRetriever | None = None,
-        tools: Any = None,
+        agent_tools: list[AgentTool] | None = None,
         llm: Any = None,
         scheduler: SchedulerPort | None = None,
-        store: AgentStore | None = None,
+        store: AgentStorePort | None = None,
     ) -> None:
         self.manifest = manifest
         self.knowledge_base = knowledge_base
         self.skill_store = skill_store
         self.retriever = retriever
-        self.tools = tools
+        self._tool_registry: dict[str, AgentTool] = {t.name: t for t in (agent_tools or [])}
         self.llm = llm
         self._scheduler = scheduler
         self.store = store
@@ -52,7 +59,7 @@ class BaseSpecialist:
     # ------------------------------------------------------------------
 
     def tool_definitions(self) -> list[dict]:
-        raise NotImplementedError
+        return [t.definition().model_dump() for t in self._tool_registry.values()]
 
     def _logs(self) -> list[str]:
         raise NotImplementedError
@@ -73,7 +80,22 @@ class BaseSpecialist:
         tool_call: Any,
         task: AgentTask,
     ) -> tuple[ToolResult | None, ActionRecord | None, list[ActionRecord]]:
-        raise NotImplementedError
+        if tool_call.name == "none":
+            return None, None, []
+        tool = self._tool_registry.get(tool_call.name)
+        if tool is None:
+            result = ToolResult(
+                status=ToolStatus.INVALID_TOOL_CALL,
+                tool=tool_call.name,
+                error=f"unknown tool: {tool_call.name}",
+            )
+            return result, ActionRecord(name=tool_call.name, status=result.status, details=result.model_dump()), []
+        user_id = optional_int(task.user.id) if task.user.id else None
+        dialog_key = str(task.context.get("dialog_key") or "") or None
+        dialog_id = str(task.context.get("dialog_id") or (task.user.raw or {}).get("dialog_id") or "") or None
+        result = await tool.execute(tool_call.args, user_id=user_id, dialog_key=dialog_key, dialog_id=dialog_id)
+        action = ActionRecord(name=tool_call.name, status=result.status, details=result.model_dump())
+        return result, action, []
 
     # ------------------------------------------------------------------
     # Lifecycle hooks (subclasses override as needed)
@@ -131,7 +153,18 @@ class BaseSpecialist:
                 confidence=0.0,
                 logs=self._logs(),
             )
-        available_skills = self.skill_store.list_skills(self.manifest) if self.skill_store is not None else []
+
+        # Load per-specialist dialog history from agent's own PG schema (if configured),
+        # otherwise fall back to the shared history passed via task.context.
+        dialog_key: str = task.context.get("dialog_key") or ""
+        if self.store is not None and dialog_key:
+            dialog_history: list[dict] = await self.store.load_turns(dialog_key, limit=20)
+        else:
+            dialog_history = list(task.context.get("dialog_history") or [])
+
+        available_skills = (
+            self.skill_store.list_skills_with_content(self.manifest) if self.skill_store is not None else []
+        )
         task, extra_context_details = await self._load_extra_context(task)
         retrieval_hits = (
             self.retriever.search(self.manifest, task.request, limit=5) if self.retriever is not None else []
@@ -174,7 +207,8 @@ class BaseSpecialist:
                     retrieval_hits=retrieval_hits,
                     tool_definitions=self.tool_definitions(),
                     tool_results=list(tool_results),
-                    dialog_history=task.context.get("dialog_history"),
+                    dialog_history=dialog_history or None,
+                    available_skills=available_skills,
                 )
             except Exception as exc:
                 failure = self._llm_failure_result(f"{type(exc).__name__}: {exc}")
@@ -280,7 +314,21 @@ class BaseSpecialist:
                 details={},
             )
         )
-        status = "needs_human" if approval_actions else final_result.status
+        # Decide status is authoritative for needs_clarification/needs_human:
+        # compose only formats the answer text, not the conversational state.
+        # If decide said needs_clarification but compose returned completed, trust decide.
+        if (
+            decision is not None
+            and decision.status in ("needs_clarification", "needs_human")
+            and final_result.status == "completed"
+        ):
+            effective_status = decision.status
+        else:
+            effective_status = final_result.status
+        status = "needs_human" if approval_actions else effective_status
+
+        if self.store is not None and dialog_key and final_result.answer:
+            await self.store.append_turn(dialog_key, task.request, final_result.answer)
 
         return AgentResult(
             status=status,
@@ -292,3 +340,47 @@ class BaseSpecialist:
             confidence=decision.confidence,
             logs=self._logs(),
         )
+
+    async def run(self, queue: AgentQueuePort) -> None:
+        """Queue consumer loop: claim → handle → publish result → ack/nack.
+
+        Specialists never call queue.publish() directly inside handle().
+        run() is the only place that touches the queue; handle() stays pure business logic.
+        """
+        agent_id = self.manifest.id
+        while True:
+            message = await queue.claim_next(agent_id)
+            if message is None:
+                await asyncio.sleep(self._queue_poll_interval)
+                continue
+            msg_id = str(message.get("id") or "")
+            try:
+                try:
+                    task = AgentTask.model_validate(message["payload"])
+                except (KeyError, ValidationError) as exc:
+                    logger.warning("Agent %s: invalid message %s: %s", agent_id, msg_id, exc)
+                    await queue.nack(msg_id, error=f"invalid message: {exc}")
+                    continue
+                result = await self.handle(task)
+                reply_to = message.get("reply_to") or ""
+                if reply_to:
+                    await queue.publish(
+                        {
+                            "to": reply_to,
+                            "from": agent_id,
+                            "type": "result",
+                            "correlation_id": message.get("correlation_id") or "",
+                            "payload": result.model_dump(),
+                            "routing": {
+                                "channel_id": task.context.get("channel_id") or "",
+                                "recipient_id": task.context.get("recipient_id") or "",
+                                "dialog_key": task.context.get("dialog_key") or "",
+                            },
+                        }
+                    )
+                await queue.ack(msg_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Agent %s failed processing message %s", agent_id, msg_id)
+                await queue.nack(msg_id, error=f"{type(exc).__name__}: {exc}")

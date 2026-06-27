@@ -12,8 +12,6 @@ from ai_server.runtime_migration import (
 def test_runtime_paths_use_var_root():
     paths = runtime_paths(Path("var"))
 
-    assert paths.search_index_db == Path("var") / "search_index.sqlite"
-    assert paths.bitrix_oauth_db == Path("var") / "bitrix_oauth.sqlite"
     assert paths.dialog_state_db == Path("var") / "dialog_state.sqlite"
     assert paths.attachments_dir == Path("var") / "attachments"
     assert paths.learning_events_log == Path("var") / "learning_events.jsonl"

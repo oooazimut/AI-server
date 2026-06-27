@@ -6,11 +6,17 @@ from typing import Any
 from ai_server.models import AgentManifest, ToolResult
 from ai_server.registry import resolve_project_path
 from ai_server.retrieval import RetrievalHit
+from ai_server.skills import Skill
 
 logger = logging.getLogger(__name__)
 
 DECISION_STATUSES = {"completed", "needs_clarification", "needs_human"}
 RESULT_STATUSES = {"completed", "needs_clarification", "needs_human", "failed"}
+
+SKILLS_PROMPT_FRAGMENT = (
+    "В payload есть available_skills — пошаговые how-to для типовых сценариев. "
+    "Читай их перед выбором инструментов: они описывают правильную последовательность действий. "
+)
 
 DIALOG_HISTORY_PROMPT_FRAGMENT = (
     "В payload есть dialog_history — последние сообщения этого диалога (роли user/assistant). "
@@ -58,6 +64,15 @@ def retrieval_context(hits: list[RetrievalHit]) -> list[dict[str, Any]]:
 
 def allowed_tool_definitions(definitions: list[dict[str, Any]], allowed_tool_names: set[str]) -> list[dict[str, Any]]:
     return [definition for definition in definitions if definition.get("name") in allowed_tool_names]
+
+
+def safe_context(context: dict[str, Any]) -> dict[str, Any]:
+    """Strip internal per-request keys (toolset objects) before passing context to json.dumps."""
+    return {k: v for k, v in context.items() if not k.startswith("_")}
+
+
+def skills_context(skills: list[Skill]) -> list[dict[str, Any]]:
+    return [{"id": s.id, "title": s.title, "content": s.content or s.preview} for s in skills]
 
 
 def compact_tool_result(result: ToolResult) -> dict[str, Any]:

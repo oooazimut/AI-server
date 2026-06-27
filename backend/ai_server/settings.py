@@ -24,7 +24,6 @@ class Settings:
     bitrix_oauth_required_for_writes: bool
     bitrix_oauth_app_path: str
     bitrix_oauth_callback_path: str
-    bitrix_oauth_db_path_override: str
     bitrix_oauth_token_endpoint: str
     bitrix_rest_webhook_url: str
     bitrix_projects_webhook_url: str
@@ -171,12 +170,6 @@ class Settings:
         return bool(self.llm_provider and self.llm_model and self.llm_api_key)
 
     @property
-    def bitrix_oauth_db_path(self) -> Path:
-        if self.bitrix_oauth_db_path_override:
-            return Path(self.bitrix_oauth_db_path_override)
-        return runtime_paths(self.var_dir).bitrix_oauth_db
-
-    @property
     def resolved_bot_webhook_url(self) -> str:
         if self.bitrix_bot_webhook_url:
             return self._with_webhook_secret(self.bitrix_bot_webhook_url)
@@ -220,10 +213,6 @@ class Settings:
         return f"/marketplace/view/{self.bitrix_oauth_client_id}/"
 
     @property
-    def webhook_event_queue_path(self) -> Path:
-        return runtime_paths(self.var_dir).webhook_event_queue_db
-
-    @property
     def dialog_state_path(self) -> Path:
         return runtime_paths(self.var_dir).dialog_state_db
 
@@ -242,10 +231,6 @@ class Settings:
     @property
     def supervisor_state_path(self) -> Path:
         return runtime_paths(self.var_dir).supervisor_state
-
-    @property
-    def vehicle_usage_db_path(self) -> Path:
-        return runtime_paths(self.var_dir).vehicle_usage_db
 
     @property
     def attachment_storage_dir(self) -> Path:
@@ -294,10 +279,6 @@ class Settings:
         return set(_id_list(self.vehicle_usage_excluded_user_ids))
 
     @property
-    def search_index_path(self) -> Path:
-        return runtime_paths(self.var_dir).search_index_db
-
-    @property
     def search_background_state_path(self) -> Path:
         return runtime_paths(self.var_dir).search_indexer_state
 
@@ -344,7 +325,6 @@ def get_settings() -> Settings:
         bitrix_oauth_required_for_writes=_env_bool("BITRIX_OAUTH_REQUIRED_FOR_WRITES", True),
         bitrix_oauth_app_path=_env("BITRIX_OAUTH_APP_PATH", "/bitrix/app"),
         bitrix_oauth_callback_path=_env("BITRIX_OAUTH_CALLBACK_PATH", "/bitrix/oauth/callback"),
-        bitrix_oauth_db_path_override=_env("BITRIX_OAUTH_DB_PATH"),
         bitrix_oauth_token_endpoint=_env("BITRIX_OAUTH_TOKEN_ENDPOINT", "https://oauth.bitrix.info/oauth/token/"),
         bitrix_rest_webhook_url=_env("BITRIX_REST_WEBHOOK_URL"),
         bitrix_projects_webhook_url=_env("BITRIX_PROJECTS_WEBHOOK_URL"),

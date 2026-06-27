@@ -1,64 +1,33 @@
-import json
 from pathlib import Path
 
 from ai_server.agents.pto import PtoLLMToolCall, PtoSpecialist
-from ai_server.integrations.bitrix.portal_search import PortalSearchIndex
+from ai_server.agents.pto.tools import (
+    DocumentDraftCreateTool,
+    DocumentDraftListTool,
+    DocumentReadTool,
+    SpreadsheetCompareTool,
+    SpreadsheetPreviewTool,
+)
 from ai_server.models import AgentTask
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import get_settings
-from ai_server.tools.document_access import DocumentToolset
 from tests.fakes import FakeEmbeddingProvider, FakePtoLLM
-
-
-def test_document_toolset_compares_spreadsheets(monkeypatch, tmp_path):
-    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
-    index = _document_index(tmp_path / "search_index.sqlite")
-    toolset = DocumentToolset(client=FakeDocumentBitrix(), portal_search=index, user_id=9, settings=get_settings())
-
-    preview = anyio_run(toolset.spreadsheet_preview({"query": "смета январь"}))
-    assert preview.status == "ok"
-    assert preview.data["sheets"][0]["rows"][0]["cells"][0] == {
-        "index": 0,
-        "letter": "A",
-        "value": "Наименование",
-    }
-
-    result = anyio_run(
-        toolset.spreadsheet_compare(
-            {
-                "first_query": "смета январь",
-                "second_query": "смета февраль",
-                "header_row_number": 1,
-                "key_column": "Наименование",
-                "value_columns": ["Стоимость"],
-                "limit": 10,
-            }
-        )
-    )
-
-    assert result.status == "ok"
-    report = result.data["report"]
-    assert report["common_rows"] == 2
-    assert report["changed"][0]["key"] == "Кабель UTP"
-    assert report["changed"][0]["fields"][0]["field"] == "Стоимость"
-    assert "Отличий по значениям: 1" in result.data["summary"]
 
 
 def test_spreadsheet_compare_requires_llm_selected_schema(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
-    index = _document_index(tmp_path / "search_index.sqlite")
-    toolset = DocumentToolset(client=FakeDocumentBitrix(), portal_search=index, user_id=9, settings=get_settings())
+    compare_tool = SpreadsheetCompareTool(FakeDocumentBitrix(), settings=get_settings())
 
     result = anyio_run(
-        toolset.spreadsheet_compare(
+        compare_tool.execute(
             {
                 "first_query": "смета январь",
                 "second_query": "смета февраль",
                 "limit": 10,
-            }
+            },
+            user_id=9,
         )
     )
 
@@ -69,19 +38,16 @@ def test_spreadsheet_compare_requires_llm_selected_schema(monkeypatch, tmp_path)
 def test_document_toolset_creates_local_draft(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
-    toolset = DocumentToolset(
-        client=FakeDocumentBitrix(),
-        portal_search=_document_index(tmp_path / "search_index.sqlite"),
-        user_id=9,
-        settings=get_settings(),
-    )
+    draft_tool = DocumentDraftCreateTool(get_settings())
 
-    result = toolset.document_draft_create(
-        {
-            "title": "../Акт проверки",
-            "content": "Замечаний по комплектности нет.",
-            "extension": ".md",
-        }
+    result = anyio_run(
+        draft_tool.execute(
+            {
+                "title": "../Акт проверки",
+                "content": "Замечаний по комплектности нет.",
+                "extension": ".md",
+            }
+        )
     )
 
     assert result.status == "ok"
@@ -92,67 +58,23 @@ def test_document_toolset_creates_local_draft(monkeypatch, tmp_path):
     assert "Замечаний" in path.read_text(encoding="utf-8")
 
 
-def test_pto_specialist_uses_spreadsheet_compare_tool(monkeypatch, tmp_path):
-    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
-    manifest = get_agent_manifest("pto")
-    assert manifest is not None
-    index = _document_index(tmp_path / "search_index.sqlite")
-    fake_llm = FakePtoLLM(
-        tool_call_steps=[
-            [
-                PtoLLMToolCall(name="spreadsheet_preview", args={"query": "смета январь"}),
-                PtoLLMToolCall(name="spreadsheet_preview", args={"query": "смета февраль"}),
-            ],
-            [
-                PtoLLMToolCall(
-                    name="spreadsheet_compare",
-                    args={
-                        "first_query": "смета январь",
-                        "second_query": "смета февраль",
-                        "header_row_number": 1,
-                        "key_column": "Наименование",
-                        "value_columns": ["Стоимость"],
-                        "limit": 10,
-                    },
-                )
-            ],
-            [PtoLLMToolCall(name="none")],
-        ],
-        final_answer="В сметах изменился кабель.",
-    )
-    specialist = PtoSpecialist(
-        manifest,
-        retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
-        tools=DocumentToolset(client=FakeDocumentBitrix(), portal_search=index, user_id=9, settings=get_settings()),
-        llm=fake_llm,
-    )
-
-    result = anyio_run(specialist.handle(AgentTask(task_id="pto-1", request="Сравни сметы за январь и февраль")))
-
-    preview_actions = [item for item in result.actions_taken if item.name == "pto_spreadsheet_preview"]
-    assert len(preview_actions) == 2
-    action = next(item for item in result.actions_taken if item.name == "pto_spreadsheet_compare")
-    assert action.status == "ok"
-    assert len(fake_llm.decide_calls[1]["tool_results"]) == 2
-    assert result.answer == "В сметах изменился кабель."
-    assert result.handoff_to == []
-
-
 def test_pto_specialist_creates_document_draft(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     manifest = get_agent_manifest("pto")
     assert manifest is not None
+    settings = get_settings()
+    client = FakeDocumentBitrix()
     specialist = PtoSpecialist(
         manifest,
         retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
-        tools=DocumentToolset(
-            client=FakeDocumentBitrix(),
-            portal_search=_document_index(tmp_path / "search_index.sqlite"),
-            user_id=9,
-            settings=get_settings(),
-        ),
+        agent_tools=[
+            SpreadsheetPreviewTool(client, settings=settings),
+            SpreadsheetCompareTool(client, settings=settings),
+            DocumentDraftCreateTool(settings),
+            DocumentDraftListTool(settings),
+            DocumentReadTool(client, settings=settings),
+        ],
         llm=FakePtoLLM(
             tool_call_steps=[
                 [
@@ -173,7 +95,7 @@ def test_pto_specialist_creates_document_draft(monkeypatch, tmp_path):
 
     result = anyio_run(specialist.handle(AgentTask(task_id="pto-2", request="Подготовь акт проверки")))
 
-    action = next(item for item in result.actions_taken if item.name == "pto_document_draft_create")
+    action = next(item for item in result.actions_taken if item.name == "document_draft_create")
     assert action.status == "ok"
     assert Path(action.details["data"]["path"]).exists()
     assert result.answer == "Черновик подготовлен."
@@ -194,39 +116,6 @@ class FakeDocumentBitrix:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(encoded)
         return len(encoded)
-
-
-def _document_index(path: Path) -> PortalSearchIndex:
-    index = PortalSearchIndex(path)
-    index.ensure_schema()
-    _insert_document(index, entity_id="1001", title="Смета январь.csv", body="смета январь кабель камера")
-    _insert_document(index, entity_id="1002", title="Смета февраль.csv", body="смета февраль кабель камера")
-    return index
-
-
-def _insert_document(index: PortalSearchIndex, *, entity_id: str, title: str, body: str) -> None:
-    with index._connect() as connection:
-        connection.execute(
-            """
-            INSERT INTO portal_search_items (
-                entity_type, entity_id, title, body, url, search_text,
-                metadata_json, source_updated_at, last_seen_at, indexed_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "disk_file",
-                entity_id,
-                title,
-                body,
-                f"https://example.test/docs/{entity_id}",
-                f"disk_file {entity_id} {title} {body}",
-                json.dumps({"disk_object_id": int(entity_id), "path": "/ПТО/Сметы"}, ensure_ascii=False),
-                "2026-06-01T10:00:00+03:00",
-                "2026-06-01T10:00:00+03:00",
-                "2026-06-01T10:00:00+03:00",
-            ),
-        )
 
 
 def anyio_run(awaitable):

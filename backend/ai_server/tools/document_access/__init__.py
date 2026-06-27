@@ -7,7 +7,6 @@ from ai_server.tools.document_access.access_control import (
 from ai_server.tools.document_access.download import resolve_portal_file_download_url
 from ai_server.tools.document_access.formatting import format_document_comparison_report
 from ai_server.tools.document_access.spreadsheet import compare_spreadsheets_by_query
-from ai_server.tools.document_access.toolset import DocumentToolset
 from ai_server.tools.document_access.types import (
     CellValue,
     ComparedDocument,
@@ -23,7 +22,6 @@ from ai_server.tools.document_access.types import (
 )
 
 __all__ = [
-    "DocumentToolset",
     "ResolvedDocument",
     "CellValue",
     "SpreadsheetEntry",

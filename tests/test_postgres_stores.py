@@ -1,0 +1,351 @@
+"""Tests for PostgreSQL agent stores (business logic with mocked DB connections)."""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import AsyncMock, patch
+
+from ai_server.integrations.postgres.bitrix_agent import PostgresBitrixAgentStore
+from ai_server.integrations.postgres.orchestrator_agent import PostgresOrchestratorStore
+from ai_server.integrations.postgres.pto_agent import PostgresPtoAgentStore
+from ai_server.integrations.postgres.vehicle_usage import PostgresVehicleUsageStore, _parse_row
+from ai_server.tools.vehicle_usage import StaffMember
+
+# ---------------------------------------------------------------------------
+# Fake psycopg sync connection
+# ---------------------------------------------------------------------------
+
+
+class _FakeCursor:
+    def __init__(self, rows: list[dict] | None = None):
+        self._rows = rows or []
+        self.rowcount = len(self._rows)
+
+    def fetchone(self) -> dict | None:
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self) -> list[dict]:
+        return list(self._rows)
+
+
+class _FakeSyncConn:
+    """Fake psycopg sync connection used as a context manager."""
+
+    def __init__(self, rows: list[dict] | None = None):
+        self._rows = rows or []
+        self.calls: list[tuple[str, tuple]] = []
+
+    def execute(self, sql: str, params: tuple = ()) -> _FakeCursor:
+        self.calls.append((str(sql), params))
+        return _FakeCursor(self._rows)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+
+def _sync_conn_factory(rows=None):
+    conn = _FakeSyncConn(rows=rows)
+    return lambda: conn, conn
+
+
+# ---------------------------------------------------------------------------
+# _parse_row (pure function)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_row_none():
+    assert _parse_row(None) is None
+
+
+def test_parse_row_no_parsed_json():
+    row = {"id": 1, "status": "sent", "parsed_json": None}
+    result = _parse_row(row)
+    assert result["status"] == "sent"
+    assert "parsed" not in result
+
+
+def test_parse_row_valid_json():
+    payload = {"date": "2026-06-05", "people": []}
+    row = {"id": 1, "status": "pending_confirmation", "parsed_json": json.dumps(payload)}
+    result = _parse_row(row)
+    assert result["parsed"] == payload
+
+
+def test_parse_row_invalid_json():
+    row = {"id": 1, "status": "sent", "parsed_json": "{not valid}"}
+    result = _parse_row(row)
+    assert result["parsed"] is None
+
+
+# ---------------------------------------------------------------------------
+# PostgresVehicleUsageStore — sync methods
+# ---------------------------------------------------------------------------
+
+
+def test_vehicle_store_upsert_employees(monkeypatch):
+    store = PostgresVehicleUsageStore("postgresql://fake")
+    factory, conn = _sync_conn_factory()
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    store.upsert_employees(
+        [
+            StaffMember(order=1, user_id=15, name="Иван Петров"),
+            StaffMember(order=2, user_id=16, name="Олег Сидоров"),
+        ]
+    )
+
+    insert_calls = [sql for sql, _ in conn.calls if "INSERT INTO logistics.employees" in sql]
+    assert len(insert_calls) == 2
+
+
+def test_vehicle_store_save_draft(monkeypatch):
+    store = PostgresVehicleUsageStore("postgresql://fake")
+    factory, conn = _sync_conn_factory(rows=[{"id": 42}])
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    result_id = store.save_draft(
+        request_date="2026-06-05",
+        user_id=9,
+        dialog_id="chat9",
+        response_text="Иван на Ларгусе",
+        parsed={"date": "2026-06-05"},
+    )
+
+    assert result_id == 42
+    assert any("INSERT INTO logistics.vehicle_usage_requests" in sql for sql, _ in conn.calls)
+
+
+def test_vehicle_store_save_draft_serializes_parsed(monkeypatch):
+    store = PostgresVehicleUsageStore("postgresql://fake")
+    factory, conn = _sync_conn_factory(rows=[{"id": 1}])
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    parsed = {"date": "2026-06-05", "people": [{"staff_order": 1}]}
+    store.save_draft(request_date="2026-06-05", user_id=9, dialog_id="", response_text="ok", parsed=parsed)
+
+    insert_params = [p for sql, p in conn.calls if "INSERT INTO logistics.vehicle_usage_requests" in sql]
+    assert insert_params
+    # parsed_json is the 7th param
+    parsed_json_str = insert_params[0][6]
+    assert json.loads(parsed_json_str) == parsed
+
+
+def test_vehicle_store_mark_escalated_returns_true(monkeypatch):
+    store = PostgresVehicleUsageStore("postgresql://fake")
+    factory, conn = _sync_conn_factory(rows=[{"id": 1}])
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    result = store.mark_escalated(request_date="2026-06-05", user_id=9, escalated_at="2026-06-05T09:00:00+03:00")
+    assert result is True
+
+
+def test_vehicle_store_mark_escalated_returns_false_when_no_rows(monkeypatch):
+    store = PostgresVehicleUsageStore("postgresql://fake")
+    factory, conn = _sync_conn_factory(rows=[])
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    result = store.mark_escalated(request_date="2099-01-01", user_id=None, escalated_at="2099-01-01T00:00:00+03:00")
+    assert result is False
+
+
+def test_vehicle_store_latest_request_by_dialog_id(monkeypatch):
+    store = PostgresVehicleUsageStore("postgresql://fake")
+    row = {"id": 5, "status": "sent", "parsed_json": None, "request_date": "2026-06-05"}
+    factory, conn = _sync_conn_factory(rows=[row])
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    result = store.latest_request(user_id=None, dialog_id="chat9")
+    assert result is not None
+    assert result["status"] == "sent"
+    assert any("dialog_id = %s" in sql for sql, _ in conn.calls)
+
+
+def test_vehicle_store_latest_request_none_when_no_user_or_dialog(monkeypatch):
+    store = PostgresVehicleUsageStore("postgresql://fake")
+    result = store.latest_request(user_id=None, dialog_id="")
+    assert result is None
+
+
+def test_vehicle_store_replace_day_report(monkeypatch):
+    store = PostgresVehicleUsageStore("postgresql://fake")
+    factory, conn = _sync_conn_factory()
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    store.replace_day_report(
+        status_date="2026-06-05",
+        employee_statuses=[(1, "shift", ""), (2, "day_off", "")],
+        vehicle_assignments=[(1, 1, ""), (2, None, "")],
+    )
+
+    delete_calls = [sql for sql, _ in conn.calls if "DELETE FROM logistics" in sql]
+    assert len(delete_calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# PostgresBitrixAgentStore — proposal methods
+# ---------------------------------------------------------------------------
+
+
+def test_bitrix_store_save_proposal(monkeypatch):
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    factory, conn = _sync_conn_factory(rows=[{"id": 7}])
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    pid = store.save_proposal(task_id=101, task_title="Задача", missing_parts="исполнитель", responsible_id=9)
+    assert pid == 7
+    assert any("INSERT INTO bitrix24.incomplete_proposals" in sql for sql, _ in conn.calls)
+
+
+def test_bitrix_store_get_proposal_by_id(monkeypatch):
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    row = {"id": 3, "task_id": 101, "status": "awaiting_response"}
+    factory, conn = _sync_conn_factory(rows=[row])
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    result = store.get_proposal_by_id(3)
+    assert result == row
+
+
+def test_bitrix_store_get_proposal_by_id_missing(monkeypatch):
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    factory, conn = _sync_conn_factory(rows=[])
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    assert store.get_proposal_by_id(999) is None
+
+
+def test_bitrix_store_get_proposals_for_manager(monkeypatch):
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    rows = [
+        {"id": 1, "task_id": 10, "status": "awaiting_response"},
+        {"id": 2, "task_id": 11, "status": "proposed"},
+    ]
+    factory, conn = _sync_conn_factory(rows=rows)
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    result = store.get_proposals_for_manager()
+    assert len(result) == 2
+    assert any("awaiting_response" in sql or "proposed" in sql for sql, _ in conn.calls)
+
+
+def test_bitrix_store_mark_status(monkeypatch):
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    factory, conn = _sync_conn_factory()
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    store.mark_status(3, "proposed")
+    assert any("UPDATE bitrix24.incomplete_proposals SET status" in sql for sql, _ in conn.calls)
+
+
+def test_bitrix_store_delete_proposal(monkeypatch):
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    factory, conn = _sync_conn_factory()
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    store.delete_proposal(3)
+    assert any("DELETE FROM bitrix24.incomplete_proposals" in sql for sql, _ in conn.calls)
+
+
+def test_bitrix_store_update_responsible_response(monkeypatch):
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    factory, conn = _sync_conn_factory()
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    store.update_responsible_response(3, "Согласен с дедлайном")
+    assert any("responsible_response" in sql for sql, _ in conn.calls)
+
+
+# ---------------------------------------------------------------------------
+# PostgresAgentSchema — async dialog_history methods
+# ---------------------------------------------------------------------------
+
+
+def anyio_run(coro):
+    import anyio
+
+    async def _runner():
+        return await coro
+
+    return anyio.run(_runner)
+
+
+def _make_async_conn(rows=None):
+    """Return an async context manager mock that returns a fake async connection."""
+    conn = AsyncMock()
+    conn.__aenter__ = AsyncMock(return_value=conn)
+    conn.__aexit__ = AsyncMock(return_value=False)
+    cur = AsyncMock()
+    cur.fetchall = AsyncMock(return_value=rows or [])
+    conn.execute = AsyncMock(return_value=cur)
+    return conn
+
+
+def test_orchestrator_store_load_turns_empty():
+    store = PostgresOrchestratorStore("postgresql://fake")
+    async_conn = _make_async_conn(rows=[])
+
+    async def run():
+        with patch.object(store, "_connect", AsyncMock(return_value=async_conn)):
+            return await store.load_turns("dialog:9")
+
+    rows = anyio_run(run())
+    assert rows == []
+
+
+def test_orchestrator_store_load_turns_returns_history():
+    store = PostgresOrchestratorStore("postgresql://fake")
+    fake_rows = [{"role": "user", "content": "привет"}, {"role": "assistant", "content": "здравствуй"}]
+    async_conn = _make_async_conn(rows=fake_rows)
+
+    async def run():
+        with patch.object(store, "_connect", AsyncMock(return_value=async_conn)):
+            return await store.load_turns("dialog:9")
+
+    turns = anyio_run(run())
+    assert turns == [{"role": "user", "content": "привет"}, {"role": "assistant", "content": "здравствуй"}]
+
+
+def test_pto_store_append_turn_inserts_two_rows():
+    store = PostgresPtoAgentStore("postgresql://fake")
+    inserted_sqls: list[str] = []
+
+    async def _fake_execute(sql, params=()):
+        inserted_sqls.append(str(sql))
+        return AsyncMock()
+
+    async_conn = AsyncMock()
+    async_conn.__aenter__ = AsyncMock(return_value=async_conn)
+    async_conn.__aexit__ = AsyncMock(return_value=False)
+    async_conn.execute = _fake_execute
+
+    async def run():
+        with patch.object(store, "_connect", AsyncMock(return_value=async_conn)):
+            await store.append_turn("dialog:9", "вопрос", "ответ")
+
+    anyio_run(run())
+
+    inserts = [s for s in inserted_sqls if "INSERT INTO" in s]
+    assert len(inserts) == 2
+
+
+def test_pto_store_schema_name():
+    store = PostgresPtoAgentStore("postgresql://fake")
+    assert store._SCHEMA == "pto"
+
+
+def test_orchestrator_store_schema_name():
+    store = PostgresOrchestratorStore("postgresql://fake")
+    assert store._SCHEMA == "internal_orchestrator"
+
+
+def test_bitrix_store_schema_name():
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    assert store._SCHEMA == "bitrix24"
+
+
+def test_vehicle_store_schema_name():
+    store = PostgresVehicleUsageStore("postgresql://fake")
+    assert store._SCHEMA == "logistics"

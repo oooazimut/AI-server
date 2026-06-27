@@ -8,12 +8,14 @@ from typing import Any, Protocol
 
 from ai_server.agents.specialist_llm_shared import (
     DIALOG_HISTORY_PROMPT_FRAGMENT,
+    SKILLS_PROMPT_FRAGMENT,
     allowed_tool_definitions,
     compact_tool_result,
     decision_status,
     load_instructions,
     result_status,
     retrieval_context,
+    skills_context,
 )
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
@@ -43,6 +45,7 @@ class PtoAgentLLM(Protocol):
         tool_definitions: list[dict[str, Any]],
         tool_results: list[ToolResult] | None = None,
         dialog_history: list[dict[str, str]] | None = None,
+        available_skills: list | None = None,
     ) -> PtoLLMDecisionResult:
         pass
 
@@ -101,6 +104,7 @@ class PtoLLMService:
         tool_definitions: list[dict[str, Any]],
         tool_results: list[ToolResult] | None = None,
         dialog_history: list[dict[str, str]] | None = None,
+        available_skills: list | None = None,
     ) -> PtoLLMDecisionResult:
         instructions = load_instructions(manifest)
         completion = await self.client.complete(
@@ -120,6 +124,7 @@ class PtoLLMService:
                             "user": task.user.model_dump(),
                             "files": task.files,
                             "current_datetime": datetime.now(UTC).astimezone().isoformat(),
+                            "available_skills": skills_context(available_skills or []),
                             "dialog_history": dialog_history or [],
                             "retrieval_context": retrieval_context(retrieval_hits),
                             "tools": allowed_tool_definitions(tool_definitions, ALLOWED_TOOL_NAMES),
@@ -198,6 +203,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "и применяет guardrails доступа. "
         "В tool_results могут прийти результаты твоих предыдущих tool_calls; используй их как наблюдения "
         "для следующего шага. "
+        f"{SKILLS_PROMPT_FRAGMENT}"
         f"{DIALOG_HISTORY_PROMPT_FRAGMENT}"
         "Если документ по смыслу бухгалтерский, складской, сетевой или программный, не притворяйся профильным специалистом: "
         "верни needs_human/needs_clarification и объясни, кому лучше передать. "

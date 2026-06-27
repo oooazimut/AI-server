@@ -7,8 +7,8 @@ from ai_server.integrations.bitrix.portal_search import (
     PortalSearchResult,
     portal_file_cache_path,
 )
-from ai_server.integrations.bitrix.ports import BitrixFileDownloadPort
 from ai_server.settings import Settings
+from ai_server.tools.bitrix_ports import BitrixFileDownloadPort
 from ai_server.utils import optional_int
 
 

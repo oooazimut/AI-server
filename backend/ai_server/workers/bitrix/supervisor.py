@@ -9,8 +9,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from ai_server.integrations.bitrix.ports import BitrixSupervisorPort
 from ai_server.settings import Settings
+from ai_server.tools.bitrix_ports import BitrixSupervisorPort
 from ai_server.utils import MOSCOW_TZ, optional_int
 
 logger = logging.getLogger(__name__)

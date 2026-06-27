@@ -1,22 +1,48 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 
 from ai_server.agents.logistics import LogisticsLLMService, LogisticsLLMToolCall, LogisticsSpecialist
+from ai_server.agents.logistics.specialist import VehicleUsageSettings
+from ai_server.agents.logistics.tools import VehicleContextTool, VehicleSaveDraftTool, VehicleSaveReportTool
 from ai_server.models import AgentTask, UserContext
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
-from ai_server.settings import get_settings
-from ai_server.tools.vehicle_usage import SentRequestData, StaffMember, VehicleUsageStore, VehicleUsageToolset
-from tests.fakes import FakeEmbeddingProvider, FakeLogisticsLLM, RecordingLLMClient
+from ai_server.tools.vehicle_usage import StaffMember
+from tests.fakes import FakeEmbeddingProvider, FakeLogisticsLLM, FakeVehicleUsageStore, RecordingLLMClient
 
 _FAKE_RETRIEVER = HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider())
 
+_VU_SETTINGS = VehicleUsageSettings(
+    manager_user_id=5,
+    max_reminders=3,
+    reminder_interval_minutes=30,
+    dry_run=True,
+)
 
-def test_logistics_specialist_forwards_dialog_history_to_decide(monkeypatch, tmp_path):
+
+def _specialist(
+    manifest,
+    store: FakeVehicleUsageStore,
+    *,
+    llm=None,
+    vu_settings: VehicleUsageSettings | None = None,
+) -> LogisticsSpecialist:
+    return LogisticsSpecialist(
+        manifest,
+        retriever=_FAKE_RETRIEVER,
+        agent_tools=[
+            VehicleContextTool(store),
+            VehicleSaveDraftTool(store),
+            VehicleSaveReportTool(store),
+        ],
+        llm=llm or FakeLogisticsLLM(),
+        vu_settings=vu_settings,
+    )
+
+
+def test_logistics_specialist_forwards_dialog_history_to_decide(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
     llm = FakeLogisticsLLM()
@@ -24,14 +50,9 @@ def test_logistics_specialist_forwards_dialog_history_to_decide(monkeypatch, tmp
         {"role": "user", "content": "кто сегодня на смене"},
         {"role": "assistant", "content": "Уточните дату смены."},
     ]
+    store = FakeVehicleUsageStore()
 
-    specialist = LogisticsSpecialist(
-        manifest,
-        retriever=_FAKE_RETRIEVER,
-        tools=VehicleUsageToolset(store=VehicleUsageStore(tmp_path / "vehicle_usage.sqlite"), user_id=9),
-        llm=llm,
-        settings=get_settings(),
-    )
+    specialist = _specialist(manifest, store, llm=llm)
     anyio_run(
         specialist.handle(
             AgentTask(
@@ -47,7 +68,8 @@ def test_logistics_specialist_forwards_dialog_history_to_decide(monkeypatch, tmp
     assert llm.decide_calls[0]["task"].context == {"dialog_history": history}
 
 
-def test_logistics_llm_decide_payload_includes_dialog_history_and_raw_context():
+def test_logistics_llm_decide_payload_includes_dialog_history_and_raw_context(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
     client = RecordingLLMClient(
@@ -71,12 +93,11 @@ def test_logistics_llm_decide_payload_includes_dialog_history_and_raw_context():
     assert payload["context"] == scheduler_context
 
 
-def test_logistics_specialist_saves_llm_parsed_draft(monkeypatch, tmp_path):
+def test_logistics_specialist_saves_llm_parsed_draft(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
-    store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
+    store = FakeVehicleUsageStore()
     store.upsert_employees(
         [StaffMember(order=1, user_id=15, name="Иван Петров"), StaffMember(order=2, user_id=16, name="Олег Сидоров")]
     )
@@ -104,16 +125,9 @@ def test_logistics_specialist_saves_llm_parsed_draft(monkeypatch, tmp_path):
         ],
         final_answer="Сохранил черновик.",
     )
-    specialist = LogisticsSpecialist(
-        manifest,
-        retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
-        tools=VehicleUsageToolset(store=store, user_id=9, dialog_id="chat9"),
-        llm=fake_llm,
-        settings=get_settings(),
-    )
 
     result = anyio_run(
-        specialist.handle(
+        _specialist(manifest, store, llm=fake_llm).handle(
             AgentTask(
                 task_id="log-1",
                 request="Иван на Ларгусе, Олег в офисе",
@@ -123,20 +137,20 @@ def test_logistics_specialist_saves_llm_parsed_draft(monkeypatch, tmp_path):
     )
 
     assert result.answer == "Сохранил черновик."
-    assert any(action.name == "logistics_vehicle_usage_context" for action in result.actions_taken)
-    assert any(action.name == "logistics_vehicle_usage_save_draft" for action in result.actions_taken)
-    with sqlite3.connect(store.path) as db:
-        row = db.execute("SELECT status, parsed_json FROM vehicle_usage_requests").fetchone()
-    assert row[0] == "pending_confirmation"
-    assert "Иван Петров" in row[1]
+    assert any(action.name == "vehicle_usage_context" for action in result.actions_taken)
+    assert any(action.name == "vehicle_usage_save_draft" for action in result.actions_taken)
+    assert store._requests
+    saved = store._requests[-1]
+    assert saved["status"] == "pending_confirmation"
+    people = saved["parsed"].get("people", [])
+    assert any(p.get("full_name") == "Иван Петров" for p in people)
 
 
-def test_logistics_specialist_saves_confirmed_report(monkeypatch, tmp_path):
+def test_logistics_specialist_saves_confirmed_report(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
-    store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
+    store = FakeVehicleUsageStore()
     store.upsert_employees([StaffMember(order=1, user_id=15, name="Иван Петров")])
     fake_llm = FakeLogisticsLLM(
         tool_call_steps=[
@@ -159,123 +173,155 @@ def test_logistics_specialist_saves_confirmed_report(monkeypatch, tmp_path):
         ],
         final_answer="Сохранил утренний отчет.",
     )
-    specialist = LogisticsSpecialist(
-        manifest,
-        retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
-        tools=VehicleUsageToolset(store=store, user_id=9, dialog_id="chat9"),
-        llm=fake_llm,
-        settings=get_settings(),
-    )
 
-    result = anyio_run(specialist.handle(AgentTask(task_id="log-2", request="подтверждаю", user=UserContext(id="9"))))
-
-    assert result.answer == "Сохранил утренний отчет."
-    with sqlite3.connect(store.path) as db:
-        request = db.execute("SELECT status FROM vehicle_usage_requests").fetchone()
-        status = db.execute("SELECT status FROM employee_daily_statuses").fetchone()
-        assignment = db.execute("SELECT vehicle_id, employee_id FROM vehicle_daily_assignments").fetchone()
-    assert request[0] == "answered"
-    assert status[0] == "shift"
-    assert assignment == (1, 1)
-
-
-def test_logistics_morning_handler_delivers_and_records_request(monkeypatch, tmp_path):
-    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
-    monkeypatch.setenv("VEHICLE_USAGE_ENABLED", "true")
-    monkeypatch.setenv("VEHICLE_USAGE_DRY_RUN", "false")
-    monkeypatch.setenv("VEHICLE_USAGE_MANAGER_USER_ID", "9")
-    monkeypatch.setenv("VEHICLE_USAGE_DIALOG_ID", "chat9")
-    monkeypatch.setenv("VEHICLE_USAGE_REMINDER_INTERVAL_MINUTES", "30")
-    monkeypatch.setenv("VEHICLE_USAGE_MAX_REMINDERS", "3")
-    from ai_server.settings import get_settings
-
-    store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
-    fake_llm = FakeLogisticsLLM(
-        tool_call_steps=[
-            [LogisticsLLMToolCall(name="vehicle_usage_context", args={"request_date": "2026-06-05"})],
-            [LogisticsLLMToolCall(name="none")],
-        ],
-        final_answer="Нужен утренний отчет.",
-    )
-    delivered = []
-
-    async def _deliver(dialog_id: str, message: str) -> None:
-        delivered.append((dialog_id, message))
-
-    manifest = get_agent_manifest("logistics")
-    assert manifest is not None
-    # No real scheduler — schedule_job is a safe no-op when _scheduler is None
-    specialist = LogisticsSpecialist(
-        manifest,
-        retriever=_FAKE_RETRIEVER,
-        tools=VehicleUsageToolset(store=store, user_id=9, dialog_id="chat9"),
-        llm=fake_llm,
-        deliver_fn=_deliver,
-        settings=get_settings(),
-    )
-    anyio_run(specialist._run_and_deliver(reminder_count=0))
-
-    assert delivered == [("chat9", "Нужен утренний отчет.")]
-    with sqlite3.connect(store.path) as db:
-        row = db.execute("SELECT status, reminder_count, message FROM vehicle_usage_requests").fetchone()
-    assert row == ("sent", 1, "Нужен утренний отчет.")
-
-
-def test_logistics_escalates_after_max_reminders(monkeypatch, tmp_path):
-    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
-    monkeypatch.setenv("VEHICLE_USAGE_ENABLED", "true")
-    monkeypatch.setenv("VEHICLE_USAGE_DRY_RUN", "false")
-    monkeypatch.setenv("VEHICLE_USAGE_MANAGER_USER_ID", "9")
-    monkeypatch.setenv("VEHICLE_USAGE_DIALOG_ID", "chat9")
-    monkeypatch.setenv("VEHICLE_USAGE_ADMIN_NOTIFY_USER_IDS", "1,9")
-    monkeypatch.setenv("VEHICLE_USAGE_MAX_REMINDERS", "3")
-    from datetime import datetime
-
-    from ai_server.settings import get_settings
-    from ai_server.utils import MOSCOW_TZ
-
-    today = datetime.now(MOSCOW_TZ).date().isoformat()
-    store = VehicleUsageStore(tmp_path / "vehicle_usage.sqlite")
-    store.create_sent_request(
-        SentRequestData(
-            request_date=today,
-            user_id=9,
-            dialog_id="chat9",
-            message="Нужен отчет.",
-            sent_at=f"{today}T08:00:00+03:00",
-            reminder_count=3,
+    result = anyio_run(
+        _specialist(manifest, store, llm=fake_llm).handle(
+            AgentTask(task_id="log-2", request="подтверждаю", user=UserContext(id="9"))
         )
     )
-    fake_llm = FakeLogisticsLLM(
-        tool_call_steps=[
-            [LogisticsLLMToolCall(name="vehicle_usage_context", args={"request_date": "2026-06-05"})],
-            [LogisticsLLMToolCall(name="none")],
-        ],
-        final_answer="Отчет по машинам не получен.",
-    )
-    notified: list[int] = []
 
-    async def _notify(user_id: int, message: str) -> None:
-        notified.append(user_id)
+    assert result.answer == "Сохранил утренний отчет."
+    assert store._requests
+    assert store._requests[-1]["status"] == "answered"
+    assert store._day_reports
+    report = store._day_reports[-1]
+    assert report["employee_statuses"]
+    assert report["employee_statuses"][0][1] == "shift"
+    assert report["vehicle_assignments"]
+    assert report["vehicle_assignments"][0][0] == 1
 
+
+def test_morning_task_schedules_reminder(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     manifest = get_agent_manifest("logistics")
     assert manifest is not None
-    specialist = LogisticsSpecialist(
-        manifest,
-        retriever=_FAKE_RETRIEVER,
-        tools=VehicleUsageToolset(store=store, user_id=9, dialog_id="chat9"),
-        llm=fake_llm,
-        notify_fn=_notify,
-        settings=get_settings(),
-    )
-    anyio_run(specialist._run_and_deliver(reminder_count=3))
+    store = FakeVehicleUsageStore()
+    fake_llm = FakeLogisticsLLM(final_answer="Привет, заполните отчёт по автомобилям за сегодня.")
 
-    assert notified == [1, 9]
-    with sqlite3.connect(store.path) as db:
-        row = db.execute("SELECT escalated_at FROM vehicle_usage_requests").fetchone()
-    assert row[0]
+    result = anyio_run(
+        _specialist(manifest, store, llm=fake_llm, vu_settings=_VU_SETTINGS).handle(
+            AgentTask(
+                task_id="morning-1",
+                request="Сгенерируй утренний отчёт.",
+                context={
+                    "channel_id": "bitrix24",
+                    "recipient_id": "chat77",
+                    "event": "vehicle_usage_morning",
+                    "request_date": "2026-06-23",
+                },
+            )
+        )
+    )
+
+    assert result.answer == "Привет, заполните отчёт по автомобилям за сегодня."
+    assert len(result.scheduled_tasks) == 1
+    sched = result.scheduled_tasks[0]
+    assert sched.cancel is False
+    assert sched.agent_id == "logistics"
+    assert sched.job_id == "vu_reminder_2026-06-23"
+    assert sched.task is not None
+    assert sched.task.context["event"] == "vehicle_usage_reminder_due"
+    assert sched.task.context["channel_id"] == "bitrix24"
+    assert sched.task.context["recipient_id"] == "chat77"
+    assert sched.task.context["reminder_count"] == 1
+
+
+def test_reminder_increments_count(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    manifest = get_agent_manifest("logistics")
+    assert manifest is not None
+    store = FakeVehicleUsageStore()
+
+    result = anyio_run(
+        _specialist(manifest, store, vu_settings=_VU_SETTINGS).handle(
+            AgentTask(
+                task_id="reminder-2",
+                request="Напоминание.",
+                context={
+                    "channel_id": "bitrix24",
+                    "recipient_id": "chat77",
+                    "event": "vehicle_usage_reminder_due",
+                    "request_date": "2026-06-23",
+                    "reminder_count": 1,
+                },
+            )
+        )
+    )
+
+    if result.scheduled_tasks:
+        sched = result.scheduled_tasks[0]
+        assert sched.task is not None
+        assert sched.task.context["reminder_count"] == 2
+
+
+def test_max_reminders_stops_scheduling(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    manifest = get_agent_manifest("logistics")
+    assert manifest is not None
+    store = FakeVehicleUsageStore()
+
+    result = anyio_run(
+        _specialist(manifest, store, vu_settings=_VU_SETTINGS).handle(
+            AgentTask(
+                task_id="reminder-max",
+                request="Напоминание.",
+                context={
+                    "event": "vehicle_usage_reminder_due",
+                    "request_date": "2026-06-23",
+                    "reminder_count": 3,  # already at max
+                },
+            )
+        )
+    )
+
+    assert result.scheduled_tasks == []
+
+
+def test_save_report_cancels_reminder(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    manifest = get_agent_manifest("logistics")
+    assert manifest is not None
+    store = FakeVehicleUsageStore()
+    store.upsert_employees([StaffMember(order=1, user_id=15, name="Иван Петров")])
+    fake_llm = FakeLogisticsLLM(
+        tool_call_steps=[
+            [LogisticsLLMToolCall(name="vehicle_usage_context", args={"request_date": "2026-06-23"})],
+            [
+                LogisticsLLMToolCall(
+                    name="vehicle_usage_save_report",
+                    args={
+                        "request_date": "2026-06-23",
+                        "source_text": "подтверждаю",
+                        "parsed": {
+                            "date": "2026-06-23",
+                            "people": [{"staff_order": 1, "full_name": "Иван Петров", "status": "shift"}],
+                            "vehicles": [],
+                        },
+                    },
+                )
+            ],
+            [LogisticsLLMToolCall(name="none")],
+        ],
+        final_answer="Отчёт сохранён.",
+    )
+
+    result = anyio_run(
+        _specialist(manifest, store, llm=fake_llm, vu_settings=_VU_SETTINGS).handle(
+            AgentTask(
+                task_id="save-report-1",
+                request="подтверждаю",
+                user=UserContext(id="9"),
+                context={"request_date": "2026-06-23"},
+            )
+        )
+    )
+
+    assert result.answer == "Отчёт сохранён."
+    assert len(result.scheduled_tasks) == 1
+    cancel = result.scheduled_tasks[0]
+    assert cancel.cancel is True
+    assert cancel.job_id == "vu_reminder_2026-06-23"
+    assert cancel.agent_id == "logistics"
 
 
 def anyio_run(awaitable):
@@ -285,17 +331,3 @@ def anyio_run(awaitable):
         return await awaitable
 
     return anyio.run(runner)
-
-
-class FakeVehicleBitrix:
-    def __init__(self) -> None:
-        self.messages = []
-        self.notifications = []
-
-    async def send_bot_message(self, dialog_id, message, *, bot_id=None, keyboard=None):
-        self.messages.append({"dialog_id": dialog_id, "message": message, "bot_id": bot_id, "keyboard": keyboard})
-        return 1
-
-    async def notify_user(self, *, user_id, message, tag="ai_server", sub_tag=""):
-        self.notifications.append({"user_id": user_id, "message": message, "tag": tag, "sub_tag": sub_tag})
-        return 1

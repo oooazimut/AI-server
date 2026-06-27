@@ -8,12 +8,14 @@ from typing import Any, Protocol
 
 from ai_server.agents.specialist_llm_shared import (
     DIALOG_HISTORY_PROMPT_FRAGMENT,
+    SKILLS_PROMPT_FRAGMENT,
     allowed_tool_definitions,
     compact_tool_result,
     decision_status,
     load_instructions,
     result_status,
     retrieval_context,
+    skills_context,
 )
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
@@ -25,7 +27,6 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_TOOL_NAMES = {
     "bitrix_api",
-    "current_user_profile",
     "task_create_draft",
     "save_incomplete_proposal",
     "delete_incomplete_proposal",
@@ -45,6 +46,7 @@ class BitrixAgentLLM(Protocol):
         tool_definitions: list[dict[str, Any]],
         tool_results: list[ToolResult] | None = None,
         dialog_history: list[dict[str, str]] | None = None,
+        available_skills: list | None = None,
     ) -> BitrixLLMDecisionResult:
         pass
 
@@ -104,6 +106,7 @@ class BitrixLLMService:
         tool_definitions: list[dict[str, Any]],
         tool_results: list[ToolResult] | None = None,
         dialog_history: list[dict[str, str]] | None = None,
+        available_skills: list | None = None,
     ) -> BitrixLLMDecisionResult:
         instructions = load_instructions(manifest)
         completion = await self.client.complete(
@@ -123,6 +126,7 @@ class BitrixLLMService:
                             "user": task.user.model_dump(),
                             "files": task.files,
                             "current_datetime": datetime.now(UTC).astimezone().isoformat(),
+                            "available_skills": skills_context(available_skills or []),
                             "dialog_history": dialog_history or [],
                             "permission_context": _permission_context(task, self.settings),
                             "retrieval_context": retrieval_context(retrieval_hits),
@@ -207,6 +211,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "В payload есть permission_context: именно ты обязан прочитать его до write-tool "
         "и решить, имеет ли текущий пользователь право просить такое действие. "
         "permission_context содержит Bitrix-факты о текущем пользователе и RAG-выдержки из политики прав. "
+        f"{SKILLS_PROMPT_FRAGMENT}"
         f"{DIALOG_HISTORY_PROMPT_FRAGMENT}"
         "Если Bitrix-факты отсутствуют или противоречат политике, не угадывай права. "
         "Если permission_context не разрешает write-действие, не вызывай write-tool; "
@@ -216,24 +221,28 @@ def _decision_system_prompt(instructions: str = "") -> str:
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
-        '"tool_calls":[{"name":"current_user_profile|bitrix_api|task_create_draft|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
+        '"tool_calls":[{"name":"bitrix_api|task_create_draft|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
         "Перед каждым tool_call сам проверь, хватает ли данных для его корректного вызова. "
         "Нельзя вызывать tool с надеждой, что backend или tool сам разберётся с недостающими данными. "
         'Если данных не хватает, не вызывай tool: верни status=needs_clarification, tool_calls=[{"name":"none"}], '
         "а в answer задай короткий уточняющий вопрос. "
-        "Для проверки фактов о текущем пользователе можно использовать current_user_profile, но перед write-tool "
-        "обычно уже есть permission_context.bitrix_current_user_profile. "
+        "Данные о текущем пользователе уже есть в permission_context.bitrix_current_user_profile. "
         "Для поиска задач используй bitrix_api с tasks.task.list/tasks.task.get. "
+        "Для поиска сотрудника по имени — bitrix_api с user.search, получи numeric ID. "
+        "Для поиска проекта по названию — bitrix_api с sonet_group.get, получи numeric ID. "
         "Для создания задачи используй task_create_draft. "
-        "Для task_create_draft именно ты распознаёшь title, responsible_id/responsible_query/responsible_self, "
-        "group_id/project_query, deadline_iso или no_deadline. "
+        "Для task_create_draft именно ты распознаёшь title, responsible_id/responsible_self, "
+        "group_id, deadline_iso или no_deadline. "
+        "Если ответственный указан по имени — сначала вызови bitrix_api(user.search), получи ID, затем task_create_draft. "
+        "Если проект указан по названию — сначала вызови bitrix_api(sonet_group.get), получи ID, затем task_create_draft. "
         "Если пользователь сказал относительный срок, вычисли deadline_iso сам по current_datetime. "
         "Если срок не указан, применяй правила из retrieval_context; если правило неясно, спроси уточнение. "
-        "Не вызывай task_create_draft без title, одного из responsible_id/responsible_query/responsible_self, "
+        "Не вызывай task_create_draft без title, одного из responsible_id/responsible_self, "
         "и одного из deadline_iso/no_deadline=true. "
         "Закрытие задачи исполнителем: вызови tasks.task.result.add (добавить результат) + tasks.task.complete "
         "(завершить). Если TASK_CONTROL=Y, задача перейдёт в STATUS=4 (ждёт контроля). "
         "Закрытие задачи постановщиком: вызови tasks.task.approve напрямую — STATUS=5, без проверки результата. "
+        "Для уведомления пользователя используй bitrix_api с im.notify.system.add. "
         "Все Bitrix-методы (approve/disapprove/complete/result.add/commentitem.add) вызывай через bitrix_api. "
         "Для поиска документов/файлов используй portal_search. Если данных не хватает, status=needs_clarification."
         f"{extra}"

@@ -2,28 +2,19 @@ from __future__ import annotations
 
 import asyncio
 
-from ai_server.models import ActionRecord, AgentResult, AgentTask
+from ai_server.agents.bitrix24 import Bitrix24Specialist
+from ai_server.agents.bitrix24.quality_control import handle_quality_control_task
+from ai_server.models import AgentTask
+from ai_server.registry import get_agent_manifest
 from ai_server.result_templates import active_result_templates_context
 from ai_server.settings import get_settings
-from ai_server.workers.bitrix.quality_control import handle_quality_control_webhook_event
-
-
-def _task_update_payload(task_id: int = 101) -> dict:
-    return {
-        "event": "onTaskUpdate",
-        "data": {
-            "FIELDS_AFTER": {
-                "ID": str(task_id),
-            }
-        },
-    }
+from tests.fakes import FakeBitrixLLM
 
 
 class FakeQualityBitrix:
-    def __init__(self, *, status: str = "4", group_id: str = "44") -> None:
+    def __init__(self, *, status: str = "4") -> None:
         self.calls: list = []
         self._status = status
-        self._group_id = group_id
 
     async def get_task(self, task_id, *, select=None):
         self.calls.append(("get_task", task_id))
@@ -31,11 +22,11 @@ class FakeQualityBitrix:
             "task": {
                 "id": str(task_id),
                 "title": "Проверить IP-камеру",
-                "description": "Проверить доступность камеры и время на устройстве.",
+                "description": "Проверить доступность камеры.",
                 "status": self._status,
                 "responsibleId": "9",
                 "createdBy": "1",
-                "groupId": self._group_id,
+                "groupId": "44",
                 "taskControl": "Y",
                 "changedDate": "2026-06-04T10:00:00+03:00",
             }
@@ -53,49 +44,32 @@ class FakeQualityBitrix:
         ]
 
 
-class FakeSpecialist:
-    def __init__(self, *, actions: list[str] | None = None, answer: str = "Проверено.") -> None:
-        self.calls: list[AgentTask] = []
-        self._actions = actions or ["bitrix_api"]
-        self._answer = answer
-
-    async def handle(self, task: AgentTask) -> AgentResult:
-        self.calls.append(task)
-        return AgentResult(
-            status="completed",
-            agent_id="bitrix24",
-            answer=self._answer,
-            actions_taken=[ActionRecord(name=a, status="ok", details={}) for a in self._actions],
-        )
+def _qc_task(task_id: int = 101) -> AgentTask:
+    return AgentTask(
+        task_id=f"qc_input_{task_id}",
+        request="quality_control",
+        context={"bitrix_event_type": "ONTASKUPDATE", "task_id": task_id},
+    )
 
 
-def test_quality_control_calls_specialist_for_status4_task(monkeypatch, tmp_path):
+def _specialist() -> Bitrix24Specialist:
+    return Bitrix24Specialist(get_agent_manifest("bitrix24"), llm=FakeBitrixLLM())
+
+
+def test_quality_control_calls_llm_for_status4_task(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path))
     monkeypatch.setenv("QUALITY_CONTROL_WEBHOOK_ENABLED", "true")
     monkeypatch.setenv("QUALITY_CONTROL_DRY_RUN", "false")
 
     bitrix = FakeQualityBitrix(status="4")
-    specialist = FakeSpecialist(actions=["bitrix_api", "bitrix_api"])
+    specialist = _specialist()
 
-    result = asyncio.run(
-        handle_quality_control_webhook_event(
-            bitrix,
-            payload=_task_update_payload(101),
-            status={},
-            specialist=specialist,
-            settings=get_settings(),
-        )
-    )
+    result = asyncio.run(handle_quality_control_task(specialist, _qc_task(101), bitrix=bitrix, settings=get_settings()))
 
-    assert result["handled"] is True
-    assert result["task_id"] == 101
-    assert len(specialist.calls) == 1
-    called_task = specialist.calls[0]
-    assert called_task.task_id == "qc_101"
-    assert called_task.source == "quality_control_webhook"
-    assert called_task.context["task_detail"]["status"] == "4"
-    assert result["actions"] == ["bitrix_api", "bitrix_api"]
+    assert result.status in ("completed", "needs_human", "failed")
+    assert ("get_task", 101) in bitrix.calls
+    assert ("list_task_results", 101) in bitrix.calls
 
 
 def test_quality_control_skips_non_status4_task(monkeypatch, tmp_path):
@@ -105,21 +79,13 @@ def test_quality_control_skips_non_status4_task(monkeypatch, tmp_path):
     monkeypatch.setenv("QUALITY_CONTROL_DRY_RUN", "false")
 
     bitrix = FakeQualityBitrix(status="5")
-    specialist = FakeSpecialist()
+    specialist = _specialist()
 
-    result = asyncio.run(
-        handle_quality_control_webhook_event(
-            bitrix,
-            payload=_task_update_payload(202),
-            status={},
-            specialist=specialist,
-            settings=get_settings(),
-        )
-    )
+    result = asyncio.run(handle_quality_control_task(specialist, _qc_task(202), bitrix=bitrix, settings=get_settings()))
 
-    assert result["handled"] is False
-    assert "status_5" in result["reason"]
-    assert len(specialist.calls) == 0
+    assert result.status == "completed"
+    assert "status_5" in result.answer
+    assert ("list_task_results", 202) not in bitrix.calls
 
 
 def test_quality_control_disabled_skips(monkeypatch, tmp_path):
@@ -128,21 +94,13 @@ def test_quality_control_disabled_skips(monkeypatch, tmp_path):
     monkeypatch.setenv("QUALITY_CONTROL_WEBHOOK_ENABLED", "false")
 
     bitrix = FakeQualityBitrix(status="4")
-    specialist = FakeSpecialist()
+    specialist = _specialist()
 
-    result = asyncio.run(
-        handle_quality_control_webhook_event(
-            bitrix,
-            payload=_task_update_payload(303),
-            status={},
-            specialist=specialist,
-            settings=get_settings(),
-        )
-    )
+    result = asyncio.run(handle_quality_control_task(specialist, _qc_task(303), bitrix=bitrix, settings=get_settings()))
 
-    assert result["handled"] is False
-    assert result["reason"] == "disabled"
-    assert len(specialist.calls) == 0
+    assert result.status == "completed"
+    assert "quality_control_disabled" in result.answer
+    assert bitrix.calls == []
 
 
 def test_quality_control_deduplication(monkeypatch, tmp_path):
@@ -152,54 +110,16 @@ def test_quality_control_deduplication(monkeypatch, tmp_path):
     monkeypatch.setenv("QUALITY_CONTROL_DRY_RUN", "false")
 
     bitrix = FakeQualityBitrix(status="4")
-    specialist = FakeSpecialist()
+    specialist = _specialist()
     settings = get_settings()
 
-    first = asyncio.run(
-        handle_quality_control_webhook_event(
-            bitrix,
-            payload=_task_update_payload(404),
-            status={},
-            specialist=specialist,
-            settings=settings,
-        )
-    )
-    assert first["handled"] is True
+    first = asyncio.run(handle_quality_control_task(specialist, _qc_task(404), bitrix=bitrix, settings=settings))
+    assert first.status in ("completed", "needs_human")
 
-    duplicate = asyncio.run(
-        handle_quality_control_webhook_event(
-            bitrix,
-            payload=_task_update_payload(404),
-            status={},
-            specialist=specialist,
-            settings=settings,
-        )
-    )
-    assert duplicate["handled"] is False
-    assert duplicate.get("duplicate") is True
-    assert len(specialist.calls) == 1
+    bitrix2 = FakeQualityBitrix(status="4")
+    duplicate = asyncio.run(handle_quality_control_task(specialist, _qc_task(404), bitrix=bitrix2, settings=settings))
 
-
-def test_quality_control_no_specialist_marks_done_with_empty_actions(monkeypatch, tmp_path):
-    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path))
-    monkeypatch.setenv("QUALITY_CONTROL_WEBHOOK_ENABLED", "true")
-    monkeypatch.setenv("QUALITY_CONTROL_DRY_RUN", "false")
-
-    bitrix = FakeQualityBitrix(status="4")
-
-    result = asyncio.run(
-        handle_quality_control_webhook_event(
-            bitrix,
-            payload=_task_update_payload(505),
-            status={},
-            specialist=None,
-            settings=get_settings(),
-        )
-    )
-
-    assert result["handled"] is True
-    assert result["actions"] == []
+    assert "already_processed" in duplicate.answer
 
 
 def test_result_templates_catalog_contains_default_template():

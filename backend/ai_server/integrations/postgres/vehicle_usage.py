@@ -1,31 +1,34 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from typing import Any
-
-import psycopg
-from psycopg.rows import dict_row
 
 from ai_server.utils import MOSCOW_TZ
 
+from .agent_schema import PostgresAgentSchema
+
 
 def _now() -> str:
+    from datetime import datetime
+
     return datetime.now(MOSCOW_TZ).isoformat()
 
 
-class PostgresVehicleUsageStore:
-    def __init__(self, database_url: str) -> None:
-        self._url = database_url
+class PostgresVehicleUsageStore(PostgresAgentSchema):
+    """Vehicle usage store: dialog_history + operational tables in the 'logistics' schema.
 
-    def _connect(self) -> psycopg.Connection:
-        return psycopg.connect(self._url, row_factory=dict_row)
+    Async methods (ensure_schema, load_turns, append_turn) satisfy AgentStorePort.
+    Sync vehicle methods satisfy VehicleUsageStorePort via structural typing.
+    """
 
-    def ensure_schema(self) -> None:
-        with self._connect() as db:
+    _SCHEMA = "logistics"
+
+    async def ensure_schema(self) -> None:
+        await super().ensure_schema()  # creates logistics schema + dialog_history table
+        with self._sync_connect() as db:
             db.execute(
                 """
-                CREATE TABLE IF NOT EXISTS employees (
+                CREATE TABLE IF NOT EXISTS logistics.employees (
                     id INTEGER PRIMARY KEY,
                     bitrix_user_id INTEGER,
                     full_name TEXT NOT NULL,
@@ -35,7 +38,7 @@ class PostgresVehicleUsageStore:
             )
             db.execute(
                 """
-                CREATE TABLE IF NOT EXISTS vehicles (
+                CREATE TABLE IF NOT EXISTS logistics.vehicles (
                     id INTEGER PRIMARY KEY,
                     brand_model TEXT NOT NULL,
                     registration_number TEXT NOT NULL,
@@ -46,7 +49,7 @@ class PostgresVehicleUsageStore:
             )
             db.execute(
                 """
-                CREATE TABLE IF NOT EXISTS vehicle_usage_requests (
+                CREATE TABLE IF NOT EXISTS logistics.vehicle_usage_requests (
                     id SERIAL PRIMARY KEY,
                     request_date TEXT NOT NULL,
                     user_id INTEGER,
@@ -66,7 +69,7 @@ class PostgresVehicleUsageStore:
             )
             db.execute(
                 """
-                CREATE TABLE IF NOT EXISTS employee_daily_statuses (
+                CREATE TABLE IF NOT EXISTS logistics.employee_daily_statuses (
                     id SERIAL PRIMARY KEY,
                     status_date TEXT NOT NULL,
                     employee_id INTEGER NOT NULL,
@@ -78,7 +81,7 @@ class PostgresVehicleUsageStore:
             )
             db.execute(
                 """
-                CREATE TABLE IF NOT EXISTS vehicle_daily_assignments (
+                CREATE TABLE IF NOT EXISTS logistics.vehicle_daily_assignments (
                     id SERIAL PRIMARY KEY,
                     assignment_date TEXT NOT NULL,
                     vehicle_id INTEGER NOT NULL,
@@ -90,12 +93,11 @@ class PostgresVehicleUsageStore:
             )
 
     def upsert_employees(self, members: list[Any]) -> None:
-        self.ensure_schema()
-        with self._connect() as db:
+        with self._sync_connect() as db:
             for member in members:
                 db.execute(
                     """
-                    INSERT INTO employees (id, bitrix_user_id, full_name, position)
+                    INSERT INTO logistics.employees (id, bitrix_user_id, full_name, position)
                     VALUES (%s, %s, %s, '')
                     ON CONFLICT (id) DO UPDATE SET
                         bitrix_user_id = EXCLUDED.bitrix_user_id,
@@ -105,7 +107,6 @@ class PostgresVehicleUsageStore:
                 )
 
     def context(self, *, request_date: str, user_id: int | None, dialog_id: str) -> dict[str, Any]:
-        self.ensure_schema()
         return {
             "request_date": request_date,
             "staff_roster": self.staff_roster(),
@@ -114,18 +115,22 @@ class PostgresVehicleUsageStore:
         }
 
     def _vehicles(self) -> list[dict[str, Any]]:
-        with self._connect() as db:
+        with self._sync_connect() as db:
             rows = db.execute(
-                "SELECT id, brand_model, registration_number, debit_card_number, ppr_card_number FROM vehicles ORDER BY id"
+                """
+                SELECT id, brand_model, registration_number, debit_card_number, ppr_card_number
+                FROM logistics.vehicles
+                ORDER BY id
+                """
             ).fetchall()
         return list(rows)
 
     def staff_roster(self) -> list[dict[str, Any]]:
-        with self._connect() as db:
+        with self._sync_connect() as db:
             rows = db.execute(
                 """
                 SELECT id AS display_order, bitrix_user_id AS user_id, full_name, position
-                FROM employees
+                FROM logistics.employees
                 ORDER BY id
                 """
             ).fetchall()
@@ -133,10 +138,10 @@ class PostgresVehicleUsageStore:
 
     def latest_request(self, *, user_id: int | None, dialog_id: str) -> dict[str, Any] | None:
         if dialog_id:
-            with self._connect() as db:
+            with self._sync_connect() as db:
                 row = db.execute(
                     """
-                    SELECT * FROM vehicle_usage_requests
+                    SELECT * FROM logistics.vehicle_usage_requests
                     WHERE dialog_id = %s
                     ORDER BY request_date DESC, id DESC
                     LIMIT 1
@@ -146,10 +151,10 @@ class PostgresVehicleUsageStore:
             return _parse_row(row)
         if user_id is None:
             return None
-        with self._connect() as db:
+        with self._sync_connect() as db:
             row = db.execute(
                 """
-                SELECT * FROM vehicle_usage_requests
+                SELECT * FROM logistics.vehicle_usage_requests
                 WHERE user_id = %s
                 ORDER BY request_date DESC, id DESC
                 LIMIT 1
@@ -159,10 +164,10 @@ class PostgresVehicleUsageStore:
         return _parse_row(row)
 
     def get_request(self, *, request_date: str, user_id: int | None) -> dict[str, Any] | None:
-        with self._connect() as db:
+        with self._sync_connect() as db:
             row = db.execute(
                 """
-                SELECT * FROM vehicle_usage_requests
+                SELECT * FROM logistics.vehicle_usage_requests
                 WHERE request_date = %s AND (user_id = %s OR (%s IS NULL AND user_id IS NULL))
                 LIMIT 1
                 """,
@@ -171,10 +176,10 @@ class PostgresVehicleUsageStore:
         return _parse_row(row)
 
     def latest_requests(self, *, limit: int = 10) -> list[dict[str, Any]]:
-        with self._connect() as db:
+        with self._sync_connect() as db:
             rows = db.execute(
                 """
-                SELECT * FROM vehicle_usage_requests
+                SELECT * FROM logistics.vehicle_usage_requests
                 ORDER BY request_date DESC, id DESC
                 LIMIT %s
                 """,
@@ -183,11 +188,10 @@ class PostgresVehicleUsageStore:
         return [item for row in rows if (item := _parse_row(row)) is not None]
 
     def create_sent_request(self, data: Any) -> int:
-        self.ensure_schema()
-        with self._connect() as db:
+        with self._sync_connect() as db:
             db.execute(
                 """
-                INSERT INTO vehicle_usage_requests (
+                INSERT INTO logistics.vehicle_usage_requests (
                     request_date, user_id, dialog_id, status, message, sent_at,
                     reminder_count, last_reminder_at
                 )
@@ -195,12 +199,15 @@ class PostgresVehicleUsageStore:
                 ON CONFLICT (request_date, user_id) DO UPDATE SET
                     dialog_id = EXCLUDED.dialog_id,
                     status = CASE
-                        WHEN vehicle_usage_requests.status = 'answered' THEN vehicle_usage_requests.status
+                        WHEN logistics.vehicle_usage_requests.status = 'answered'
+                            THEN logistics.vehicle_usage_requests.status
                         ELSE 'sent'
                     END,
                     message = EXCLUDED.message,
-                    sent_at = COALESCE(vehicle_usage_requests.sent_at, EXCLUDED.sent_at),
-                    reminder_count = GREATEST(vehicle_usage_requests.reminder_count, EXCLUDED.reminder_count),
+                    sent_at = COALESCE(logistics.vehicle_usage_requests.sent_at, EXCLUDED.sent_at),
+                    reminder_count = GREATEST(
+                        logistics.vehicle_usage_requests.reminder_count, EXCLUDED.reminder_count
+                    ),
                     last_reminder_at = EXCLUDED.last_reminder_at
                 """,
                 (
@@ -215,7 +222,7 @@ class PostgresVehicleUsageStore:
             )
             row = db.execute(
                 """
-                SELECT id FROM vehicle_usage_requests
+                SELECT id FROM logistics.vehicle_usage_requests
                 WHERE request_date = %s AND (user_id = %s OR (%s IS NULL AND user_id IS NULL))
                 """,
                 (data.request_date, data.user_id, data.user_id),
@@ -223,10 +230,10 @@ class PostgresVehicleUsageStore:
         return int(row["id"]) if row else 0
 
     def mark_escalated(self, *, request_date: str, user_id: int | None, escalated_at: str) -> bool:
-        with self._connect() as db:
+        with self._sync_connect() as db:
             cur = db.execute(
                 """
-                UPDATE vehicle_usage_requests
+                UPDATE logistics.vehicle_usage_requests
                 SET escalated_at = %s
                 WHERE request_date = %s AND (user_id = %s OR (%s IS NULL AND user_id IS NULL))
                 """,
@@ -244,12 +251,11 @@ class PostgresVehicleUsageStore:
         parsed: dict[str, Any],
         status: str = "pending_confirmation",
     ) -> int:
-        self.ensure_schema()
         now = _now()
-        with self._connect() as db:
+        with self._sync_connect() as db:
             db.execute(
                 """
-                INSERT INTO vehicle_usage_requests (
+                INSERT INTO logistics.vehicle_usage_requests (
                     request_date, user_id, dialog_id, status, response_text, responded_at, parsed_json
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
@@ -272,7 +278,7 @@ class PostgresVehicleUsageStore:
             )
             row = db.execute(
                 """
-                SELECT id FROM vehicle_usage_requests
+                SELECT id FROM logistics.vehicle_usage_requests
                 WHERE request_date = %s AND (user_id = %s OR (%s IS NULL AND user_id IS NULL))
                 """,
                 (request_date, user_id, user_id),
@@ -286,14 +292,20 @@ class PostgresVehicleUsageStore:
         employee_statuses: list[tuple[int, str, str]],
         vehicle_assignments: list[tuple[int, int | None, str]],
     ) -> None:
-        self.ensure_schema()
-        with self._connect() as db:
-            db.execute("DELETE FROM employee_daily_statuses WHERE status_date = %s", (status_date,))
-            db.execute("DELETE FROM vehicle_daily_assignments WHERE assignment_date = %s", (status_date,))
+        with self._sync_connect() as db:
+            db.execute(
+                "DELETE FROM logistics.employee_daily_statuses WHERE status_date = %s",
+                (status_date,),
+            )
+            db.execute(
+                "DELETE FROM logistics.vehicle_daily_assignments WHERE assignment_date = %s",
+                (status_date,),
+            )
             for employee_id, status, notes in employee_statuses:
                 db.execute(
                     """
-                    INSERT INTO employee_daily_statuses (status_date, employee_id, status, notes)
+                    INSERT INTO logistics.employee_daily_statuses
+                        (status_date, employee_id, status, notes)
                     VALUES (%s, %s, %s, %s)
                     ON CONFLICT (status_date, employee_id) DO UPDATE SET
                         status = EXCLUDED.status,
@@ -304,7 +316,8 @@ class PostgresVehicleUsageStore:
             for vehicle_id, employee_id, notes in vehicle_assignments:
                 db.execute(
                     """
-                    INSERT INTO vehicle_daily_assignments (assignment_date, vehicle_id, employee_id, notes)
+                    INSERT INTO logistics.vehicle_daily_assignments
+                        (assignment_date, vehicle_id, employee_id, notes)
                     VALUES (%s, %s, %s, %s)
                     ON CONFLICT (assignment_date, vehicle_id) DO UPDATE SET
                         employee_id = EXCLUDED.employee_id,

@@ -2,14 +2,30 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
+import time
+from typing import Any
 
-from ai_server.agents.ports import SchedulerPort
-from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentResultStatus, AgentTask
-from ai_server.orchestrators.internal_llm import InternalLLMRouter, InternalOrchestratorLLM, ScheduledTaskDecision
-from ai_server.specialists import Specialist, build_specialist_registry
+from pydantic import ValidationError
+
+from ai_server.agents.ports import AgentQueuePort, AgentStorePort, ChannelPort, SchedulerPort
+from ai_server.learning import LearningEventRecorder
+from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ScheduledTask, ToolResult, ToolStatus
+from ai_server.orchestrators.orchestrator_llm import (
+    OrchestratorDecision,
+    OrchestratorDecisionResult,
+    OrchestratorLLM,
+    OrchestratorLLMService,
+    OrchestratorToolCall,
+    apply_scheduled_tasks,
+    orchestrator_llm_failure_result,
+)
+from ai_server.retrieval import HybridKnowledgeRetriever, RetrievalHit
+from ai_server.specialists import Specialist, build_specialist_registry, manifest_by_id
+from ai_server.technical_footer import TechnicalFooterService, append_footer
 
 logger = logging.getLogger(__name__)
+
+_MAX_AGENT_STEPS = 4
 
 
 class InternalOrchestrator:
@@ -18,233 +34,437 @@ class InternalOrchestrator:
         manifests: list[AgentManifest],
         specialists: dict[str, Specialist] | None = None,
         *,
-        orchestrator_llm: InternalOrchestratorLLM | None = None,
+        orchestrator_llm: OrchestratorLLM | None = None,
         scheduler: SchedulerPort | None = None,
+        store: AgentStorePort | None = None,
+        retriever: HybridKnowledgeRetriever | None = None,
+        channels: dict[str, ChannelPort] | None = None,
+        footer_service: TechnicalFooterService | None = None,
+        learning_recorder: LearningEventRecorder | None = None,
     ) -> None:
         self.manifests = manifests
         self.specialists = specialists or build_specialist_registry(manifests)
-        self.orchestrator_llm = orchestrator_llm or InternalLLMRouter()
-        self.scheduler: SchedulerPort | None = scheduler
+        self.orchestrator_llm = orchestrator_llm or OrchestratorLLMService()
+        self.scheduler = scheduler
+        self.store = store
+        self.retriever = retriever
+        self._channels: dict[str, ChannelPort] = channels or {}
+        self._footer_svc = footer_service
+        self._learning_recorder = learning_recorder
+        self._manifest = manifest_by_id(manifests, "internal_orchestrator") or _dummy_manifest()
+
+    @classmethod
+    def build(
+        cls,
+        manifest: AgentManifest,
+        *,
+        manifests: list[AgentManifest] | None = None,
+        orchestrator_llm: OrchestratorLLM | None = None,
+        orchestrator_store: AgentStorePort | None = None,
+        orchestrator_retriever: HybridKnowledgeRetriever | None = None,
+        channels: dict[str, ChannelPort] | None = None,
+        footer_service: TechnicalFooterService | None = None,
+        learning_recorder: LearningEventRecorder | None = None,
+        **specialist_deps: Any,
+    ) -> InternalOrchestrator:
+        _manifests = manifests or []
+        if not specialist_deps.get("bitrix_bot"):
+            specialist_deps["bitrix_bot"] = specialist_deps.get("bitrix_client")
+        specialists = build_specialist_registry(
+            _manifests,
+            audience="employee",
+            **{k: v for k, v in specialist_deps.items() if v is not None},
+        )
+        return cls(
+            _manifests,
+            specialists=specialists,
+            orchestrator_llm=orchestrator_llm,
+            scheduler=specialist_deps.get("scheduler"),
+            store=orchestrator_store,
+            retriever=orchestrator_retriever,
+            channels=channels,
+            footer_service=footer_service,
+            learning_recorder=learning_recorder,
+        )
+
+    def tool_definitions(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": f"call_{m.id}",
+                "description": m.handoff_description or f"Вызвать специалиста {m.name}",
+                "parameters": {"request": {"type": "string", "description": "Запрос для специалиста"}},
+            }
+            for m in self.manifests
+            if m.kind == "specialist" and m.id in self.specialists
+        ]
+
+    async def _execute_tool_call(
+        self, tool_call: Any, task: AgentTask
+    ) -> tuple[ToolResult, ActionRecord, list[ActionRecord]]:
+        if tool_call.name.startswith("call_"):
+            specialist_id = tool_call.name[len("call_") :]
+            specialist = self.specialists.get(specialist_id)
+            if specialist is None:
+                result = ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool=tool_call.name,
+                    error=f"Специалист '{specialist_id}' не найден",
+                )
+                return (
+                    result,
+                    ActionRecord(
+                        name="delegate_to_specialist",
+                        status="error",
+                        details={"specialist": specialist_id, "error": result.error},
+                    ),
+                    [],
+                )
+            sub_task = AgentTask(
+                task_id=task.task_id,
+                request=tool_call.args.get("request") or task.request,
+                user=task.user,
+                context=task.context,
+            )
+            try:
+                sr = await specialist.handle(sub_task)
+            except Exception as exc:
+                err = f"{type(exc).__name__}: {exc}"
+                result = ToolResult(status=ToolStatus.ERROR, tool=tool_call.name, error=err)
+                return (
+                    result,
+                    ActionRecord(
+                        name="delegate_to_specialist",
+                        status="error",
+                        details={"specialist": specialist_id, "error": err},
+                    ),
+                    [],
+                )
+            self._apply_agent_scheduled_tasks(sr.scheduled_tasks)
+            result = ToolResult(
+                status=ToolStatus.OK,
+                tool=tool_call.name,
+                data={"specialist": specialist_id, "answer": sr.answer, "status": sr.status},
+            )
+            return (
+                result,
+                ActionRecord(
+                    name="delegate_to_specialist",
+                    status="completed",
+                    details={"specialist": specialist_id},
+                ),
+                list(sr.actions_requiring_approval),
+            )
+        result = ToolResult(
+            status=ToolStatus.INVALID_TOOL_CALL,
+            tool=tool_call.name,
+            error=f"Неизвестный инструмент оркестратора: {tool_call.name}",
+        )
+        return result, ActionRecord(name=tool_call.name, status="error", details={"error": result.error}), []
 
     async def handle(self, task: AgentTask) -> AgentResult:
-        if task.context.get("pending_action"):
-            pending_data = task.context["pending_action"]
-            default_specialist_id = next((m.id for m in self.manifests if m.kind == "specialist"), "")
-            specialist_id = (
-                pending_data.get("specialist_id") or default_specialist_id
-                if isinstance(pending_data, dict)
-                else default_specialist_id
-            )
-            specialist = self.specialists.get(specialist_id)
-            if specialist is not None:
-                specialist_result = await specialist.handle(task)
-                return AgentResult(
-                    status=specialist_result.status,
-                    agent_id="internal_orchestrator",
-                    answer=specialist_result.answer,
-                    artifacts=specialist_result.artifacts,
-                    actions_taken=[
-                        ActionRecord(
-                            name="orchestrator_pending_route",
-                            status="completed",
-                            details={"handoff_to": specialist_id, "reason": "pending_action"},
-                        ),
-                        *specialist_result.actions_taken,
-                    ],
-                    actions_requiring_approval=specialist_result.actions_requiring_approval,
-                    model_usage=specialist_result.model_usage,
-                    handoff_to=[specialist_id],
-                    confidence=specialist_result.confidence,
-                    logs=specialist_result.logs,
-                )
+        t_start = time.monotonic()
+        result = await self._handle_core(task)
+        elapsed_ms = {"total_ms": round((time.monotonic() - t_start) * 1000, 1)}
+        await self._send_to_channel(task, result)
+        self._record_learning(task, result, elapsed_ms=elapsed_ms)
+        return result
 
-        try:
-            route_result = await self.orchestrator_llm.route(task=task, manifests=self.manifests)
-        except Exception as exc:
+    async def _handle_core(self, task: AgentTask) -> AgentResult:
+        dialog_key: str = task.context.get("dialog_key") or ""
+        if self.store is not None and dialog_key:
+            dialog_history: list[dict] = await self.store.load_turns(dialog_key, limit=20)
+        else:
+            dialog_history = list(task.context.get("dialog_history") or [])
+
+        retrieval_hits: list[RetrievalHit] = []
+        if self.retriever is not None:
+            retrieval_hits = self.retriever.search(self._manifest, task.request, limit=3)
+
+        all_actions: list[ActionRecord] = []
+        all_model_usage = []
+        tool_results: list[ToolResult] = []
+        specialist_ids: list[str] = []
+        approval_actions: list[ActionRecord] = []
+        decision: OrchestratorDecision | None = None
+        decision_results: list[OrchestratorDecisionResult] = []
+
+        # Deterministic routing: if a specialist is mid-clarification, skip LLM routing.
+        if self.store is not None and dialog_key and hasattr(self.store, "get_kv"):
+            pending = await self.store.get_kv(dialog_key, "pending_specialist")  # type: ignore[attr-defined]
+            if pending and pending in self.specialists:
+                tc = OrchestratorToolCall(name=f"call_{pending}", args={"request": task.request})
+                tr, action, approvals = await self._execute_tool_call(tc, task)
+                tool_results.append(tr)
+                all_actions.append(action)
+                approval_actions.extend(approvals)
+                if tr.status == ToolStatus.OK:
+                    specialist_ids.append(pending)
+                    specialist_status = (tr.data or {}).get("status", "")
+                    if specialist_status != "needs_clarification":
+                        await self.store.delete_kv(dialog_key, "pending_specialist")  # type: ignore[attr-defined]
+                else:
+                    await self.store.delete_kv(dialog_key, "pending_specialist")  # type: ignore[attr-defined]
+                # Use a no-op decision so the compose step has something to work with.
+                decision = OrchestratorDecision(
+                    status="completed",
+                    answer="",
+                    tool_calls=[tc],
+                )
+                # Jump straight to compose — skip LLM routing.
+
+        if decision is None:
+            for step in range(1, _MAX_AGENT_STEPS + 1):
+                try:
+                    dr = await self.orchestrator_llm.decide(
+                        manifest=self._manifest,
+                        task=task,
+                        dialog_history=dialog_history,
+                        retrieval_hits=retrieval_hits,
+                        tool_definitions=self.tool_definitions(),
+                        tool_results=list(tool_results),
+                    )
+                except Exception as exc:
+                    return AgentResult(
+                        status="failed",
+                        agent_id="internal_orchestrator",
+                        answer=f"Не смог обработать запрос через LLM-оркестратор: {type(exc).__name__}: {exc}",
+                        actions_taken=[
+                            *all_actions,
+                            ActionRecord(
+                                name="orchestrator_llm_decision",
+                                status="error",
+                                details={"step": step, "error": f"{type(exc).__name__}: {exc}"},
+                            ),
+                        ],
+                        model_usage=all_model_usage,
+                        confidence=0.0,
+                    )
+
+                decision_results.append(dr)
+                decision = dr.decision
+                all_model_usage.append(dr.model_usage)
+                all_actions.append(
+                    ActionRecord(
+                        name="orchestrator_llm_decision",
+                        status=decision.status,
+                        details={
+                            "step": step,
+                            "tool_calls": [{"name": tc.name, "summary": tc.summary} for tc in decision.tool_calls],
+                            "confidence": decision.confidence,
+                        },
+                    )
+                )
+                all_actions.extend(apply_scheduled_tasks(decision.scheduled_tasks, self.scheduler))
+
+                executable = [tc for tc in decision.tool_calls if tc.name != "none"]
+                if not executable:
+                    break
+
+                raw = await asyncio.gather(
+                    *[self._execute_tool_call(tc, task) for tc in executable],
+                    return_exceptions=True,
+                )
+                for tc, item in zip(executable, raw, strict=False):
+                    if isinstance(item, Exception):
+                        all_actions.append(
+                            ActionRecord(
+                                name="delegate_to_specialist",
+                                status="error",
+                                details={"error": f"{type(item).__name__}: {item}"},
+                            )
+                        )
+                    else:
+                        tr, action, approvals = item
+                        tool_results.append(tr)
+                        all_actions.append(action)
+                        approval_actions.extend(approvals)
+                        if tr.status == ToolStatus.OK and tc.name.startswith("call_"):
+                            sid = tc.name[len("call_") :]
+                            specialist_ids.append(sid)
+                            if dialog_key and self.store is not None and hasattr(self.store, "set_kv"):
+                                specialist_status = (tr.data or {}).get("status", "")
+                                if specialist_status == "needs_clarification":
+                                    await self.store.set_kv(dialog_key, "pending_specialist", sid)  # type: ignore[attr-defined]
+                                else:
+                                    await self.store.delete_kv(dialog_key, "pending_specialist")  # type: ignore[attr-defined]
+
+        if decision is None:
+            failure = orchestrator_llm_failure_result("пустой цикл решений оркестратора")
             return AgentResult(
                 status="failed",
                 agent_id="internal_orchestrator",
-                answer=f"Не смог обработать запрос через LLM-оркестратор: {type(exc).__name__}: {exc}",
+                answer=failure.answer,
+                actions_taken=all_actions,
+                model_usage=[failure.model_usage],
+                confidence=0.0,
+            )
+
+        try:
+            final = await self.orchestrator_llm.compose(
+                manifest=self._manifest,
+                task=task,
+                decision=decision,
+                tool_results=tool_results,
+            )
+        except Exception as exc:
+            failure = orchestrator_llm_failure_result(f"{type(exc).__name__}: {exc}")
+            return AgentResult(
+                status="failed",
+                agent_id="internal_orchestrator",
+                answer=failure.answer,
                 actions_taken=[
+                    *all_actions,
                     ActionRecord(
-                        name="orchestrator_llm_route",
+                        name="orchestrator_llm_compose",
                         status="error",
                         details={"error": f"{type(exc).__name__}: {exc}"},
-                    )
+                    ),
                 ],
+                model_usage=[*all_model_usage, failure.model_usage],
                 confidence=0.0,
             )
 
-        decision = route_result.decision
-        schedule_actions = _apply_scheduled_tasks(decision.scheduled_tasks, self.scheduler)
-        route_action = ActionRecord(
-            name="orchestrator_llm_route",
-            status=decision.status,
-            details={
-                "handoff_to": decision.handoff_to,
-                "scheduled_tasks": len(decision.scheduled_tasks),
-                "confidence": decision.confidence,
-            },
+        all_model_usage.append(final.model_usage)
+        all_actions.append(
+            ActionRecord(
+                name="orchestrator_llm_compose",
+                status=final.status,
+                details={"specialists_used": specialist_ids},
+            )
         )
 
-        targets = [
-            (agent_id, specialist)
-            for agent_id in decision.handoff_to
-            if (specialist := self.specialists.get(agent_id)) is not None
-        ]
+        if self.store is not None and dialog_key and final.answer:
+            await self.store.append_turn(dialog_key, task.request, final.answer)
 
-        if not targets:
-            return AgentResult(
-                status=decision.status,
-                agent_id="internal_orchestrator",
-                answer=decision.answer,
-                actions_taken=[route_action, *schedule_actions],
-                model_usage=[route_result.model_usage],
-                confidence=decision.confidence,
-            )
+        effective_status = "needs_human" if approval_actions else final.status
 
-        raw_results = await asyncio.gather(
-            *[specialist.handle(task) for _, specialist in targets],
-            return_exceptions=True,
-        )
-
-        good: list[tuple[str, AgentResult]] = []
-        delegate_actions: list[ActionRecord] = []
-        all_model_usage = [route_result.model_usage]
-
-        for (agent_id, _), result in zip(targets, raw_results, strict=False):
-            if isinstance(result, Exception):
-                delegate_actions.append(
-                    ActionRecord(
-                        name="delegate_to_specialist",
-                        status="error",
-                        details={"specialist": agent_id, "error": f"{type(result).__name__}: {result}"},
-                    )
-                )
-            else:
-                delegate_actions.append(
-                    ActionRecord(
-                        name="delegate_to_specialist",
-                        status="completed",
-                        details={"specialist": agent_id},
-                    )
-                )
-                good.append((agent_id, result))
-                all_model_usage.extend(result.model_usage)
-
-        if not good:
-            return AgentResult(
-                status="failed",
-                agent_id="internal_orchestrator",
-                answer="Специалисты не смогли обработать запрос.",
-                actions_taken=[route_action, *delegate_actions],
-                model_usage=all_model_usage,
-                confidence=0.0,
-            )
-
-        all_actions = [
-            route_action,
-            *schedule_actions,
-            *delegate_actions,
-            *[a for _, sr in good for a in sr.actions_taken],
-        ]
-        all_approvals = [a for _, sr in good for a in sr.actions_requiring_approval]
-        all_artifacts = [art for _, sr in good for art in sr.artifacts]
-        all_logs = [log for _, sr in good for log in sr.logs]
-        agent_ids = [aid for aid, _ in good]
-
-        if len(good) == 1:
-            agent_id, sr = good[0]
-            return AgentResult(
-                status=sr.status,
-                agent_id="internal_orchestrator",
-                answer=sr.answer,
-                artifacts=sr.artifacts,
-                actions_taken=all_actions,
-                actions_requiring_approval=all_approvals,
-                model_usage=all_model_usage,
-                handoff_to=[agent_id],
-                confidence=sr.confidence,
-                logs=sr.logs,
-            )
-
-        # Multiple specialists — synthesize answers into one response
-        try:
-            synthesis = await self.orchestrator_llm.synthesize(task=task, specialist_results=good)
-            all_model_usage.append(synthesis.model_usage)
-            all_actions.append(
-                ActionRecord(
-                    name="orchestrator_synthesize",
-                    status="completed",
-                    details={"specialists": agent_ids},
-                )
-            )
-            synthesized_answer = synthesis.answer
-        except Exception as exc:
-            all_actions.append(
-                ActionRecord(
-                    name="orchestrator_synthesize",
-                    status="error",
-                    details={"error": f"{type(exc).__name__}: {exc}"},
-                )
-            )
-            # Fall back to first specialist's answer
-            synthesized_answer = good[0][1].answer
-
-        status = "needs_human" if all_approvals else _merge_status([sr.status for _, sr in good])
         return AgentResult(
-            status=status,
+            status=effective_status,
             agent_id="internal_orchestrator",
-            answer=synthesized_answer,
-            artifacts=all_artifacts,
+            answer=final.answer,
             actions_taken=all_actions,
-            actions_requiring_approval=all_approvals,
+            actions_requiring_approval=approval_actions,
             model_usage=all_model_usage,
-            handoff_to=agent_ids,
-            confidence=min(sr.confidence for _, sr in good),
-            logs=all_logs,
+            handoff_to=specialist_ids,
+            confidence=decision.confidence,
         )
 
+    async def _send_to_channel(self, task: AgentTask, result: AgentResult) -> None:
+        channel_id = task.context.get("channel_id", "")
+        recipient_id = task.context.get("recipient_id", "")
+        if not channel_id or not recipient_id:
+            return
+        channel = self._channels.get(channel_id)
+        if channel is None:
+            return
+        footer = ""
+        if self._footer_svc and result.answer:
+            user_id_raw = task.user.id if task.user else None
+            user_id = int(user_id_raw) if user_id_raw and str(user_id_raw).isdigit() else None
+            try:
+                footer = await self._footer_svc.build_for_agent_result(
+                    result, user_id=user_id, channel=f"{channel_id}_chat"
+                )
+            except Exception:
+                logger.exception("Footer build failed")
+        body = append_footer(result.answer, footer) if result.answer else ""
+        if body:
+            try:
+                await channel.send(recipient_id, body)
+            except Exception:
+                logger.exception("Channel send failed for channel=%s recipient=%s", channel_id, recipient_id)
 
-_STATUS_PRIORITY: dict[AgentResultStatus, int] = {
-    "failed": 0,
-    "needs_human": 1,
-    "needs_clarification": 2,
-    "completed": 3,
-}
-
-
-def _merge_status(statuses: list[AgentResultStatus]) -> AgentResultStatus:
-    return min(statuses, key=lambda s: _STATUS_PRIORITY.get(s, 2))
-
-
-def _apply_scheduled_tasks(
-    tasks: list[ScheduledTaskDecision],
-    scheduler: SchedulerPort | None,
-) -> list[ActionRecord]:
-    if not tasks or scheduler is None:
-        return []
-    actions: list[ActionRecord] = []
-    for task in tasks:
-        job_id = task.job_id or str(uuid.uuid4())[:8]
+    def _record_learning(
+        self, task: AgentTask, result: AgentResult, *, elapsed_ms: dict[str, float] | None = None
+    ) -> None:
+        if self._learning_recorder is None:
+            return
         try:
-            job = scheduler.schedule_task(task.agent_id, job_id, task.trigger, task.task_description)
-            next_run = job.next_run_time.isoformat() if job.next_run_time else None
-            actions.append(
-                ActionRecord(
-                    name="orchestrator_schedule_task",
-                    status="scheduled",
-                    details={"agent_id": task.agent_id, "job_id": f"{task.agent_id}:{job_id}", "next_run": next_run},
-                )
+            self._learning_recorder.record_agent_result(
+                task,
+                result,
+                metadata={"dialog_key": task.context.get("dialog_key", "")},
+                elapsed_ms=elapsed_ms,
             )
-            logger.info("Orchestrator scheduled task %s:%s next=%s", task.agent_id, job_id, next_run)
-        except Exception as exc:
-            logger.exception("Orchestrator failed to schedule task for %s", task.agent_id)
-            actions.append(
-                ActionRecord(
-                    name="orchestrator_schedule_task",
-                    status="error",
-                    details={"agent_id": task.agent_id, "job_id": job_id, "error": f"{type(exc).__name__}: {exc}"},
-                )
-            )
-    return actions
+        except Exception:
+            logger.exception("Learning recording failed")
+
+    def _apply_agent_scheduled_tasks(self, tasks: list[ScheduledTask]) -> None:
+        if not tasks or self.scheduler is None:
+            return
+        _orch = self
+        for sched in tasks:
+            if sched.cancel:
+                self.scheduler.remove_job(sched.agent_id, sched.job_id)
+            elif sched.task is not None:
+                _task = sched.task
+
+                async def _run(_t: AgentTask = _task, _o: InternalOrchestrator = _orch) -> None:
+                    await _o.handle(_t)
+
+                try:
+                    self.scheduler.schedule_callback(sched.agent_id, sched.job_id, sched.trigger, _run)
+                except Exception:
+                    logger.exception("Failed to schedule task job_id=%s agent=%s", sched.job_id, sched.agent_id)
+
+    async def run(self, queue: AgentQueuePort) -> None:
+        """Queue consumer loop for the orchestrator.
+
+        Handles two message types:
+        - "task"   — new request from channel or scheduler → handle(task) → _send_to_channel()
+        - "result" — proactive result from a specialist (e.g. morning_proposals) → _send_to_channel()
+
+        Sprint 21: internal dispatch to specialists remains synchronous (direct calls in handle()).
+        Sprint 22 will introduce async specialist dispatch via correlation_id.
+        """
+        _poll_interval = 0.1
+        while True:
+            message = await queue.claim_next("orchestrator")
+            if message is None:
+                await asyncio.sleep(_poll_interval)
+                continue
+            msg_id = str(message.get("id") or "")
+            try:
+                msg_type = str(message.get("type") or "")
+                if msg_type in ("task", "bitrix_chat"):
+                    try:
+                        task = AgentTask.model_validate(message["payload"])
+                    except (KeyError, ValidationError) as exc:
+                        logger.warning("Orchestrator: invalid task message %s: %s", msg_id, exc)
+                        await queue.nack(msg_id, error=f"invalid message: {exc}")
+                        continue
+                    await self.handle(task)
+                elif msg_type == "result":
+                    try:
+                        result = AgentResult.model_validate(message["payload"])
+                    except (KeyError, ValidationError) as exc:
+                        logger.warning("Orchestrator: invalid result message %s: %s", msg_id, exc)
+                        await queue.nack(msg_id, error=f"invalid message: {exc}")
+                        continue
+                    routing = message.get("routing") or {}
+                    if routing.get("channel_id") and routing.get("recipient_id"):
+                        stub_task = AgentTask(
+                            task_id="",
+                            request="",
+                            context={
+                                "channel_id": routing["channel_id"],
+                                "recipient_id": routing["recipient_id"],
+                                "dialog_key": routing.get("dialog_key") or "",
+                            },
+                        )
+                        await self._send_to_channel(stub_task, result)
+                await queue.ack(msg_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Orchestrator failed processing message %s", msg_id)
+                await queue.nack(msg_id, error=f"{type(exc).__name__}: {exc}")
+
+
+def _dummy_manifest() -> AgentManifest:
+    return AgentManifest(
+        id="internal_orchestrator",
+        name="Переговорщик",
+        kind="orchestrator",
+        description="Старший AI-агент. Посредник между людьми и специалистами.",
+    )

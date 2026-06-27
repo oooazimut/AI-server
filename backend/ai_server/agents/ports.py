@@ -3,7 +3,35 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Protocol
 
-from ai_server.models import ToolDefinition, ToolResult
+
+class AgentQueuePort(Protocol):
+    """Per-agent event queue: publish messages, claim next message, ack/nack."""
+
+    async def publish(self, message: dict[str, Any]) -> None: ...
+
+    async def claim_next(self, agent_id: str) -> dict[str, Any] | None: ...
+
+    async def ack(self, message_id: str) -> None: ...
+
+    async def nack(self, message_id: str, *, error: str) -> None: ...
+
+
+class ChannelPort(Protocol):
+    """Outbound port for delivering messages to a communication channel."""
+
+    channel_id: str
+
+    async def send(self, recipient_id: str, body: str) -> None: ...
+
+
+class AgentStorePort(Protocol):
+    """Per-specialist async dialog history store."""
+
+    async def ensure_schema(self) -> None: ...
+
+    async def load_turns(self, dialog_key: str, *, limit: int = 20) -> list[dict[str, str]]: ...
+
+    async def append_turn(self, dialog_key: str, user_text: str, agent_response: str) -> None: ...
 
 
 class SchedulerPort(Protocol):
@@ -25,49 +53,3 @@ class SchedulerPort(Protocol):
         task_description: str,
         context: dict[str, Any] | None = None,
     ) -> Any: ...
-
-
-class BitrixToolsetPort(Protocol):
-    """Narrow interface used by Bitrix24Specialist. BitrixToolset satisfies this structurally."""
-
-    def definitions(self) -> list[ToolDefinition]: ...
-
-    def portal_search_contract(self, args: dict[str, Any]) -> ToolResult: ...
-
-    async def bitrix_api(self, args: dict[str, Any]) -> ToolResult: ...
-
-    async def resolve_user(self, query: str, *, limit: int = 5) -> ToolResult: ...
-
-    async def resolve_project(self, query: str, *, limit: int = 5) -> ToolResult: ...
-
-
-class PtoToolsetPort(Protocol):
-    """Narrow interface used by PtoSpecialist. DocumentToolset satisfies this structurally."""
-
-    def definitions(self) -> list[ToolDefinition]: ...
-
-    def portal_document_search(self, args: dict[str, Any]) -> ToolResult: ...
-
-    async def document_read(self, args: dict[str, Any]) -> ToolResult: ...
-
-    async def spreadsheet_preview(self, args: dict[str, Any]) -> ToolResult: ...
-
-    async def spreadsheet_compare(self, args: dict[str, Any]) -> ToolResult: ...
-
-    def document_draft_create(self, args: dict[str, Any]) -> ToolResult: ...
-
-    def document_draft_list(self, args: dict[str, Any]) -> ToolResult: ...
-
-
-class VehicleUsageToolsetPort(Protocol):
-    """Narrow interface used by LogisticsSpecialist. VehicleUsageToolset satisfies this structurally."""
-
-    store: Any  # VehicleUsageRepositoryProtocol | None — kept as Any to avoid cross-module coupling
-
-    def definitions(self) -> list[ToolDefinition]: ...
-
-    def vehicle_usage_context(self, args: dict[str, Any]) -> ToolResult: ...
-
-    def vehicle_usage_save_draft(self, args: dict[str, Any]) -> ToolResult: ...
-
-    def vehicle_usage_save_report(self, args: dict[str, Any]) -> ToolResult: ...

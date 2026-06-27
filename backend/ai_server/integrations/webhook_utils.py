@@ -42,7 +42,7 @@ def webhook_event_partition_key(payload: dict[str, Any], *, event_type: str) -> 
 def webhook_event_key(payload: dict[str, Any], *, event_type: str, received_at: str) -> str:
     message_id = _extract_message_id(payload)
     if event_type in {"ONIMBOTV2MESSAGEADD", "ONIMBOTMESSAGEADD"} and message_id:
-        return f"message:{event_type}:{message_id}"
+        return f"message:{message_id}"
     body = json.dumps(
         {"event": event_type, "payload": payload, "received_at": received_at},
         ensure_ascii=False,

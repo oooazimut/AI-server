@@ -21,6 +21,12 @@ class SkillStore:
             return []
         return [self._read_skill(path, include_content=False) for path in sorted(directory.glob("*.md"))]
 
+    def list_skills_with_content(self, manifest: AgentManifest) -> list[Skill]:
+        directory = self._skills_path(manifest)
+        if not directory.exists():
+            return []
+        return [self._read_skill(path, include_content=True) for path in sorted(directory.glob("*.md"))]
+
     def read_skill(self, manifest: AgentManifest, skill_id: str) -> Skill | None:
         directory = self._skills_path(manifest)
         path = directory / f"{skill_id}.md"

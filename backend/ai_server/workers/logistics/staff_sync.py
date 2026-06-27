@@ -5,14 +5,15 @@ import logging
 from datetime import datetime, timedelta
 
 from ai_server.integrations.bitrix.client import BitrixClient
+from ai_server.integrations.ports import VehicleUsageStorePort
 from ai_server.settings import Settings
-from ai_server.tools.vehicle_usage import VehicleUsageStore, fetch_staff_roster
+from ai_server.tools.vehicle_usage import fetch_staff_roster
 from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)
 
 
-async def run_staff_sync(bitrix: BitrixClient, store: VehicleUsageStore, *, settings: Settings) -> None:
+async def run_staff_sync(bitrix: BitrixClient, store: VehicleUsageStorePort, *, settings: Settings) -> None:
     while True:
         try:
             roster = await fetch_staff_roster(

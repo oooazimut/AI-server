@@ -1,5 +1,5 @@
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, Field
 
@@ -8,7 +8,6 @@ class ToolStatus(StrEnum):
     OK = "ok"
     ERROR = "error"
     NOT_CONFIGURED = "not_configured"
-    CONFIRMATION_REQUIRED = "confirmation_required"
     INVALID_TOOL_CALL = "invalid_tool_call"
     NOT_FOUND = "not_found"
     NOT_AVAILABLE = "not_available"
@@ -16,13 +15,7 @@ class ToolStatus(StrEnum):
     DENIED = "denied"
     CONTRACT_VIOLATION = "contract_violation"
     READY = "ready"
-    # pending-action passthrough statuses from PendingActionResult → ToolResult
-    EXECUTED = "executed"
-    CANCELLED = "cancelled"
-    NOTHING_TO_CANCEL = "nothing_to_cancel"
-    NOTHING_TO_CONFIRM = "nothing_to_confirm"
     DRY_RUN = "dry_run"
-    OAUTH_REQUIRED = "oauth_required"
 
 
 AgentKind = Literal["orchestrator", "operator", "specialist"]
@@ -126,13 +119,34 @@ class UserContext(BaseModel):
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
+class TaskContext(TypedDict, total=False):
+    # Маршрутизация ответа через канал
+    channel_id: str
+    recipient_id: str
+    # Диалог
+    dialog_key: str
+    dialog_id: str
+    dialog_history: list[dict[str, Any]]
+    # Вложения и голос
+    transcriptions: list[Any]
+    attachment_errors: list[str]
+    # Bitrix-специфика
+    bitrix_event_type: str
+    bitrix_current_user_profile: dict[str, Any]
+    permission_policy_context: list[Any]
+    # Планировщик и события
+    event: str
+    request_date: str
+    reminder_count: int
+
+
 class AgentTask(BaseModel):
     task_id: str
     source: str = "internal_orchestrator"
     user: UserContext = Field(default_factory=UserContext)
     request: str
     files: list[dict[str, Any]] = Field(default_factory=list)
-    context: dict[str, Any] = Field(default_factory=dict)
+    context: dict[str, Any] = Field(default_factory=dict)  # see TaskContext for documented keys
     allowed_actions: list[str] = Field(default_factory=list)
     required_output_format: str = "structured_result"
 
@@ -162,6 +176,15 @@ class ModelUsageRecord(BaseModel):
     notes: list[str] = Field(default_factory=list)
 
 
+class ScheduledTask(BaseModel):
+    job_id: str
+    agent_id: str
+    trigger: dict[str, Any] = Field(default_factory=dict)
+    task: AgentTask | None = None
+    description: str = ""
+    cancel: bool = False
+
+
 class AgentResult(BaseModel):
     status: AgentResultStatus
     agent_id: str
@@ -173,6 +196,7 @@ class AgentResult(BaseModel):
     handoff_to: list[str] = Field(default_factory=list)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     logs: list[str] = Field(default_factory=list)
+    scheduled_tasks: list[ScheduledTask] = Field(default_factory=list)
 
 
 class AgentTestRequest(BaseModel):
