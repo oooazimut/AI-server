@@ -4,8 +4,9 @@ import ai_server.specialists as _specialists_module
 from ai_server.agents.bitrix24 import Bitrix24Specialist
 from ai_server.agents.logistics import LogisticsSpecialist
 from ai_server.agents.pto import PtoSpecialist
-from ai_server.models import AgentResult, AgentTask
+from ai_server.models import AgentManifest, AgentResult, AgentTask
 from ai_server.orchestrators.internal import InternalOrchestrator
+from ai_server.orchestrators.tools import CallSpecialistTool
 from ai_server.registry import load_agent_manifests
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.specialists import manifest_by_id
@@ -65,7 +66,29 @@ def _logistics_specialist(manifests, **kwargs):
     )
 
 
-# Параллельное выполнение специалистов
+def _orch_manifest() -> AgentManifest:
+    return AgentManifest(
+        id="internal_orchestrator",
+        name="Переговорщик",
+        kind="orchestrator",
+        description="test",
+    )
+
+
+def _make_orch(specialists: dict, llm, *, store=None) -> InternalOrchestrator:
+    manifests = load_agent_manifests()
+    call_tool = CallSpecialistTool(specialists, manifests, store=store)
+    orch = InternalOrchestrator(
+        _orch_manifest(),
+        agent_tools=[call_tool],
+        llm=llm,
+        store=store,
+    )
+    call_tool.schedule_fn = orch._apply_scheduled_tasks_from_specialist
+    return orch
+
+
+# Вызов двух специалистов за один turn
 def test_orchestrator_executes_two_specialists_in_parallel():
     manifests = load_agent_manifests()
     fake_llm = FakeInternalOrchestratorLLM(
@@ -73,13 +96,12 @@ def test_orchestrator_executes_two_specialists_in_parallel():
         synthesized_answer="Оба специалиста ответили.",
     )
     result = asyncio.run(
-        InternalOrchestrator(
-            manifests,
-            specialists={
+        _make_orch(
+            {
                 "bitrix24": _bitrix_specialist(manifests, final_answer="Битрикс готово."),
                 "pto": _pto_specialist(manifests, final_answer="ПТО готово."),
             },
-            orchestrator_llm=fake_llm,
+            fake_llm,
         ).handle(AgentTask(task_id="t1", request="Нужно и задачу создать, и документ проверить"))
     )
 
@@ -87,43 +109,41 @@ def test_orchestrator_executes_two_specialists_in_parallel():
     assert set(result.handoff_to) == {"bitrix24", "pto"}
     assert result.answer == "Оба специалиста ответили."
     assert len(fake_llm.compose_calls) == 1
-    delegate_actions = [a for a in result.actions_taken if a.name == "delegate_to_specialist"]
-    assert len(delegate_actions) == 2
+    call_actions = [a for a in result.actions_taken if a.name == "call_specialist"]
+    assert len(call_actions) == 2
 
 
 def test_orchestrator_compose_action_recorded():
     manifests = load_agent_manifests()
     result = asyncio.run(
-        InternalOrchestrator(
-            manifests,
-            specialists={
+        _make_orch(
+            {
                 "bitrix24": _bitrix_specialist(manifests),
                 "pto": _pto_specialist(manifests),
             },
-            orchestrator_llm=FakeInternalOrchestratorLLM(call_specialists=["bitrix24", "pto"]),
+            FakeInternalOrchestratorLLM(call_specialists=["bitrix24", "pto"]),
         ).handle(AgentTask(task_id="t1", request="Комбинированный запрос"))
     )
 
-    compose_actions = [a for a in result.actions_taken if a.name == "orchestrator_llm_compose"]
+    compose_actions = [a for a in result.actions_taken if a.name == "orchestrator_llm_final_answer"]
     assert len(compose_actions) == 1
     assert compose_actions[0].status == "completed"
-    assert set(compose_actions[0].details["specialists_used"]) == {"bitrix24", "pto"}
+    assert set(result.handoff_to) == {"bitrix24", "pto"}
 
 
 def test_orchestrator_single_specialist_no_extra_compose():
     manifests = load_agent_manifests()
     fake_llm = FakeInternalOrchestratorLLM(call_specialists=["bitrix24"])
     result = asyncio.run(
-        InternalOrchestrator(
-            manifests,
-            specialists={"bitrix24": _bitrix_specialist(manifests, final_answer="Готово.")},
-            orchestrator_llm=fake_llm,
+        _make_orch(
+            {"bitrix24": _bitrix_specialist(manifests, final_answer="Готово.")},
+            fake_llm,
         ).handle(AgentTask(task_id="t1", request="Задача в Битриксе"))
     )
 
     assert result.answer == "Готово."
     assert len(fake_llm.compose_calls) == 1
-    compose_actions = [a for a in result.actions_taken if a.name == "orchestrator_llm_compose"]
+    compose_actions = [a for a in result.actions_taken if a.name == "orchestrator_llm_final_answer"]
     assert len(compose_actions) == 1
 
 
@@ -135,20 +155,19 @@ def test_orchestrator_handles_specialist_exception():
 
     manifests = load_agent_manifests()
     result = asyncio.run(
-        InternalOrchestrator(
-            manifests,
-            specialists={
+        _make_orch(
+            {
                 "bitrix24": BrokenSpecialist(),
                 "pto": _pto_specialist(manifests, final_answer="ПТО в порядке."),
             },
-            orchestrator_llm=FakeInternalOrchestratorLLM(call_specialists=["bitrix24", "pto"]),
+            FakeInternalOrchestratorLLM(call_specialists=["bitrix24", "pto"]),
         ).handle(AgentTask(task_id="t1", request="Запрос"))
     )
 
-    error_actions = [a for a in result.actions_taken if a.status == "error" and a.name == "delegate_to_specialist"]
+    error_actions = [a for a in result.actions_taken if a.status == "error" and a.name == "call_specialist"]
     assert len(error_actions) == 1
-    assert (
-        "BrokenSpecialist" in error_actions[0].details["error"] or "RuntimeError" in error_actions[0].details["error"]
+    assert "RuntimeError" in error_actions[0].details.get("error", "") or "RuntimeError" in str(
+        error_actions[0].details
     )
 
 
@@ -157,15 +176,10 @@ def test_orchestrator_all_specialists_fail_returns_failed():
         async def handle(self, task):
             raise ValueError("always fails")
 
-    manifests = load_agent_manifests()
     result = asyncio.run(
-        InternalOrchestrator(
-            manifests,
-            specialists={
-                "bitrix24": BrokenSpecialist(),
-                "pto": BrokenSpecialist(),
-            },
-            orchestrator_llm=FakeInternalOrchestratorLLM(call_specialists=["bitrix24", "pto"]),
+        _make_orch(
+            {"bitrix24": BrokenSpecialist(), "pto": BrokenSpecialist()},
+            FakeInternalOrchestratorLLM(call_specialists=["bitrix24", "pto"]),
         ).handle(AgentTask(task_id="t1", request="Запрос"))
     )
 
@@ -175,10 +189,9 @@ def test_orchestrator_all_specialists_fail_returns_failed():
 def test_orchestrator_no_matching_specialists_returns_direct_answer():
     manifests = load_agent_manifests()
     result = asyncio.run(
-        InternalOrchestrator(
-            manifests,
-            specialists={"unrelated": _make_fake_specialist_cls().build(manifests[0])},
-            orchestrator_llm=FakeInternalOrchestratorLLM(
+        _make_orch(
+            {"unrelated": _make_fake_specialist_cls().build(manifests[0])},
+            FakeInternalOrchestratorLLM(
                 call_specialists=["nonexistent_specialist"],
                 answer="Специалист недоступен.",
             ),
@@ -198,28 +211,19 @@ def test_orchestrator_llm_failure_returns_failed(monkeypatch):
             raise ConnectionError("LLM is down")
 
     monkeypatch.setattr(_specialists_module, "_load_entrypoint", lambda ep: _make_fake_specialist_cls())
-    manifests = load_agent_manifests()
-    result = asyncio.run(
-        InternalOrchestrator(
-            manifests,
-            specialists={},
-            orchestrator_llm=AlwaysFailingLLM(),
-        ).handle(AgentTask(task_id="t1", request="Запрос"))
-    )
+    result = asyncio.run(_make_orch({}, AlwaysFailingLLM()).handle(AgentTask(task_id="t1", request="Запрос")))
 
     assert result.status == "failed"
     assert "ConnectionError" in result.answer
 
 
-# _merge_status удалён — статус теперь из compose()
-# Проверяем, что агентный цикл заканчивается compose с корректным статусом
+# статус теперь из compose()
 def test_orchestrator_direct_answer_no_specialists():
     manifests = load_agent_manifests()
     result = asyncio.run(
-        InternalOrchestrator(
-            manifests,
-            specialists={"bitrix24": _bitrix_specialist(manifests)},
-            orchestrator_llm=FakeInternalOrchestratorLLM(answer="Я отвечаю сам."),
+        _make_orch(
+            {"bitrix24": _bitrix_specialist(manifests)},
+            FakeInternalOrchestratorLLM(answer="Я отвечаю сам."),
         ).handle(AgentTask(task_id="t1", request="Просто вопрос"))
     )
 

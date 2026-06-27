@@ -623,7 +623,10 @@ class FakeInternalOrchestratorLLM:
             tool_calls = [OrchestratorToolCall(name="none")]
         else:
             tool_calls = [
-                OrchestratorToolCall(name=f"call_{sid}", args={"request": task.request})
+                OrchestratorToolCall(
+                    name="call_specialist",
+                    args={"specialist_id": sid, "request": task.request},
+                )
                 for sid in self.call_specialists
             ]
         return OrchestratorDecisionResult(
