@@ -8,6 +8,7 @@ handoff_description: Использовать только во внутренн
 entrypoint: backend.ai_server.agents.diagnostic_agent.DiagnosticAgent
 instructions_file: agents/diagnostic_agent/instructions.md
 knowledge_path: agents/diagnostic_agent/knowledge
+skills_path: agents/diagnostic_agent/skills
 channels:
   - internal_orchestrator
 capabilities:

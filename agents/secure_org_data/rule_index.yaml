@@ -4,7 +4,7 @@ purpose: >
   Индекс правил Secure Org Data Agent. Кодовый rule-loader использует этот файл,
   чтобы подгружать только главы мини-книги, нужные для конкретного запроса.
 
-always_load:
+core_load:
   - file: instructions.md
     reason: "Короткое ядро агента, обязательное для каждого запроса."
 
@@ -88,6 +88,15 @@ rules:
         - "открой"
         - "документ"
     load_reason: "Нужно решить, можно ли показывать путь к файлу."
+
+  - id: fallback_behavior
+    title: "Fallback-поведение"
+    file: knowledge/fallback_behavior.md
+    type: knowledge
+    priority: 1
+    use_when:
+      fallback: true
+    load_reason: "Ни одна специализированная глава Secure Org Data Agent не подошла к запросу."
 
   - id: read_only_limits
     title: "Read-only ограничения"

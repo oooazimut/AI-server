@@ -1,0 +1,35 @@
+schema_version: 1
+agent_id: logistics
+purpose: >
+  Индекс правил Логиста. Агент пока не развивается в текущем этапе, но структура
+  приведена к общему стандарту AI-server.
+
+core_load:
+  - file: instructions.md
+    reason: "Короткое ядро Логиста, обязательное для каждого запроса."
+
+trace:
+  event_name: logistics_rules_retrieved
+  record_fields:
+    - rule_id
+    - file
+    - reason
+    - matched_context_keys
+    - matched_keywords
+    - priority
+
+rules:
+  - id: vehicle_usage_rules
+    title: "Правила учета автомобилей"
+    file: knowledge/topics/vehicle_usage_rules.md
+    type: knowledge
+    priority: 100
+    use_when:
+      request_topics:
+        - "машина"
+        - "автомобиль"
+        - "логистика"
+        - "выезд"
+        - "служебный"
+        - "утренний отчет"
+    load_reason: "Запрос относится к учету служебных автомобилей или логистическому отчету."

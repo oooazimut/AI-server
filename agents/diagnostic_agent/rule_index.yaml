@@ -4,7 +4,7 @@ purpose: >
   Индекс правил Агента диагностики. Кодовый rule-loader использует этот файл,
   чтобы подгружать только те главы мини-книги, которые нужны для конкретного разбора.
 
-always_load:
+core_load:
   - file: instructions.md
     reason: "Короткое ядро диагностического агента, обязательное для каждого разбора."
 
@@ -77,6 +77,15 @@ rules:
         - "loaded_skills"
         - "called_agents"
     load_reason: "Нужно предложить конкретную правку и regression test."
+
+  - id: fallback_behavior
+    title: "Fallback-поведение"
+    file: knowledge/fallback_behavior.md
+    type: knowledge
+    priority: 1
+    use_when:
+      fallback: true
+    load_reason: "Ни одна специализированная глава диагностики не подошла к запросу."
 
   - id: batch_patterns
     title: "Группировка однотипных ошибок"

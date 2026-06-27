@@ -46,4 +46,6 @@ def test_bitrix_llm_payload_includes_loaded_skills(monkeypatch):
     assert "Складской учёт и каталог товаров" in system_prompt
     assert payload["loaded_skills"][0]["id"] == "catalog"
     assert payload["loaded_skills"][0]["file"] == "skills/catalog.md"
+    assert payload["loaded_skills"][0]["matched_statuses"] == []
+    assert payload["loaded_skills"][0]["match_reasons"] == ["request_topics"]
     assert result.raw["loaded_skills"][0]["id"] == "catalog"

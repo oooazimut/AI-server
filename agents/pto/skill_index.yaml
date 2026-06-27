@@ -1,0 +1,33 @@
+schema_version: 1
+agent_id: pto
+purpose: >
+  Индекс скилов ПТО. Скилы описывают рабочие процедуры агента отдельно от правил.
+
+core_load:
+  - file: instructions.md
+    reason: "Короткое ядро ПТО-агента, обязательное для каждого запроса."
+
+trace:
+  event_name: pto_skills_retrieved
+  record_fields:
+    - skill_id
+    - file
+    - reason
+    - matched_context_keys
+    - matched_keywords
+    - priority
+
+skills:
+  - id: document_review
+    title: "Проверка технического документа"
+    file: skills/document_review.md
+    priority: 100
+    use_when:
+      request_topics:
+        - "проверь документ"
+        - "акт"
+        - "смета"
+        - "ведомость"
+        - "исполнительная"
+        - "сравни версии"
+    load_reason: "Нужна рабочая процедура проверки или сравнения технических документов."

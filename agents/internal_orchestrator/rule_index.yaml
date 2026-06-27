@@ -23,7 +23,7 @@ stage_scope:
     pto и logistics остаются в проекте, но правила и сценарии текущего этапа
     не должны расширять их поведение.
 
-always_load:
+core_load:
   - file: instructions.md
     reason: "Короткое ядро правил, обязательное для каждого запроса."
 
@@ -139,6 +139,15 @@ rules:
         - "learning_event_id"
         - "rating"
     load_reason: "Нужно разобрать ошибку, feedback или подготовить данные для Diagnostic Agent."
+
+  - id: fallback_behavior
+    title: "Fallback-поведение"
+    file: knowledge/fallback_behavior.md
+    type: knowledge
+    priority: 1
+    use_when:
+      fallback: true
+    load_reason: "Ни одна специализированная глава правил не подошла к запросу."
 
 future_rules:
   - id: modular_agent_routing

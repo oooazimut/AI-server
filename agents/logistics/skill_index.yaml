@@ -1,0 +1,33 @@
+schema_version: 1
+agent_id: logistics
+purpose: >
+  Индекс скилов Логиста. Скилы описывают рабочие процедуры агента отдельно от правил.
+
+core_load:
+  - file: instructions.md
+    reason: "Короткое ядро Логиста, обязательное для каждого запроса."
+
+trace:
+  event_name: logistics_skills_retrieved
+  record_fields:
+    - skill_id
+    - file
+    - reason
+    - matched_context_keys
+    - matched_keywords
+    - priority
+
+skills:
+  - id: vehicle_usage
+    title: "Учет служебных автомобилей"
+    file: skills/vehicle_usage.md
+    priority: 100
+    use_when:
+      request_topics:
+        - "машина"
+        - "автомобиль"
+        - "кто на машине"
+        - "выезд"
+        - "отчет по машинам"
+        - "логистика"
+    load_reason: "Нужно обработать запрос по служебным автомобилям или ежедневному отчету."

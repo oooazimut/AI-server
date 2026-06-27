@@ -12,6 +12,7 @@ handoff_description: >
 entrypoint: backend.ai_server.agents.secure_org_data.SecureOrgDataAgent
 instructions_file: agents/secure_org_data/instructions.md
 knowledge_path: agents/secure_org_data/knowledge
+skills_path: agents/secure_org_data/skills
 channels:
   - internal_orchestrator
 capabilities:

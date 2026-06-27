@@ -1,0 +1,35 @@
+schema_version: 1
+agent_id: pto
+purpose: >
+  Индекс правил ПТО. Агент пока не развивается в текущем этапе, но структура
+  приведена к общему стандарту AI-server.
+
+core_load:
+  - file: instructions.md
+    reason: "Короткое ядро ПТО-агента, обязательное для каждого запроса."
+
+trace:
+  event_name: pto_rules_retrieved
+  record_fields:
+    - rule_id
+    - file
+    - reason
+    - matched_context_keys
+    - matched_keywords
+    - priority
+
+rules:
+  - id: document_ownership
+    title: "Ответственность за документы"
+    file: knowledge/topics/document_ownership.md
+    type: knowledge
+    priority: 100
+    use_when:
+      request_topics:
+        - "ПТО"
+        - "документ"
+        - "акт"
+        - "смета"
+        - "ведомость"
+        - "исполнительная"
+    load_reason: "Запрос относится к технической или исполнительной документации."

@@ -4,7 +4,7 @@ purpose: >
   Индекс скилов Bitrix Agent. Кодовый skill-loader использует этот файл,
   чтобы подгружать только те skills/*.md, которые нужны для конкретной задачи.
 
-always_load:
+core_load:
   - file: instructions.md
     reason: "Короткое ядро Bitrix Agent, обязательное для каждого запроса."
 
@@ -113,6 +113,14 @@ skills:
         - "контакт"
         - "компан"
     load_reason: "Запрос относится к проектам, рабочим группам или CRM."
+
+  - id: fallback_task
+    title: "Fallback-процедура"
+    file: skills/fallback_task.md
+    priority: 1
+    use_when:
+      fallback: true
+    load_reason: "Ни один специализированный Bitrix-скил не подошел к запросу."
 
   - id: portal_links
     title: "Ссылки на портал в листингах"

@@ -66,8 +66,18 @@ feature/secure-org-data-agent
 Текущая активная ветка:
 
 ```text
-feature/batch-incident-analysis
+feature/rule-index
 ```
+
+По Rule index / dynamic loading выполнено:
+
+- для всех агентов зафиксирован единый стандарт: `instructions.md`, `rule_index.yaml`, `knowledge/`, `skill_index.yaml`, `skills/`;
+- добавлен общий loader `backend/ai_server/index_loader.py`;
+- `rule_loader.py` и `skill_loader.py` стали совместимыми обертками над общим механизмом;
+- поддержаны `request_topics`, `context_keys`, `statuses`, `always_load`, `fallback`, `default_for_orchestrator`, `priority`;
+- верхний справочный `always_load` в YAML заменен на `core_load`;
+- добавлены fallback-главы и fallback-скилы для активного контура: `internal_orchestrator`, `bitrix24`, `diagnostic_agent`, `secure_org_data`;
+- trace по подгруженным rules/skills расширен полями `matched_statuses` и `match_reasons`.
 
 По TraceRecorder уже заложен минимальный слой:
 
@@ -148,6 +158,8 @@ feature/modular-agent-rules
 ```
 
 ### 3. Rule index и загрузка правил по ситуации
+
+Статус: выполнено в ветке `feature/rule-index`.
 
 Сейчас часть правил может попадать в контекст сразу. Цель - перейти к более управляемой схеме:
 

@@ -104,4 +104,6 @@ rules:
     assert "routing chapter for current task" in system_prompt
     assert payload["loaded_rules"][0]["id"] == "routing"
     assert payload["loaded_rules"][0]["file"] == "knowledge/routing.md"
+    assert payload["loaded_rules"][0]["matched_statuses"] == []
+    assert payload["loaded_rules"][0]["match_reasons"] == ["default_for_orchestrator"]
     assert result.raw["loaded_rules"][0]["id"] == "routing"

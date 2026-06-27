@@ -16,6 +16,7 @@ from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
 from ai_server.retrieval import RetrievalHit
 from ai_server.rule_loader import format_loaded_rules, load_rules_for_task
+from ai_server.skill_loader import format_loaded_skills, load_skills_for_task
 from ai_server.utils import confidence
 
 ALLOWED_TOOL_NAMES = {"none", "search_org_data"}
@@ -93,6 +94,8 @@ class SecureOrgDataLLMService:
         instructions = load_instructions(manifest)
         loaded_rules = load_rules_for_task(manifest, request=task.request, context=task.context)
         rules_prompt = format_loaded_rules(loaded_rules)
+        loaded_skills = load_skills_for_task(manifest, request=task.request, context=task.context)
+        skills_prompt = format_loaded_skills(loaded_skills)
         loaded_rules_meta = [
             {
                 "id": rule.id,
@@ -101,14 +104,30 @@ class SecureOrgDataLLMService:
                 "reason": rule.reason,
                 "matched_context_keys": rule.matched_context_keys,
                 "matched_keywords": rule.matched_keywords,
+                "matched_statuses": rule.matched_statuses,
+                "match_reasons": rule.match_reasons,
                 "priority": rule.priority,
             }
             for rule in loaded_rules
         ]
+        loaded_skills_meta = [
+            {
+                "id": skill.id,
+                "title": skill.title,
+                "file": skill.file,
+                "reason": skill.reason,
+                "matched_context_keys": skill.matched_context_keys,
+                "matched_keywords": skill.matched_keywords,
+                "matched_statuses": skill.matched_statuses,
+                "match_reasons": skill.match_reasons,
+                "priority": skill.priority,
+            }
+            for skill in loaded_skills
+        ]
         completion = await self.client.complete(
             agent_id=manifest.id,
             messages=[
-                {"role": "system", "content": _decision_system_prompt(instructions, rules_prompt)},
+                {"role": "system", "content": _decision_system_prompt(instructions, rules_prompt, skills_prompt)},
                 {
                     "role": "user",
                     "content": json.dumps(
@@ -126,6 +145,7 @@ class SecureOrgDataLLMService:
                             "dialog_history": dialog_history or [],
                             "retrieval_context": retrieval_context(retrieval_hits),
                             "loaded_rules": loaded_rules_meta,
+                            "loaded_skills": loaded_skills_meta,
                             "tools": tool_definitions,
                             "tool_results": [compact_tool_result(result) for result in (tool_results or [])],
                         },
@@ -138,7 +158,7 @@ class SecureOrgDataLLMService:
         return SecureOrgDataLLMDecisionResult(
             decision=_parse_decision(completion.json_content()),
             model_usage=completion.model_usage,
-            raw={**completion.raw, "loaded_rules": loaded_rules_meta},
+            raw={**completion.raw, "loaded_rules": loaded_rules_meta, "loaded_skills": loaded_skills_meta},
         )
 
     async def compose(
@@ -195,9 +215,10 @@ def secure_org_data_llm_failure_result(
     )
 
 
-def _decision_system_prompt(instructions: str = "", loaded_rules: str = "") -> str:
+def _decision_system_prompt(instructions: str = "", loaded_rules: str = "", loaded_skills: str = "") -> str:
     extra = f"\n\nДополнительные инструкции:\n{instructions}" if instructions else ""
     rules_extra = f"\n\n{loaded_rules}" if loaded_rules else ""
+    skills_extra = f"\n\n{loaded_skills}" if loaded_skills else ""
     return (
         "Ты Secure Org Data Agent внутри AI-server. "
         "Ты помогаешь искать данные по объектам, оборудованию, настройкам, документам, сетевым параметрам и учетным данным. "
@@ -210,7 +231,7 @@ def _decision_system_prompt(instructions: str = "", loaded_rules: str = "") -> s
         '"answer":"краткий предварительный ответ",'
         '"confidence":0.0,'
         '"tool_calls":[{"name":"search_org_data|none","args":{},"summary":""}]}.'
-        f"{extra}{rules_extra}"
+        f"{extra}{rules_extra}{skills_extra}"
     )
 
 
