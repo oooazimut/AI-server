@@ -4,7 +4,8 @@ import json
 import httpx
 import pytest
 
-from ai_server.llm import LLMError, OpenAICompatibleLLMClient
+from ai_server.llm import LLMCompletion, LLMError, OpenAICompatibleLLMClient
+from ai_server.models import ModelUsageRecord
 from ai_server.settings import get_settings
 
 _RealAsyncClient = httpx.AsyncClient
@@ -27,6 +28,14 @@ def _response(*, finish_reason: str, content: str) -> dict:
         "choices": [{"message": {"content": content}, "finish_reason": finish_reason}],
         "usage": {"prompt_tokens": 10, "completion_tokens": 5},
     }
+
+
+def _completion(content: str) -> LLMCompletion:
+    return LLMCompletion(
+        content=content,
+        model_usage=ModelUsageRecord(agent_id="test", provider="test", model="test-model", status="used"),
+        raw={},
+    )
 
 
 def test_complete_retries_with_doubled_max_tokens_on_truncation(monkeypatch):
@@ -76,6 +85,12 @@ def test_complete_does_not_retry_when_not_truncated(monkeypatch):
 
     assert len(requests) == 1
     assert completion.json_content() == {"answer": "ok"}
+
+
+def test_json_content_extracts_object_from_wrapped_text():
+    completion = _completion('Готово:\n{"answer": "ok", "nested": {"value": "{inside}"}}\nЕсли нужно, уточню.')
+
+    assert completion.json_content() == {"answer": "ok", "nested": {"value": "{inside}"}}
 
 
 def test_complete_raises_on_provider_error(monkeypatch):

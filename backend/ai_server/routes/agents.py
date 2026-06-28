@@ -20,7 +20,7 @@ async def orchestrator_test(request: Request, body: AgentTestRequest) -> Any:
         user=UserContext(id=body.user_id, channel=body.channel, raw={"dialog_id": body.dialog_id}),
         request=body.text,
     )
-    result = await InternalOrchestrator(manifests).handle(task)
+    result = await InternalOrchestrator(manifests, trace_recorder=request.app.state.trace_recorder).handle(task)
     request.app.state.learning_recorder.record_agent_result(
         task,
         result,
