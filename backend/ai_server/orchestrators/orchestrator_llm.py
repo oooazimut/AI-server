@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
-import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-from ai_server.agents.ports import SchedulerPort
 from ai_server.agents.specialist_llm_shared import (
     compact_tool_result,
     load_instructions,
@@ -15,7 +13,7 @@ from ai_server.agents.specialist_llm_shared import (
     retrieval_context,
 )
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
-from ai_server.models import ActionRecord, AgentManifest, AgentTask, ModelUsageRecord, ToolResult
+from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
 from ai_server.retrieval import RetrievalHit
 from ai_server.utils import confidence
 
@@ -35,19 +33,10 @@ class OrchestratorToolCall:
 
 
 @dataclass(frozen=True)
-class ScheduledTaskDecision:
-    agent_id: str
-    job_id: str
-    trigger: dict[str, Any]
-    task_description: str
-
-
-@dataclass(frozen=True)
 class OrchestratorDecision:
     status: str
     answer: str
     tool_calls: list[OrchestratorToolCall] = field(default_factory=list)
-    scheduled_tasks: list[ScheduledTaskDecision] = field(default_factory=list)
     confidence: float = 0.5
 
 
@@ -77,10 +66,12 @@ class OrchestratorLLM(Protocol):
         *,
         manifest: AgentManifest,
         task: AgentTask,
-        dialog_history: list[dict[str, str]],
+        dialog_history: list[dict[str, str]] | None = None,
         retrieval_hits: list[RetrievalHit],
         tool_definitions: list[dict[str, Any]],
         tool_results: list[ToolResult] | None = None,
+        available_skills: list | None = None,
+        **kwargs: Any,
     ) -> OrchestratorDecisionResult:
         pass
 
@@ -91,6 +82,7 @@ class OrchestratorLLM(Protocol):
         task: AgentTask,
         decision: OrchestratorDecision,
         tool_results: list[ToolResult],
+        **kwargs: Any,
     ) -> OrchestratorFinalResult:
         pass
 
@@ -109,10 +101,12 @@ class OrchestratorLLMService:
         *,
         manifest: AgentManifest,
         task: AgentTask,
-        dialog_history: list[dict[str, str]],
+        dialog_history: list[dict[str, str]] | None = None,
         retrieval_hits: list[RetrievalHit],
         tool_definitions: list[dict[str, Any]],
         tool_results: list[ToolResult] | None = None,
+        available_skills: list | None = None,
+        **kwargs: Any,
     ) -> OrchestratorDecisionResult:
         instructions = load_instructions(manifest)
         completion = await self.client.complete(
@@ -152,6 +146,7 @@ class OrchestratorLLMService:
         task: AgentTask,
         decision: OrchestratorDecision,
         tool_results: list[ToolResult],
+        **kwargs: Any,
     ) -> OrchestratorFinalResult:
         completion = await self.client.complete(
             agent_id=manifest.id,
@@ -180,43 +175,6 @@ class OrchestratorLLMService:
         )
 
 
-# ---------------------------------------------------------------------------
-# Scheduler helper (used by InternalOrchestrator)
-# ---------------------------------------------------------------------------
-
-
-def apply_scheduled_tasks(
-    tasks: list[ScheduledTaskDecision],
-    scheduler: SchedulerPort | None,
-) -> list[ActionRecord]:
-    if not tasks or scheduler is None:
-        return []
-    actions: list[ActionRecord] = []
-    for task in tasks:
-        job_id = task.job_id or str(uuid.uuid4())[:8]
-        try:
-            job = scheduler.schedule_task(task.agent_id, job_id, task.trigger, task.task_description)
-            next_run = job.next_run_time.isoformat() if job.next_run_time else None
-            actions.append(
-                ActionRecord(
-                    name="orchestrator_schedule_task",
-                    status="scheduled",
-                    details={"agent_id": task.agent_id, "job_id": f"{task.agent_id}:{job_id}", "next_run": next_run},
-                )
-            )
-            logger.info("Orchestrator scheduled task %s:%s next=%s", task.agent_id, job_id, next_run)
-        except Exception as exc:
-            logger.exception("Orchestrator failed to schedule task for %s", task.agent_id)
-            actions.append(
-                ActionRecord(
-                    name="orchestrator_schedule_task",
-                    status="error",
-                    details={"agent_id": task.agent_id, "job_id": job_id, "error": f"{type(exc).__name__}: {exc}"},
-                )
-            )
-    return actions
-
-
 def orchestrator_llm_failure_result(message: str) -> OrchestratorFinalResult:
     return OrchestratorFinalResult(
         answer=f"Не смог обработать запрос через Переговорщика: {message}",
@@ -241,21 +199,24 @@ def _decide_system_prompt(instructions: str = "") -> str:
     return (
         "Ты Переговорщик — старший AI-агент корпоративного AI-server. "
         "Ты посредник между людьми и специалистами-субагентами. "
-        'Твоя задача: понять запрос, выбрать нужного специалиста (call_<id>) или ответить самому (tool_calls=[{"name":"none"}]). '
+        'Твоя задача: понять запрос, выбрать нужного специалиста (call_specialist) или ответить самому (tool_calls=[{"name":"none"}]). '
         "Маршрутизируй к специалисту только если запрос явно относится к его зоне ответственности (см. описания инструментов). "
         "Если запрос можно обработать самому (общий вопрос, пояснение, нет подходящего специалиста) — отвечай напрямую. "
         "Если запрос неоднозначен и неясно кто нужен — уточни у пользователя, не угадывай. "
         "Если предыдущие tool_results уже содержат нужные данные — не вызывай те же инструменты снова. "
+        "dialog_history — только контекст. Write-операции и доменные задачи требуют вызова специалиста, "
+        "даже если параметры видны из истории. "
+        "Если context.pending_specialist установлен — маршрутизируй к нему через call_specialist, "
+        "если пользователь явно не переключился на другую тему. "
         "Никогда не притворяйся специалистом и не выполняй их доменную работу сам. "
         "Если task.context содержит _source — задачу инициировал специалист. "
         "Читай context._intent и принимай решение какой инструмент вызвать: "
-        "  _intent=deliver_to_dialog → call_bitrix24 для отправки в context.dialog_id; "
-        "  _intent=escalate → call_bitrix24 для уведомления context.admin_user_ids. "
+        "  _intent=deliver_to_dialog → call_specialist(bitrix24) для отправки в context.dialog_id; "
+        "  _intent=escalate → call_specialist(bitrix24) для уведомления context.admin_user_ids. "
         "Верни только JSON-объект без markdown. Формат: "
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"предварительный ответ",'
-        '"tool_calls":[{"name":"call_<id>|none","args":{"request":"задача для специалиста"},"summary":""}],'
-        '"scheduled_tasks":[],'
+        '"tool_calls":[{"name":"call_specialist|schedule_task|manage_suspended|none","args":{...},"summary":""}],'
         '"confidence":0.0}.'
         f"{extra}"
     )
@@ -296,38 +257,12 @@ def _parse_decision(data: dict[str, Any], tool_definitions: list[dict[str, Any]]
             )
     if not tool_calls:
         tool_calls = [OrchestratorToolCall(name="none")]
-    scheduled_tasks = _parse_scheduled_tasks(data.get("scheduled_tasks"), known_tools)
     return OrchestratorDecision(
         status=_status(data.get("status")),
         answer=str(data.get("answer") or "").strip(),
         tool_calls=tool_calls,
-        scheduled_tasks=scheduled_tasks,
         confidence=confidence(data.get("confidence")),
     )
-
-
-def _parse_scheduled_tasks(raw: object, known_tools: set[str]) -> list[ScheduledTaskDecision]:
-    if not isinstance(raw, list):
-        return []
-    result = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        agent_id = str(item.get("agent_id") or "").strip()
-        trigger = item.get("trigger")
-        task_description = str(item.get("task_description") or "").strip()
-        if not agent_id or not isinstance(trigger, dict) or not task_description:
-            continue
-        job_id = str(item.get("job_id") or "").strip() or agent_id
-        result.append(
-            ScheduledTaskDecision(
-                agent_id=agent_id,
-                job_id=job_id,
-                trigger=trigger,
-                task_description=task_description,
-            )
-        )
-    return result
 
 
 def _status(value: object) -> str:

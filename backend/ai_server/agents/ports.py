@@ -34,6 +34,16 @@ class AgentStorePort(Protocol):
     async def append_turn(self, dialog_key: str, user_text: str, agent_response: str) -> None: ...
 
 
+class OrchestratorStorePort(AgentStorePort, Protocol):
+    """AgentStorePort + KV-state for orchestrator (pending/suspended specialists)."""
+
+    async def get_kv(self, dialog_key: str, field: str) -> str | None: ...
+
+    async def set_kv(self, dialog_key: str, field: str, value: str) -> None: ...
+
+    async def delete_kv(self, dialog_key: str, field: str) -> None: ...
+
+
 class SchedulerPort(Protocol):
     def add_job(self, agent_id: str, job_id: str, func: Any, trigger: Any, **kwargs: Any) -> Any: ...
 

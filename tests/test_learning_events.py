@@ -5,7 +5,6 @@ from ai_server.learning import EventStream, LearningEventRecorder
 from ai_server.main import app
 from ai_server.models import ActionRecord, AgentResult, AgentTask, ModelUsageRecord, UserContext
 from ai_server.orchestrators.internal import InternalOrchestrator
-from ai_server.registry import load_agent_manifests
 
 
 def test_learning_recorder_records_agent_result_and_feedback(tmp_path):
@@ -101,7 +100,6 @@ def test_orchestrator_records_learning_event(monkeypatch, tmp_path):
                 status="completed",
                 answer="",
                 tool_calls=[],
-                scheduled_tasks=[],
                 confidence=0.9,
             )
             return OrchestratorDecisionResult(
@@ -119,11 +117,16 @@ def test_orchestrator_records_learning_event(monkeypatch, tmp_path):
                 model_usage=ModelUsageRecord(agent_id="internal_orchestrator", provider="test", model="test"),
             )
 
-    manifests = load_agent_manifests()
+    from ai_server.models import AgentManifest
+    from ai_server.orchestrators.tools import CallSpecialistTool
+
+    orch_manifest = AgentManifest(
+        id="internal_orchestrator", name="Переговорщик", kind="orchestrator", description="test"
+    )
     orchestrator = InternalOrchestrator(
-        manifests,
-        specialists={},
-        orchestrator_llm=FakeOrchestratorLLM(),
+        orch_manifest,
+        agent_tools=[CallSpecialistTool({}, [])],
+        llm=FakeOrchestratorLLM(),
         learning_recorder=recorder,
     )
 
