@@ -1,5 +1,5 @@
 [Unit]
-Description=AI Server (FastAPI)
+Description=AI Server Agent Worker
 After=network.target postgresql.service redis.service
 Wants=postgresql.service redis.service
 
@@ -7,12 +7,12 @@ Wants=postgresql.service redis.service
 Type=exec
 WorkingDirectory=/opt/ai-server
 EnvironmentFile=/opt/ai-server/.env.prod
-ExecStart=/opt/ai-server/.venv/bin/uvicorn ai_server.main:app --host 0.0.0.0 --port 8000 --workers 1
+ExecStart=/opt/ai-server/.venv/bin/python -m ai_server.agent_worker
 Restart=always
-RestartSec=5
+RestartSec=10
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=ai-server
+SyslogIdentifier=ai-server-worker
 
 [Install]
 WantedBy=multi-user.target
