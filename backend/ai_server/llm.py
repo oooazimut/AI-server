@@ -53,6 +53,7 @@ class OpenAICompatibleLLMClient:
         base_url: str | None = None,
         api_key: str | None = None,
         reasoning: bool = False,
+        reasoning_effort: str | None = None,
         timeout_seconds: float = 60.0,
     ) -> None:
         s = settings or get_settings()
@@ -61,6 +62,7 @@ class OpenAICompatibleLLMClient:
         self._base_url = base_url or s.llm_base_url
         self._api_key = api_key or s.llm_api_key
         self._reasoning = reasoning
+        self._reasoning_effort = reasoning_effort
         self.timeout = httpx.Timeout(timeout_seconds)
 
     async def complete(
@@ -107,6 +109,8 @@ class OpenAICompatibleLLMClient:
             payload["temperature"] = settings.llm_temperature
         if json_mode and not self._reasoning:
             payload["response_format"] = {"type": "json_object"}
+        if self._reasoning_effort:
+            payload["reasoning_effort"] = self._reasoning_effort
 
         async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
             response = await client.post(
@@ -137,6 +141,7 @@ def build_orchestrator_llm_client(settings: Settings) -> OpenAICompatibleLLMClie
         base_url=settings.orchestrator_llm_base_url or None,
         api_key=settings.orchestrator_llm_api_key or None,
         reasoning=settings.orchestrator_llm_reasoning,
+        reasoning_effort=settings.orchestrator_llm_reasoning_effort or None,
         timeout_seconds=settings.orchestrator_llm_timeout_seconds,
     )
 

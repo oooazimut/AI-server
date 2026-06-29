@@ -39,6 +39,7 @@ class Settings:
     orchestrator_llm_base_url: str
     orchestrator_llm_api_key: str
     orchestrator_llm_reasoning: bool
+    orchestrator_llm_reasoning_effort: str
     orchestrator_llm_timeout_seconds: float
     deepseek_api_key: str
     deepseek_balance_base_url: str
@@ -345,6 +346,7 @@ def get_settings() -> Settings:
         orchestrator_llm_base_url=_env("AI_SERVER_ORCHESTRATOR_LLM_BASE_URL"),
         orchestrator_llm_api_key=_env("AI_SERVER_ORCHESTRATOR_LLM_API_KEY"),
         orchestrator_llm_reasoning=_env_bool("AI_SERVER_ORCHESTRATOR_LLM_REASONING"),
+        orchestrator_llm_reasoning_effort=_env("AI_SERVER_ORCHESTRATOR_LLM_REASONING_EFFORT"),
         orchestrator_llm_timeout_seconds=_env_float("AI_SERVER_ORCHESTRATOR_LLM_TIMEOUT_SECONDS", 120.0) or 120.0,
         deepseek_api_key=_deepseek_api_key(),
         deepseek_balance_base_url=_env("AI_SERVER_DEEPSEEK_BALANCE_BASE_URL", "https://api.deepseek.com"),
