@@ -119,7 +119,7 @@ class CallSpecialistTool:
 
         if self._store and dialog_key:
             try:
-                if sr.status == "needs_clarification":
+                if sr.status in ("needs_clarification", "needs_human"):
                     await self._store.set_kv(dialog_key, "pending_specialist", specialist_id)
                 else:
                     await self._store.delete_kv(dialog_key, "pending_specialist")

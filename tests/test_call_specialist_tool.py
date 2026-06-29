@@ -55,6 +55,15 @@ def test_sets_pending_on_needs_clarification():
     assert store._kv.get(("dlg1", "pending_specialist")) == "bitrix24"
 
 
+def test_sets_pending_on_needs_human():
+    store = FakeOrchestratorStore()
+    tool = _make_tool({"bitrix24": _fake_specialist(status="needs_human")}, store=store)
+
+    asyncio.run(tool.execute({"specialist_id": "bitrix24", "request": "..."}, dialog_key="dlg1"))
+
+    assert store._kv.get(("dlg1", "pending_specialist")) == "bitrix24"
+
+
 def test_clears_pending_on_completed():
     store = FakeOrchestratorStore()
     store.set_pending("dlg1", "bitrix24")
