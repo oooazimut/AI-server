@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -44,9 +45,23 @@ class LLMCompletion:
 
 
 class OpenAICompatibleLLMClient:
-    def __init__(self, settings: Settings | None = None) -> None:
-        self._settings = settings or get_settings()
-        self.timeout = httpx.Timeout(60.0)
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        reasoning: bool = False,
+        timeout_seconds: float = 60.0,
+    ) -> None:
+        s = settings or get_settings()
+        self._settings = s
+        self._model = model or s.llm_model
+        self._base_url = base_url or s.llm_base_url
+        self._api_key = api_key or s.llm_api_key
+        self._reasoning = reasoning
+        self.timeout = httpx.Timeout(timeout_seconds)
 
     async def complete(
         self,
@@ -69,8 +84,8 @@ class OpenAICompatibleLLMClient:
                 max_tokens=max_tokens * 2,
             )
 
-        content = _extract_content(data)
-        usage = _model_usage(agent_id=agent_id, data=data, settings=settings)
+        content = _extract_content(data, strip_thinking=self._reasoning)
+        usage = _model_usage(agent_id=agent_id, data=data, settings=settings, model_default=self._model)
         return LLMCompletion(content=content, model_usage=usage, raw=data)
 
     async def _request(
@@ -82,15 +97,15 @@ class OpenAICompatibleLLMClient:
         max_tokens: int,
     ) -> dict[str, Any]:
         settings = self._settings
-        url = _chat_completions_url(settings.llm_provider, settings.llm_base_url)
+        url = _chat_completions_url(settings.llm_provider, self._base_url)
         payload: dict[str, Any] = {
-            "model": settings.llm_model,
+            "model": self._model,
             "messages": messages,
             "max_tokens": max_tokens,
         }
         if settings.llm_temperature is not None:
             payload["temperature"] = settings.llm_temperature
-        if json_mode:
+        if json_mode and not self._reasoning:
             payload["response_format"] = {"type": "json_object"}
 
         async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
@@ -98,7 +113,7 @@ class OpenAICompatibleLLMClient:
                 url,
                 json=payload,
                 headers={
-                    "Authorization": f"Bearer {settings.llm_api_key}",
+                    "Authorization": f"Bearer {self._api_key}",
                     "Content-Type": "application/json",
                 },
             )
@@ -115,6 +130,17 @@ def build_llm_client(settings: Settings | None = None) -> OpenAICompatibleLLMCli
     return OpenAICompatibleLLMClient(settings or get_settings())
 
 
+def build_orchestrator_llm_client(settings: Settings) -> OpenAICompatibleLLMClient:
+    return OpenAICompatibleLLMClient(
+        settings,
+        model=settings.orchestrator_llm_model or None,
+        base_url=settings.orchestrator_llm_base_url or None,
+        api_key=settings.orchestrator_llm_api_key or None,
+        reasoning=settings.orchestrator_llm_reasoning,
+        timeout_seconds=settings.orchestrator_llm_timeout_seconds,
+    )
+
+
 def _chat_completions_url(provider: str, base_url: str) -> str:
     normalized_provider = provider.strip().casefold()
     if base_url.strip():
@@ -124,7 +150,7 @@ def _chat_completions_url(provider: str, base_url: str) -> str:
     raise LLMError("AI_SERVER_LLM_BASE_URL is required for this LLM provider")
 
 
-def _extract_content(data: dict[str, Any]) -> str:
+def _extract_content(data: dict[str, Any], *, strip_thinking: bool = False) -> str:
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
         raise LLMError("LLM response does not contain choices")
@@ -137,15 +163,24 @@ def _extract_content(data: dict[str, Any]) -> str:
     content = message.get("content")
     if not isinstance(content, str) or not content.strip():
         raise LLMError("LLM response content is empty")
+    if strip_thinking:
+        content = _strip_think_tags(content)
     return content
 
 
-def _model_usage(*, agent_id: str, data: dict[str, Any], settings: Settings) -> ModelUsageRecord:
-    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+def _strip_think_tags(text: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+def _model_usage(
+    *, agent_id: str, data: dict[str, Any], settings: Settings, model_default: str | None = None
+) -> ModelUsageRecord:
+    _raw_usage = data.get("usage")
+    usage: dict[str, Any] = _raw_usage if isinstance(_raw_usage, dict) else {}
     return ModelUsageRecord(
         agent_id=agent_id,
         provider=settings.llm_provider,
-        model=str(data.get("model") or settings.llm_model),
+        model=str(data.get("model") or model_default or settings.llm_model),
         status="used",
         input_tokens=optional_int(usage.get("prompt_tokens")),
         output_tokens=optional_int(usage.get("completion_tokens")),

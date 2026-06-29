@@ -24,6 +24,7 @@ from .integrations.postgres.vehicle_usage import PostgresVehicleUsageStore
 from .integrations.redis.agent_queue import RedisAgentQueue
 from .integrations.redis.event_queue import RedisEventQueue
 from .learning import LearningEventRecorder
+from .llm import build_orchestrator_llm_client
 from .models import AgentTask
 from .orchestrators.internal import InternalOrchestrator
 from .orchestrators.orchestrator_llm import OrchestratorLLMService
@@ -253,7 +254,7 @@ async def lifespan(app: FastAPI):
             bitrix_oauth=bitrix_oauth,
             bitrix_bot=bitrix,
             scheduler=scheduler,
-            orchestrator_llm=OrchestratorLLMService(),
+            orchestrator_llm=OrchestratorLLMService(build_orchestrator_llm_client(settings)),
             orchestrator_store=orchestrator_store,
             bitrix_llm=bitrix_llm_svc,
             bitrix_store=bitrix_store,
