@@ -1,3 +1,5 @@
+import json
+
 import httpx
 
 from scripts.work_scenario_runner import run_scenarios
@@ -67,6 +69,16 @@ def test_work_scenario_runner_passes_basic_scenario(monkeypatch):
 
 
 def test_work_scenario_runner_creates_feedback_incident_and_diagnosis(monkeypatch):
+    events = [
+        {
+            "id": "event-2",
+            "event_type": "agent_result",
+            "request": "Найди датчик коленвала на складе",
+            "response": "Не найдено",
+            "metadata": {"trace_id": "trace-2"},
+        }
+    ]
+
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/orchestrator/test":
             return httpx.Response(
@@ -79,20 +91,7 @@ def test_work_scenario_runner_creates_feedback_incident_and_diagnosis(monkeypatc
                 },
             )
         if request.url.path == "/learning/events":
-            return httpx.Response(
-                200,
-                json={
-                    "events": [
-                        {
-                            "id": "event-2",
-                            "event_type": "agent_result",
-                            "request": "Найди датчик коленвала на складе",
-                            "response": "Не найдено",
-                            "metadata": {"trace_id": "trace-2"},
-                        }
-                    ],
-                },
-            )
+            return httpx.Response(200, json={"events": events})
         if request.url.path == "/learning/traces":
             return httpx.Response(200, json={"events": []})
         if request.url.path == "/learning/feedback":
@@ -105,7 +104,27 @@ def test_work_scenario_runner_creates_feedback_incident_and_diagnosis(monkeypatc
                 },
             )
         if request.url.path == "/learning/diagnose":
-            return httpx.Response(200, json={"status": "completed", "answer": "Проблема вероятно в catalog."})
+            assert request.read()
+            body = json.loads(request.content)
+            assert body["feedback_event_id"] == "feedback-1"
+            events.append(
+                {
+                    "id": "diagnostic-1",
+                    "event_type": "diagnostic_report",
+                    "metadata": {
+                        "target_event_id": "event-2",
+                        "feedback_event_ids": ["feedback-1"],
+                    },
+                }
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "status": "completed",
+                    "answer": "Проблема вероятно в catalog.",
+                    "diagnostic_event": {"recorded": True, "event_id": "diagnostic-1"},
+                },
+            )
         return httpx.Response(404)
 
     monkeypatch.setattr(
@@ -135,5 +154,7 @@ def test_work_scenario_runner_creates_feedback_incident_and_diagnosis(monkeypatc
 
     result = report["results"][0]
     assert report["ok"] is True
+    assert result["feedback_event_id"] == "feedback-1"
     assert result["incident_ids"] == ["incident-1"]
+    assert result["diagnostic_report_id"] == "diagnostic-1"
     assert result["diagnostic_answer"] == "Проблема вероятно в catalog."

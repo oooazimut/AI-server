@@ -312,6 +312,7 @@ async def run_webhook_event_worker(
     transcriber: Any,
     status: dict[str, Any],
     settings: Settings,
+    feedback_loop: Any = None,
 ) -> None:
     worker_count = settings.webhook_event_queue_worker_count
     active_partition_keys: set[str] = set()
@@ -344,6 +345,7 @@ async def run_webhook_event_worker(
                 active_partition_keys=active_partition_keys,
                 active_lock=active_lock,
                 settings=settings,
+                feedback_loop=feedback_loop,
             )
         )
         for index in range(worker_count)
@@ -369,6 +371,7 @@ async def _run_webhook_event_worker_loop(
     active_partition_keys: set[str],
     active_lock: asyncio.Lock,
     settings: Settings,
+    feedback_loop: Any = None,
 ) -> None:
     while True:
         event_id: int | None = None
@@ -396,6 +399,7 @@ async def _run_webhook_event_worker_loop(
                 attachment_service=attachment_service,
                 transcriber=transcriber,
                 settings=settings,
+                feedback_loop=feedback_loop,
             )
             await queue.mark_done(event_id, result)
             status["last_error"] = None
@@ -425,6 +429,7 @@ async def _route_event(
     attachment_service: AttachmentService,
     transcriber: Any,
     settings: Settings,
+    feedback_loop: Any = None,
 ) -> dict[str, Any]:
     """Route a Bitrix webhook event to the appropriate agent queue."""
     if event_type in MESSAGE_EVENTS:
@@ -434,6 +439,10 @@ async def _route_event(
             transcriber=transcriber,
             settings=settings,
         )
+        if feedback_loop is not None:
+            feedback_result = await feedback_loop.try_handle_feedback(task)
+            if feedback_result is not None:
+                return {**feedback_result, "event": event_type}
         await agent_queue.publish(
             {
                 "to": "orchestrator",

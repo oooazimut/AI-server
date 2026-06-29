@@ -43,6 +43,36 @@ def test_internal_orchestrator_delegates_bitrix_request():
     assert result.actions_taken[1].name == "delegate_to_specialist"
 
 
+def test_orchestrator_remembers_feedback_pending_even_if_bitrix_send_fails():
+    manifests = load_agent_manifests()
+    feedback_loop = _FakeFeedbackLoop()
+    task = AgentTask(
+        task_id="feedback-pending",
+        request="покажи склад Борисов",
+        context={
+            "channel_id": "bitrix24",
+            "recipient_id": "chat3955",
+            "dialog_key": "chat:3955:user:9",
+        },
+    )
+
+    result = asyncio.run(
+        InternalOrchestrator(
+            manifests,
+            specialists={},
+            orchestrator_llm=FakeInternalOrchestratorLLM(status="completed", answer="Склад не найден."),
+            channels={"bitrix24": _FailingChannel()},
+            feedback_loop=feedback_loop,
+            trace_recorder=TraceRecorder(path=":memory:", enabled=False),
+        ).handle(task)
+    )
+
+    assert result.status == "completed"
+    assert feedback_loop.appended == ["Склад не найден."]
+    assert len(feedback_loop.remembered) == 1
+    assert feedback_loop.remembered[0]["dialog_key"] == "chat:3955:user:9"
+
+
 def test_internal_orchestrator_delegates_pto_document_request():
     manifests = load_agent_manifests()
     result = asyncio.run(
@@ -252,3 +282,21 @@ def _fake_secure_usage() -> ModelUsageRecord:
         model="fake-secure-org-data",
         status="used",
     )
+
+
+class _FailingChannel:
+    async def send(self, recipient_id: str, body: str) -> None:
+        raise RuntimeError("send failed")
+
+
+class _FakeFeedbackLoop:
+    def __init__(self) -> None:
+        self.appended = []
+        self.remembered = []
+
+    def append_prompt(self, message: str) -> str:
+        self.appended.append(message)
+        return f"{message}\n\nОцените ответ по 10-балльной шкале."
+
+    def remember_answer(self, task, result, learning_record) -> None:
+        self.remembered.append({"dialog_key": task.context.get("dialog_key"), "answer": result.answer})

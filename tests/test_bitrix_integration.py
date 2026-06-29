@@ -70,6 +70,7 @@ def test_webhook_event_queue_is_compatible_and_sanitizes_payload(monkeypatch, tm
 
 
 def test_bitrix_events_endpoint_enqueues_payload(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     monkeypatch.setenv("WEBHOOK_SECRET", "test-secret")
     monkeypatch.setenv("AGENT_DRY_RUN", "true")

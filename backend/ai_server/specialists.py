@@ -47,6 +47,7 @@ class SpecialistDeps:
     footer_service: Any = None  # TechnicalFooterService | None
     learning_recorder: Any = None  # LearningEventRecorder | None
     trace_recorder: Any = None  # TraceRecorder | None
+    feedback_loop: Any = None  # FeedbackLoopService | None
 
     def as_build_kwargs(self) -> dict[str, Any]:
         """All non-None fields — pass to any agent build() method."""

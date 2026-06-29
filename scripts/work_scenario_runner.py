@@ -34,7 +34,9 @@ class ScenarioRun:
     handoff_to: list[str] = field(default_factory=list)
     learning_event_id: str = ""
     trace_id: str = ""
+    feedback_event_id: str = ""
     incident_ids: list[str] = field(default_factory=list)
+    diagnostic_report_id: str = ""
     diagnostic_answer: str = ""
     error: str = ""
 
@@ -48,7 +50,9 @@ class ScenarioRun:
             "handoff_to": self.handoff_to,
             "learning_event_id": self.learning_event_id,
             "trace_id": self.trace_id,
+            "feedback_event_id": self.feedback_event_id,
             "incident_ids": self.incident_ids,
+            "diagnostic_report_id": self.diagnostic_report_id,
             "diagnostic_answer": self.diagnostic_answer,
             "error": self.error,
             "checks": [check.__dict__ for check in self.checks],
@@ -246,6 +250,14 @@ def _submit_feedback(client: httpx.Client, run: ScenarioRun, feedback: dict[str,
         return checks
     payload = response.json()
     checks.append(ScenarioCheck("feedback_recorded", payload.get("recorded") is True, str(payload)))
+    run.feedback_event_id = str(payload.get("event_id") or "")
+    checks.append(
+        ScenarioCheck(
+            "feedback_event_id",
+            bool(run.feedback_event_id),
+            run.feedback_event_id or "feedback response did not include event_id",
+        )
+    )
 
     incident = payload.get("incident") if isinstance(payload.get("incident"), dict) else {}
     if incident.get("event_id"):
@@ -257,7 +269,11 @@ def _submit_feedback(client: httpx.Client, run: ScenarioRun, feedback: dict[str,
     if feedback.get("diagnose"):
         diagnostic = client.post(
             "/learning/diagnose",
-            json={"event_id": run.learning_event_id, "comment": feedback.get("comment", "")},
+            json={
+                "event_id": run.learning_event_id,
+                "feedback_event_id": run.feedback_event_id or None,
+                "comment": feedback.get("comment", ""),
+            },
         )
         checks.append(
             ScenarioCheck("diagnose_status", diagnostic.status_code == 200, f"status_code={diagnostic.status_code}")
@@ -265,6 +281,12 @@ def _submit_feedback(client: httpx.Client, run: ScenarioRun, feedback: dict[str,
         if diagnostic.status_code == 200:
             diagnostic_payload = diagnostic.json()
             run.diagnostic_answer = str(diagnostic_payload.get("answer") or "")
+            diagnostic_event = (
+                diagnostic_payload.get("diagnostic_event")
+                if isinstance(diagnostic_payload.get("diagnostic_event"), dict)
+                else {}
+            )
+            run.diagnostic_report_id = str(diagnostic_event.get("event_id") or "")
             checks.append(
                 ScenarioCheck(
                     "diagnostic_answer",
@@ -272,7 +294,35 @@ def _submit_feedback(client: httpx.Client, run: ScenarioRun, feedback: dict[str,
                     run.diagnostic_answer[:240],
                 )
             )
+            checks.append(
+                ScenarioCheck(
+                    "diagnostic_report_recorded",
+                    diagnostic_event.get("recorded") is True and bool(run.diagnostic_report_id),
+                    str(diagnostic_event),
+                )
+            )
+            if run.diagnostic_report_id:
+                checks.append(_check_diagnostic_report_event(client, run))
     return checks
+
+
+def _check_diagnostic_report_event(client: httpx.Client, run: ScenarioRun) -> ScenarioCheck:
+    diagnostic_report = _find_event_by_id(client, run.diagnostic_report_id)
+    if diagnostic_report is None:
+        return ScenarioCheck("diagnostic_report_event", False, "not found in /learning/events")
+
+    metadata = diagnostic_report.get("metadata") if isinstance(diagnostic_report.get("metadata"), dict) else {}
+    feedback_ids = _strings(metadata.get("feedback_event_ids"))
+    ok = (
+        diagnostic_report.get("event_type") == "diagnostic_report"
+        and metadata.get("target_event_id") == run.learning_event_id
+        and (not run.feedback_event_id or run.feedback_event_id in feedback_ids)
+    )
+    return ScenarioCheck(
+        "diagnostic_report_event",
+        ok,
+        f"event_type={diagnostic_report.get('event_type')} target={metadata.get('target_event_id')} feedback_ids={feedback_ids}",
+    )
 
 
 def _find_learning_event(client: httpx.Client, *, request_text: str, response_text: str) -> dict[str, Any] | None:
@@ -289,6 +339,18 @@ def _find_learning_event(client: httpx.Client, *, request_text: str, response_te
         if response_text and str(event.get("response") or "") != response_text:
             continue
         return event
+    return None
+
+
+def _find_event_by_id(client: httpx.Client, event_id: str) -> dict[str, Any] | None:
+    if not event_id:
+        return None
+    response = client.get("/learning/events", params={"limit": 100})
+    if response.status_code != 200:
+        return None
+    for event in response.json().get("events") or []:
+        if isinstance(event, dict) and event.get("id") == event_id:
+            return event
     return None
 
 
@@ -319,6 +381,8 @@ def _print_report(report: dict[str, Any]) -> None:
             print(f"learning_event_id={item['learning_event_id']} trace_id={item.get('trace_id') or ''}")
         if item.get("incident_ids"):
             print(f"incident_ids={item['incident_ids']}")
+        if item.get("diagnostic_report_id"):
+            print(f"diagnostic_report_id={item['diagnostic_report_id']}")
         if item.get("diagnostic_answer"):
             print(f"diagnostic={item['diagnostic_answer'][:300]}")
         if item.get("error"):

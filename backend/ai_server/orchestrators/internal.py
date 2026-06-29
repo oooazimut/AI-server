@@ -42,6 +42,7 @@ class InternalOrchestrator:
         footer_service: TechnicalFooterService | None = None,
         learning_recorder: LearningEventRecorder | None = None,
         trace_recorder: TraceRecorder | None = None,
+        feedback_loop: Any = None,
     ) -> None:
         self.manifests = manifests
         self.specialists = specialists or build_specialist_registry(manifests, audience="employee")
@@ -53,6 +54,7 @@ class InternalOrchestrator:
         self._footer_svc = footer_service
         self._learning_recorder = learning_recorder
         self._trace_recorder = trace_recorder
+        self._feedback_loop = feedback_loop
         self._manifest = manifest_by_id(manifests, "internal_orchestrator") or _dummy_manifest()
 
     @classmethod
@@ -68,6 +70,7 @@ class InternalOrchestrator:
         footer_service: TechnicalFooterService | None = None,
         learning_recorder: LearningEventRecorder | None = None,
         trace_recorder: TraceRecorder | None = None,
+        feedback_loop: Any = None,
         **specialist_deps: Any,
     ) -> InternalOrchestrator:
         _manifests = manifests or []
@@ -89,6 +92,7 @@ class InternalOrchestrator:
             footer_service=footer_service,
             learning_recorder=learning_recorder,
             trace_recorder=trace_recorder,
+            feedback_loop=feedback_loop,
         )
 
     def tool_definitions(self) -> list[dict[str, Any]]:
@@ -222,8 +226,8 @@ class InternalOrchestrator:
         t_start = time.monotonic()
         result = await self._handle_core(task)
         elapsed_ms = {"total_ms": round((time.monotonic() - t_start) * 1000, 1)}
-        await self._send_to_channel(task, result)
-        self._record_learning(task, result, elapsed_ms=elapsed_ms)
+        learning_record = self._record_learning(task, result, elapsed_ms=elapsed_ms)
+        await self._send_to_channel(task, result, learning_record=learning_record)
         return result
 
     async def _handle_core(self, task: AgentTask) -> AgentResult:
@@ -437,7 +441,13 @@ class InternalOrchestrator:
             confidence=decision.confidence,
         )
 
-    async def _send_to_channel(self, task: AgentTask, result: AgentResult) -> None:
+    async def _send_to_channel(
+        self,
+        task: AgentTask,
+        result: AgentResult,
+        *,
+        learning_record: dict[str, Any] | None = None,
+    ) -> None:
         channel_id = task.context.get("channel_id", "")
         recipient_id = task.context.get("recipient_id", "")
         if not channel_id or not recipient_id:
@@ -458,6 +468,9 @@ class InternalOrchestrator:
             except Exception:
                 logger.exception("Footer build failed")
         body = append_footer(result.answer, footer) if result.answer else ""
+        if body and self._feedback_loop is not None and channel_id == "bitrix24":
+            body = self._feedback_loop.append_prompt(body)
+            self._feedback_loop.remember_answer(task, result, learning_record)
         if body:
             try:
                 await channel.send(recipient_id, body)
@@ -489,11 +502,11 @@ class InternalOrchestrator:
 
     def _record_learning(
         self, task: AgentTask, result: AgentResult, *, elapsed_ms: dict[str, float] | None = None
-    ) -> None:
+    ) -> dict[str, Any] | None:
         if self._learning_recorder is None:
-            return
+            return None
         try:
-            self._learning_recorder.record_agent_result(
+            return self._learning_recorder.record_agent_result(
                 task,
                 result,
                 metadata={"dialog_key": task.context.get("dialog_key", "")},
@@ -501,6 +514,7 @@ class InternalOrchestrator:
             )
         except Exception:
             logger.exception("Learning recording failed")
+            return None
 
     def _apply_agent_scheduled_tasks(self, tasks: list[ScheduledTask]) -> None:
         if not tasks or self.scheduler is None:

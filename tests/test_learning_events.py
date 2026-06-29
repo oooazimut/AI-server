@@ -393,10 +393,20 @@ def test_learning_incidents_endpoint(monkeypatch, tmp_path):
 
     with TestClient(app) as client:
         recorder = client.app.state.learning_recorder
+        client.app.state.trace_recorder.record(
+            event_name="orchestrator_decision",
+            trace_id="trace-endpoint",
+            span_id="span-endpoint",
+            agent_id="internal_orchestrator",
+            task_id="task-endpoint",
+            status="completed",
+            payload={"tool_calls": [{"name": "bitrix_api"}]},
+        )
         target = recorder.record_event(
             event_type="agent_result",
             source="local_test",
             agent_id="internal_orchestrator",
+            task_id="task-endpoint",
             request="найди датчик",
             response="не найдено",
             status="completed",
@@ -422,6 +432,7 @@ def test_learning_incidents_endpoint(monkeypatch, tmp_path):
     assert incidents.json()["incidents"][0]["event_type"] == "incident"
     assert target_incidents.status_code == 200
     assert target_incidents.json()["incidents"][0]["metadata"]["target_event_id"] == target["event_id"]
+    assert target_incidents.json()["incidents"][0]["metadata"]["trace_events"][0]["event_name"] == "orchestrator_decision"
 
 
 def test_learning_incident_groups(tmp_path):

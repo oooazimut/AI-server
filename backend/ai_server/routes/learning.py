@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 
-from ..agents.diagnostic_agent import DiagnosticAgent
+from ..diagnostics import run_diagnostic_via_orchestrator
 from ..learning import LearningEventRecorder
 from ..models import AgentTask, LearningDiagnosticRequest, LearningFeedbackRequest, UserContext
 from ..specialists import manifest_by_id
@@ -91,6 +91,10 @@ def learning_feedback(
 ) -> dict[str, Any]:
     validate_webhook_secret(request.app.state.settings, request_secret(request, x_agent_secret))
     recorder: LearningEventRecorder = request.app.state.learning_recorder
+    target_event = recorder.get_event(body.event_id)
+    target_metadata = target_event.get("metadata") if isinstance(target_event, dict) else {}
+    trace_id = str(target_metadata.get("trace_id") or "")
+    trace_events = request.app.state.trace_recorder.for_trace(trace_id, limit=500) if trace_id else []
     return recorder.record_feedback(
         event_id=body.event_id,
         rating=body.rating,
@@ -101,6 +105,7 @@ def learning_feedback(
         tags=body.tags,
         user_id=body.user_id,
         channel=body.channel,
+        trace_events=trace_events,
     )
 
 
@@ -129,11 +134,6 @@ async def learning_diagnose(
     target_metadata = target_event.get("metadata") if isinstance(target_event.get("metadata"), dict) else {}
     trace_id = str(target_metadata.get("trace_id") or "")
     trace_events = request.app.state.trace_recorder.for_trace(trace_id, limit=500) if trace_id else []
-    diagnostic_agent = DiagnosticAgent.build(
-        manifest,
-        diagnostic_llm=diagnostic_llm,
-        trace_recorder=request.app.state.trace_recorder,
-    )
     task = AgentTask(
         task_id=str(uuid4()),
         source="learning_diagnose",
@@ -151,7 +151,12 @@ async def learning_diagnose(
             "comment": body.comment,
         },
     )
-    result = await diagnostic_agent.handle(task)
+    result = await run_diagnostic_via_orchestrator(
+        manifests=request.app.state.manifests,
+        task=task,
+        diagnostic_llm=diagnostic_llm,
+        trace_recorder=request.app.state.trace_recorder,
+    )
     diagnostic_record = recorder.record_agent_result(
         task,
         result,

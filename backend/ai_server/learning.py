@@ -169,6 +169,7 @@ class EventStream:
         tags: list[str] | None = None,
         user_id: str | int | None = None,
         channel: str = "manual",
+        trace_events: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         target_event = self.get_event(event_id)
         target_metadata = target_event.get("metadata") if isinstance(target_event, dict) else {}
@@ -208,6 +209,7 @@ class EventStream:
                 tags=tags or [],
                 user_id=user_id,
                 channel=channel,
+                trace_events=trace_events or [],
             )
             feedback_result = {**feedback_result, "incident": incident_result}
         return feedback_result
@@ -224,6 +226,7 @@ class EventStream:
         tags: list[str] | None = None,
         user_id: str | int | None = None,
         channel: str = "manual",
+        trace_events: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         target_event = self.get_event(target_event_id)
         feedback_event = self.get_event(feedback_event_id)
@@ -258,6 +261,7 @@ class EventStream:
                 "target_status": target_event.get("status") or "",
                 "target_agent_id": target_event.get("agent_id") or "",
                 "diagnostic_trace": target_metadata.get("diagnostic_trace") or {},
+                "trace_events": trace_events or [],
                 "feedback_event": feedback_event if isinstance(feedback_event, dict) else {},
             },
         )

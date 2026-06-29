@@ -538,6 +538,7 @@ def test_bitrix_llm_decision_payload_includes_permission_context(monkeypatch):
 
 def test_bitrix_llm_service_uses_injected_settings_not_global_at_call_time(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "")
     monkeypatch.setenv("BITRIX_REST_WEBHOOK_URL", "https://injected.bitrix24.ru/rest/1/token/")
     injected_settings = get_settings()
 

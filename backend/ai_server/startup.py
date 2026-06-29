@@ -16,6 +16,7 @@ from .agents.logistics.specialist import VehicleUsageSettings
 from .agents.pto import PtoLLMService
 from .attachments import AttachmentService
 from .channels.bitrix import BitrixChatChannel
+from .feedback_loop import FeedbackLoopService
 from .integrations.bitrix.bitrix_store import BitrixAgentStore
 from .integrations.bitrix.client import BitrixClient
 from .integrations.bitrix.oauth import BitrixOAuthService
@@ -277,6 +278,14 @@ async def lifespan(app: FastAPI):
 
         bitrix_channel = BitrixChatChannel(settings=settings, bitrix=bitrix)
         app.state.bitrix_channel = bitrix_channel
+        feedback_loop = FeedbackLoopService(
+            learning_recorder=learning_recorder,
+            trace_recorder=trace_recorder,
+            manifests=manifests,
+            channels={"bitrix24": bitrix_channel},
+            settings=settings,
+        )
+        app.state.feedback_loop = feedback_loop
 
         specialist_deps = SpecialistDeps(
             settings=settings,
@@ -298,6 +307,7 @@ async def lifespan(app: FastAPI):
             footer_service=TechnicalFooterService(settings=settings),
             learning_recorder=learning_recorder,
             trace_recorder=trace_recorder,
+            feedback_loop=feedback_loop,
         )
         orch_manifest = next((m for m in manifests if m.kind == "orchestrator"), None)
         orchestrator = InternalOrchestrator.build(
@@ -399,6 +409,7 @@ async def lifespan(app: FastAPI):
                 transcriber=transcriber,
                 status=app.state.webhook_event_queue_status,
                 settings=settings,
+                feedback_loop=feedback_loop,
             )
         )
 
