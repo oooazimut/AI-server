@@ -71,12 +71,14 @@ async def run_diagnostic_via_orchestrator(
     task: AgentTask,
     diagnostic_llm: Any = None,
     trace_recorder: TraceRecorder | None = None,
+    learning_recorder: Any = None,
 ) -> Any:
     specialists = build_specialist_registry(
         manifests,
         audience="diagnostics",
         diagnostic_llm=diagnostic_llm,
         trace_recorder=trace_recorder,
+        learning_recorder=learning_recorder,
     )
     orchestrator = InternalOrchestrator(
         manifests,

@@ -42,6 +42,53 @@ def learning_diagnostic_groups(
     return recorder.diagnostic_groups(limit=limit, detailed=detailed)
 
 
+@router.get("/learning/reports/errors")
+async def learning_error_report(
+    request: Request,
+    x_agent_secret: Annotated[str | None, Header(alias="X-Agent-Secret")] = None,
+    since_hours: int = Query(default=24, ge=1, le=24 * 30),
+    limit: int = Query(default=200, ge=1, le=1000),
+    max_groups: int = Query(default=5, ge=1, le=20),
+    format: str = Query(default="markdown", pattern="^(markdown|json)$"),
+) -> dict[str, Any]:
+    validate_webhook_secret(request.app.state.settings, request_secret(request, x_agent_secret))
+    task = AgentTask(
+        task_id=str(uuid4()),
+        source="learning_report_api",
+        user=UserContext(channel="diagnostics"),
+        request=f"Сформируй отчет Диагноста по ошибкам за {since_hours} ч.",
+        context={
+            "error_report_request": {
+                "since_hours": since_hours,
+                "limit": limit,
+                "max_groups": max_groups,
+            }
+        },
+    )
+    result = await run_diagnostic_via_orchestrator(
+        manifests=request.app.state.manifests,
+        task=task,
+        diagnostic_llm=getattr(request.app.state, "diagnostic_llm", None),
+        trace_recorder=request.app.state.trace_recorder,
+        learning_recorder=request.app.state.learning_recorder,
+    )
+    report = {}
+    for artifact in result.artifacts:
+        if artifact.type == "diagnostic_error_report":
+            report = artifact.metadata.get("report") if isinstance(artifact.metadata, dict) else {}
+            break
+    payload: dict[str, Any] = {
+        "status": result.status,
+        "format": format,
+        "answer": result.answer,
+        "handoff_to": result.handoff_to,
+        "report": report,
+    }
+    if format == "json":
+        payload["answer"] = ""
+    return payload
+
+
 @router.get("/learning/incidents")
 def learning_incidents(
     request: Request,

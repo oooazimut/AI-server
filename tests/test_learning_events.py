@@ -393,6 +393,55 @@ def test_learning_diagnostic_groups_endpoint(monkeypatch, tmp_path):
     assert catalog_suggestion["regression_test"] == "query existing sensor by partial name."
 
 
+def test_learning_error_report_endpoint_runs_through_diagnostic_orchestrator(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
+    monkeypatch.setenv("WEBHOOK_SECRET", "")
+    monkeypatch.setenv("LEARNING_EVENTS_ENABLED", "true")
+    monkeypatch.setenv("LEARNING_EVENTS_CAPTURE_TEXT", "true")
+
+    with TestClient(app) as client:
+        recorder = client.app.state.learning_recorder
+        target = recorder.record_event(
+            event_type="agent_result",
+            source="bitrix24_chat",
+            agent_id="internal_orchestrator",
+            request="Покажи мои задачи",
+            response="Показал статистику вместо списка",
+            status="completed",
+            handoff_to=["bitrix24"],
+            metadata={"diagnostic_trace": {"called_agents": ["bitrix24"], "loaded_skills": [{"id": "tasks"}]}},
+        )
+        feedback = recorder.record_feedback(
+            event_id=target["event_id"],
+            rating=4,
+            rating_scale=10,
+            outcome="not_completed",
+            comment="нужен список задач",
+            tags=["tasks"],
+        )
+        recorder.record_event(
+            event_type="diagnostic_report",
+            source="learning_diagnose",
+            agent_id="internal_orchestrator",
+            response="**Fix proposal:** return flat task list.",
+            status="completed",
+            metadata={
+                "target_event_id": target["event_id"],
+                "feedback_event_ids": [feedback["event_id"]],
+                "incident_event_ids": [feedback["incident"]["event_id"]],
+            },
+        )
+        response = client.get("/learning/reports/errors?format=json")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "completed"
+    assert payload["handoff_to"] == ["diagnostic_agent"]
+    assert payload["report"]["total_incidents"] == 1
+    assert payload["report"]["groups"][0]["fix_proposal"] == "return flat task list."
+
+
 def test_learning_incidents_endpoint(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))

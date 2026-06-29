@@ -9,12 +9,23 @@ from pydantic import ValidationError
 
 from ai_server.agents.ports import AgentDialogStorePort, AgentQueuePort, ChannelPort, SchedulerPort
 from ai_server.learning import LearningEventRecorder
-from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ScheduledTask, ToolResult, ToolStatus
+from ai_server.models import (
+    ActionRecord,
+    AgentManifest,
+    AgentResult,
+    AgentTask,
+    Artifact,
+    ModelUsageRecord,
+    ScheduledTask,
+    ToolResult,
+    ToolStatus,
+)
 from ai_server.orchestrators.orchestrator_llm import (
     OrchestratorDecision,
     OrchestratorDecisionResult,
     OrchestratorLLM,
     OrchestratorLLMService,
+    OrchestratorToolCall,
     apply_scheduled_tasks,
     orchestrator_llm_failure_result,
 )
@@ -43,6 +54,7 @@ class InternalOrchestrator:
         learning_recorder: LearningEventRecorder | None = None,
         trace_recorder: TraceRecorder | None = None,
         feedback_loop: Any = None,
+        settings: Any = None,
     ) -> None:
         self.manifests = manifests
         self.specialists = specialists or build_specialist_registry(manifests, audience="employee")
@@ -55,6 +67,7 @@ class InternalOrchestrator:
         self._learning_recorder = learning_recorder
         self._trace_recorder = trace_recorder
         self._feedback_loop = feedback_loop
+        self._settings = settings
         self._manifest = manifest_by_id(manifests, "internal_orchestrator") or _dummy_manifest()
 
     @classmethod
@@ -76,11 +89,23 @@ class InternalOrchestrator:
         _manifests = manifests or []
         if not specialist_deps.get("bitrix_bot"):
             specialist_deps["bitrix_bot"] = specialist_deps.get("bitrix_client")
+        registry_deps = {
+            **specialist_deps,
+            "learning_recorder": learning_recorder,
+            "trace_recorder": trace_recorder,
+        }
         specialists = build_specialist_registry(
             _manifests,
             audience="employee",
-            **{k: v for k, v in specialist_deps.items() if v is not None},
+            **{k: v for k, v in registry_deps.items() if v is not None},
         )
+        diagnostics = build_specialist_registry(
+            _manifests,
+            audience="diagnostics",
+            **{k: v for k, v in registry_deps.items() if v is not None},
+        )
+        if "diagnostic_agent" in diagnostics:
+            specialists["diagnostic_agent"] = diagnostics["diagnostic_agent"]
         return cls(
             _manifests,
             specialists=specialists,
@@ -93,6 +118,7 @@ class InternalOrchestrator:
             learning_recorder=learning_recorder,
             trace_recorder=trace_recorder,
             feedback_loop=feedback_loop,
+            settings=specialist_deps.get("settings"),
         )
 
     def tool_definitions(self) -> list[dict[str, Any]]:
@@ -103,7 +129,7 @@ class InternalOrchestrator:
                 "parameters": {"request": {"type": "string", "description": "Запрос для специалиста"}},
             }
             for m in self.manifests
-            if m.kind == "specialist" and m.id in self.specialists
+            if m.kind == "specialist" and m.id in self.specialists and m.id != "diagnostic_agent"
         ]
 
     async def _execute_tool_call(
@@ -188,7 +214,12 @@ class InternalOrchestrator:
             result = ToolResult(
                 status=ToolStatus.OK,
                 tool=tool_call.name,
-                data={"specialist": specialist_id, "answer": sr.answer, "status": sr.status},
+                data={
+                    "specialist": specialist_id,
+                    "answer": sr.answer,
+                    "status": sr.status,
+                    "artifacts": [artifact.model_dump() for artifact in sr.artifacts],
+                },
             )
             return (
                 result,
@@ -231,6 +262,14 @@ class InternalOrchestrator:
         return result
 
     async def _handle_core(self, task: AgentTask) -> AgentResult:
+        report_command = (
+            task.context.get("error_report_request")
+            if isinstance(task.context.get("error_report_request"), dict)
+            else _error_report_command(task.request)
+        )
+        if report_command:
+            return await self._handle_error_report_command(task, report_command)
+
         dialog_key: str = task.context.get("dialog_key") or ""
         if self.store is not None and dialog_key:
             dialog_history: list[dict] = await self.store.load_turns(dialog_key, limit=20)
@@ -441,6 +480,97 @@ class InternalOrchestrator:
             confidence=decision.confidence,
         )
 
+    async def _handle_error_report_command(self, task: AgentTask, report_request: dict[str, Any]) -> AgentResult:
+        if not self._error_report_allowed(task):
+            return AgentResult(
+                status="needs_human",
+                agent_id="internal_orchestrator",
+                answer="Отчет Диагноста доступен только dev/admin пользователям.",
+                actions_taken=[
+                    ActionRecord(
+                        name="diagnostic_error_report_access",
+                        status="denied",
+                        details={"source": task.source, "user_id": task.user.id if task.user else None},
+                    )
+                ],
+                model_usage=[
+                    ModelUsageRecord(
+                        agent_id="internal_orchestrator",
+                        provider="internal",
+                        model="diagnostic_report_routing",
+                    )
+                ],
+                confidence=1.0,
+            )
+        task = task.model_copy(
+            update={
+                "context": {
+                    **task.context,
+                    "error_report_request": report_request,
+                    "skip_feedback_prompt": True,
+                }
+            }
+        )
+        decision = OrchestratorDecision(
+            status="completed",
+            answer="",
+            tool_calls=[
+                OrchestratorToolCall(
+                    name="call_diagnostic_agent",
+                    args={"request": task.request},
+                    summary="Сформировать отчет Диагноста по ошибкам.",
+                )
+            ],
+            confidence=1.0,
+        )
+        tool_result, delegate_action, approvals = await self._execute_tool_call(decision.tool_calls[0], task)
+        answer = str((tool_result.data or {}).get("answer") or "") if isinstance(tool_result.data, dict) else ""
+        status = str((tool_result.data or {}).get("status") or tool_result.status.value) if isinstance(
+            tool_result.data, dict
+        ) else tool_result.status.value
+        return AgentResult(
+            status="needs_human" if approvals else status,
+            agent_id="internal_orchestrator",
+            answer=answer or "Diagnostic Agent не вернул отчет.",
+            artifacts=[
+                Artifact.model_validate(item)
+                for item in ((tool_result.data or {}).get("artifacts") if isinstance(tool_result.data, dict) else [])
+            ],
+            actions_taken=[
+                ActionRecord(
+                    name="orchestrator_diagnostic_report_command",
+                    status="completed",
+                    details={"tool_calls": [{"name": "call_diagnostic_agent"}], **report_request},
+                ),
+                delegate_action,
+            ],
+            actions_requiring_approval=approvals,
+            model_usage=[
+                ModelUsageRecord(
+                    agent_id="internal_orchestrator",
+                    provider="internal",
+                    model="diagnostic_report_routing",
+                )
+            ],
+            handoff_to=["diagnostic_agent"] if tool_result.status == ToolStatus.OK else [],
+            confidence=1.0,
+        )
+
+    def _error_report_allowed(self, task: AgentTask) -> bool:
+        if task.source != "bitrix24_chat":
+            return True
+        raw_user_id = task.user.id if task.user else None
+        if not raw_user_id or not str(raw_user_id).isdigit() or self._settings is None:
+            return False
+        user_id = int(raw_user_id)
+        allowed = set(getattr(self._settings, "resolved_diagnostic_report_admin_user_ids", []))
+        allowed.update(getattr(self._settings, "resolved_supervisor_admin_user_ids", []))
+        allowed.update(getattr(self._settings, "resolved_vehicle_usage_admin_notify_user_ids", []))
+        manager_id = getattr(self._settings, "vehicle_usage_manager_user_id", None)
+        if manager_id:
+            allowed.add(int(manager_id))
+        return user_id in allowed
+
     async def _send_to_channel(
         self,
         task: AgentTask,
@@ -468,7 +598,13 @@ class InternalOrchestrator:
             except Exception:
                 logger.exception("Footer build failed")
         body = append_footer(result.answer, footer) if result.answer else ""
-        if body and self._feedback_loop is not None and channel_id == "bitrix24":
+        if (
+            body
+            and self._feedback_loop is not None
+            and channel_id == "bitrix24"
+            and not task.context.get("skip_feedback_prompt")
+            and "diagnostic_agent" not in result.handoff_to
+        ):
             body = self._feedback_loop.append_prompt(body)
             self._feedback_loop.remember_answer(task, result, learning_record)
         if body:
@@ -586,6 +722,28 @@ class InternalOrchestrator:
             except Exception as exc:
                 logger.exception("Orchestrator failed processing message %s", msg_id)
                 await queue.nack(msg_id, error=f"{type(exc).__name__}: {exc}")
+
+
+def _error_report_command(text: str) -> dict[str, Any] | None:
+    normalized = str(text or "").strip().casefold().replace("ё", "е")
+    if not normalized:
+        return None
+    report_markers = ("отчет", "отчёт", "report", "сводка", "покажи", "дай")
+    diagnostic_markers = ("ошиб", "incident", "инцидент", "diagnostic", "диагност", "feedback")
+    if not any(marker in normalized for marker in report_markers):
+        return None
+    if not any(marker in normalized for marker in diagnostic_markers):
+        return None
+    since_hours = 24
+    if "недел" in normalized or "7д" in normalized or "7 д" in normalized:
+        since_hours = 24 * 7
+    elif "сегодня" in normalized:
+        since_hours = 24
+    elif "час" in normalized:
+        since_hours = 1
+    limit = 200
+    max_groups = 5
+    return {"since_hours": since_hours, "limit": limit, "max_groups": max_groups}
 
 
 def _dummy_manifest() -> AgentManifest:

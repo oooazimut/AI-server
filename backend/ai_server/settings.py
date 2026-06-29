@@ -96,6 +96,7 @@ class Settings:
     supervisor_max_tasks: int
     supervisor_max_tasks_per_user: int
     supervisor_admin_user_ids: str
+    diagnostic_report_admin_user_ids: str
     supervisor_notify_responsibles: bool
     supervisor_reminder_cooldown_hours: int
     reconcile_enabled: bool
@@ -280,6 +281,10 @@ class Settings:
         return _id_list(self.supervisor_admin_user_ids)
 
     @property
+    def resolved_diagnostic_report_admin_user_ids(self) -> list[int]:
+        return _id_list(self.diagnostic_report_admin_user_ids)
+
+    @property
     def resolved_agent_private_disk_path_markers(self) -> list[str]:
         return [
             item.strip() for item in self.agent_private_disk_path_markers.replace(";", ",").split(",") if item.strip()
@@ -438,6 +443,7 @@ def get_settings() -> Settings:
         supervisor_max_tasks=_env_int("SUPERVISOR_MAX_TASKS", 50) or 50,
         supervisor_max_tasks_per_user=_env_int("SUPERVISOR_MAX_TASKS_PER_USER", 10) or 10,
         supervisor_admin_user_ids=_env("SUPERVISOR_ADMIN_USER_IDS"),
+        diagnostic_report_admin_user_ids=_env("DIAGNOSTIC_REPORT_ADMIN_USER_IDS"),
         supervisor_notify_responsibles=_env_bool("SUPERVISOR_NOTIFY_RESPONSIBLES", False),
         supervisor_reminder_cooldown_hours=_env_int("SUPERVISOR_REMINDER_COOLDOWN_HOURS", 12) or 12,
         reconcile_enabled=_env_bool("RECONCILE_ENABLED", False),
