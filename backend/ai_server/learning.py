@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import re
 from collections import Counter, deque
 from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
@@ -357,8 +358,14 @@ class EventStream:
 
         ordered = sorted(groups.values(), key=lambda item: (-int(item["count"]), str(item["key"])))
         if detailed:
+            diagnostic_reports = self._latest_by_type("diagnostic_report", limit=limit)
+            reports_by_incident = _diagnostic_reports_by_incident(diagnostic_reports)
             for group in ordered:
                 group["diagnosis"] = _incident_group_diagnosis(str(group["key"]))
+                group["diagnostic_reports"] = _incident_group_diagnostic_reports(
+                    group.get("incident_ids"),
+                    reports_by_incident,
+                )
         return {
             "total_incidents": len(events),
             "mode": "detailed" if detailed else "brief",
@@ -385,8 +392,10 @@ class EventStream:
 
         ordered = sorted(groups.values(), key=lambda item: (-int(item["count"]), str(item["key"])))
         if detailed:
+            events_by_id = {str(event.get("id") or ""): event for event in events}
             for group in ordered:
                 group["diagnosis"] = _diagnostic_group_diagnosis(str(group["key"]))
+                group["suggestions"] = _diagnostic_group_suggestions(group.get("event_ids"), events_by_id)
         return {
             "total_reports": len(events),
             "mode": "detailed" if detailed else "brief",
@@ -713,6 +722,113 @@ def _incident_group_diagnosis(key: str) -> dict[str, str]:
             "fix_proposal": "Проверить правила финального ответа и условия, когда ответ считается completed/needs_human/failed.",
         }
     return _diagnostic_group_diagnosis(key)
+
+
+def _diagnostic_group_suggestions(event_ids: Any, events_by_id: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    suggestions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for event_id in _strings(event_ids):
+        if event_id in seen:
+            continue
+        seen.add(event_id)
+        event = events_by_id.get(event_id)
+        if not event:
+            continue
+        summary = _diagnostic_report_summary(event)
+        if summary:
+            suggestions.append(summary)
+        if len(suggestions) >= 3:
+            break
+    return suggestions
+
+
+def _diagnostic_reports_by_incident(events: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    reports_by_incident: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+        incident_ids = _strings(metadata.get("incident_event_ids"))
+        incident_id = str(metadata.get("incident_event_id") or "")
+        if incident_id:
+            incident_ids.append(incident_id)
+        for item in sorted(set(incident_ids)):
+            reports_by_incident.setdefault(item, []).append(event)
+    return reports_by_incident
+
+
+def _incident_group_diagnostic_reports(
+    incident_ids: Any,
+    reports_by_incident: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    reports: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for incident_id in _strings(incident_ids):
+        for event in reports_by_incident.get(incident_id, []):
+            event_id = str(event.get("id") or "")
+            if not event_id or event_id in seen:
+                continue
+            seen.add(event_id)
+            summary = _diagnostic_report_summary(event)
+            if summary:
+                reports.append(summary)
+            if len(reports) >= 3:
+                return reports
+    return reports
+
+
+def _diagnostic_report_summary(event: dict[str, Any]) -> dict[str, Any]:
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    sections = _diagnostic_report_sections(str(event.get("response") or ""))
+    summary: dict[str, Any] = {
+        "id": event.get("id"),
+        "target_event_id": metadata.get("target_event_id"),
+        "feedback_event_ids": _strings(metadata.get("feedback_event_ids")),
+        "incident_event_ids": _strings(metadata.get("incident_event_ids")),
+        "status": event.get("status"),
+    }
+    for source, target in (
+        ("problem", "problem"),
+        ("where_to_fix", "where_to_fix"),
+        ("fix_proposal", "fix_proposal"),
+        ("regression_test", "regression_test"),
+    ):
+        if sections.get(source):
+            summary[target] = sections[source]
+    if len(summary) <= 5:
+        response = str(event.get("response") or "").strip()
+        if response:
+            summary["excerpt"] = _truncate_text(response, 800)
+    return summary
+
+
+def _diagnostic_report_sections(response: str) -> dict[str, str]:
+    sections: dict[str, str] = {}
+    if not response.strip():
+        return sections
+    matches = list(
+        re.finditer(
+            r"(?:^|\n)\s*\*\*(?P<title>[^*\n:]{2,80}):\*\*\s*(?P<body>.*?)(?=\n\s*\*\*[^*\n:]{2,80}:\*\*|\Z)",
+            response,
+            flags=re.S,
+        )
+    )
+    for match in matches:
+        title = match.group("title").strip().casefold()
+        body = _truncate_text(match.group("body").strip(), 800)
+        if not body:
+            continue
+        if _contains_any(title, ("what went wrong", "problem", "\u043f\u0440\u043e\u0431\u043b\u0435\u043c")):
+            sections.setdefault("problem", body)
+        elif _contains_any(title, ("where", "\u0433\u0434\u0435")):
+            sections.setdefault("where_to_fix", body)
+        elif _contains_any(title, ("fix", "patch", "\u0438\u0441\u043f\u0440\u0430\u0432")):
+            sections.setdefault("fix_proposal", body)
+        elif _contains_any(title, ("regression", "test", "\u0440\u0435\u0433\u0440\u0435\u0441", "\u0442\u0435\u0441\u0442")):
+            sections.setdefault("regression_test", body)
+    return sections
+
+
+def _contains_any(value: str, markers: tuple[str, ...]) -> bool:
+    return any(marker in value for marker in markers)
 
 
 def _strings(value: Any) -> list[str]:

@@ -346,7 +346,12 @@ def test_learning_diagnostic_groups_endpoint(monkeypatch, tmp_path):
                 event_type="diagnostic_report",
                 source="learning_diagnose",
                 agent_id="diagnostic_agent",
-                response="Проблема в поиске catalog.",
+                response=(
+                    "**What went wrong:** catalog search missed an existing item.\n"
+                    "**Where to fix:** skills/catalog.md\n"
+                    "**Fix proposal:** add synonym and partial-name fallback.\n"
+                    "**Regression test:** query existing sensor by partial name."
+                ),
                 status="completed",
                 metadata={
                     "target_event_id": target["event_id"],
@@ -382,6 +387,10 @@ def test_learning_diagnostic_groups_endpoint(monkeypatch, tmp_path):
     assert detailed_response.json()["mode"] == "detailed"
     assert "skill `catalog`" in catalog_diagnosis["problem"]
     assert "fix_proposal" in catalog_diagnosis
+    catalog_suggestion = detailed_groups["loaded_skill:catalog"]["suggestions"][0]
+    assert catalog_suggestion["where_to_fix"] == "skills/catalog.md"
+    assert catalog_suggestion["fix_proposal"] == "add synonym and partial-name fallback."
+    assert catalog_suggestion["regression_test"] == "query existing sensor by partial name."
 
 
 def test_learning_incidents_endpoint(monkeypatch, tmp_path):
@@ -457,13 +466,29 @@ def test_learning_incident_groups(tmp_path):
                 },
             },
         )
-        recorder.record_feedback(
+        feedback = recorder.record_feedback(
             event_id=target["event_id"],
             rating=3,
             rating_scale=10,
             outcome="not_completed",
             comment="товар есть",
             tags=["catalog"],
+        )
+        recorder.record_event(
+            event_type="diagnostic_report",
+            source="learning_diagnose",
+            agent_id="internal_orchestrator",
+            response=(
+                "**Where to fix:** skills/catalog.md\n"
+                "**Fix proposal:** add catalog fallback search.\n"
+                "**Regression test:** missing item feedback creates grouped report."
+            ),
+            status="completed",
+            metadata={
+                "target_event_id": target["event_id"],
+                "feedback_event_ids": [feedback["event_id"]],
+                "incident_event_ids": [feedback["incident"]["event_id"]],
+            },
         )
 
     brief = recorder.incident_groups()
@@ -482,6 +507,9 @@ def test_learning_incident_groups(tmp_path):
 
     assert detailed["mode"] == "detailed"
     assert "fix_proposal" in detailed_groups["loaded_skill:catalog"]["diagnosis"]
+    linked_report = detailed_groups["loaded_skill:catalog"]["diagnostic_reports"][0]
+    assert linked_report["fix_proposal"] == "add catalog fallback search."
+    assert linked_report["regression_test"] == "missing item feedback creates grouped report."
     assert "Повторяется причина" in detailed_groups["incident_reason:feedback_outcome:not_completed"]["diagnosis"][
         "problem"
     ]
