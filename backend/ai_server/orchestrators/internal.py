@@ -89,6 +89,8 @@ class InternalOrchestrator(BaseSpecialist):
 
     async def handle(self, task: AgentTask) -> AgentResult:
         t_start = time.monotonic()
+        dialog_key = task.context.get("dialog_key", "")
+        logger.info("Orchestrator.handle: start task_id=%s dialog_key=%s", task.task_id, dialog_key)
         result = await super().handle(task)
         # Extract specialist IDs called during this turn for handoff_to
         specialist_ids = [
@@ -100,6 +102,13 @@ class InternalOrchestrator(BaseSpecialist):
         if specialist_ids:
             result = result.model_copy(update={"handoff_to": specialist_ids})
         elapsed_ms = {"total_ms": round((time.monotonic() - t_start) * 1000, 1)}
+        logger.info(
+            "Orchestrator.handle: done task_id=%s dialog_key=%s elapsed_ms=%.0f status=%s",
+            task.task_id,
+            dialog_key,
+            elapsed_ms["total_ms"],
+            result.status,
+        )
         await self._send_to_channel(task, result)
         self._record_learning(task, result, elapsed_ms=elapsed_ms)
         return result
@@ -120,6 +129,10 @@ class InternalOrchestrator(BaseSpecialist):
             msg_id = str(message.get("id") or "")
             try:
                 msg_type = str(message.get("type") or "")
+                _payload = message.get("payload") or {}
+                _ctx = _payload.get("context") or {} if isinstance(_payload, dict) else {}
+                _dlg = str(_ctx.get("dialog_key") or "") if isinstance(_ctx, dict) else ""
+                logger.info("Orchestrator.run: claimed msg_id=%s type=%s dialog_key=%s", msg_id, msg_type, _dlg)
                 if msg_type in ("task", "bitrix_chat"):
                     try:
                         task = AgentTask.model_validate(message["payload"])

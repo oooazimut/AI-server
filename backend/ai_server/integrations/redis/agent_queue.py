@@ -58,6 +58,12 @@ class RedisAgentQueue:
         stale_before = time.time() - _PROCESSING_TTL
         stale_ids = await r.zrangebyscore(_processing_key(agent_id), 0, stale_before)
         if stale_ids:
+            logger.warning(
+                "AgentQueue: reclaiming %d stale message(s) for agent=%s ids=%s",
+                len(stale_ids),
+                agent_id,
+                list(stale_ids),
+            )
             pipe = r.pipeline()
             pipe.zrem(_processing_key(agent_id), *stale_ids)
             for sid in stale_ids:
