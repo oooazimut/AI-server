@@ -11,7 +11,7 @@ import redis.asyncio as aioredis
 logger = logging.getLogger(__name__)
 
 _PREFIX = "ai_server:aq"
-_PROCESSING_TTL = 120  # seconds before a claimed message is considered stale
+_PROCESSING_TTL = 360  # seconds before a claimed message is considered stale
 _MAX_NACK_RETRIES = 3
 
 

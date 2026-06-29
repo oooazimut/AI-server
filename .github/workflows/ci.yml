@@ -49,6 +49,15 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra dev --extra retrieval
 
+      - name: Cache fastembed models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/fastembed
+          key: fastembed-${{ runner.os }}-bge-small-en-v1.5
+
+      - name: Pre-download fastembed model
+        run: uv run python -c "from fastembed import TextEmbedding; TextEmbedding('BAAI/bge-small-en-v1.5')" || true
+
       - name: Run tests
         run: uv run pytest -v
 
