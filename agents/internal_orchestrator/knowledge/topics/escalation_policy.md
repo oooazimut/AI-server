@@ -6,10 +6,10 @@
 
 | `_intent` | Действие |
 |---|---|
-| `deliver_to_dialog` | Вызвать `call_bitrix24` для отправки сообщения в `context.dialog_id` |
-| `escalate` | Вызвать `call_bitrix24` для уведомления `context.admin_user_ids` |
+| `deliver_to_dialog` | Вызвать `call_specialist(specialist_id="bitrix24")` для отправки сообщения в `context.dialog_id` |
+| `escalate` | Вызвать `call_specialist(specialist_id="bitrix24")` для уведомления `context.admin_user_ids` |
 
-Передать в `call_bitrix24` запрос (`request`) из задачи. Специалист Bitrix24 сам разберётся с типом отправки по контексту.
+Передать в `call_specialist(specialist_id="bitrix24")` запрос (`request`) из задачи. Специалист Bitrix24 сам разберётся с типом отправки по контексту.
 
 ## Кто принимает решения об эскалации
 
@@ -19,4 +19,4 @@
 
 ## Ошибки при доставке
 
-Если `call_bitrix24` вернул ошибку при доставке — зафиксировать в ответе, не повторять попытку.
+Если `call_specialist(specialist_id="bitrix24")` вернул ошибку при доставке — зафиксировать в ответе, не повторять попытку.
