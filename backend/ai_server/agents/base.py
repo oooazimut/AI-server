@@ -78,6 +78,10 @@ class BaseSpecialist:
         """
         return task, {}
 
+    async def _early_result(self, task: AgentTask, actions_taken: list[ActionRecord]) -> AgentResult | None:
+        """Return a deterministic specialist result before the LLM loop when a safe case is fully handled."""
+        return None
+
     async def _execute_tool_call(
         self,
         tool_call: Any,
@@ -229,6 +233,15 @@ class BaseSpecialist:
                 **extra_context_details,
             },
         )
+        early_result = await self._early_result(task, actions_taken)
+        if early_result is not None:
+            self._record_trace_event(
+                task,
+                event_name="specialist_final_answer",
+                status=early_result.status,
+                payload={"answer_present": bool(early_result.answer), "early_result": True},
+            )
+            return early_result
 
         tool_results: list[ToolResult] = []
         approval_actions: list[ActionRecord] = []

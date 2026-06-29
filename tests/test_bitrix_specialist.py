@@ -192,6 +192,65 @@ def test_bitrix_specialist_passes_user_profile_and_permission_rag_to_llm():
     assert "user_permissions" in result.actions_taken[0].details["permission_policy_topics"]
 
 
+def test_bitrix_specialist_loads_webhook_profile_when_user_id_is_not_numeric():
+    llm = FakeBitrixLLM()
+    tools = FakeResolverTools(
+        profile_result=ToolResult(
+            status="ok",
+            tool="current_user_profile",
+            data={
+                "user_id": 1,
+                "source": "webhook_profile",
+                "profile": {
+                    "id": 1,
+                    "label": "Кулинич Валерий",
+                    "active": True,
+                    "is_admin": True,
+                },
+            },
+        )
+    )
+
+    result = asyncio.run(
+        _bitrix_specialist(tools=tools, llm=llm).handle(
+            AgentTask(task_id="t1", request="Покажи мои открытые задачи", user={"id": "scenario-user"})
+        )
+    )
+
+    context = llm.decide_calls[0]["task"].context
+    assert tools.current_user_profile_calls[0]["user_id"] is None
+    assert result.actions_taken[0].details["bitrix_current_user_profile_status"] == "ok"
+    assert context["bitrix_current_user_profile"]["data"]["source"] == "webhook_profile"
+    assert context["bitrix_current_user_profile"]["data"]["profile"]["label"] == "Кулинич Валерий"
+
+
+def test_bitrix_specialist_answers_current_user_profile_without_llm_loop():
+    llm = FakeBitrixLLM()
+    tools = FakeResolverTools(
+        profile_result=ToolResult(
+            status="ok",
+            tool="current_user_profile",
+            data={
+                "user_id": 1,
+                "source": "webhook_profile",
+                "profile": {"id": 1, "label": "Кулинич Валерий", "active": True},
+            },
+        )
+    )
+
+    result = asyncio.run(
+        _bitrix_specialist(tools=tools, llm=llm).handle(
+            AgentTask(task_id="t1", request="Кто я в Битриксе?", user={"id": "scenario-user"})
+        )
+    )
+
+    assert result.status == "completed"
+    assert "Кулинич Валерий" in result.answer
+    assert "ID 1" in result.answer
+    assert not llm.decide_calls
+    assert result.actions_taken[-1].name == "bitrix_current_user_profile_answer"
+
+
 def test_bitrix_specialist_can_call_current_user_profile_tool():
     result = asyncio.run(
         _bitrix_specialist(
@@ -206,7 +265,7 @@ def test_bitrix_specialist_can_call_current_user_profile_tool():
                 tool_calls=[BitrixLLMToolCall(name="current_user_profile")],
                 final_answer="Профиль пользователя проверен.",
             ),
-        ).handle(AgentTask(task_id="t1", request="Кто я в Битриксе?", user={"id": "9"}))
+        ).handle(AgentTask(task_id="t1", request="Проверь профиль текущего пользователя", user={"id": "9"}))
     )
 
     assert result.status == "completed"
@@ -548,6 +607,28 @@ def test_bitrix_current_user_profile_tool_compacts_user_fields():
     assert profile["work_position"] == "Монтажник"
 
 
+def test_bitrix_current_user_profile_tool_uses_webhook_profile_without_user_id():
+    class ProfileClient:
+        async def result(self, method: str, params: dict):
+            assert method == "profile"
+            assert params == {}
+            return {
+                "ID": "1",
+                "ACTIVE": "Y",
+                "NAME": "Валерий",
+                "LAST_NAME": "Кулинич",
+                "IS_ADMIN": "Y",
+            }
+
+    result = asyncio.run(CurrentUserProfileTool(client=ProfileClient()).execute({}))
+
+    assert result.status == "ok"
+    assert result.data["source"] == "webhook_profile"
+    assert result.data["user_id"] == 1
+    assert result.data["profile"]["label"] == "Кулинич Валерий"
+    assert result.data["profile"]["is_admin"] is True
+
+
 class _FakePortalSearchTool:
     name = "portal_search"
 
@@ -576,13 +657,15 @@ class _FakeBitrixApiTool:
 class _FakeCurrentUserProfileTool:
     name = "current_user_profile"
 
-    def __init__(self, result: ToolResult):
+    def __init__(self, result: ToolResult, calls: list):
         self._result = result
+        self._calls = calls
 
     def definition(self):
         return ToolDefinition(name="current_user_profile", description="", parameters={})
 
     async def execute(self, args, *, user_id=None, dialog_key=None, dialog_id=None):
+        self._calls.append({"args": args, "user_id": user_id, "dialog_key": dialog_key, "dialog_id": dialog_id})
         return self._result
 
 
@@ -624,6 +707,7 @@ class FakeResolverTools:
         profile_result: ToolResult | None = None,
     ) -> None:
         self.bitrix_api_calls: list = []
+        self.current_user_profile_calls: list = []
         self._tools = [
             _FakePortalSearchTool(),
             _FakeBitrixApiTool(
@@ -631,7 +715,8 @@ class FakeResolverTools:
                 self.bitrix_api_calls,
             ),
             _FakeCurrentUserProfileTool(
-                profile_result or ToolResult(status="not_available", tool="current_user_profile")
+                profile_result or ToolResult(status="not_available", tool="current_user_profile"),
+                self.current_user_profile_calls,
             ),
             _FakeResolveUserTool(users or {}),
             _FakeResolveProjectTool(projects or {}),

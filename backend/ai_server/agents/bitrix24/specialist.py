@@ -452,6 +452,38 @@ class Bitrix24Specialist(BaseSpecialist):
         }
         return merged_task, extra_details
 
+    async def _early_result(self, task: AgentTask, actions_taken: list[ActionRecord]) -> AgentResult | None:
+        if not _is_current_user_profile_request(task.request):
+            return None
+        profile_result = task.context.get("bitrix_current_user_profile")
+        if not isinstance(profile_result, dict) or profile_result.get("status") != "ok":
+            return None
+        data = profile_result.get("data") if isinstance(profile_result.get("data"), dict) else {}
+        profile = data.get("profile") if isinstance(data.get("profile"), dict) else {}
+        label = str(profile.get("label") or "").strip()
+        user_id = optional_int(data.get("user_id") or profile.get("id"))
+        if not label and user_id is None:
+            return None
+        details = {"source": data.get("source") or "bitrix_user", "user_id": user_id, "profile": profile}
+        answer = f"В Битрикс24 вы: {label or f'пользователь #{user_id}'}"
+        if user_id is not None:
+            answer += f" (ID {user_id})"
+        work_position = str(profile.get("work_position") or "").strip()
+        if work_position:
+            answer += f", должность: {work_position}"
+        answer += "."
+        return AgentResult(
+            status="completed",
+            agent_id=self.manifest.id,
+            answer=answer,
+            actions_taken=[
+                *actions_taken,
+                ActionRecord(name="bitrix_current_user_profile_answer", status="ok", details=details),
+            ],
+            confidence=1.0,
+            logs=self._logs(),
+        )
+
     async def _load_permission_context(self, task: AgentTask) -> dict:
         profile_result = await self._current_user_profile_result(task)
         policy_hits = (
@@ -480,11 +512,11 @@ class Bitrix24Specialist(BaseSpecialist):
     async def _current_user_profile_result(self, task: AgentTask) -> ToolResult:
         user_id = optional_int(task.user.id)
         tool = self._tool_registry.get("current_user_profile")
-        if user_id is None or tool is None:
+        if tool is None:
             return ToolResult(
                 status=ToolStatus.NOT_AVAILABLE,
                 tool="current_user_profile",
-                error="current Bitrix user id is not available",
+                error="current_user_profile tool is not available",
             )
         try:
             return await tool.execute({}, user_id=user_id)
@@ -493,7 +525,7 @@ class Bitrix24Specialist(BaseSpecialist):
                 status=ToolStatus.ERROR,
                 tool="current_user_profile",
                 error=f"{type(exc).__name__}: {exc}",
-                data={"user_id": user_id},
+                data={"user_id": user_id} if user_id is not None else {},
             )
 
     async def _resolve_user_field(self, query: str, fields: dict[str, Any]) -> tuple[int | None, str, list[str]]:
@@ -617,6 +649,13 @@ def _permission_policy_query(request: str, profile_result: ToolResult) -> str:
         if profile.get("is_admin") is True:
             parts.append("администратор admin")
     return " ".join(parts)
+
+
+def _is_current_user_profile_request(request: str) -> bool:
+    text = request.casefold()
+    profile_markers = ("кто я", "мой профиль", "мои данные", "кто я в bitrix", "кто я в битрикс")
+    bitrix_markers = ("битрикс", "bitrix", "bitrix24", "б24")
+    return any(marker in text for marker in profile_markers) and any(marker in text for marker in bitrix_markers)
 
 
 def _tool_context_status(value: object) -> str:
