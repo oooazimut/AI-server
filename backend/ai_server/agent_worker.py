@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from ai_server.agent_scheduler import AgentScheduler
 from ai_server.agents.bitrix24 import BitrixLLMService
+from ai_server.agents.kartoteka.llm import KartotekaLLMService
 from ai_server.agents.logistics import LogisticsLLMService
 from ai_server.agents.logistics.specialist import VehicleUsageSettings
 from ai_server.agents.pto import PtoLLMService
@@ -26,6 +27,7 @@ from ai_server.channels.bitrix import BitrixChatChannel
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService
 from ai_server.integrations.postgres.bitrix_agent import PostgresBitrixAgentStore
+from ai_server.integrations.postgres.kartoteka_agent import PostgresKartotekaStore
 from ai_server.integrations.postgres.orchestrator_agent import PostgresOrchestratorStore
 from ai_server.integrations.postgres.pto_agent import PostgresPtoAgentStore
 from ai_server.integrations.postgres.vehicle_usage import PostgresVehicleUsageStore
@@ -89,6 +91,13 @@ async def main() -> None:
     pto_store = PostgresPtoAgentStore(settings.database_url)
     await pto_store.ensure_schema()
 
+    kartoteka_store = PostgresKartotekaStore(
+        settings.database_url,
+        protected_user_ids=settings.kartoteka_protected_user_ids,
+        secret_user_ids=settings.kartoteka_secret_user_ids,
+    )
+    await kartoteka_store.ensure_schema()
+
     orchestrator_store = PostgresOrchestratorStore(settings.database_url)
     await orchestrator_store.ensure_schema()
 
@@ -137,6 +146,8 @@ async def main() -> None:
             bitrix_store=bitrix_store,
             pto_llm=PtoLLMService(),
             pto_store=pto_store,
+            kartoteka_llm=KartotekaLLMService(),
+            kartoteka_store=kartoteka_store,
             logistics_llm=logistics_llm_svc,
             vehicle_usage_store=vehicle_usage_store,
             logistics_vu_settings=vu_settings,
