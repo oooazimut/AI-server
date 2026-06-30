@@ -147,6 +147,8 @@ https://kitvideovpn.ru:1695/bitrix/events?secret=<secret>
 
 Статус: базовая цепочка в реальном Bitrix-чате проверена, нужно расширить детализацию.
 
+Подробный roadmap по структуре incident, diagnostic_report, классификации, группировке и отчетам вынесен в `docs/11-diagnostic-error-roadmap.md`.
+
 На каждый тест должно быть видно:
 - `trace_id`;
 - входящее сообщение пользователя;
