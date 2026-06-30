@@ -98,9 +98,14 @@ class AgentScheduler:
         func: Callable,
         hour: int,
         minute: int,
+        *,
+        day_of_week: str | None = None,
         **kwargs: Any,
     ) -> Job:
-        return self.add_job(agent_id, job_id, func, CronTrigger(hour=hour, minute=minute, timezone=MOSCOW_TZ), **kwargs)
+        trigger_kwargs: dict[str, Any] = {"hour": hour, "minute": minute, "timezone": MOSCOW_TZ}
+        if day_of_week is not None:
+            trigger_kwargs["day_of_week"] = day_of_week
+        return self.add_job(agent_id, job_id, func, CronTrigger(**trigger_kwargs), **kwargs)
 
     def remove_job(self, agent_id: str, job_id: str) -> bool:
         full_id = _full_id(agent_id, job_id)

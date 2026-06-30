@@ -19,7 +19,7 @@ from ai_server.integrations.bitrix.portal_search import (
 from ai_server.models import ToolResult, ToolStatus
 from ai_server.settings import Settings
 from ai_server.tools.bitrix_ports import BitrixFileDownloadPort
-from ai_server.tools.document_access.download import _ensure_local_document
+from ai_server.tools.document_access.download import ensure_local_document as _ensure_local_document
 from ai_server.tools.document_access.types import (
     CellValue,
     ComparedDocument,

@@ -1,33 +1,43 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from datetime import datetime, timedelta
 
-from ai_server.integrations.bitrix.client import BitrixClient
-from ai_server.integrations.ports import VehicleUsageStorePort
-from ai_server.settings import Settings
-from ai_server.tools.vehicle_usage import fetch_staff_roster
-from ai_server.utils import MOSCOW_TZ
+import redis.asyncio as aioredis
+
+from ai_server.tools.vehicle_usage import StaffMember, VehicleUsageStorePort
+from ai_server.utils import optional_int
 
 logger = logging.getLogger(__name__)
 
+_ROSTER_KEY = "ai_server:staff_roster:pending"
 
-async def run_staff_sync(bitrix: BitrixClient, store: VehicleUsageStorePort, *, settings: Settings) -> None:
+
+async def run_staff_sync(store: VehicleUsageStorePort, redis_url: str) -> None:
     while True:
         try:
-            roster = await fetch_staff_roster(
-                bitrix, exclude_user_ids=settings.resolved_vehicle_usage_excluded_user_ids
-            )
-            store.upsert_employees(roster)
-            logger.info("staff_sync: upserted %d employees", len(roster))
+            await _apply_pending_roster(store, redis_url)
         except Exception:
-            logger.exception("staff_sync: failed to sync employees from Bitrix")
-        await _sleep_until_midnight_moscow()
+            logger.exception("staff_sync: error applying pending roster")
+        await asyncio.sleep(3600)
 
 
-async def _sleep_until_midnight_moscow() -> None:
-    now = datetime.now(MOSCOW_TZ)
-    tomorrow_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    sleep_seconds = (tomorrow_midnight - now).total_seconds()
-    await asyncio.sleep(max(sleep_seconds, 1))
+async def _apply_pending_roster(store: VehicleUsageStorePort, redis_url: str) -> None:
+    r = aioredis.from_url(redis_url)
+    async with r:
+        raw = await r.get(_ROSTER_KEY)
+        if not raw:
+            return
+        members_data: list[dict] = json.loads(raw)
+        members = [
+            StaffMember(
+                order=int(d["display_order"]),
+                name=str(d["full_name"]),
+                user_id=optional_int(d.get("user_id")),
+            )
+            for d in members_data
+        ]
+        store.upsert_employees(members)
+        await r.delete(_ROSTER_KEY)
+    logger.info("staff_sync: applied %d employees from Redis roster", len(members))

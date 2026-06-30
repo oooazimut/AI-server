@@ -2,18 +2,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from ai_server.integrations.bitrix.portal_search import (
-    PortalSearchIndex,
-    entity_types_for_scope,
-    format_portal_search_results,
-)
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
+from ai_server.tools.bitrix_search import PortalSearchPort, entity_types_for_scope, format_portal_search_results
 
 
 class PortalSearchTool:
     name = "portal_search"
 
-    def __init__(self, portal_search: PortalSearchIndex | None = None) -> None:
+    def __init__(self, portal_search: PortalSearchPort | None = None) -> None:
         self._portal_search = portal_search
 
     def definition(self) -> ToolDefinition:

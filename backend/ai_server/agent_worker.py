@@ -46,6 +46,7 @@ from ai_server.transcription import build_transcriber
 from ai_server.utils import MOSCOW_TZ
 from ai_server.workers.bitrix.reconciler import run_reconciler
 from ai_server.workers.bitrix.search_indexer import PortalSearchIndexerWorker
+from ai_server.workers.bitrix.staff_roster_publisher import publish_staff_roster
 from ai_server.workers.bitrix.supervisor import run_task_supervisor
 from ai_server.workers.bitrix.webhook_event_queue import run_webhook_event_worker
 from ai_server.workers.logistics.staff_sync import run_staff_sync
@@ -260,7 +261,23 @@ async def main() -> None:
         agent_tasks.append(asyncio.create_task(portal_search_indexer.run(agent_queue)))
 
     if settings.vehicle_usage_enabled and vehicle_usage_store is not None:
-        agent_tasks.append(asyncio.create_task(run_staff_sync(bitrix, vehicle_usage_store, settings=settings)))
+        _bitrix_ref = bitrix
+        _redis_url = settings.redis_url
+
+        async def _publish_roster() -> None:
+            await publish_staff_roster(_bitrix_ref, _redis_url, settings=settings)
+
+        scheduler.add_job_cron(
+            "bitrix",
+            "staff_roster_sync",
+            _publish_roster,
+            3,
+            0,
+            day_of_week="tue",
+            replace_existing=False,
+        )
+        agent_tasks.append(asyncio.create_task(_publish_roster()))
+        agent_tasks.append(asyncio.create_task(run_staff_sync(vehicle_usage_store, settings.redis_url)))
     if settings.search_background_indexer_enabled:
         agent_tasks.append(asyncio.create_task(portal_search_indexer.run_periodic()))
     if settings.supervisor_enabled:

@@ -4,7 +4,11 @@ from ai_server.tools.document_access.access_control import (
     is_private_disk_item,
     user_has_private_disk_restrictions,
 )
-from ai_server.tools.document_access.download import resolve_portal_file_download_url
+from ai_server.tools.document_access.download import (
+    delete_portal_file_cache_path,
+    ensure_local_document,
+    resolve_portal_file_download_url,
+)
 from ai_server.tools.document_access.formatting import format_document_comparison_report
 from ai_server.tools.document_access.spreadsheet import compare_spreadsheets_by_query
 from ai_server.tools.document_access.types import (
@@ -36,6 +40,8 @@ __all__ = [
     "compare_spreadsheets_by_query",
     "format_document_comparison_report",
     "resolve_portal_file_download_url",
+    "ensure_local_document",
+    "delete_portal_file_cache_path",
     "user_has_private_disk_restrictions",
     "is_private_disk_item",
     "can_user_see_portal_item",
