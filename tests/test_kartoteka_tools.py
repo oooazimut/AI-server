@@ -65,12 +65,13 @@ def test_search_tool_ok_no_results():
 def test_search_tool_ok_with_results():
     files = [
         {
-            "id": 1,
-            "path": "/docs/contract.pdf",
+            "chunk_id": "abc:0000",
+            "relative_path": "docs\\contract.pdf",
             "filename": "contract.pdf",
-            "extension": "pdf",
-            "tags": "договор",
-            "content_preview": "",
+            "extension": ".pdf",
+            "snippet": "текст договора",
+            "access_level": "open",
+            "group_name": "Офис",
         },
     ]
     store = _make_store(search_results=files)
@@ -85,14 +86,14 @@ def test_search_tool_limit_clamped():
     store = _make_store()
     tool = KartotekaSearchTool(store=store)
     _exec(tool, {"query": "doc", "limit": 999})
-    store.search.assert_awaited_once_with("doc", limit=20)
+    store.search.assert_awaited_once_with("doc", user_id=None, limit=20)
 
 
 def test_search_tool_default_limit():
     store = _make_store()
     tool = KartotekaSearchTool(store=store)
     _exec(tool, {"query": "doc"})
-    store.search.assert_awaited_once_with("doc", limit=5)
+    store.search.assert_awaited_once_with("doc", user_id=None, limit=5)
 
 
 # ---------------------------------------------------------------------------
@@ -107,11 +108,12 @@ def test_context_tool_no_store():
 
 
 def test_context_tool_ok():
-    store = _make_store(stats={"total_files": 42})
+    store = _make_store(stats={"total_chunks": 42, "total_documents": 10})
     tool = KartotekaContextTool(store=store)
     result = _exec(tool, {})
     assert result.status == ToolStatus.OK
-    assert result.data["total_files"] == 42
+    assert result.data["total_chunks"] == 42
+    assert result.data["total_documents"] == 10
 
 
 # ---------------------------------------------------------------------------

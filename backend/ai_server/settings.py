@@ -144,6 +144,9 @@ class Settings:
     agent_shell_timeout_seconds: float
     agent_shell_max_command_chars: int
     agent_shell_max_output_chars: int
+    kartoteka_data_dir: str
+    kartoteka_protected_user_ids: str
+    kartoteka_secret_user_ids: str
     database_url: str
     redis_url: str
     var_dir: Path
@@ -457,6 +460,9 @@ def get_settings() -> Settings:
         agent_shell_timeout_seconds=_env_float("AGENT_SHELL_TIMEOUT_SECONDS", 30.0) or 30.0,
         agent_shell_max_command_chars=_env_int("AGENT_SHELL_MAX_COMMAND_CHARS", 500) or 500,
         agent_shell_max_output_chars=_env_int("AGENT_SHELL_MAX_OUTPUT_CHARS", 4000) or 4000,
+        kartoteka_data_dir=_env("KARTOTEKA_DATA_DIR"),
+        kartoteka_protected_user_ids=_env("KARTOTEKA_PROTECTED_USER_IDS"),
+        kartoteka_secret_user_ids=_env("KARTOTEKA_SECRET_USER_IDS"),
         database_url=_env("DATABASE_URL"),
         redis_url=_env("REDIS_URL"),
         var_dir=paths.root,

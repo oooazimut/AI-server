@@ -70,7 +70,11 @@ async def _make_orchestrator_store(settings: Settings) -> PostgresOrchestratorSt
 
 
 async def _make_kartoteka_store(settings: Settings) -> PostgresKartotekaStore:
-    store = PostgresKartotekaStore(settings.database_url)
+    store = PostgresKartotekaStore(
+        settings.database_url,
+        protected_user_ids=settings.kartoteka_protected_user_ids,
+        secret_user_ids=settings.kartoteka_secret_user_ids,
+    )
     await store.ensure_schema()
     return store
 

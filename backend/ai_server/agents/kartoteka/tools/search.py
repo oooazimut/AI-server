@@ -17,7 +17,10 @@ class KartotekaSearchTool:
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="kartoteka_search",
-            description="Ищет файлы в локальном каталоге по ключевым словам (названию, тегам, содержимому).",
+            description=(
+                "Ищет в локальном каталоге организации по ключевым словам. "
+                "Возвращает путь, имя файла и сниппет из текста документа."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -48,7 +51,7 @@ class KartotekaSearchTool:
         if not query:
             return ToolResult(status=ToolStatus.INVALID_TOOL_CALL, tool=self.name, error="query обязателен")
         limit = min(max(int(args.get("limit") or 5), 1), 20)
-        results = await self._store.search(query, limit=limit)
+        results = await self._store.search(query, user_id=user_id, limit=limit)
         return ToolResult(status=ToolStatus.OK, tool=self.name, data={"results": results, "count": len(results)})
 
 
@@ -61,7 +64,7 @@ class KartotekaContextTool:
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="kartoteka_context",
-            description="Возвращает общую статистику локального файлового каталога (количество файлов).",
+            description="Возвращает статистику локального файлового каталога: число документов и чанков.",
             parameters={"type": "object", "properties": {}},
         )
 

@@ -28,5 +28,14 @@ var/search_content/*
 !var/tmp/
 var/tmp/*
 !var/tmp/.gitkeep
+!var/kartoteka/
+var/kartoteka/*
+!var/kartoteka/.gitkeep
+!var/kartoteka/data/
+var/kartoteka/data/*
+!var/kartoteka/data/.gitkeep
+!var/kartoteka/data/content_index/
+var/kartoteka/data/content_index/*
+!var/kartoteka/data/content_index/.gitkeep
 logs/
 artifacts/
