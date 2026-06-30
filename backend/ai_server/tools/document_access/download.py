@@ -3,10 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ai_server.integrations.bitrix.portal_search import (
-    PortalSearchResult,
+from ai_server.integrations.bitrix.portal_search.file_cache import (
+    delete_portal_file_cache_path as delete_portal_file_cache_path,
+)
+from ai_server.integrations.bitrix.portal_search.file_cache import (
     portal_file_cache_path,
 )
+from ai_server.integrations.bitrix.portal_search.types import PortalSearchResult
 from ai_server.settings import Settings
 from ai_server.tools.bitrix_ports import BitrixFileDownloadPort
 from ai_server.utils import optional_int
@@ -30,7 +33,7 @@ async def resolve_portal_file_download_url(bitrix: BitrixFileDownloadPort, item:
     return None
 
 
-async def _ensure_local_document(
+async def ensure_local_document(
     bitrix: BitrixFileDownloadPort, item: PortalSearchResult, *, max_bytes: int, settings: Settings
 ) -> Path:
     path = portal_file_cache_path(item, settings)

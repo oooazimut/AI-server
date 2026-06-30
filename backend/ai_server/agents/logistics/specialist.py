@@ -15,11 +15,11 @@ from ai_server.agents.logistics.llm import (
 from ai_server.agents.logistics.tools import VehicleContextTool, VehicleSaveDraftTool, VehicleSaveReportTool
 from ai_server.agents.ports import SchedulerPort
 from ai_server.agents.tool import AgentTool
-from ai_server.integrations.ports import VehicleUsageStorePort
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import AgentManifest, AgentResult, AgentTask, ScheduledTask
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
+from ai_server.tools.vehicle_usage import VehicleUsageStorePort
 from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)

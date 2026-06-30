@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from ai_server.integrations.ports import VehicleUsageStorePort
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
-from ai_server.tools.vehicle_usage import _request_date
+from ai_server.tools.vehicle_usage import VehicleUsageStorePort, _request_date
 
 
 class VehicleContextTool:

@@ -1,10 +1,11 @@
-"""Tests for fetch_staff_roster and staff_sync helpers."""
+"""Tests for fetch_staff_roster (Bitrix domain) and StaffMember."""
 
 from __future__ import annotations
 
 from unittest.mock import AsyncMock
 
-from ai_server.tools.vehicle_usage import StaffMember, fetch_staff_roster
+from ai_server.tools.vehicle_usage import StaffMember
+from ai_server.workers.bitrix.staff_roster_publisher import fetch_staff_roster
 
 
 def anyio_run(coro):
