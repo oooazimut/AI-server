@@ -47,5 +47,9 @@ def fake_infra(monkeypatch):
             "ai_server.integrations.postgres.vehicle_usage.PostgresVehicleUsageStore.ensure_schema",
             _noop,
         ),
+        patch(
+            "ai_server.integrations.postgres.kartoteka_agent.PostgresKartotekaStore.ensure_schema",
+            _noop,
+        ),
     ):
         yield

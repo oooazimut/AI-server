@@ -42,6 +42,9 @@ class SpecialistDeps:
     vehicle_usage_store: Any = None  # VehicleUsageStorePort | None
     logistics_llm: Any = None
     logistics_vu_settings: Any = None  # VehicleUsageSettings | None
+    # kartoteka specialist
+    kartoteka_store: Any = None  # PostgresKartotekaStore | None
+    kartoteka_llm: Any = None  # KartotekaAgentLLM | None
     # channel delivery + telemetry (captured by InternalOrchestrator.build, not passed to specialists)
     channels: Any = None  # dict[str, ChannelPort]
     footer_service: Any = None  # TechnicalFooterService | None

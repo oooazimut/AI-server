@@ -283,6 +283,60 @@ var/                                # Рантайм: SQLite, вложения, 
 
 ---
 
+## Хранилище агента (AgentStore)
+
+Каждый агент-специалист и оркестратор владеет **собственным изолированным хранилищем**. Хранилище — это порт (`AgentDialogStorePort`, `agents/ports.py`): агент зависит от абстракции, конкретный адаптер инжектируется снаружи через `SpecialistDeps`.
+
+### Обязанности хранилища
+
+- **История диалогов** — обязательно: `load_turns(dialog_key)`, `append_turn(dialog_key, user_text, response)`
+- **Домен-специфичные данные** — опционально: черновики, индексы файлов, кэши — каждый агент добавляет нужные таблицы/коллекции в своём адаптере
+- **Изоляция по namespace** — агенты не пересекаются; хранилище одного агента не видно другому
+
+### DIP
+
+Агент знает только о порте (`AgentDialogStorePort`). Конкретная реализация передаётся через `SpecialistDeps` → `build()`. Замена хранилища (PostgreSQL → что угодно) требует только нового адаптера — агент не меняется.
+
+### Текущая реализация: PostgreSQL
+
+Все агенты используют адаптер `PostgresAgentSchema` (`integrations/postgres/agent_schema.py`). Каждый агент — отдельная PostgreSQL-схема:
+
+```python
+# integrations/postgres/<agent_id>_agent.py
+from .agent_schema import PostgresAgentSchema
+
+class PostgresMyAgentStore(PostgresAgentSchema):
+    _SCHEMA = "my_agent"  # своя схема в PostgreSQL
+
+    async def ensure_schema(self) -> None:
+        await super().ensure_schema()  # создаёт my_agent.dialog_history
+        async with await self._connect() as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS my_agent.my_table (
+                    id BIGSERIAL PRIMARY KEY,
+                    search_text TEXT NOT NULL,
+                    data JSONB NOT NULL
+                )
+            """)
+```
+
+Базовый класс даёт: `ensure_schema()`, `load_turns()`, `append_turn()`, `_connect()` (async), `_sync_connect()` (sync).
+
+Поиск по домен-таблицам — PostgreSQL `ILIKE` по колонке `search_text`, не FTS.
+
+**Существующие адаптеры:**
+
+| Файл | Класс | Схема |
+|---|---|---|
+| `integrations/postgres/bitrix_agent.py` | `PostgresBitrixAgentStore` | `bitrix24` |
+| `integrations/postgres/pto_agent.py` | `PostgresPtoAgentStore` | `pto` |
+| `integrations/postgres/orchestrator_agent.py` | `PostgresOrchestratorStore` | `orchestrator` |
+| `integrations/postgres/vehicle_usage.py` | `PostgresVehicleUsageStore` | `vehicle_usage` |
+
+При добавлении нового специалиста: создать `integrations/postgres/<id>_agent.py`, добавить поле в `SpecialistDeps`, передать в `startup.py`.
+
+---
+
 ## Процессная архитектура (Sprint 27)
 
 Сервис разделён на два независимых системных процесса:
