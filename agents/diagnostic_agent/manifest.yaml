@@ -1,0 +1,34 @@
+id: diagnostic_agent
+name: Агент диагностики
+kind: specialist
+audience: diagnostics
+description: Анализирует feedback, learning events, trace и действия агентов, чтобы находить причины сбоев и предлагать исправления.
+version: 0.1.0
+handoff_description: Использовать только во внутреннем контуре диагностики ошибок, feedback и trace. Не использовать для обычных пользовательских задач.
+entrypoint: backend.ai_server.agents.diagnostic_agent.DiagnosticAgent
+instructions_file: agents/diagnostic_agent/instructions.md
+knowledge_path: agents/diagnostic_agent/knowledge
+skills_path: agents/diagnostic_agent/skills
+channels:
+  - internal_orchestrator
+capabilities:
+  - feedback_analysis
+  - trace_analysis
+  - failure_localization
+  - regression_recommendations
+  - batch_error_grouping
+tools: []
+data_scopes:
+  - learning_events
+  - traces
+  - agent_rules
+  - diagnostic_reports
+allowed_actions:
+  - read_learning_events
+  - read_trace
+  - analyze_failure
+  - propose_patch
+approval_required:
+  - apply_rule_change
+  - apply_code_change
+  - expose_trace_to_user

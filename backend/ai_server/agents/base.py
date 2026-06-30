@@ -13,6 +13,7 @@ from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult, ToolStatus
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
+from ai_server.tracing import TraceRecorder, parent_span_id_from_task, span_id_from_task
 from ai_server.utils import optional_int, unique
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,7 @@ class BaseSpecialist:
         llm: Any = None,
         scheduler: SchedulerPort | None = None,
         store: AgentStorePort | None = None,
+        trace_recorder: TraceRecorder | None = None,
     ) -> None:
         self.manifest = manifest
         self.knowledge_base = knowledge_base
@@ -53,6 +55,7 @@ class BaseSpecialist:
         self.llm = llm
         self._scheduler = scheduler
         self.store = store
+        self._trace_recorder = trace_recorder
 
     # ------------------------------------------------------------------
     # Hooks subclasses implement/override
@@ -74,6 +77,10 @@ class BaseSpecialist:
         ``load_{action_prefix}_specialist_context`` action record (e.g. bitrix24's permission_context).
         """
         return task, {}
+
+    async def _early_result(self, task: AgentTask, actions_taken: list[ActionRecord]) -> AgentResult | None:
+        """Return a deterministic specialist result before the LLM loop when a safe case is fully handled."""
+        return None
 
     async def _execute_tool_call(
         self,
@@ -141,8 +148,27 @@ class BaseSpecialist:
     # ------------------------------------------------------------------
 
     async def handle(self, task: AgentTask) -> AgentResult:
+        if self._trace_recorder is not None:
+            trace_id, span_id = self._trace_recorder.ensure_task_context(task)
+            self._trace_recorder.record(
+                event_name="specialist_called",
+                trace_id=trace_id,
+                span_id=span_id,
+                parent_span_id=parent_span_id_from_task(task),
+                agent_id=self.manifest.id,
+                task_id=task.task_id,
+                status="received",
+                payload={"request": task.request},
+            )
+
         if self.llm is None:
             failure = self._llm_failure_result(_NOT_CONFIGURED_ANSWER)
+            self._record_trace_event(
+                task,
+                event_name="specialist_final_answer",
+                status="failed",
+                payload={"reason": "llm_not_configured"},
+            )
             return AgentResult(
                 status="failed",
                 agent_id=self.manifest.id,
@@ -193,6 +219,31 @@ class BaseSpecialist:
                 },
             )
         ]
+        self._record_trace_event(
+            task,
+            event_name="specialist_rules_retrieved",
+            status="completed",
+            payload={
+                "available_skills": [
+                    {"id": skill.id, "title": skill.title, "preview": skill.preview} for skill in available_skills
+                ],
+                "retrieval_topics": unique([hit.chunk.topic for hit in retrieval_hits]),
+                "retrieval_hits": [
+                    {"topic": hit.chunk.topic, "section": hit.chunk.section, "score": hit.score}
+                    for hit in retrieval_hits
+                ],
+                **extra_context_details,
+            },
+        )
+        early_result = await self._early_result(task, actions_taken)
+        if early_result is not None:
+            self._record_trace_event(
+                task,
+                event_name="specialist_final_answer",
+                status=early_result.status,
+                payload={"answer_present": bool(early_result.answer), "early_result": True},
+            )
+            return early_result
 
         tool_results: list[ToolResult] = []
         approval_actions: list[ActionRecord] = []
@@ -243,15 +294,61 @@ class BaseSpecialist:
                             for call in decision.tool_calls
                         ],
                         "confidence": decision.confidence,
+                        "loaded_rules": decision_result.raw.get("loaded_rules", []),
+                        "loaded_skills": decision_result.raw.get("loaded_skills", []),
                     },
                 )
+            )
+            self._record_trace_event(
+                task,
+                event_name="specialist_llm_decision",
+                status=decision.status,
+                payload={
+                    "step": step,
+                    "tool_calls": [
+                        {"name": call.name, "args": call.args, "summary": call.summary}
+                        for call in decision.tool_calls
+                    ],
+                    "confidence": decision.confidence,
+                    "loaded_rules": decision_result.raw.get("loaded_rules", []),
+                    "loaded_skills": decision_result.raw.get("loaded_skills", []),
+                },
             )
 
             executable_calls = [call for call in decision.tool_calls if call.name != "none"]
             if not executable_calls:
                 break
             for tool_call in executable_calls:
+                tool_span_id = ""
+                if self._trace_recorder is not None:
+                    trace_id, tool_span_id, _ = self._trace_recorder.child_context(task)
+                    self._trace_recorder.record(
+                        event_name="tool_called",
+                        trace_id=trace_id,
+                        span_id=tool_span_id,
+                        parent_span_id=span_id_from_task(task),
+                        agent_id=self.manifest.id,
+                        task_id=task.task_id,
+                        status="started",
+                        payload={"name": tool_call.name, "args": tool_call.args, "summary": tool_call.summary},
+                    )
                 result, action, approvals = await self._execute_tool_call(tool_call, task)
+                if self._trace_recorder is not None:
+                    trace_id, _ = self._trace_recorder.ensure_task_context(task)
+                    self._trace_recorder.record(
+                        event_name="tool_result",
+                        trace_id=trace_id,
+                        span_id=tool_span_id,
+                        parent_span_id=span_id_from_task(task),
+                        agent_id=self.manifest.id,
+                        task_id=task.task_id,
+                        status=str(result.status) if result is not None else "skipped",
+                        payload={
+                            "name": tool_call.name,
+                            "result": result.model_dump() if result is not None else {},
+                            "approvals": [approval.model_dump() for approval in approvals],
+                        },
+                    )
                 if result is not None:
                     tool_results.append(result)
                 if action is not None:
@@ -314,6 +411,12 @@ class BaseSpecialist:
                 details={},
             )
         )
+        self._record_trace_event(
+            task,
+            event_name="specialist_final_answer",
+            status=final_result.status,
+            payload={"answer_present": bool(final_result.answer), "approval_actions": len(approval_actions)},
+        )
         # Decide status is authoritative for needs_clarification/needs_human:
         # compose only formats the answer text, not the conversational state.
         # If decide said needs_clarification but compose returned completed, trust decide.
@@ -339,6 +442,28 @@ class BaseSpecialist:
             model_usage=[*[item.model_usage for item in decision_results], final_result.model_usage],
             confidence=decision.confidence,
             logs=self._logs(),
+        )
+
+    def _record_trace_event(
+        self,
+        task: AgentTask,
+        *,
+        event_name: str,
+        status: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        if self._trace_recorder is None:
+            return
+        trace_id, span_id = self._trace_recorder.ensure_task_context(task)
+        self._trace_recorder.record(
+            event_name=event_name,
+            trace_id=trace_id,
+            span_id=span_id,
+            parent_span_id=parent_span_id_from_task(task),
+            agent_id=self.manifest.id,
+            task_id=task.task_id,
+            status=status,
+            payload=payload or {},
         )
 
     async def run(self, queue: AgentQueuePort) -> None:

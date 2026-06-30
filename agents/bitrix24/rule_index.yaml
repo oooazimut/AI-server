@@ -1,0 +1,81 @@
+schema_version: 1
+agent_id: bitrix24
+purpose: >
+  Индекс правил Bitrix Agent. Rule-loader использует этот файл для загрузки
+  глав правил поведения отдельно от рабочих skills/*.md.
+
+core_load:
+  - file: instructions.md
+    reason: "Короткое ядро Bitrix Agent, обязательное для каждого запроса."
+
+trace:
+  event_name: bitrix_rules_retrieved
+  record_fields:
+    - rule_id
+    - file
+    - reason
+    - matched_context_keys
+    - matched_keywords
+    - priority
+
+rules:
+  - id: user_permissions
+    title: "Права пользователя"
+    file: knowledge/topics/user_permissions.md
+    type: knowledge
+    priority: 100
+    use_when:
+      request_topics:
+        - "создай"
+        - "измени"
+        - "удали"
+        - "закрой"
+        - "заверши"
+        - "отправь"
+        - "добавь"
+        - "напиши"
+      context_keys:
+        - "permission_context"
+        - "bitrix_current_user_profile"
+    load_reason: "Нужно проверить права перед write-действием в Bitrix24."
+
+  - id: bitrix_rest
+    title: "Bitrix REST"
+    file: knowledge/topics/bitrix_rest.md
+    type: knowledge
+    priority: 90
+    use_when:
+      request_topics:
+        - "Bitrix"
+        - "Битрикс"
+        - "задача"
+        - "проект"
+        - "CRM"
+        - "диск"
+        - "файл"
+      context_keys:
+        - "tool_results"
+    load_reason: "Нужны правила работы с Bitrix REST и результатами tools."
+
+  - id: tasks_quality
+    title: "Качество задач"
+    file: knowledge/topics/tasks_quality.md
+    type: knowledge
+    priority: 80
+    use_when:
+      request_topics:
+        - "качество"
+        - "результат"
+        - "проверка"
+        - "закрытие задачи"
+        - "контроль"
+    load_reason: "Запрос относится к контролю качества задачи или результата."
+
+  - id: fallback_behavior
+    title: "Fallback-поведение"
+    file: knowledge/topics/fallback_behavior.md
+    type: knowledge
+    priority: 1
+    use_when:
+      fallback: true
+    load_reason: "Ни одна специализированная глава правил Bitrix Agent не подошла к запросу."

@@ -1,0 +1,63 @@
+schema_version: 1
+agent_id: secure_org_data
+purpose: >
+  Индекс скилов Secure Org Data Agent. Скилы описывают рабочие процедуры поиска
+  и выдачи данных, а rule_index.yaml отдельно подгружает правила доступа.
+
+core_load:
+  - file: instructions.md
+    reason: "Короткое ядро агента, обязательное для каждого запроса."
+
+trace:
+  event_name: secure_org_data_skills_retrieved
+  record_fields:
+    - skill_id
+    - file
+    - reason
+    - matched_context_keys
+    - matched_keywords
+    - priority
+
+skills:
+  - id: search_org_data
+    title: "Поиск по базе организации"
+    file: skills/search_org_data.md
+    priority: 100
+    use_when:
+      request_topics:
+        - "найди"
+        - "покажи"
+        - "где"
+        - "объект"
+        - "оборудование"
+        - "настройки"
+        - "инструкция"
+        - "документ"
+        - "файл"
+        - "логин"
+        - "пароль"
+        - "IP"
+    load_reason: "Нужно найти данные в локальной базе организации."
+
+  - id: fallback_task
+    title: "Fallback-процедура"
+    file: skills/fallback_task.md
+    priority: 1
+    use_when:
+      fallback: true
+    load_reason: "Ни один специализированный скил Secure Org Data Agent не подошел к запросу."
+
+  - id: answer_with_access_filter
+    title: "Ответ с учетом доступа"
+    file: skills/answer_with_access_filter.md
+    priority: 90
+    use_when:
+      context_keys:
+        - "tool_results"
+        - "secure_org_data_access_level"
+      request_topics:
+        - "ссылка"
+        - "путь"
+        - "открой"
+        - "покажи"
+    load_reason: "Нужно собрать ответ по найденным данным и не нарушить метки доступа."

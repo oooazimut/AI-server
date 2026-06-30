@@ -11,6 +11,7 @@ from .agents.logistics import LogisticsLLMService
 from .agents.logistics.specialist import VehicleUsageSettings
 from .agents.pto import PtoLLMService
 from .channels.bitrix import BitrixChatChannel
+from .feedback_loop import FeedbackLoopService
 from .integrations.bitrix.client import BitrixClient
 from .integrations.bitrix.oauth import BitrixOAuthService
 from .integrations.postgres.bitrix_agent import PostgresBitrixAgentStore
@@ -28,6 +29,7 @@ from .runtime import ensure_runtime_dirs
 from .settings import Settings, get_settings
 from .specialists import SpecialistDeps
 from .technical_footer import TechnicalFooterService
+from .tracing import TraceRecorder
 from .workers.bitrix.reconciler import reconcile_once
 from .workers.bitrix.search_indexer import PortalSearchIndexerWorker
 from .workers.bitrix.supervisor import run_task_supervisor_once
@@ -83,6 +85,7 @@ async def lifespan(app: FastAPI):
     portal_search = bitrix_store
     portal_search_indexer = PortalSearchIndexerWorker(bitrix, portal_search, settings=settings)
     learning_recorder = LearningEventRecorder()
+    trace_recorder = TraceRecorder()
     webhook_event_queue = _make_event_queue(settings)
     pto_store = await _make_pto_store(settings)
     orchestrator_store = await _make_orchestrator_store(settings)
@@ -94,6 +97,7 @@ async def lifespan(app: FastAPI):
     app.state.portal_search = portal_search
     app.state.portal_search_indexer = portal_search_indexer
     app.state.learning_recorder = learning_recorder
+    app.state.trace_recorder = trace_recorder
     app.state.webhook_event_queue = webhook_event_queue
     app.state.webhook_event_status = {
         "enabled": True,
@@ -223,6 +227,14 @@ async def lifespan(app: FastAPI):
 
         bitrix_channel = BitrixChatChannel(settings=settings, bitrix=bitrix)
         app.state.bitrix_channel = bitrix_channel
+        feedback_loop = FeedbackLoopService(
+            learning_recorder=learning_recorder,
+            trace_recorder=trace_recorder,
+            manifests=manifests,
+            channels={"bitrix24": bitrix_channel},
+            settings=settings,
+        )
+        app.state.feedback_loop = feedback_loop
 
         specialist_deps = SpecialistDeps(
             settings=settings,
@@ -244,6 +256,8 @@ async def lifespan(app: FastAPI):
             channels={"bitrix24": bitrix_channel},
             footer_service=TechnicalFooterService(settings=settings),
             learning_recorder=learning_recorder,
+            trace_recorder=trace_recorder,
+            feedback_loop=feedback_loop,
         )
         orch_manifest = next((m for m in manifests if m.kind == "orchestrator"), None)
         orchestrator = InternalOrchestrator.build(

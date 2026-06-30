@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import re
 from collections import Counter, deque
 from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
@@ -15,6 +16,7 @@ from pydantic import BaseModel
 
 from ai_server.models import AgentResult, AgentTask
 from ai_server.settings import Settings, get_settings
+from ai_server.tracing import trace_id_from_task
 
 logger = logging.getLogger(__name__)
 
@@ -131,9 +133,11 @@ class EventStream:
         channel = task.user.channel if task.user and task.user.channel else task.source
         event_metadata: dict[str, Any] = {
             "confidence": result.confidence,
+            "trace_id": trace_id_from_task(task),
             "task_context": task.context,
             "files": task.files,
             "logs": result.logs,
+            "diagnostic_trace": _diagnostic_trace_summary(actions, handoff_to=result.handoff_to),
             **(metadata or {}),
         }
         if elapsed_ms:
@@ -159,13 +163,19 @@ class EventStream:
         *,
         event_id: str,
         rating: int | None = None,
+        rating_scale: int | None = None,
+        outcome: str = "",
         corrected_answer: str = "",
         comment: str = "",
         tags: list[str] | None = None,
         user_id: str | int | None = None,
         channel: str = "manual",
+        trace_events: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        return self.record_event(
+        target_event = self.get_event(event_id)
+        target_metadata = target_event.get("metadata") if isinstance(target_event, dict) else {}
+        trace_id = target_metadata.get("trace_id") if isinstance(target_metadata, dict) else ""
+        feedback_result = self.record_event(
             event_type="human_feedback",
             source="manual_feedback",
             agent_id="human_reviewer",
@@ -177,8 +187,83 @@ class EventStream:
             status="reviewed",
             metadata={
                 "target_event_id": event_id,
+                "trace_id": trace_id or "",
                 "rating": rating,
+                "rating_scale": rating_scale,
+                "outcome": outcome,
                 "tags": tags or [],
+            },
+        )
+        if feedback_result.get("recorded") is True and _feedback_should_create_incident(
+            rating=rating,
+            rating_scale=rating_scale,
+            outcome=outcome,
+            tags=tags or [],
+        ):
+            incident_result = self.record_incident(
+                target_event_id=event_id,
+                feedback_event_id=str(feedback_result.get("event_id") or ""),
+                rating=rating,
+                rating_scale=rating_scale,
+                outcome=outcome,
+                comment=comment,
+                tags=tags or [],
+                user_id=user_id,
+                channel=channel,
+                trace_events=trace_events or [],
+            )
+            feedback_result = {**feedback_result, "incident": incident_result}
+        return feedback_result
+
+    def record_incident(
+        self,
+        *,
+        target_event_id: str,
+        feedback_event_id: str,
+        rating: int | None = None,
+        rating_scale: int | None = None,
+        outcome: str = "",
+        comment: str = "",
+        tags: list[str] | None = None,
+        user_id: str | int | None = None,
+        channel: str = "manual",
+        trace_events: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        target_event = self.get_event(target_event_id)
+        feedback_event = self.get_event(feedback_event_id)
+        if not isinstance(target_event, dict):
+            return {"recorded": False, "reason": "target_event_not_found"}
+        target_metadata = target_event.get("metadata") if isinstance(target_event.get("metadata"), dict) else {}
+        trace_id = str(target_metadata.get("trace_id") or "")
+        reason = _incident_reason(rating=rating, rating_scale=rating_scale, outcome=outcome, tags=tags or [])
+        return self.record_event(
+            event_type="incident",
+            source="feedback_incident",
+            agent_id="incident_recorder",
+            task_id=str(target_event.get("task_id") or target_event_id),
+            user_id=user_id,
+            channel=channel,
+            request=str(target_event.get("request") or ""),
+            response=str(target_event.get("response") or ""),
+            status="open",
+            handoff_to=_strings(target_event.get("handoff_to")),
+            actions=target_event.get("actions") if isinstance(target_event.get("actions"), list) else [],
+            model_usage=target_event.get("model_usage") if isinstance(target_event.get("model_usage"), list) else [],
+            metadata={
+                "target_event_id": target_event_id,
+                "feedback_event_id": feedback_event_id,
+                "trace_id": trace_id,
+                "reason": reason,
+                "rating": rating,
+                "rating_scale": rating_scale,
+                "outcome": outcome,
+                "comment": comment,
+                "tags": tags or [],
+                "target_status": target_event.get("status") or "",
+                "target_agent_id": target_event.get("agent_id") or "",
+                "diagnostic_trace": target_metadata.get("diagnostic_trace") or {},
+                "trace_events": trace_events or [],
+                "feedback_event": feedback_event if isinstance(feedback_event, dict) else {},
             },
         )
 
@@ -199,6 +284,141 @@ class EventStream:
             if isinstance(parsed, dict):
                 events.append(parsed)
         return events
+
+    def get_event(self, event_id: str) -> dict[str, Any] | None:
+        if not event_id or not self.path.exists():
+            return None
+        with self.path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(event, dict) and event.get("id") == event_id:
+                    return event
+        return None
+
+    def feedback_for(self, event_id: str, *, limit: int = 10) -> list[dict[str, Any]]:
+        if not event_id or limit <= 0 or not self.path.exists():
+            return []
+        matches: deque[dict[str, Any]] = deque(maxlen=limit)
+        with self.path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    isinstance(event, dict)
+                    and event.get("event_type") == "human_feedback"
+                    and (event.get("metadata") or {}).get("target_event_id") == event_id
+                ):
+                    matches.append(event)
+        return list(matches)
+
+    def incidents(self, *, limit: int = 50, status: str = "") -> list[dict[str, Any]]:
+        events = self._latest_by_type("incident", limit=max(limit * 3, limit))
+        if status:
+            events = [event for event in events if str(event.get("status") or "") == status]
+        return events[-limit:]
+
+    def incidents_for(self, event_id: str, *, limit: int = 10) -> list[dict[str, Any]]:
+        if not event_id or limit <= 0:
+            return []
+        matches: deque[dict[str, Any]] = deque(maxlen=limit)
+        for event in self._latest_by_type("incident", limit=max(limit * 10, limit)):
+            metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+            if metadata.get("target_event_id") == event_id:
+                matches.append(event)
+        return list(matches)
+
+    def incident_groups(self, *, limit: int = 100, detailed: bool = False) -> dict[str, Any]:
+        events = self._latest_by_type("incident", limit=limit)
+        groups: dict[str, dict[str, Any]] = {}
+        for event in events:
+            for key in _incident_group_keys(event):
+                group = groups.setdefault(key, {"key": key, "count": 0, "incident_ids": [], "examples": []})
+                group["count"] += 1
+                group["incident_ids"].append(event.get("id"))
+                if len(group["examples"]) < 3:
+                    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+                    group["examples"].append(
+                        {
+                            "id": event.get("id"),
+                            "target_event_id": metadata.get("target_event_id"),
+                            "reason": metadata.get("reason"),
+                            "request": event.get("request"),
+                            "response": event.get("response"),
+                        }
+                    )
+
+        ordered = sorted(groups.values(), key=lambda item: (-int(item["count"]), str(item["key"])))
+        if detailed:
+            diagnostic_reports = self._latest_by_type("diagnostic_report", limit=limit)
+            reports_by_incident = _diagnostic_reports_by_incident(diagnostic_reports)
+            for group in ordered:
+                group["diagnosis"] = _incident_group_diagnosis(str(group["key"]))
+                group["diagnostic_reports"] = _incident_group_diagnostic_reports(
+                    group.get("incident_ids"),
+                    reports_by_incident,
+                )
+        return {
+            "total_incidents": len(events),
+            "mode": "detailed" if detailed else "brief",
+            "groups": ordered,
+        }
+
+    def diagnostic_groups(self, *, limit: int = 100, detailed: bool = False) -> dict[str, Any]:
+        events = self._latest_by_type("diagnostic_report", limit=limit)
+        groups: dict[str, dict[str, Any]] = {}
+        for event in events:
+            for key in _diagnostic_group_keys(event):
+                group = groups.setdefault(key, {"key": key, "count": 0, "event_ids": [], "examples": []})
+                group["count"] += 1
+                group["event_ids"].append(event.get("id"))
+                if len(group["examples"]) < 3:
+                    group["examples"].append(
+                        {
+                            "id": event.get("id"),
+                            "target_event_id": (event.get("metadata") or {}).get("target_event_id"),
+                            "status": event.get("status"),
+                            "response": event.get("response"),
+                        }
+                    )
+
+        ordered = sorted(groups.values(), key=lambda item: (-int(item["count"]), str(item["key"])))
+        if detailed:
+            events_by_id = {str(event.get("id") or ""): event for event in events}
+            for group in ordered:
+                group["diagnosis"] = _diagnostic_group_diagnosis(str(group["key"]))
+                group["suggestions"] = _diagnostic_group_suggestions(group.get("event_ids"), events_by_id)
+        return {
+            "total_reports": len(events),
+            "mode": "detailed" if detailed else "brief",
+            "groups": ordered,
+        }
+
+    def _latest_by_type(self, event_type: str, *, limit: int) -> list[dict[str, Any]]:
+        if limit <= 0 or not self.path.exists():
+            return []
+        lines: deque[str] = deque(maxlen=max(limit * 5, limit))
+        with self.path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    lines.append(line)
+        matches: deque[dict[str, Any]] = deque(maxlen=limit)
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict) and event.get("event_type") == event_type:
+                matches.append(event)
+        return list(matches)
 
     def stats(self) -> dict[str, Any]:
         by_event_type: Counter[str] = Counter()
@@ -238,6 +458,7 @@ class EventStream:
             "total_events": total,
             "invalid_lines": invalid,
             "by_event_type": dict(by_event_type),
+            "open_incidents": by_event_type.get("incident", 0),
             "by_source": dict(by_source),
             "by_status": dict(by_status),
             "last_event_at": last_event_at,
@@ -263,6 +484,357 @@ def _compact_value(value: Any, *, max_chars: int) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return _truncate_text(value, max_chars) if isinstance(value, str) else value
     return _truncate_text(str(value), max_chars)
+
+
+def _diagnostic_trace_summary(actions: list[dict[str, Any]], *, handoff_to: list[str]) -> dict[str, Any]:
+    loaded_rules: list[dict[str, Any]] = []
+    loaded_skills: list[dict[str, Any]] = []
+    tool_calls: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    for action in actions:
+        details = action.get("details") if isinstance(action.get("details"), dict) else {}
+        loaded_rules.extend(_list_of_dicts(details.get("loaded_rules")))
+        loaded_skills.extend(_list_of_dicts(details.get("loaded_skills")))
+        for call in _list_of_dicts(details.get("tool_calls")):
+            tool_calls.append({"action": action.get("name"), **call})
+        status = str(action.get("status") or "")
+        error = details.get("error")
+        if status in {"error", "failed"} or error:
+            errors.append(
+                {
+                    "action": action.get("name"),
+                    "status": status,
+                    "error": error,
+                }
+            )
+
+    return {
+        "called_agents": list(handoff_to),
+        "loaded_rules": _dedupe_by_id_file(loaded_rules),
+        "loaded_skills": _dedupe_by_id_file(loaded_skills),
+        "tool_calls": tool_calls,
+        "errors": errors,
+    }
+
+
+def _list_of_dicts(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _dedupe_by_id_file(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, str]] = set()
+    result: list[dict[str, Any]] = []
+    for item in items:
+        key = (str(item.get("id") or ""), str(item.get("file") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def _diagnostic_group_keys(event: dict[str, Any]) -> list[str]:
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    trace = metadata.get("diagnostic_trace") if isinstance(metadata.get("diagnostic_trace"), dict) else {}
+    task_context = metadata.get("task_context") if isinstance(metadata.get("task_context"), dict) else {}
+    target_event = task_context.get("target_event") if isinstance(task_context.get("target_event"), dict) else {}
+    target_trace = (target_event.get("metadata") or {}).get("diagnostic_trace")
+    target_trace = target_trace if isinstance(target_trace, dict) else {}
+    feedback_events = task_context.get("feedback_events") if isinstance(task_context.get("feedback_events"), list) else []
+
+    keys: list[str] = []
+    for agent_id in _strings(target_trace.get("called_agents")):
+        keys.append(f"target_agent:{agent_id}")
+    for rule in _list_of_dicts(target_trace.get("loaded_rules")):
+        if rule.get("id"):
+            keys.append(f"loaded_rule:{rule['id']}")
+    for skill in _list_of_dicts(target_trace.get("loaded_skills")):
+        if skill.get("id"):
+            keys.append(f"loaded_skill:{skill['id']}")
+    for tool_call in _list_of_dicts(target_trace.get("tool_calls")):
+        if tool_call.get("name"):
+            keys.append(f"tool_call:{tool_call['name']}")
+    for error in _list_of_dicts(target_trace.get("errors")):
+        if error.get("action"):
+            keys.append(f"error_action:{error['action']}")
+    for feedback in feedback_events:
+        if not isinstance(feedback, dict):
+            continue
+        for tag in _strings((feedback.get("metadata") or {}).get("tags")):
+            keys.append(f"tag:{tag}")
+    for agent_id in _strings(trace.get("called_agents")):
+        keys.append(f"diagnostic_agent:{agent_id}")
+    return sorted(set(keys)) or ["ungrouped"]
+
+
+def _incident_group_keys(event: dict[str, Any]) -> list[str]:
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    diagnostic_trace = metadata.get("diagnostic_trace") if isinstance(metadata.get("diagnostic_trace"), dict) else {}
+    keys: list[str] = []
+
+    reason = str(metadata.get("reason") or "")
+    if reason:
+        keys.append(f"incident_reason:{reason}")
+
+    target_agent_id = str(metadata.get("target_agent_id") or "")
+    if target_agent_id:
+        keys.append(f"target_agent:{target_agent_id}")
+
+    target_status = str(metadata.get("target_status") or "")
+    if target_status:
+        keys.append(f"target_status:{target_status}")
+
+    for agent_id in _strings(diagnostic_trace.get("called_agents")):
+        keys.append(f"target_agent:{agent_id}")
+    for rule in _list_of_dicts(diagnostic_trace.get("loaded_rules")):
+        if rule.get("id"):
+            keys.append(f"loaded_rule:{rule['id']}")
+    for skill in _list_of_dicts(diagnostic_trace.get("loaded_skills")):
+        if skill.get("id"):
+            keys.append(f"loaded_skill:{skill['id']}")
+    for tool_call in _list_of_dicts(diagnostic_trace.get("tool_calls")):
+        if tool_call.get("name"):
+            keys.append(f"tool_call:{tool_call['name']}")
+    for error in _list_of_dicts(diagnostic_trace.get("errors")):
+        if error.get("action"):
+            keys.append(f"error_action:{error['action']}")
+    for tag in _strings(metadata.get("tags")):
+        keys.append(f"tag:{tag}")
+
+    return sorted(set(keys)) or ["ungrouped"]
+
+
+def _feedback_should_create_incident(
+    *,
+    rating: int | None,
+    rating_scale: int | None,
+    outcome: str,
+    tags: list[str],
+) -> bool:
+    normalized_outcome = _normalize_marker(outcome)
+    normalized_tags = {_normalize_marker(tag) for tag in tags}
+    bad_markers = {
+        "not_done",
+        "not_completed",
+        "failed",
+        "incorrect",
+        "bad_result",
+        "ne_vypolneno",
+        "не_выполнено",
+        "не выполнено",
+        "ошибка",
+    }
+    if normalized_outcome in bad_markers or normalized_tags.intersection(bad_markers):
+        return True
+    if rating is None:
+        return False
+    if rating_scale and rating_scale >= 5:
+        return rating <= max(1, rating_scale // 2)
+    if rating <= 0:
+        return True
+    # Backward compatibility: old scale used 1 as good. Values 2..6 are treated as low 10-point scores.
+    return 2 <= rating <= 6
+
+
+def _incident_reason(
+    *,
+    rating: int | None,
+    rating_scale: int | None,
+    outcome: str,
+    tags: list[str],
+) -> str:
+    if outcome:
+        return f"feedback_outcome:{outcome}"
+    normalized_tags = {_normalize_marker(tag) for tag in tags}
+    for marker in ("not_done", "not_completed", "failed", "incorrect", "bad_result", "не_выполнено", "ошибка"):
+        if marker in normalized_tags:
+            return f"feedback_tag:{marker}"
+    if rating is not None:
+        suffix = f"/{rating_scale}" if rating_scale else ""
+        return f"low_rating:{rating}{suffix}"
+    return "feedback_requires_review"
+
+
+def _normalize_marker(value: str) -> str:
+    return str(value or "").strip().casefold().replace("-", "_")
+
+
+def _diagnostic_group_diagnosis(key: str) -> dict[str, str]:
+    prefix, _, value = key.partition(":")
+    if prefix == "loaded_skill":
+        return {
+            "problem": f"Повторяющиеся ошибки связаны со skill `{value}`.",
+            "likely_reason": "Агент открывает этот skill, но правило может быть неполным, неточным или не покрывать реальный сценарий.",
+            "fix_proposal": f"Проверить `skill_index.yaml` и текст skill `{value}`; добавить недостающие условия, алгоритм и regression test.",
+        }
+    if prefix == "loaded_rule":
+        return {
+            "problem": f"Повторяющиеся ошибки связаны с правилом `{value}`.",
+            "likely_reason": "Правило подгружается, но может давать недостаточно точные указания для текущего типа запроса.",
+            "fix_proposal": f"Уточнить главу правила `{value}` и добавить тест на сценарий, где оно должно сработать.",
+        }
+    if prefix == "target_agent":
+        return {
+            "problem": f"Ошибки часто происходят в контуре агента `{value}`.",
+            "likely_reason": "Проблема может быть в routing, skill/rule агента, tool-вызове или финальной интерпретации результата.",
+            "fix_proposal": f"Разобрать последние отчеты по `{value}` и проверить: выбранный skill, tool_calls, tool_results и финальный ответ.",
+        }
+    if prefix == "tool_call":
+        return {
+            "problem": f"Повторяющиеся ошибки связаны с tool `{value}`.",
+            "likely_reason": "Tool может вызываться с неполными аргументами, неверным методом или без нужной предварительной проверки.",
+            "fix_proposal": f"Проверить правила подготовки аргументов для `{value}` и добавить regression test на неправильный вызов.",
+        }
+    if prefix == "error_action":
+        return {
+            "problem": f"В отчетах повторяется ошибка на действии `{value}`.",
+            "likely_reason": "На этом этапе возникает технический сбой, ошибка tool или некорректная обработка результата.",
+            "fix_proposal": f"Проверить обработку action `{value}`, лог ошибки и добавить тест на этот failure-path.",
+        }
+    if prefix == "tag":
+        return {
+            "problem": f"Пользовательские feedback часто помечены тегом `{value}`.",
+            "likely_reason": "Люди вручную указывают на повторяющуюся область проблемы.",
+            "fix_proposal": f"Посмотреть примеры с тегом `{value}` и сделать общий патч для повторяющегося сценария.",
+        }
+    return {
+        "problem": "Группа ошибок пока не имеет точной категории.",
+        "likely_reason": "Недостаточно структурированных признаков в diagnostic_trace или feedback.",
+        "fix_proposal": "Улучшить трассировку и добавить более точные tags/loaded_rules/loaded_skills/tool_calls.",
+    }
+
+
+def _incident_group_diagnosis(key: str) -> dict[str, str]:
+    prefix, _, value = key.partition(":")
+    if prefix == "incident_reason":
+        return {
+            "problem": f"Повторяется причина incident `{value}`.",
+            "likely_reason": "Пользователи одинаково помечают сбой или система одинаково классифицирует плохой feedback.",
+            "fix_proposal": "Посмотреть примеры группы, найти общий сценарий и добавить общий patch plan с regression tests.",
+        }
+    if prefix == "target_status":
+        return {
+            "problem": f"Incidents часто связаны со статусом ответа `{value}`.",
+            "likely_reason": "Финальный статус может не отражать реальную успешность задачи для человека.",
+            "fix_proposal": "Проверить правила финального ответа и условия, когда ответ считается completed/needs_human/failed.",
+        }
+    return _diagnostic_group_diagnosis(key)
+
+
+def _diagnostic_group_suggestions(event_ids: Any, events_by_id: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    suggestions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for event_id in _strings(event_ids):
+        if event_id in seen:
+            continue
+        seen.add(event_id)
+        event = events_by_id.get(event_id)
+        if not event:
+            continue
+        summary = _diagnostic_report_summary(event)
+        if summary:
+            suggestions.append(summary)
+        if len(suggestions) >= 3:
+            break
+    return suggestions
+
+
+def _diagnostic_reports_by_incident(events: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    reports_by_incident: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+        incident_ids = _strings(metadata.get("incident_event_ids"))
+        incident_id = str(metadata.get("incident_event_id") or "")
+        if incident_id:
+            incident_ids.append(incident_id)
+        for item in sorted(set(incident_ids)):
+            reports_by_incident.setdefault(item, []).append(event)
+    return reports_by_incident
+
+
+def _incident_group_diagnostic_reports(
+    incident_ids: Any,
+    reports_by_incident: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    reports: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for incident_id in _strings(incident_ids):
+        for event in reports_by_incident.get(incident_id, []):
+            event_id = str(event.get("id") or "")
+            if not event_id or event_id in seen:
+                continue
+            seen.add(event_id)
+            summary = _diagnostic_report_summary(event)
+            if summary:
+                reports.append(summary)
+            if len(reports) >= 3:
+                return reports
+    return reports
+
+
+def _diagnostic_report_summary(event: dict[str, Any]) -> dict[str, Any]:
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    sections = _diagnostic_report_sections(str(event.get("response") or ""))
+    summary: dict[str, Any] = {
+        "id": event.get("id"),
+        "target_event_id": metadata.get("target_event_id"),
+        "feedback_event_ids": _strings(metadata.get("feedback_event_ids")),
+        "incident_event_ids": _strings(metadata.get("incident_event_ids")),
+        "status": event.get("status"),
+    }
+    for source, target in (
+        ("problem", "problem"),
+        ("where_to_fix", "where_to_fix"),
+        ("fix_proposal", "fix_proposal"),
+        ("regression_test", "regression_test"),
+    ):
+        if sections.get(source):
+            summary[target] = sections[source]
+    if len(summary) <= 5:
+        response = str(event.get("response") or "").strip()
+        if response:
+            summary["excerpt"] = _truncate_text(response, 800)
+    return summary
+
+
+def _diagnostic_report_sections(response: str) -> dict[str, str]:
+    sections: dict[str, str] = {}
+    if not response.strip():
+        return sections
+    matches = list(
+        re.finditer(
+            r"(?:^|\n)\s*\*\*(?P<title>[^*\n:]{2,80}):\*\*\s*(?P<body>.*?)(?=\n\s*\*\*[^*\n:]{2,80}:\*\*|\Z)",
+            response,
+            flags=re.S,
+        )
+    )
+    for match in matches:
+        title = match.group("title").strip().casefold()
+        body = _truncate_text(match.group("body").strip(), 800)
+        if not body:
+            continue
+        if _contains_any(title, ("what went wrong", "problem", "\u043f\u0440\u043e\u0431\u043b\u0435\u043c")):
+            sections.setdefault("problem", body)
+        elif _contains_any(title, ("where", "\u0433\u0434\u0435")):
+            sections.setdefault("where_to_fix", body)
+        elif _contains_any(title, ("fix", "patch", "\u0438\u0441\u043f\u0440\u0430\u0432")):
+            sections.setdefault("fix_proposal", body)
+        elif _contains_any(title, ("regression", "test", "\u0440\u0435\u0433\u0440\u0435\u0441", "\u0442\u0435\u0441\u0442")):
+            sections.setdefault("regression_test", body)
+    return sections
+
+
+def _contains_any(value: str, markers: tuple[str, ...]) -> bool:
+    return any(marker in value for marker in markers)
+
+
+def _strings(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item)]
 
 
 def _truncate_text(value: str, max_chars: int) -> str:

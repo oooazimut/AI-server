@@ -1,0 +1,114 @@
+schema_version: 1
+agent_id: secure_org_data
+purpose: >
+  Индекс правил Secure Org Data Agent. Кодовый rule-loader использует этот файл,
+  чтобы подгружать только главы мини-книги, нужные для конкретного запроса.
+
+core_load:
+  - file: instructions.md
+    reason: "Короткое ядро агента, обязательное для каждого запроса."
+
+trace:
+  event_name: secure_org_data_rules_retrieved
+  record_fields:
+    - rule_id
+    - file
+    - reason
+    - matched_context_keys
+    - matched_keywords
+    - priority
+
+rules:
+  - id: access_model
+    title: "Модель доступа"
+    file: knowledge/access_model.md
+    type: knowledge
+    priority: 100
+    use_when:
+      default_for_orchestrator: true
+      request_topics:
+        - "доступ"
+        - "protected"
+        - "secret"
+        - "закрыто"
+        - "пароль"
+        - "логин"
+      context_keys:
+        - "secure_org_data_access_level"
+        - "user"
+    load_reason: "Нужно определить, какие данные можно показать пользователю."
+
+  - id: data_sources
+    title: "Источники данных"
+    file: knowledge/data_sources.md
+    type: knowledge
+    priority: 95
+    use_when:
+      request_topics:
+        - "объект"
+        - "оборудование"
+        - "настройки"
+        - "инструкция"
+        - "документ"
+        - "папка"
+        - "файл"
+      context_keys:
+        - "secure_org_data_root"
+        - "metadata_dir"
+        - "index_dir"
+    load_reason: "Нужно понять, откуда брать данные и какие индексы использовать."
+
+  - id: search_and_answer
+    title: "Поиск и ответ"
+    file: knowledge/search_and_answer.md
+    type: knowledge
+    priority: 90
+    use_when:
+      request_topics:
+        - "найди"
+        - "покажи"
+        - "где"
+        - "какой"
+        - "какие"
+        - "поиск"
+      context_keys:
+        - "tool_results"
+    load_reason: "Нужно выполнить поиск и собрать понятный ответ по найденным данным."
+
+  - id: file_links
+    title: "Пути и ссылки на файлы"
+    file: knowledge/file_links.md
+    type: knowledge
+    priority: 80
+    use_when:
+      request_topics:
+        - "ссылка"
+        - "путь"
+        - "файл"
+        - "открой"
+        - "документ"
+    load_reason: "Нужно решить, можно ли показывать путь к файлу."
+
+  - id: fallback_behavior
+    title: "Fallback-поведение"
+    file: knowledge/fallback_behavior.md
+    type: knowledge
+    priority: 1
+    use_when:
+      fallback: true
+    load_reason: "Ни одна специализированная глава Secure Org Data Agent не подошла к запросу."
+
+  - id: read_only_limits
+    title: "Read-only ограничения"
+    file: knowledge/read_only_limits.md
+    type: knowledge
+    priority: 85
+    use_when:
+      request_topics:
+        - "измени"
+        - "добавь"
+        - "удали"
+        - "замени"
+        - "обнови"
+        - "запиши"
+    load_reason: "Нужно остановить операцию изменения данных на первом этапе."

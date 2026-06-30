@@ -123,6 +123,13 @@ MIGRATION_ITEMS: tuple[VarMigrationItem, ...] = (
         description="История learning/events старого агента.",
         sensitive=True,
     ),
+    VarMigrationItem(
+        path="traces.jsonl",
+        item_type="file",
+        category="audit",
+        description="Полная трассировка цепочек пользователь -> Переговорщик -> специалисты -> tools -> ответ.",
+        sensitive=True,
+    ),
 )
 
 EXCLUDED_RUNTIME_ITEMS: tuple[str, ...] = (

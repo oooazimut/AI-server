@@ -20,7 +20,9 @@ from ai_server.agents.specialist_llm_shared import (
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
 from ai_server.retrieval import RetrievalHit
+from ai_server.rule_loader import format_loaded_rules, load_rules_for_task
 from ai_server.settings import Settings
+from ai_server.skill_loader import format_loaded_skills, load_skills_for_task
 from ai_server.utils import confidence, optional_int
 
 logger = logging.getLogger(__name__)
@@ -109,10 +111,42 @@ class BitrixLLMService:
         available_skills: list | None = None,
     ) -> BitrixLLMDecisionResult:
         instructions = load_instructions(manifest)
+        loaded_rules = load_rules_for_task(manifest, request=task.request, context=task.context)
+        rules_prompt = format_loaded_rules(loaded_rules)
+        loaded_skills = load_skills_for_task(manifest, request=task.request, context=task.context)
+        skills_prompt = format_loaded_skills(loaded_skills)
+        loaded_rules_meta = [
+            {
+                "id": rule.id,
+                "title": rule.title,
+                "file": rule.file,
+                "reason": rule.reason,
+                "matched_context_keys": rule.matched_context_keys,
+                "matched_keywords": rule.matched_keywords,
+                "matched_statuses": rule.matched_statuses,
+                "match_reasons": rule.match_reasons,
+                "priority": rule.priority,
+            }
+            for rule in loaded_rules
+        ]
+        loaded_skills_meta = [
+            {
+                "id": skill.id,
+                "title": skill.title,
+                "file": skill.file,
+                "reason": skill.reason,
+                "matched_context_keys": skill.matched_context_keys,
+                "matched_keywords": skill.matched_keywords,
+                "matched_statuses": skill.matched_statuses,
+                "match_reasons": skill.match_reasons,
+                "priority": skill.priority,
+            }
+            for skill in loaded_skills
+        ]
         completion = await self.client.complete(
             agent_id=manifest.id,
             messages=[
-                {"role": "system", "content": _decision_system_prompt(instructions)},
+                {"role": "system", "content": _decision_system_prompt(instructions, rules_prompt, skills_prompt)},
                 {
                     "role": "user",
                     "content": json.dumps(
@@ -130,6 +164,8 @@ class BitrixLLMService:
                             "dialog_history": dialog_history or [],
                             "permission_context": _permission_context(task, self.settings),
                             "retrieval_context": retrieval_context(retrieval_hits),
+                            "loaded_rules": loaded_rules_meta,
+                            "loaded_skills": loaded_skills_meta,
                             "tools": allowed_tool_definitions(tool_definitions, ALLOWED_TOOL_NAMES),
                             "tool_results": [compact_tool_result(result) for result in (tool_results or [])],
                         },
@@ -142,7 +178,7 @@ class BitrixLLMService:
         return BitrixLLMDecisionResult(
             decision=_parse_decision(completion.json_content()),
             model_usage=completion.model_usage,
-            raw=completion.raw,
+            raw={**completion.raw, "loaded_rules": loaded_rules_meta, "loaded_skills": loaded_skills_meta},
         )
 
     async def compose(
@@ -200,8 +236,10 @@ def llm_failure_result(message: str, agent_id: str = "bitrix24") -> BitrixLLMFin
     )
 
 
-def _decision_system_prompt(instructions: str = "") -> str:
+def _decision_system_prompt(instructions: str = "", loaded_rules: str = "", loaded_skills: str = "") -> str:
     extra = f"\n\nДополнительные инструкции:\n{instructions}" if instructions else ""
+    rules_extra = f"\n\n{loaded_rules}" if loaded_rules else ""
+    skills_extra = f"\n\n{loaded_skills}" if loaded_skills else ""
     return (
         "Ты LLM-субагент Bitrix24 внутри корпоративного AI-server. "
         "Оркестратор уже передал тебе запрос человека. "
@@ -245,7 +283,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Для уведомления пользователя используй bitrix_api с im.notify.system.add. "
         "Все Bitrix-методы (approve/disapprove/complete/result.add/commentitem.add) вызывай через bitrix_api. "
         "Для поиска документов/файлов используй portal_search. Если данных не хватает, status=needs_clarification."
-        f"{extra}"
+        f"{extra}{rules_extra}{skills_extra}"
     )
 
 

@@ -40,6 +40,14 @@ class RuntimePaths:
         return self.root / "learning_events.jsonl"
 
     @property
+    def trace_events_log(self) -> Path:
+        return self.root / "traces.jsonl"
+
+    @property
+    def secure_org_data_db(self) -> Path:
+        return self.root / "secure_org_data" / "secure_org_data.sqlite"
+
+    @property
     def search_content_dir(self) -> Path:
         return self.root / "search_content"
 
@@ -77,6 +85,7 @@ def ensure_runtime_dirs(paths: RuntimePaths | None = None) -> None:
         selected.attachments_dir,
         selected.document_drafts_dir,
         selected.embedding_models_dir,
+        selected.secure_org_data_db.parent,
         selected.search_content_dir,
         selected.tmp_dir,
     ):

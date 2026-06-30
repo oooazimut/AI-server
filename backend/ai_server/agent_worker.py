@@ -23,6 +23,7 @@ from ai_server.agents.logistics.specialist import VehicleUsageSettings
 from ai_server.agents.pto import PtoLLMService
 from ai_server.attachments import AttachmentService
 from ai_server.channels.bitrix import BitrixChatChannel
+from ai_server.feedback_loop import FeedbackLoopService
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService
 from ai_server.integrations.postgres.bitrix_agent import PostgresBitrixAgentStore
@@ -42,6 +43,7 @@ from ai_server.settings import get_settings
 from ai_server.specialists import SpecialistDeps
 from ai_server.technical_footer import TechnicalFooterService
 from ai_server.tools.vehicle_usage import SentRequestData
+from ai_server.tracing import TraceRecorder
 from ai_server.transcription import build_transcriber
 from ai_server.utils import MOSCOW_TZ
 from ai_server.workers.bitrix.reconciler import run_reconciler
@@ -93,6 +95,7 @@ async def main() -> None:
 
     portal_search_indexer = PortalSearchIndexerWorker(bitrix, portal_search, settings=settings)
     learning_recorder = LearningEventRecorder()
+    trace_recorder = TraceRecorder()
     webhook_event_queue = RedisEventQueue(settings.redis_url)
 
     vehicle_usage_store = None
@@ -122,6 +125,13 @@ async def main() -> None:
         )
 
         bitrix_channel = BitrixChatChannel(settings=settings, bitrix=bitrix)
+        feedback_loop = FeedbackLoopService(
+            learning_recorder=learning_recorder,
+            trace_recorder=trace_recorder,
+            manifests=manifests,
+            channels={"bitrix24": bitrix_channel},
+            settings=settings,
+        )
         specialist_deps = SpecialistDeps(
             settings=settings,
             manifests=manifests,
@@ -142,6 +152,8 @@ async def main() -> None:
             channels={"bitrix24": bitrix_channel},
             footer_service=TechnicalFooterService(settings=settings),
             learning_recorder=learning_recorder,
+            trace_recorder=trace_recorder,
+            feedback_loop=feedback_loop,
         )
         orch_manifest = next((m for m in manifests if m.kind == "orchestrator"), None)
         orchestrator = InternalOrchestrator.build(
@@ -251,6 +263,7 @@ async def main() -> None:
                     transcriber=transcriber,
                     status=_webhook_status,
                     settings=settings,
+                    feedback_loop=feedback_loop,
                 )
             )
         )

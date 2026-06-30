@@ -15,6 +15,7 @@ def test_runtime_paths_use_var_root():
     assert paths.dialog_state_db == Path("var") / "dialog_state.sqlite"
     assert paths.attachments_dir == Path("var") / "attachments"
     assert paths.learning_events_log == Path("var") / "learning_events.jsonl"
+    assert paths.trace_events_log == Path("var") / "traces.jsonl"
 
 
 def test_cutover_profile_includes_sensitive_continuity_state():
@@ -27,6 +28,7 @@ def test_cutover_profile_includes_sensitive_continuity_state():
     assert "attachments" in items
     assert "document_drafts" in items
     assert "learning_events.jsonl" in items
+    assert "traces.jsonl" in items
 
 
 def test_migration_plan_marks_existing_and_missing_items(tmp_path):

@@ -1,0 +1,47 @@
+schema_version: 1
+agent_id: internal_orchestrator
+purpose: >
+  Индекс скилов Переговорщика. Skill-loader использует этот файл для загрузки
+  рабочих процедур Оркестратора отдельно от knowledge/*.md.
+
+core_load:
+  - file: instructions.md
+    reason: "Короткое ядро Переговорщика, обязательное для каждого запроса."
+
+trace:
+  event_name: orchestrator_skills_retrieved
+  record_fields:
+    - skill_id
+    - file
+    - reason
+    - matched_context_keys
+    - matched_keywords
+    - priority
+
+skills:
+  - id: route_internal_request
+    title: "Маршрутизация внутреннего запроса"
+    file: skills/route_internal_request.md
+    priority: 100
+    use_when:
+      request_topics:
+        - "маршрутизация"
+        - "внутренний запрос"
+        - "кому поручить"
+        - "специалист"
+        - "Bitrix"
+        - "Битрикс"
+        - "база"
+        - "диагностика"
+      context_keys:
+        - "_source"
+        - "_intent"
+    load_reason: "Нужна рабочая процедура выбора специалиста и следующего шага."
+
+  - id: fallback_task
+    title: "Fallback-процедура"
+    file: skills/fallback_task.md
+    priority: 1
+    use_when:
+      fallback: true
+    load_reason: "Ни один специализированный скил Переговорщика не подошел к запросу."

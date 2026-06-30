@@ -1,0 +1,39 @@
+id: secure_org_data
+name: Защищенные данные организации
+version: 0.1.0
+kind: specialist
+audience: employee
+description: Ищет и объясняет данные из локальной базы объектов, оборудования, настроек, документов и учетных данных организации, соблюдая уже заданные метки доступа.
+handoff_description: >
+  Использовать для запросов про локальную базу объектов, оборудование, инструкции,
+  настройки, сетевые параметры, пути к документам, логины и пароли организации.
+  Агент работает read-only и не сам решает, что секретно: он использует метки
+  доступа существующего механизма базы.
+entrypoint: backend.ai_server.agents.secure_org_data.SecureOrgDataAgent
+instructions_file: agents/secure_org_data/instructions.md
+knowledge_path: agents/secure_org_data/knowledge
+skills_path: agents/secure_org_data/skills
+channels:
+  - internal_orchestrator
+capabilities:
+  - organization_data_search
+  - object_settings_lookup
+  - network_settings_lookup
+  - local_document_lookup
+  - credential_metadata_lookup
+tools:
+  - search_org_data
+data_scopes:
+  - organization_objects
+  - equipment_settings
+  - network_settings
+  - local_documents
+  - access_metadata
+allowed_actions:
+  - search_open_data
+  - search_allowed_protected_data
+  - return_file_path_when_allowed
+approval_required:
+  - reveal_secret_value
+  - modify_org_data
+  - modify_access_rules

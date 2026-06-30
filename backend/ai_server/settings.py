@@ -51,6 +51,9 @@ class Settings:
     learning_events_enabled: bool
     learning_events_capture_text: bool
     learning_events_max_text_chars: int
+    trace_events_enabled: bool
+    trace_events_capture_payload: bool
+    trace_events_max_payload_chars: int
     webhook_event_queue_enabled: bool
     webhook_event_worker_enabled: bool
     webhook_event_queue_interval_seconds: int
@@ -98,6 +101,7 @@ class Settings:
     supervisor_max_tasks: int
     supervisor_max_tasks_per_user: int
     supervisor_admin_user_ids: str
+    diagnostic_report_admin_user_ids: str
     supervisor_notify_responsibles: bool
     supervisor_reminder_cooldown_hours: int
     reconcile_enabled: bool
@@ -144,6 +148,11 @@ class Settings:
     agent_shell_timeout_seconds: float
     agent_shell_max_command_chars: int
     agent_shell_max_output_chars: int
+    secure_org_data_root: str
+    secure_org_data_metadata_dir: str
+    secure_org_data_index_dir: str
+    secure_org_data_protected_user_ids: str
+    secure_org_data_secret_user_ids: str
     database_url: str
     redis_url: str
     var_dir: Path
@@ -231,6 +240,10 @@ class Settings:
         return runtime_paths(self.var_dir).learning_events_log
 
     @property
+    def trace_events_path(self) -> Path:
+        return runtime_paths(self.var_dir).trace_events_log
+
+    @property
     def quality_control_state_path(self) -> Path:
         return runtime_paths(self.var_dir).quality_control_state
 
@@ -257,6 +270,10 @@ class Settings:
     @property
     def resolved_supervisor_admin_user_ids(self) -> list[int]:
         return _id_list(self.supervisor_admin_user_ids)
+
+    @property
+    def resolved_diagnostic_report_admin_user_ids(self) -> list[int]:
+        return _id_list(self.diagnostic_report_admin_user_ids)
 
     @property
     def resolved_agent_private_disk_path_markers(self) -> list[str]:
@@ -295,6 +312,10 @@ class Settings:
     @property
     def search_content_storage_dir(self) -> Path:
         return runtime_paths(self.var_dir).search_content_dir
+
+    @property
+    def secure_org_data_db_path(self) -> Path:
+        return runtime_paths(self.var_dir).secure_org_data_db
 
     @property
     def resolved_search_content_allowed_extensions(self) -> set[str]:
@@ -358,6 +379,9 @@ def get_settings() -> Settings:
         learning_events_enabled=_env_bool("LEARNING_EVENTS_ENABLED", True),
         learning_events_capture_text=_env_bool("LEARNING_EVENTS_CAPTURE_TEXT", True),
         learning_events_max_text_chars=_env_int("LEARNING_EVENTS_MAX_TEXT_CHARS", 8000) or 8000,
+        trace_events_enabled=_env_bool("TRACE_EVENTS_ENABLED", True),
+        trace_events_capture_payload=_env_bool("TRACE_EVENTS_CAPTURE_PAYLOAD", True),
+        trace_events_max_payload_chars=_env_int("TRACE_EVENTS_MAX_PAYLOAD_CHARS", 8000) or 8000,
         webhook_event_queue_enabled=_env_bool("WEBHOOK_EVENT_QUEUE_ENABLED", True),
         webhook_event_worker_enabled=_env_bool("AI_SERVER_WEBHOOK_EVENT_WORKER_ENABLED", False),
         webhook_event_queue_interval_seconds=_env_int("WEBHOOK_EVENT_QUEUE_INTERVAL_SECONDS", 2) or 2,
@@ -411,6 +435,7 @@ def get_settings() -> Settings:
         supervisor_max_tasks=_env_int("SUPERVISOR_MAX_TASKS", 50) or 50,
         supervisor_max_tasks_per_user=_env_int("SUPERVISOR_MAX_TASKS_PER_USER", 10) or 10,
         supervisor_admin_user_ids=_env("SUPERVISOR_ADMIN_USER_IDS"),
+        diagnostic_report_admin_user_ids=_env("DIAGNOSTIC_REPORT_ADMIN_USER_IDS"),
         supervisor_notify_responsibles=_env_bool("SUPERVISOR_NOTIFY_RESPONSIBLES", False),
         supervisor_reminder_cooldown_hours=_env_int("SUPERVISOR_REMINDER_COOLDOWN_HOURS", 12) or 12,
         reconcile_enabled=_env_bool("RECONCILE_ENABLED", False),
@@ -457,6 +482,11 @@ def get_settings() -> Settings:
         agent_shell_timeout_seconds=_env_float("AGENT_SHELL_TIMEOUT_SECONDS", 30.0) or 30.0,
         agent_shell_max_command_chars=_env_int("AGENT_SHELL_MAX_COMMAND_CHARS", 500) or 500,
         agent_shell_max_output_chars=_env_int("AGENT_SHELL_MAX_OUTPUT_CHARS", 4000) or 4000,
+        secure_org_data_root=_env("SECURE_ORG_DATA_ROOT"),
+        secure_org_data_metadata_dir=_env("SECURE_ORG_DATA_METADATA_DIR"),
+        secure_org_data_index_dir=_env("SECURE_ORG_DATA_INDEX_DIR"),
+        secure_org_data_protected_user_ids=_env("SECURE_ORG_DATA_PROTECTED_USER_IDS"),
+        secure_org_data_secret_user_ids=_env("SECURE_ORG_DATA_SECRET_USER_IDS"),
         database_url=_env("DATABASE_URL"),
         redis_url=_env("REDIS_URL"),
         var_dir=paths.root,

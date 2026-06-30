@@ -1,0 +1,78 @@
+schema_version: 1
+agent_id: diagnostic_agent
+purpose: >
+  Индекс скилов Diagnostic Agent. Скилы описывают рабочие процедуры анализа,
+  а rule_index.yaml отдельно подгружает правила и ограничения.
+
+core_load:
+  - file: instructions.md
+    reason: "Короткое ядро диагностического агента, обязательное для каждого разбора."
+
+trace:
+  event_name: diagnostic_skills_retrieved
+  record_fields:
+    - skill_id
+    - file
+    - reason
+    - matched_context_keys
+    - matched_keywords
+    - priority
+
+skills:
+  - id: analyze_feedback
+    title: "Анализ feedback"
+    file: skills/analyze_feedback.md
+    priority: 100
+    use_when:
+      request_topics:
+        - "feedback"
+        - "оценка"
+        - "не выполнено"
+        - "ошибка"
+      context_keys:
+        - "feedback"
+        - "rating"
+        - "comment"
+    load_reason: "Нужно разобрать пользовательскую оценку или жалобу."
+
+  - id: analyze_trace
+    title: "Анализ trace"
+    file: skills/analyze_trace.md
+    priority: 95
+    use_when:
+      request_topics:
+        - "trace"
+        - "трассировка"
+        - "tool_calls"
+        - "tool_results"
+      context_keys:
+        - "trace_id"
+        - "actions"
+        - "tool_results"
+        - "loaded_rules"
+        - "loaded_skills"
+    load_reason: "Нужно восстановить шаги выполнения и найти вероятный этап сбоя."
+
+  - id: fallback_task
+    title: "Fallback-процедура"
+    file: skills/fallback_task.md
+    priority: 1
+    use_when:
+      fallback: true
+    load_reason: "Ни один специализированный скил диагностики не подошел к запросу."
+
+  - id: batch_incident_analysis
+    title: "Групповой анализ инцидентов"
+    file: skills/batch_incident_analysis.md
+    priority: 80
+    use_when:
+      request_topics:
+        - "batch"
+        - "группа ошибок"
+        - "однотипные"
+        - "повторяется"
+      context_keys:
+        - "events"
+        - "batch"
+        - "similar_failures"
+    load_reason: "Нужно сгруппировать похожие сбои и предложить общий патч."

@@ -1,0 +1,165 @@
+schema_version: 1
+agent_id: internal_orchestrator
+purpose: >
+  Строгий индекс правил Переговорщика. Кодовый rule-loader должен использовать
+  этот файл, чтобы подгружать только те главы мини-книги, которые нужны для
+  конкретной задачи.
+
+stage_scope:
+  active_flow:
+    - internal_orchestrator
+    - bitrix24
+    - secure_org_data
+    - diagnostic_agent
+  ordinary_dialog_agents:
+    - bitrix24
+    - secure_org_data
+  diagnostic_only_agents:
+    - diagnostic_agent
+  out_of_scope_for_this_stage:
+    - pto
+    - logistics
+  note: >
+    pto и logistics остаются в проекте, но правила и сценарии текущего этапа
+    не должны расширять их поведение.
+
+core_load:
+  - file: instructions.md
+    reason: "Короткое ядро правил, обязательное для каждого запроса."
+
+trace:
+  event_name: orchestrator_rules_retrieved
+  record_fields:
+    - rule_id
+    - file
+    - reason
+    - matched_context_keys
+    - matched_keywords
+    - priority
+
+rules:
+  - id: routing_guidelines
+    title: "Маршрутизация запросов"
+    file: knowledge/routing_guidelines.md
+    type: knowledge
+    priority: 100
+    use_when:
+      default_for_orchestrator: true
+      request_topics:
+        - "выбор специалиста"
+        - "маршрутизация"
+        - "Bitrix24"
+        - "Битрикс"
+        - "задача"
+        - "проект"
+        - "CRM"
+        - "склад"
+        - "товар"
+        - "наличие"
+        - "каталог"
+        - "номенклатура"
+        - "документ"
+        - "настройки"
+        - "инструкция"
+        - "оборудование"
+        - "объект"
+        - "пароль"
+        - "логин"
+        - "IP"
+        - "сеть"
+      context_keys: []
+    load_reason: "Нужно определить, какой специалист должен обработать запрос."
+
+  - id: escalation_policy
+    title: "Эскалации и задачи от специалистов"
+    file: knowledge/escalation_policy.md
+    type: knowledge
+    priority: 95
+    use_when:
+      context_keys:
+        - "_source"
+        - "_intent"
+        - "admin_user_ids"
+        - "notify_user_ids"
+        - "dialog_id"
+      request_topics:
+        - "эскалация"
+        - "уведомить"
+        - "напомнить"
+        - "не ответил"
+        - "доставка сообщения"
+    load_reason: "Задача пришла от специалиста или требует уведомления/эскалации."
+
+  - id: communication_style
+    title: "Стиль общения"
+    file: knowledge/communication_style.md
+    type: knowledge
+    priority: 80
+    use_when:
+      request_topics:
+        - "уточнение"
+        - "подтверждение"
+        - "финальный ответ"
+        - "как ответить"
+        - "неоднозначный запрос"
+      statuses:
+        - "needs_clarification"
+        - "needs_human"
+        - "completed"
+    load_reason: "Нужно сформулировать уточнение, подтверждение или финальный ответ человеку."
+
+  - id: route_internal_request
+    title: "Процедура маршрутизации внутреннего запроса"
+    file: skills/route_internal_request.md
+    type: skill
+    priority: 90
+    use_when:
+      request_topics:
+        - "маршрутизация"
+        - "внутренний запрос"
+        - "несколько специалистов"
+        - "опасное действие"
+      context_keys:
+        - "_source"
+        - "_intent"
+    load_reason: "Нужна пошаговая процедура выбора специалиста и проверки безопасности."
+
+  - id: diagnostics_and_feedback
+    title: "Диагностика ошибок и feedback"
+    file: knowledge/diagnostics_and_feedback.md
+    type: knowledge
+    priority: 85
+    use_when:
+      request_topics:
+        - "ошибка"
+        - "не выполнено"
+        - "оценка"
+        - "feedback"
+        - "диагностика"
+        - "trace"
+        - "разбор сбоя"
+      context_keys:
+        - "feedback"
+        - "trace_id"
+        - "learning_event_id"
+        - "rating"
+    load_reason: "Нужно разобрать ошибку, feedback или подготовить данные для Diagnostic Agent."
+
+  - id: fallback_behavior
+    title: "Fallback-поведение"
+    file: knowledge/fallback_behavior.md
+    type: knowledge
+    priority: 1
+    use_when:
+      fallback: true
+    load_reason: "Ни одна специализированная глава правил не подошла к запросу."
+
+future_rules:
+  - id: modular_agent_routing
+    expected_file: knowledge/modular_agent_routing.md
+    purpose: "Правила добавления новых агентов без переписывания старых правил."
+    roadmap_branch: feature/modular-agent-rules
+  - id: diagnostics_and_feedback
+    expected_file: knowledge/diagnostics_and_feedback.md
+    purpose: "Правила, которые помогут diagnostic_agent анализировать ошибки по trace и feedback."
+    roadmap_branch: feature/diagnostic-agent

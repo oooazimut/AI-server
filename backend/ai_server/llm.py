@@ -34,7 +34,7 @@ class LLMCompletion:
     raw: dict[str, Any]
 
     def json_content(self) -> dict[str, Any]:
-        text = _strip_json_fence(self.content)
+        text = _json_object_text(self.content)
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError as exc:
@@ -208,6 +208,44 @@ def _strip_json_fence(text: str) -> str:
     if len(lines) >= 2 and lines[0].startswith("```") and lines[-1].strip() == "```":
         return "\n".join(lines[1:-1]).strip()
     return value
+
+
+def _json_object_text(text: str) -> str:
+    value = _strip_json_fence(text)
+    if value.startswith("{"):
+        return value
+    extracted = _extract_first_json_object(value)
+    return extracted or value
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
 
 
 def _response_json(response: httpx.Response) -> dict[str, Any]:

@@ -1,0 +1,66 @@
+version: 1
+description: "Минимальный набор рабочих сценариев для API-прогона AI-server."
+
+defaults:
+  channel: local_test
+  user_id: scenario-user
+  dialog_id: scenario-test
+
+scenarios:
+  - id: secure_org_data_open_search
+    title: "Поиск открытой инструкции во внутренней базе"
+    text: "Найди инструкцию TL-WR820N"
+    expected:
+      status: completed
+      handoff_to_any:
+        - secure_org_data
+      answer_contains_any:
+        - TL-WR820N
+        - инструкция
+      trace_events_any:
+        - orchestrator_decision
+        - specialist_called
+
+  - id: bitrix_task_search
+    title: "Поиск задач в Bitrix"
+    text: "Покажи мои открытые задачи в Битриксе"
+    expected:
+      status_any:
+        - completed
+        - needs_clarification
+        - failed
+      handoff_to_any:
+        - bitrix24
+      actions_include_any:
+        - delegate_to_specialist
+
+  - id: ambiguous_short_request
+    title: "Неоднозначный короткий запрос"
+    text: "Найди это"
+    expected:
+      status_any:
+        - needs_clarification
+        - completed
+      answer_contains_any:
+        - уточ
+        - что
+        - какой
+
+  - id: feedback_incident_demo
+    title: "Демонстрация feedback -> incident -> diagnose"
+    text: "Найди датчик коленвала на складе"
+    expected:
+      status_any:
+        - completed
+        - needs_clarification
+        - failed
+      handoff_to_any:
+        - bitrix24
+    feedback:
+      rating: 3
+      rating_scale: 10
+      outcome: not_completed
+      comment: "Тестовая плохая оценка: товар есть, но ответ не помог."
+      tags:
+        - catalog
+      diagnose: true
