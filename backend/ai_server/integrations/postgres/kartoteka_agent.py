@@ -98,10 +98,11 @@ class PostgresKartotekaStore(PostgresAgentSchema):
                 )
                 """
             )
+            await db.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
             await db.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_kartoteka_search_text
-                ON kartoteka.file_index (search_text)
+                ON kartoteka.file_index USING GIN (search_text gin_trgm_ops)
                 """
             )
             await db.execute(
