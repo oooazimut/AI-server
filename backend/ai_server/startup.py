@@ -7,6 +7,7 @@ from fastapi import FastAPI
 
 from .agent_scheduler import AgentScheduler
 from .agents.bitrix24 import BitrixLLMService
+from .agents.kartoteka import KartotekaLLMService
 from .agents.logistics import LogisticsLLMService
 from .agents.logistics.specialist import VehicleUsageSettings
 from .agents.pto import PtoLLMService
@@ -14,6 +15,7 @@ from .channels.bitrix import BitrixChatChannel
 from .integrations.bitrix.client import BitrixClient
 from .integrations.bitrix.oauth import BitrixOAuthService
 from .integrations.postgres.bitrix_agent import PostgresBitrixAgentStore
+from .integrations.postgres.kartoteka_agent import PostgresKartotekaStore
 from .integrations.postgres.orchestrator_agent import PostgresOrchestratorStore
 from .integrations.postgres.pto_agent import PostgresPtoAgentStore
 from .integrations.postgres.vehicle_usage import PostgresVehicleUsageStore
@@ -67,6 +69,16 @@ async def _make_orchestrator_store(settings: Settings) -> PostgresOrchestratorSt
     return store
 
 
+async def _make_kartoteka_store(settings: Settings) -> PostgresKartotekaStore:
+    store = PostgresKartotekaStore(
+        settings.database_url,
+        protected_user_ids=settings.kartoteka_protected_user_ids,
+        secret_user_ids=settings.kartoteka_secret_user_ids,
+    )
+    await store.ensure_schema()
+    return store
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -86,6 +98,7 @@ async def lifespan(app: FastAPI):
     webhook_event_queue = _make_event_queue(settings)
     pto_store = await _make_pto_store(settings)
     orchestrator_store = await _make_orchestrator_store(settings)
+    kartoteka_store = await _make_kartoteka_store(settings)
 
     app.state.settings = settings
     app.state.manifests = manifests
@@ -241,6 +254,8 @@ async def lifespan(app: FastAPI):
             logistics_llm=logistics_llm_svc,
             vehicle_usage_store=vehicle_usage_store,
             logistics_vu_settings=vu_settings,
+            kartoteka_store=kartoteka_store,
+            kartoteka_llm=KartotekaLLMService(),
             channels={"bitrix24": bitrix_channel},
             footer_service=TechnicalFooterService(settings=settings),
             learning_recorder=learning_recorder,

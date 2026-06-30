@@ -1,0 +1,29 @@
+id: kartoteka
+name: ИИ-Картотека
+version: 0.1.0
+kind: specialist
+audience: employee
+
+description: >
+  Ищет файлы и документы в локальном файловом индексе организации по названию,
+  тегам и содержимому. Отвечает за управление файловым каталогом: поиск, статистику,
+  добавление, удаление и перемещение файлов (последние три пока недоступны).
+
+handoff_description: >
+  Использовать для поиска локальных файлов и документов организации по ключевым словам.
+  Не работает с Bitrix-диском — только с локальным файловым сервером.
+  Для работы с документами в задачах Bitrix или на диске — обращаться к ИИ-ПТО или ИИ-Битрикс.
+
+entrypoint: backend.ai_server.agents.kartoteka.KartotekaSpecialist
+skills_path: agents/kartoteka/skills
+
+capabilities:
+  - file_index_search
+  - file_catalog_management
+
+tools:
+  - kartoteka_search
+  - kartoteka_context
+  - kartoteka_file_add
+  - kartoteka_file_delete
+  - kartoteka_file_move
