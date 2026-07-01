@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from ai_server.agent_scheduler import AgentScheduler
 from ai_server.agents.bitrix24 import BitrixLLMService
+from ai_server.agents.diagnost import DiagnostLLMService
 from ai_server.agents.kartoteka.llm import KartotekaLLMService
 from ai_server.agents.logistics import LogisticsLLMService
 from ai_server.agents.logistics.specialist import VehicleUsageSettings
@@ -27,13 +28,14 @@ from ai_server.channels.bitrix import BitrixChatChannel
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService
 from ai_server.integrations.postgres.bitrix_agent import PostgresBitrixAgentStore
+from ai_server.integrations.postgres.diagnost_agent import PostgresDiagnostStore
 from ai_server.integrations.postgres.kartoteka_agent import PostgresKartotekaStore
 from ai_server.integrations.postgres.orchestrator_agent import PostgresOrchestratorStore
 from ai_server.integrations.postgres.pto_agent import PostgresPtoAgentStore
 from ai_server.integrations.postgres.vehicle_usage import PostgresVehicleUsageStore
 from ai_server.integrations.redis.agent_queue import RedisAgentQueue
+from ai_server.integrations.redis.diagnost_queue import RedisDiagnostQueue
 from ai_server.integrations.redis.event_queue import RedisEventQueue
-from ai_server.learning import LearningEventRecorder
 from ai_server.llm import build_orchestrator_llm_client
 from ai_server.models import AgentTask
 from ai_server.orchestrators.internal import InternalOrchestrator
@@ -51,7 +53,9 @@ from ai_server.workers.bitrix.search_indexer import PortalSearchIndexerWorker
 from ai_server.workers.bitrix.staff_roster_publisher import publish_staff_roster
 from ai_server.workers.bitrix.supervisor import run_task_supervisor
 from ai_server.workers.bitrix.webhook_event_queue import run_webhook_event_worker
+from ai_server.workers.diagnost.event_worker import run_diagnost_event_worker
 from ai_server.workers.logistics.staff_sync import run_staff_sync
+from ai_server.workers.orchestrator.result_publisher import OrchestratorResultPublisher
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +105,12 @@ async def main() -> None:
     orchestrator_store = PostgresOrchestratorStore(settings.database_url)
     await orchestrator_store.ensure_schema()
 
+    diagnost_store = PostgresDiagnostStore(settings.database_url)
+    await diagnost_store.ensure_schema()
+
     portal_search_indexer = PortalSearchIndexerWorker(bitrix, portal_search, settings=settings)
-    learning_recorder = LearningEventRecorder()
+    diagnost_queue = RedisDiagnostQueue(settings.redis_url)
+    result_publisher = OrchestratorResultPublisher(diagnost_queue)
     webhook_event_queue = RedisEventQueue(settings.redis_url)
 
     vehicle_usage_store = None
@@ -148,12 +156,14 @@ async def main() -> None:
             pto_store=pto_store,
             kartoteka_llm=KartotekaLLMService(),
             kartoteka_store=kartoteka_store,
+            diagnost_llm=DiagnostLLMService(),
+            diagnost_store=diagnost_store,
             logistics_llm=logistics_llm_svc,
             vehicle_usage_store=vehicle_usage_store,
             logistics_vu_settings=vu_settings,
             channels={"bitrix24": bitrix_channel},
             footer_service=TechnicalFooterService(settings=settings),
-            learning_recorder=learning_recorder,
+            result_publisher=result_publisher,
         )
         orch_manifest = next((m for m in manifests if m.kind == "orchestrator"), None)
         orchestrator = InternalOrchestrator.build(
@@ -270,6 +280,7 @@ async def main() -> None:
         for sp in orchestrator.specialists.values():
             agent_tasks.append(asyncio.create_task(sp.run(agent_queue)))  # type: ignore[union-attr]
         agent_tasks.append(asyncio.create_task(portal_search_indexer.run(agent_queue)))
+        agent_tasks.append(asyncio.create_task(run_diagnost_event_worker(diagnost_queue, diagnost_store)))
 
     if settings.vehicle_usage_enabled and vehicle_usage_store is not None:
         _bitrix_ref = bitrix

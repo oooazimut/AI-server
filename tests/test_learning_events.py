@@ -86,24 +86,20 @@ def test_learning_recorder_can_disable_text_capture(tmp_path):
     assert event["privacy"]["text_captured"] is False
 
 
-def test_orchestrator_records_learning_event(monkeypatch, tmp_path):
+def test_orchestrator_calls_result_publisher(monkeypatch):
+    """Оркестратор вызывает result_publisher.publish() после обработки задачи."""
+    from unittest.mock import AsyncMock
+
     monkeypatch.setenv("AGENT_DRY_RUN", "true")
     monkeypatch.setenv("AI_SERVER_TECH_FOOTER_ENABLED", "false")
-    recorder = LearningEventRecorder(path=tmp_path / "learning_events.jsonl", enabled=True)
 
     class FakeOrchestratorLLM:
         async def decide(self, **kwargs):
             from ai_server.models import ModelUsageRecord
             from ai_server.orchestrators.orchestrator_llm import OrchestratorDecision, OrchestratorDecisionResult
 
-            decision = OrchestratorDecision(
-                status="completed",
-                answer="",
-                tool_calls=[],
-                confidence=0.9,
-            )
             return OrchestratorDecisionResult(
-                decision=decision,
+                decision=OrchestratorDecision(status="completed", answer="", tool_calls=[], confidence=0.9),
                 model_usage=ModelUsageRecord(agent_id="internal_orchestrator", provider="test", model="test"),
             )
 
@@ -120,6 +116,7 @@ def test_orchestrator_records_learning_event(monkeypatch, tmp_path):
     from ai_server.models import AgentManifest
     from ai_server.orchestrators.tools import CallSpecialistTool
 
+    publisher = AsyncMock()
     orch_manifest = AgentManifest(
         id="internal_orchestrator", name="Переговорщик", kind="orchestrator", description="test"
     )
@@ -127,7 +124,7 @@ def test_orchestrator_records_learning_event(monkeypatch, tmp_path):
         orch_manifest,
         agent_tools=[CallSpecialistTool({}, [])],
         llm=FakeOrchestratorLLM(),
-        learning_recorder=recorder,
+        result_publisher=publisher,
     )
 
     task = AgentTask(
@@ -143,55 +140,23 @@ def test_orchestrator_records_learning_event(monkeypatch, tmp_path):
         },
     )
     anyio.run(orchestrator.handle, task)
-    event = recorder.latest(limit=1)[0]
 
-    assert event["source"] == "bitrix24_chat"
-    assert event["agent_id"] == "internal_orchestrator"
-    assert event["request"] == "Покажи задачи в Битриксе"
-    assert event["response"] == "Готово"
-    assert event["metadata"]["dialog_key"] == "chat:77:user:9"
+    publisher.publish.assert_called_once()
+    call_task, call_result = publisher.publish.call_args.args
+    assert call_task.task_id == "test-task"
+    assert call_result.answer == "Готово"
 
 
-def test_learning_feedback_endpoint(monkeypatch, tmp_path):
+def test_learning_status_endpoint(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     monkeypatch.setenv("WEBHOOK_SECRET", "")
-    monkeypatch.setenv("LEARNING_EVENTS_ENABLED", "true")
-    monkeypatch.setenv("LEARNING_EVENTS_CAPTURE_TEXT", "true")
 
     with TestClient(app) as client:
         status = client.get("/learning/status")
-        feedback = client.post(
-            "/learning/feedback",
-            json={
-                "event_id": "event-1",
-                "rating": -1,
-                "comment": "Нужно поправить тон",
-                "corrected_answer": "Более короткий ответ",
-                "tags": ["tone"],
-                "user_id": "9",
-            },
-        )
-        events = client.get("/learning/events")
 
     assert status.status_code == 200
-    assert feedback.status_code == 200
-    assert feedback.json()["recorded"] is True
-    assert events.json()["events"][0]["event_type"] == "human_feedback"
-    assert events.json()["events"][0]["metadata"]["rating"] == -1
-
-
-def test_learning_events_endpoint_requires_secret_when_configured(monkeypatch, tmp_path):
-    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
-    monkeypatch.setenv("WEBHOOK_SECRET", "learning-secret")
-
-    with TestClient(app) as client:
-        forbidden = client.get("/learning/events")
-        allowed = client.get("/learning/events?secret=learning-secret")
-
-    assert forbidden.status_code == 403
-    assert allowed.status_code == 200
+    assert "diagnost" in status.json()["status"].lower()
 
 
 def test_event_stream_subscriber_called(tmp_path):

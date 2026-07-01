@@ -45,10 +45,13 @@ class SpecialistDeps:
     # kartoteka specialist
     kartoteka_store: Any = None  # PostgresKartotekaStore | None
     kartoteka_llm: Any = None  # KartotekaAgentLLM | None
-    # channel delivery + telemetry (captured by InternalOrchestrator.build, not passed to specialists)
+    # diagnost specialist
+    diagnost_store: Any = None  # PostgresDiagnostStore | None
+    diagnost_llm: Any = None  # DiagnostAgentLLM | None
+    # channel delivery (captured by InternalOrchestrator.build, not passed to specialists)
     channels: Any = None  # dict[str, ChannelPort]
     footer_service: Any = None  # TechnicalFooterService | None
-    learning_recorder: Any = None  # LearningEventRecorder | None
+    result_publisher: Any = None  # ResultPublisherPort | None
 
     def as_build_kwargs(self) -> dict[str, Any]:
         """All non-None fields — pass to any agent build() method."""

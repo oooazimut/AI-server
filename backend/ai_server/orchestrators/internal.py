@@ -8,8 +8,13 @@ from typing import Any
 from pydantic import ValidationError
 
 from ai_server.agents.base import BaseSpecialist
-from ai_server.agents.ports import AgentQueuePort, ChannelPort, OrchestratorStorePort, SchedulerPort
-from ai_server.learning import LearningEventRecorder
+from ai_server.agents.ports import (
+    AgentQueuePort,
+    ChannelPort,
+    OrchestratorStorePort,
+    ResultPublisherPort,
+    SchedulerPort,
+)
 from ai_server.models import AgentManifest, AgentResult, AgentTask, ScheduledTask
 from ai_server.orchestrators.orchestrator_llm import (
     OrchestratorFinalResult,
@@ -47,7 +52,7 @@ class InternalOrchestrator(BaseSpecialist):
         retriever: HybridKnowledgeRetriever | None = None,
         channels: dict[str, ChannelPort] | None = None,
         footer_service: TechnicalFooterService | None = None,
-        learning_recorder: LearningEventRecorder | None = None,
+        result_publisher: ResultPublisherPort | None = None,
     ) -> None:
         super().__init__(
             manifest,
@@ -59,7 +64,7 @@ class InternalOrchestrator(BaseSpecialist):
         )
         self._channels: dict[str, ChannelPort] = channels or {}
         self._footer_svc = footer_service
-        self._learning_recorder = learning_recorder
+        self._result_publisher = result_publisher
 
     # ------------------------------------------------------------------
     # BaseSpecialist hooks
@@ -110,7 +115,7 @@ class InternalOrchestrator(BaseSpecialist):
             result.status,
         )
         await self._send_to_channel(task, result)
-        self._record_learning(task, result, elapsed_ms=elapsed_ms)
+        await self._publish_result(task, result)
         return result
 
     async def run(self, queue: AgentQueuePort) -> None:
@@ -182,7 +187,7 @@ class InternalOrchestrator(BaseSpecialist):
         orchestrator_retriever: HybridKnowledgeRetriever | None = None,
         channels: dict[str, ChannelPort] | None = None,
         footer_service: TechnicalFooterService | None = None,
-        learning_recorder: LearningEventRecorder | None = None,
+        result_publisher: ResultPublisherPort | None = None,
         **specialist_deps: Any,
     ) -> InternalOrchestrator:
         _manifests = manifests or []
@@ -213,7 +218,7 @@ class InternalOrchestrator(BaseSpecialist):
             retriever=orchestrator_retriever,
             channels=channels,
             footer_service=footer_service,
-            learning_recorder=learning_recorder,
+            result_publisher=result_publisher,
         )
         # Break circular dep: CallSpecialistTool needs orch to schedule specialist tasks
         call_tool.schedule_fn = orch._apply_scheduled_tasks_from_specialist
@@ -272,20 +277,13 @@ class InternalOrchestrator(BaseSpecialist):
             except Exception:
                 logger.exception("Channel send failed for channel=%s recipient=%s", channel_id, recipient_id)
 
-    def _record_learning(
-        self, task: AgentTask, result: AgentResult, *, elapsed_ms: dict[str, float] | None = None
-    ) -> None:
-        if self._learning_recorder is None:
+    async def _publish_result(self, task: AgentTask, result: AgentResult) -> None:
+        if self._result_publisher is None:
             return
         try:
-            self._learning_recorder.record_agent_result(
-                task,
-                result,
-                metadata={"dialog_key": task.context.get("dialog_key", "")},
-                elapsed_ms=elapsed_ms,
-            )
+            await self._result_publisher.publish(task, result)
         except Exception:
-            logger.exception("Learning recording failed")
+            logger.exception("Result publishing failed")
 
     # ------------------------------------------------------------------
     # Backward-compat: expose specialists dict for startup.py run() calls
