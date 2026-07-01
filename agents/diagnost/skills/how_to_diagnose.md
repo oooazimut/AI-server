@@ -1,21 +1,36 @@
-# Как проводить диагностику системы
+# Как провести диагностику
 
-## Общий подход
+Используй этот скил как отправную точку для любого запроса на диагностику системы.
 
-1. Начни с отчёта: `diagnost_error_report` — покажет сводку инцидентов за последние N часов.
-2. Если нужен конкретный инцидент: `diagnost_get_incident` по ID.
-3. Для поиска проблемных диалогов: `diagnost_search_events` по ключевым словам.
-4. Для создания инцидента вручную: `diagnost_create_incident` с ID события и описанием.
+## Быстрый старт
 
-## Когда автоматически создаётся инцидент
+1. **Сводка за период** → сначала всегда вызови `diagnost_error_report(since_hours=24)`.
+2. **Конкретная проблема** → ищи событие через `diagnost_search_events(query="ключевые слова")`.
+3. **Конкретный инцидент** → получи детали через `diagnost_get_incident(incident_id="...")`.
+4. **Все открытые инциденты** → `diagnost_list_incidents(status="open")`.
+5. **Ручной инцидент** → `diagnost_create_incident(event_id="...", comment="описание")`.
 
-Воркер создаёт инцидент автоматически при:
+## Когда что применять
+
+| Ситуация | Инструмент |
+|---|---|
+| "Покажи ошибки за неделю" | `diagnost_error_report(since_hours=168)` |
+| "Что случилось с запросом про камеру" | `diagnost_search_events(query="камера")` |
+| "Открой инцидент №X" | `diagnost_get_incident(incident_id="X")` |
+| "Сколько открытых проблем?" | `diagnost_list_incidents(status="open", limit=50)` |
+| "Пометь это событие как проблему" | `diagnost_create_incident(event_id="...", comment="...")` |
+
+## Как автоматически создаются инциденты
+
+Воркер диагноста создаёт инцидент при каждом событии оркестратора с:
 - `status = "failed"` → `reason = "failed"`
 - `confidence < 0.5` → `reason = "low_confidence"`
 
+Ручные инциденты создаются через `diagnost_create_incident` с `reason = "manual"`.
+
 ## Статусы инцидентов
 
-- `open` — открыт, требует внимания
+- `open` — требует внимания
 - `resolved` — закрыт
 
-Для фильтрации: `diagnost_list_incidents` с параметром `status`.
+Фильтрация: `diagnost_list_incidents(status="open")` или `diagnost_list_incidents(status="resolved")`.

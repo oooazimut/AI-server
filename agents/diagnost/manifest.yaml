@@ -13,6 +13,8 @@ handoff_description: >
   Не работает с Bitrix или бизнес-данными.
 
 entrypoint: backend.ai_server.agents.diagnost.DiagnostSpecialist
+instructions_file: agents/diagnost/instructions.md
+knowledge_path: agents/diagnost/knowledge
 skills_path: agents/diagnost/skills
 
 capabilities:
