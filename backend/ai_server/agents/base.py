@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from ai_server.agents.ports import AgentQueuePort, AgentStorePort, SchedulerPort
+from ai_server.agents.ports import AgentQueuePort, AgentStorePort, ResultPublisherPort, SchedulerPort
 from ai_server.agents.tool import AgentTool
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult, ToolStatus
@@ -44,6 +44,7 @@ class BaseSpecialist:
         llm: Any = None,
         scheduler: SchedulerPort | None = None,
         store: AgentStorePort | None = None,
+        result_publisher: ResultPublisherPort | None = None,
     ) -> None:
         self.manifest = manifest
         self.knowledge_base = knowledge_base
@@ -53,6 +54,7 @@ class BaseSpecialist:
         self.llm = llm
         self._scheduler = scheduler
         self.store = store
+        self._result_publisher = result_publisher
 
     # ------------------------------------------------------------------
     # Hooks subclasses implement/override
@@ -362,6 +364,11 @@ class BaseSpecialist:
                     await queue.nack(msg_id, error=f"invalid message: {exc}")
                     continue
                 result = await self.handle(task)
+                if self._result_publisher is not None:
+                    try:
+                        await self._result_publisher.publish(task, result)
+                    except Exception:
+                        logger.exception("Agent %s: result_publisher failed", agent_id)
                 reply_to = message.get("reply_to") or ""
                 if reply_to:
                     await queue.publish(

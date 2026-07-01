@@ -38,6 +38,7 @@ async def run_webhook_event_worker(
     transcriber: Any,
     status: dict[str, Any],
     settings: Settings,
+    feedback_receiver: Any = None,
 ) -> None:
     worker_count = settings.webhook_event_queue_worker_count
     active_partition_keys: set[str] = set()
@@ -69,6 +70,7 @@ async def run_webhook_event_worker(
                 active_partition_keys=active_partition_keys,
                 active_lock=active_lock,
                 settings=settings,
+                feedback_receiver=feedback_receiver,
             )
         )
         for index in range(worker_count)
@@ -94,6 +96,7 @@ async def _run_webhook_event_worker_loop(
     active_partition_keys: set[str],
     active_lock: asyncio.Lock,
     settings: Settings,
+    feedback_receiver: Any = None,
 ) -> None:
     while True:
         event_id: int | None = None
@@ -121,6 +124,7 @@ async def _run_webhook_event_worker_loop(
                 attachment_service=attachment_service,
                 transcriber=transcriber,
                 settings=settings,
+                feedback_receiver=feedback_receiver,
             )
             await queue.mark_done(event_id, result)
             status["last_error"] = None
@@ -150,6 +154,7 @@ async def _route_event(
     attachment_service: AttachmentService,
     transcriber: Any,
     settings: Settings,
+    feedback_receiver: Any = None,
 ) -> dict[str, Any]:
     """Route a Bitrix webhook event to the appropriate agent queue."""
     if event_type in MESSAGE_EVENTS:
@@ -159,6 +164,14 @@ async def _route_event(
             transcriber=transcriber,
             settings=settings,
         )
+        if feedback_receiver is not None:
+            try:
+                intercepted = await feedback_receiver.handle(task)
+            except Exception:
+                logger.exception("_route_event: feedback_receiver.handle failed")
+                intercepted = False
+            if intercepted:
+                return {"handled": True, "routed_to": "feedback_receiver", "event": event_type}
         await agent_queue.publish(
             {
                 "to": "orchestrator",

@@ -36,6 +36,7 @@ class PtoSpecialist(BaseSpecialist):
         llm: PtoAgentLLM | None = None,
         scheduler: SchedulerPort | None = None,
         store: Any | None = None,
+        result_publisher: Any | None = None,
     ) -> None:
         super().__init__(
             manifest,
@@ -46,6 +47,7 @@ class PtoSpecialist(BaseSpecialist):
             llm=llm,
             scheduler=scheduler,
             store=store,
+            result_publisher=result_publisher,
         )
 
     @classmethod
@@ -59,6 +61,7 @@ class PtoSpecialist(BaseSpecialist):
         pto_llm: PtoAgentLLM | None = None,
         pto_store: Any | None = None,
         scheduler: SchedulerPort | None = None,
+        specialist_result_publisher: Any | None = None,
         **_: Any,
     ) -> PtoSpecialist:
         from ai_server.settings import get_settings
@@ -78,6 +81,7 @@ class PtoSpecialist(BaseSpecialist):
             llm=pto_llm or PtoLLMService(),
             scheduler=scheduler,
             store=pto_store,
+            result_publisher=specialist_result_publisher,
         )
 
     def _llm_failure_result(self, message: str):

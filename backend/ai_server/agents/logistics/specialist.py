@@ -50,6 +50,7 @@ class LogisticsSpecialist(BaseSpecialist):
         scheduler: SchedulerPort | None = None,
         store: Any | None = None,
         vu_settings: VehicleUsageSettings | None = None,
+        result_publisher: Any | None = None,
     ) -> None:
         self._vu_settings = vu_settings
         super().__init__(
@@ -61,6 +62,7 @@ class LogisticsSpecialist(BaseSpecialist):
             llm=llm,
             scheduler=scheduler,
             store=store,
+            result_publisher=result_publisher,
         )
 
     @classmethod
@@ -74,6 +76,7 @@ class LogisticsSpecialist(BaseSpecialist):
         logistics_store: Any | None = None,
         scheduler: SchedulerPort | None = None,
         logistics_vu_settings: VehicleUsageSettings | None = None,
+        specialist_result_publisher: Any | None = None,
         **_: Any,
     ) -> LogisticsSpecialist:
         tools: list[AgentTool] = [
@@ -89,6 +92,7 @@ class LogisticsSpecialist(BaseSpecialist):
             scheduler=scheduler,
             store=logistics_store,
             vu_settings=logistics_vu_settings,
+            result_publisher=specialist_result_publisher,
         )
 
     # ------------------------------------------------------------------

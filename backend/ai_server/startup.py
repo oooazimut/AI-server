@@ -21,7 +21,6 @@ from .integrations.postgres.pto_agent import PostgresPtoAgentStore
 from .integrations.postgres.vehicle_usage import PostgresVehicleUsageStore
 from .integrations.redis.agent_queue import RedisAgentQueue
 from .integrations.redis.event_queue import RedisEventQueue
-from .learning import LearningEventRecorder
 from .llm import build_orchestrator_llm_client
 from .orchestrators.internal import InternalOrchestrator
 from .orchestrators.orchestrator_llm import OrchestratorLLMService
@@ -94,7 +93,6 @@ async def lifespan(app: FastAPI):
     bitrix_store = await _make_bitrix_store(settings)
     portal_search = bitrix_store
     portal_search_indexer = PortalSearchIndexerWorker(bitrix, portal_search, settings=settings)
-    learning_recorder = LearningEventRecorder()
     webhook_event_queue = _make_event_queue(settings)
     pto_store = await _make_pto_store(settings)
     orchestrator_store = await _make_orchestrator_store(settings)
@@ -106,7 +104,6 @@ async def lifespan(app: FastAPI):
     app.state.bitrix_oauth = bitrix_oauth
     app.state.portal_search = portal_search
     app.state.portal_search_indexer = portal_search_indexer
-    app.state.learning_recorder = learning_recorder
     app.state.webhook_event_queue = webhook_event_queue
     app.state.webhook_event_status = {
         "enabled": True,
@@ -258,7 +255,6 @@ async def lifespan(app: FastAPI):
             kartoteka_llm=KartotekaLLMService(),
             channels={"bitrix24": bitrix_channel},
             footer_service=TechnicalFooterService(settings=settings),
-            learning_recorder=learning_recorder,
         )
         orch_manifest = next((m for m in manifests if m.kind == "orchestrator"), None)
         orchestrator = InternalOrchestrator.build(

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from ai_server.models import AgentResult, AgentTask
 
 
 class AgentQueuePort(Protocol):
@@ -63,3 +66,9 @@ class SchedulerPort(Protocol):
         task_description: str,
         context: dict[str, Any] | None = None,
     ) -> Any: ...
+
+
+class ResultPublisherPort(Protocol):
+    """Output port: publish orchestrator result for downstream consumers (e.g. DiagnostWorker)."""
+
+    async def publish(self, task: AgentTask, result: AgentResult) -> None: ...
