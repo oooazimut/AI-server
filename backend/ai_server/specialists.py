@@ -51,7 +51,8 @@ class SpecialistDeps:
     # channel delivery (captured by InternalOrchestrator.build, not passed to specialists)
     channels: Any = None  # dict[str, ChannelPort]
     footer_service: Any = None  # TechnicalFooterService | None
-    result_publisher: Any = None  # ResultPublisherPort | None
+    result_publisher: Any = None  # ResultPublisherPort | None (orchestrator)
+    specialist_result_publisher: Any = None  # ResultPublisherPort | None (specialists, not diagnost)
 
     def as_build_kwargs(self) -> dict[str, Any]:
         """All non-None fields — pass to any agent build() method."""

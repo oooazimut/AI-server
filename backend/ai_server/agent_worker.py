@@ -54,8 +54,10 @@ from ai_server.workers.bitrix.staff_roster_publisher import publish_staff_roster
 from ai_server.workers.bitrix.supervisor import run_task_supervisor
 from ai_server.workers.bitrix.webhook_event_queue import run_webhook_event_worker
 from ai_server.workers.diagnost.event_worker import run_diagnost_event_worker
+from ai_server.workers.diagnost.feedback_receiver import FeedbackReceiverAdapter
+from ai_server.workers.diagnost.feedback_scheduler import run_feedback_scheduler_worker
 from ai_server.workers.logistics.staff_sync import run_staff_sync
-from ai_server.workers.orchestrator.result_publisher import OrchestratorResultPublisher
+from ai_server.workers.orchestrator.result_publisher import OrchestratorResultPublisher, SpecialistResultPublisher
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +113,7 @@ async def main() -> None:
     portal_search_indexer = PortalSearchIndexerWorker(bitrix, portal_search, settings=settings)
     diagnost_queue = RedisDiagnostQueue(settings.redis_url)
     result_publisher = OrchestratorResultPublisher(diagnost_queue)
+    specialist_result_publisher = SpecialistResultPublisher(diagnost_queue)
     webhook_event_queue = RedisEventQueue(settings.redis_url)
 
     vehicle_usage_store = None
@@ -158,6 +161,7 @@ async def main() -> None:
             kartoteka_store=kartoteka_store,
             diagnost_llm=DiagnostLLMService(),
             diagnost_store=diagnost_store,
+            specialist_result_publisher=specialist_result_publisher,
             logistics_llm=logistics_llm_svc,
             vehicle_usage_store=vehicle_usage_store,
             logistics_vu_settings=vu_settings,
@@ -264,6 +268,7 @@ async def main() -> None:
             "errors": 0,
             "last_error": None,
         }
+        feedback_receiver = FeedbackReceiverAdapter(diagnost_store)
         agent_tasks.append(
             asyncio.create_task(
                 run_webhook_event_worker(
@@ -273,6 +278,7 @@ async def main() -> None:
                     transcriber=transcriber,
                     status=_webhook_status,
                     settings=settings,
+                    feedback_receiver=feedback_receiver,
                 )
             )
         )
@@ -281,6 +287,7 @@ async def main() -> None:
             agent_tasks.append(asyncio.create_task(sp.run(agent_queue)))  # type: ignore[union-attr]
         agent_tasks.append(asyncio.create_task(portal_search_indexer.run(agent_queue)))
         agent_tasks.append(asyncio.create_task(run_diagnost_event_worker(diagnost_queue, diagnost_store)))
+        agent_tasks.append(asyncio.create_task(run_feedback_scheduler_worker(diagnost_store, bitrix)))
 
     if settings.vehicle_usage_enabled and vehicle_usage_store is not None:
         _bitrix_ref = bitrix

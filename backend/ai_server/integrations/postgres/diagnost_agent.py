@@ -36,7 +36,8 @@ class PostgresDiagnostStore(PostgresAgentSchema):
                     handoff_to TEXT[],
                     actions JSONB,
                     model_usage JSONB,
-                    metadata JSONB
+                    metadata JSONB,
+                    source TEXT NOT NULL DEFAULT 'orchestrator'
                 )
                 """
             )
@@ -46,6 +47,11 @@ class PostgresDiagnostStore(PostgresAgentSchema):
             )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_diagnost_events_confidence ON diagnost.events (confidence)"
+            )
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_diagnost_events_source ON diagnost.events (source)")
+            # ALTER for existing tables that predate the source column
+            await db.execute(
+                "ALTER TABLE diagnost.events ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'orchestrator'"
             )
             await db.execute(
                 """
@@ -63,8 +69,42 @@ class PostgresDiagnostStore(PostgresAgentSchema):
             )
             await db.execute("CREATE INDEX IF NOT EXISTS idx_diagnost_incidents_status ON diagnost.incidents (status)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_diagnost_incidents_event ON diagnost.incidents (event_id)")
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS diagnost.pending_feedback (
+                    id BIGSERIAL PRIMARY KEY,
+                    event_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    dialog_key TEXT NOT NULL,
+                    channel TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    prompt_sent_at TIMESTAMPTZ,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                )
+                """
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_pending_fb_user ON diagnost.pending_feedback (user_id, status)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_pending_fb_status ON diagnost.pending_feedback (status, created_at)"
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS diagnost.feedback (
+                    id BIGSERIAL PRIMARY KEY,
+                    event_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    dialog_key TEXT,
+                    rating SMALLINT,
+                    raw_text TEXT NOT NULL DEFAULT '',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_feedback_event ON diagnost.feedback (event_id)")
 
-    async def save_event(self, task: AgentTask, result: AgentResult) -> None:
+    async def save_event(self, task: AgentTask, result: AgentResult, *, source: str = "orchestrator") -> None:
         user_id = str(task.user.id) if task.user and task.user.id is not None else None
         channel = task.user.channel if task.user else None
         async with await self._connect() as db:
@@ -72,8 +112,8 @@ class PostgresDiagnostStore(PostgresAgentSchema):
                 """
                 INSERT INTO diagnost.events
                     (event_id, agent_id, user_id, channel, request, response,
-                     status, confidence, handoff_to, actions, model_usage, metadata)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     status, confidence, handoff_to, actions, model_usage, metadata, source)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (event_id) DO NOTHING
                 """,
                 (
@@ -89,6 +129,7 @@ class PostgresDiagnostStore(PostgresAgentSchema):
                     _jsonb([a.model_dump() for a in result.actions_taken]),
                     _jsonb([u.model_dump() for u in result.model_usage]),
                     _jsonb({"dialog_key": task.context.get("dialog_key", "")}),
+                    source,
                 ),
             )
 
@@ -111,7 +152,7 @@ class PostgresDiagnostStore(PostgresAgentSchema):
             cur = await db.execute(
                 """
                 SELECT event_id, created_at, agent_id, user_id, channel,
-                       request, response, status, confidence, handoff_to
+                       request, response, status, confidence, handoff_to, source
                 FROM diagnost.events
                 WHERE request ILIKE %s OR response ILIKE %s
                 ORDER BY created_at DESC
@@ -201,14 +242,121 @@ class PostgresDiagnostStore(PostgresAgentSchema):
             )
             recent = await cur3.fetchall()
 
+            cur4 = await db.execute(
+                """
+                SELECT e.agent_id, COUNT(*) AS cnt
+                FROM diagnost.incidents i
+                LEFT JOIN diagnost.events e ON e.event_id = i.event_id
+                WHERE i.created_at >= NOW() - INTERVAL '%s hours'
+                GROUP BY e.agent_id
+                ORDER BY cnt DESC
+                """,
+                (since_hours,),
+            )
+            by_specialist = await cur4.fetchall()
+
+            cur5 = await db.execute(
+                """
+                SELECT AVG(rating) AS avg_rating, COUNT(*) AS feedback_count
+                FROM diagnost.feedback
+                WHERE created_at >= NOW() - INTERVAL '%s hours'
+                """,
+                (since_hours,),
+            )
+            fb_totals = await cur5.fetchone()
+
         return {
             "since_hours": since_hours,
             "generated_at": datetime.now(UTC).isoformat(),
             "total_incidents": int((totals or {}).get("total") or 0),
             "open_incidents": int((totals or {}).get("open_count") or 0),
             "by_reason": [{"reason": r["reason"], "count": int(r["cnt"])} for r in by_reason],
+            "by_specialist": [{"agent_id": r["agent_id"] or "unknown", "count": int(r["cnt"])} for r in by_specialist],
+            "avg_rating": float((fb_totals or {}).get("avg_rating") or 0) or None,
+            "feedback_count": int((fb_totals or {}).get("feedback_count") or 0),
             "recent_incidents": [_row(r) for r in recent],
         }
+
+    # ------------------------------------------------------------------
+    # FeedbackLoop methods
+    # ------------------------------------------------------------------
+
+    async def create_pending_feedback(
+        self, event_id: str, user_id: str, dialog_key: str, *, channel: str | None = None
+    ) -> None:
+        async with await self._connect() as db:
+            await db.execute(
+                """
+                INSERT INTO diagnost.pending_feedback (event_id, user_id, dialog_key, channel)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (event_id, user_id, dialog_key, channel),
+            )
+
+    async def get_pending_feedback_for_user(self, user_id: str) -> dict[str, Any] | None:
+        """Return the most recent 'sent' pending_feedback entry for the user, or None."""
+        async with await self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT id, event_id, user_id, dialog_key, channel, created_at
+                FROM diagnost.pending_feedback
+                WHERE user_id = %s AND status = 'sent'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (user_id,),
+            )
+            row = await cur.fetchone()
+        return _row(row) if row else None
+
+    async def get_unsent_feedback_requests(self, *, delay_seconds: int = 10, limit: int = 20) -> list[dict[str, Any]]:
+        """Return pending_feedback rows whose dialog turn is old enough to send a prompt."""
+        async with await self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT id, event_id, user_id, dialog_key, channel, created_at
+                FROM diagnost.pending_feedback
+                WHERE status = 'pending'
+                  AND created_at <= NOW() - INTERVAL '%s seconds'
+                ORDER BY created_at ASC
+                LIMIT %s
+                """,
+                (delay_seconds, limit),
+            )
+            rows = await cur.fetchall()
+        return [_row(r) for r in rows]
+
+    async def save_feedback(
+        self,
+        event_id: str,
+        user_id: str,
+        *,
+        rating: int | None,
+        raw_text: str,
+        dialog_key: str = "",
+    ) -> None:
+        async with await self._connect() as db:
+            await db.execute(
+                """
+                INSERT INTO diagnost.feedback (event_id, user_id, dialog_key, rating, raw_text)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (event_id, user_id, dialog_key or None, rating, raw_text),
+            )
+
+    async def mark_pending_sent(self, pending_id: int) -> None:
+        async with await self._connect() as db:
+            await db.execute(
+                "UPDATE diagnost.pending_feedback SET status = 'sent', prompt_sent_at = NOW() WHERE id = %s",
+                (pending_id,),
+            )
+
+    async def mark_pending_received(self, pending_id: int) -> None:
+        async with await self._connect() as db:
+            await db.execute(
+                "UPDATE diagnost.pending_feedback SET status = 'received' WHERE id = %s",
+                (pending_id,),
+            )
 
 
 def _jsonb(value: Any) -> str:

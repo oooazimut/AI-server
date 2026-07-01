@@ -53,6 +53,8 @@ def test_ensure_schema_creates_events_and_incidents():
     assert "diagnost.incidents" in joined
     assert "idx_diagnost_events_status" in joined
     assert "idx_diagnost_incidents_status" in joined
+    assert "diagnost.pending_feedback" in joined
+    assert "diagnost.feedback" in joined
 
 
 # ── save_event ─────────────────────────────────────────────────────────────────
@@ -161,11 +163,15 @@ def test_error_report_returns_aggregated_structure():
     totals_cur.fetchone = AsyncMock(return_value={"total": 3, "open_count": 2})
     recent_cur = AsyncMock()
     recent_cur.fetchall = AsyncMock(return_value=[])
+    by_specialist_cur = AsyncMock()
+    by_specialist_cur.fetchall = AsyncMock(return_value=[{"agent_id": "bitrix24", "cnt": 2}])
+    fb_totals_cur = AsyncMock()
+    fb_totals_cur.fetchone = AsyncMock(return_value={"avg_rating": 4.0, "feedback_count": 5})
 
     db = AsyncMock()
     db.__aenter__ = AsyncMock(return_value=db)
     db.__aexit__ = AsyncMock(return_value=False)
-    db.execute = AsyncMock(side_effect=[by_reason_cur, totals_cur, recent_cur])
+    db.execute = AsyncMock(side_effect=[by_reason_cur, totals_cur, recent_cur, by_specialist_cur, fb_totals_cur])
 
     with patch.object(store, "_connect", AsyncMock(return_value=db)):
         report = _run(store.error_report(since_hours=24))
@@ -174,4 +180,79 @@ def test_error_report_returns_aggregated_structure():
     assert report["total_incidents"] == 3
     assert report["open_incidents"] == 2
     assert report["by_reason"][0]["reason"] == "low_confidence"
+    assert report["by_specialist"][0]["agent_id"] == "bitrix24"
+    assert report["avg_rating"] == 4.0
+    assert report["feedback_count"] == 5
     assert "generated_at" in report
+
+
+def _fake_db_for_feedback():
+    db = AsyncMock()
+    db.__aenter__ = AsyncMock(return_value=db)
+    db.__aexit__ = AsyncMock(return_value=False)
+    db.execute = AsyncMock()
+    return db
+
+
+def test_create_pending_feedback_executes_insert():
+    store = _store()
+    db = _fake_db_for_feedback()
+    with patch.object(store, "_connect", AsyncMock(return_value=db)):
+        _run(store.create_pending_feedback("ev-1", "user-1", "dialog-1", channel="bitrix24"))
+    sql = db.execute.call_args.args[0]
+    assert "INSERT INTO diagnost.pending_feedback" in sql
+
+
+def test_get_pending_feedback_for_user_returns_row():
+    store = _store()
+    row = {"id": 1, "event_id": "ev-1", "user_id": "u1", "dialog_key": "dk"}
+    cur = AsyncMock()
+    cur.fetchone = AsyncMock(return_value=row)
+    db = AsyncMock()
+    db.__aenter__ = AsyncMock(return_value=db)
+    db.__aexit__ = AsyncMock(return_value=False)
+    db.execute = AsyncMock(return_value=cur)
+    with patch.object(store, "_connect", AsyncMock(return_value=db)):
+        result = _run(store.get_pending_feedback_for_user("u1"))
+    assert result is not None
+    assert result["event_id"] == "ev-1"
+
+
+def test_get_pending_feedback_for_user_returns_none_when_not_found():
+    store = _store()
+    cur = AsyncMock()
+    cur.fetchone = AsyncMock(return_value=None)
+    db = AsyncMock()
+    db.__aenter__ = AsyncMock(return_value=db)
+    db.__aexit__ = AsyncMock(return_value=False)
+    db.execute = AsyncMock(return_value=cur)
+    with patch.object(store, "_connect", AsyncMock(return_value=db)):
+        result = _run(store.get_pending_feedback_for_user("no-user"))
+    assert result is None
+
+
+def test_save_feedback_executes_insert():
+    store = _store()
+    db = _fake_db_for_feedback()
+    with patch.object(store, "_connect", AsyncMock(return_value=db)):
+        _run(store.save_feedback("ev-1", "u1", rating=5, raw_text="👍", dialog_key="dk"))
+    sql = db.execute.call_args.args[0]
+    assert "INSERT INTO diagnost.feedback" in sql
+
+
+def test_mark_pending_sent_updates_status():
+    store = _store()
+    db = _fake_db_for_feedback()
+    with patch.object(store, "_connect", AsyncMock(return_value=db)):
+        _run(store.mark_pending_sent(42))
+    sql = db.execute.call_args.args[0]
+    assert "status = 'sent'" in sql
+
+
+def test_mark_pending_received_updates_status():
+    store = _store()
+    db = _fake_db_for_feedback()
+    with patch.object(store, "_connect", AsyncMock(return_value=db)):
+        _run(store.mark_pending_received(42))
+    sql = db.execute.call_args.args[0]
+    assert "status = 'received'" in sql

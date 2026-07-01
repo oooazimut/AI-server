@@ -1,0 +1,81 @@
+from __future__ import annotations
+
+import logging
+
+from ai_server.integrations.postgres.diagnost_agent import PostgresDiagnostStore
+from ai_server.models import AgentTask
+
+logger = logging.getLogger(__name__)
+
+# Words/symbols that count as a positive or negative rating.
+# Mapped to rating score 1–5.
+_RATING_MAP: dict[str, int] = {
+    "👍": 5,
+    "5": 5,
+    "5/5": 5,
+    "отлично": 5,
+    "супер": 5,
+    "хорошо": 4,
+    "4": 4,
+    "4/5": 4,
+    "неплохо": 4,
+    "нормально": 3,
+    "3": 3,
+    "3/5": 3,
+    "средне": 3,
+    "плохо": 2,
+    "2": 2,
+    "2/5": 2,
+    "слабо": 2,
+    "👎": 1,
+    "1": 1,
+    "1/5": 1,
+    "ужасно": 1,
+    "нет": 1,
+}
+
+
+def _detect_rating(text: str) -> tuple[int | None, str]:
+    """Return (rating, raw_text) or (None, raw_text) if the text is not a rating."""
+    normalized = text.strip().lower()
+    rating = _RATING_MAP.get(normalized)
+    return rating, text.strip()
+
+
+class FeedbackReceiverAdapter:
+    """Implements FeedbackReceiverPort: classify feedback messages and save to diagnost store.
+
+    Called from webhook_event_queue BEFORE routing to orchestrator.
+    Returns True  → intercept; False → pass through normally.
+    """
+
+    def __init__(self, store: PostgresDiagnostStore) -> None:
+        self._store = store
+
+    async def handle(self, task: AgentTask) -> bool:
+        user_id = str(task.user.id) if task.user and task.user.id is not None else ""
+        if not user_id:
+            return False
+
+        rating, raw_text = _detect_rating(task.request or "")
+        if rating is None:
+            return False
+
+        pending = await self._store.get_pending_feedback_for_user(user_id)
+        if pending is None:
+            return False
+
+        try:
+            await self._store.save_feedback(
+                pending["event_id"],
+                user_id,
+                rating=rating,
+                raw_text=raw_text,
+                dialog_key=str(pending.get("dialog_key") or task.context.get("dialog_key") or ""),
+            )
+            await self._store.mark_pending_received(int(pending["id"]))
+        except Exception:
+            logger.exception("FeedbackReceiverAdapter: failed to save feedback for user %s", user_id)
+            return False
+
+        return True

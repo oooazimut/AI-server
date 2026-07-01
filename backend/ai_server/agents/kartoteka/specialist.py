@@ -28,6 +28,7 @@ class KartotekaSpecialist(BaseSpecialist):
         kartoteka_store: Any | None = None,
         kartoteka_llm: KartotekaAgentLLM | None = None,
         scheduler: SchedulerPort | None = None,
+        specialist_result_publisher: Any | None = None,
         **_: Any,
     ) -> KartotekaSpecialist:
         tools: list[AgentTool] = [
@@ -43,6 +44,7 @@ class KartotekaSpecialist(BaseSpecialist):
             llm=kartoteka_llm or KartotekaLLMService(),
             scheduler=scheduler,
             store=kartoteka_store,
+            result_publisher=specialist_result_publisher,
         )
 
     def _llm_failure_result(self, message: str):  # noqa: ANN201

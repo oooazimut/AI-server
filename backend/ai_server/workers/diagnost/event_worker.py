@@ -50,13 +50,29 @@ async def run_diagnost_event_worker(
             task = AgentTask.model_validate(raw_task)
             result = AgentResult.model_validate(raw_result)
 
-            await store.save_event(task, result)
+            source = str(msg.get("source") or "orchestrator")
+            await store.save_event(task, result, source=source)
 
             confidence = result.confidence if result.confidence is not None else 1.0
             if result.status == "failed":
                 await store.save_incident(task.task_id, reason="failed")
             elif confidence < confidence_threshold:
                 await store.save_incident(task.task_id, reason="low_confidence")
+
+            # Schedule a feedback prompt for completed orchestrator turns with a real user
+            if source == "orchestrator" and result.status == "completed":
+                user_id = str(task.user.id) if task.user and task.user.id is not None else ""
+                dialog_key = str(task.context.get("dialog_key") or "")
+                if user_id and dialog_key:
+                    try:
+                        await store.create_pending_feedback(
+                            task.task_id,
+                            user_id,
+                            dialog_key,
+                            channel=task.user.channel if task.user else None,
+                        )
+                    except Exception:
+                        logger.exception("DiagnostWorker: create_pending_feedback failed for %s", task.task_id)
 
             await queue.ack(msg_id)
         except asyncio.CancelledError:
