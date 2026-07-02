@@ -22,7 +22,7 @@ async def run_feedback_scheduler_worker(
 ) -> None:
     """Read unsent pending_feedback rows and send a rating prompt via Bitrix.
 
-    bitrix must expose: async send_message(dialog_id, text) — BitrixClient satisfies this.
+    bitrix must expose: async send_bot_message(dialog_id, message) — BitrixClient satisfies this.
     """
     logger.info("FeedbackScheduler: started (delay=%ds, poll=%ds)", delay_seconds, poll_interval)
     while True:
@@ -33,7 +33,7 @@ async def run_feedback_scheduler_worker(
                 if not dialog_key:
                     continue
                 try:
-                    await bitrix.send_message(dialog_id=dialog_key, text=prompt_text)  # type: ignore[attr-defined]
+                    await bitrix.send_bot_message(dialog_key, prompt_text)  # type: ignore[attr-defined]
                     await store.mark_pending_sent(int(item["id"]))
                     logger.debug("FeedbackScheduler: prompt sent for event %s", item.get("event_id"))
                 except Exception:
