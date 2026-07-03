@@ -7,7 +7,7 @@ from ai_server.integrations.postgres.diagnost_agent import PostgresDiagnostStore
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_PROMPT = "Оцените ответ: 👍 (хорошо) или 👎 (плохо), либо введите оценку от 1 до 5."
+_DEFAULT_PROMPT = "Оцените ответ по 10-балльной шкале. Если что-то не так, напишите пояснение."
 _DEFAULT_DELAY_SECONDS = 10
 _DEFAULT_POLL_INTERVAL = 30
 

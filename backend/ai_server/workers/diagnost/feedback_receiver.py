@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from ai_server.integrations.postgres.diagnost_agent import PostgresDiagnostStore
 from ai_server.models import AgentTask
@@ -8,38 +9,49 @@ from ai_server.models import AgentTask
 logger = logging.getLogger(__name__)
 
 # Words/symbols that count as a positive or negative rating.
-# Mapped to rating score 1–5.
+# Mapped to rating score 1-10.
 _RATING_MAP: dict[str, int] = {
-    "👍": 5,
-    "5": 5,
-    "5/5": 5,
-    "отлично": 5,
-    "супер": 5,
-    "хорошо": 4,
-    "4": 4,
-    "4/5": 4,
-    "неплохо": 4,
-    "нормально": 3,
-    "3": 3,
-    "3/5": 3,
-    "средне": 3,
-    "плохо": 2,
-    "2": 2,
-    "2/5": 2,
+    "👍": 10,
+    "10": 10,
+    "10/10": 10,
+    "отлично": 10,
+    "супер": 10,
+    "хорошо": 8,
+    "неплохо": 7,
+    "нормально": 5,
+    "средне": 5,
+    "плохо": 3,
     "слабо": 2,
     "👎": 1,
-    "1": 1,
-    "1/5": 1,
     "ужасно": 1,
     "нет": 1,
 }
 
 
+def _parse_numeric_rating(value: str) -> int | None:
+    if value.isdigit():
+        rating = int(value)
+        return rating if 1 <= rating <= 10 else None
+    if value.endswith("/10"):
+        prefix = value[:-3].strip()
+        if prefix.isdigit():
+            rating = int(prefix)
+            return rating if 1 <= rating <= 10 else None
+    return None
+
+
 def _detect_rating(text: str) -> tuple[int | None, str]:
     """Return (rating, raw_text) or (None, raw_text) if the text is not a rating."""
-    normalized = text.strip().lower()
+    raw_text = text.strip()
+    normalized = raw_text.lower()
     rating = _RATING_MAP.get(normalized)
-    return rating, text.strip()
+    if rating is None:
+        rating = _parse_numeric_rating(normalized)
+    if rating is None:
+        match = re.match(r"^(10|[1-9])(?:\s*/\s*10)?(?:\b|\s|[.,:;!?)\]-])", normalized)
+        if match:
+            rating = int(match.group(1))
+    return rating, raw_text
 
 
 class FeedbackReceiverAdapter:
