@@ -118,8 +118,7 @@ class YandexSpeechKitTranscriber:
         if len(chunks) > self.max_chunks:
             max_seconds = self.chunk_seconds * self.max_chunks
             raise TranscriptionError(
-                f"Attachment is too long for SpeechKit chunked sync recognition; "
-                f"maximum is about {max_seconds} seconds"
+                f"Attachment is too long for SpeechKit chunked sync recognition; maximum is about {max_seconds} seconds"
             )
 
         texts: list[str] = []
@@ -181,7 +180,7 @@ class YandexSpeechKitTranscriber:
                 "Set FFMPEG_PATH or install ffmpeg."
             )
 
-        chunk_pattern = source.with_suffix(f".speechkit-chunk-%03d.ogg")
+        chunk_pattern = source.with_suffix(".speechkit-chunk-%03d.ogg")
         for old_chunk in source.parent.glob(f"{source.stem}.speechkit-chunk-*.ogg"):
             old_chunk.unlink(missing_ok=True)
 
