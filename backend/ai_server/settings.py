@@ -60,6 +60,7 @@ class Settings:
     webhook_event_queue_retry_base_seconds: int
     webhook_event_queue_retry_max_seconds: int
     webhook_event_queue_stale_processing_seconds: int
+    scheduler_enabled: bool
     search_index_max_tasks: int
     search_index_max_projects: int
     search_index_max_storages: int
@@ -373,6 +374,7 @@ def get_settings() -> Settings:
         webhook_event_queue_retry_max_seconds=_env_int("WEBHOOK_EVENT_QUEUE_RETRY_MAX_SECONDS", 300) or 300,
         webhook_event_queue_stale_processing_seconds=_env_int("WEBHOOK_EVENT_QUEUE_STALE_PROCESSING_SECONDS", 300)
         or 300,
+        scheduler_enabled=_env_bool("AI_SERVER_SCHEDULER_ENABLED", True),
         search_index_max_tasks=_env_int("SEARCH_INDEX_MAX_TASKS", 5000) or 5000,
         search_index_max_projects=_env_int("SEARCH_INDEX_MAX_PROJECTS", 200) or 200,
         search_index_max_storages=_env_int("SEARCH_INDEX_MAX_STORAGES", 500) or 500,

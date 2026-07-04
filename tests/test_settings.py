@@ -65,6 +65,15 @@ def test_bitrix_oauth_bot_settings_can_be_loaded(monkeypatch):
     assert settings.bitrix_bot_oauth_user_id == 9
 
 
+def test_scheduler_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("AI_SERVER_SCHEDULER_ENABLED", "false")
+
+    settings = get_settings()
+
+    assert settings.scheduler_enabled is False
+
+
 def test_bitrix_oauth_urls_are_resolved(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://ai.example.com")
