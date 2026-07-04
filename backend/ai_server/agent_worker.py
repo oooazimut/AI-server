@@ -122,7 +122,10 @@ async def main() -> None:
         await vehicle_usage_store.ensure_schema()
 
     scheduler = AgentScheduler()
-    scheduler.start()
+    if settings.scheduler_enabled:
+        scheduler.start()
+    else:
+        logger.info("AgentScheduler disabled by AI_SERVER_SCHEDULER_ENABLED=false")
 
     agent_tasks: list[asyncio.Task] = []
 
@@ -177,7 +180,7 @@ async def main() -> None:
 
         agent_queue = RedisAgentQueue(settings.redis_url)
 
-        if settings.vehicle_usage_enabled:
+        if settings.scheduler_enabled and settings.vehicle_usage_enabled:
             dialog_id = settings.vehicle_usage_dialog_id or ""
             _vu_store_ref = vehicle_usage_store
             _orch_ref = orchestrator
@@ -242,14 +245,15 @@ async def main() -> None:
                 }
             )
 
-        scheduler.add_job_cron(
-            "bitrix24",
-            "morning_proposals",
-            _run_morning_proposals,
-            8,
-            30,
-            replace_existing=False,
-        )
+        if settings.scheduler_enabled:
+            scheduler.add_job_cron(
+                "bitrix24",
+                "morning_proposals",
+                _run_morning_proposals,
+                8,
+                30,
+                replace_existing=False,
+            )
 
         attachment_service = AttachmentService(bitrix)
         transcriber = build_transcriber()
