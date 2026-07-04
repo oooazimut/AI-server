@@ -130,6 +130,8 @@ class Settings:
     yandex_speechkit_lang: str
     yandex_speechkit_max_bytes: int
     yandex_speechkit_convert_to_ogg: bool
+    yandex_speechkit_chunk_seconds: int
+    yandex_speechkit_max_chunks: int
     ffmpeg_path: str
     agent_private_disk_path_markers: str
     agent_private_disk_restricted_user_ids: str
@@ -446,6 +448,8 @@ def get_settings() -> Settings:
         yandex_speechkit_lang=_env("YANDEX_SPEECHKIT_LANG", "ru-RU"),
         yandex_speechkit_max_bytes=_env_int("YANDEX_SPEECHKIT_MAX_BYTES", 1024 * 1024) or (1024 * 1024),
         yandex_speechkit_convert_to_ogg=_env_bool("YANDEX_SPEECHKIT_CONVERT_TO_OGG", True),
+        yandex_speechkit_chunk_seconds=_env_int("YANDEX_SPEECHKIT_CHUNK_SECONDS", 25) or 25,
+        yandex_speechkit_max_chunks=_env_int("YANDEX_SPEECHKIT_MAX_CHUNKS", 12) or 12,
         ffmpeg_path=_env("FFMPEG_PATH", "ffmpeg"),
         agent_private_disk_path_markers=_env("AGENT_PRIVATE_DISK_PATH_MARKERS", "Приватный доступ"),
         agent_private_disk_restricted_user_ids=_env("AGENT_PRIVATE_DISK_RESTRICTED_USER_IDS"),
