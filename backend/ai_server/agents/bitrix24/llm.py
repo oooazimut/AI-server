@@ -26,6 +26,7 @@ from ai_server.utils import confidence, optional_int
 logger = logging.getLogger(__name__)
 
 ALLOWED_TOOL_NAMES = {
+    "bitrix_warehouse_search",
     "bitrix_api",
     "task_create_draft",
     "save_incomplete_proposal",
@@ -221,7 +222,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
-        '"tool_calls":[{"name":"bitrix_api|task_create_draft|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
+        '"tool_calls":[{"name":"bitrix_warehouse_search|bitrix_api|task_create_draft|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
         "Перед каждым tool_call сам проверь, хватает ли данных для его корректного вызова. "
         "Нельзя вызывать tool с надеждой, что backend или tool сам разберётся с недостающими данными. "
         'Если данных не хватает, не вызывай tool: верни status=needs_clarification, tool_calls=[{"name":"none"}], '
@@ -230,6 +231,9 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Для поиска задач используй bitrix_api с tasks.task.list/tasks.task.get. "
         "Для поиска сотрудника по имени — bitrix_api с user.search, получи numeric ID. "
         "Для поиска проекта по названию — bitrix_api с sonet_group.get, получи numeric ID. "
+        "Для поиска складов, остатков и запросов вида 'найди склад Борисов' используй bitrix_warehouse_search, "
+        "а не свободный bitrix_api. Если пользователь просит что есть на складе/остатки, передай include_products=true. "
+        "Не вызывай search.search: этот метод в текущем Bitrix недоступен. "
         "Для создания задачи используй task_create_draft. "
         "Для task_create_draft именно ты распознаёшь title, responsible_id/responsible_self, "
         "group_id, deadline_iso или no_deadline. "

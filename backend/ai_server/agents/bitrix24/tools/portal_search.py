@@ -20,7 +20,10 @@ class PortalSearchTool:
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "scope": {"type": "string", "enum": ["all", "documents", "files", "tasks", "projects"]},
+                    "scope": {
+                        "type": "string",
+                        "enum": ["all", "documents", "files", "tasks", "projects", "catalog", "stores", "products"],
+                    },
                     "limit": {"type": "integer", "minimum": 1, "maximum": 30},
                 },
                 "required": ["query"],

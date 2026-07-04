@@ -114,6 +114,9 @@ def entity_types_for_scope(scope: str) -> set[str] | None:
         "files": {"disk_file", "disk_folder", "disk_storage", "task_attachment"},
         "tasks": {"task", "task_attachment"},
         "projects": {"project"},
+        "catalog": {"catalog_product", "catalog_store"},
+        "stores": {"catalog_store"},
+        "products": {"catalog_product"},
     }.get(normalized)
 
 
@@ -125,6 +128,8 @@ def _entity_type_label(entity_type: str) -> str:
         "disk_storage": "Хранилище",
         "disk_folder": "Папка",
         "disk_file": "Файл",
+        "catalog_store": "Склад",
+        "catalog_product": "Товар",
     }.get(entity_type, entity_type)
 
 
