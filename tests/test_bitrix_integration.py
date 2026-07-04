@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist
-from ai_server.agents.bitrix24.tools import BitrixApiTool
+from ai_server.agents.bitrix24.tools import BitrixApiTool, BitrixWarehouseSearchTool
 from ai_server.attachments import StoredAttachment
 from ai_server.integrations.bitrix.chat_parser import build_agent_task_from_bitrix_chat
 from ai_server.integrations.bitrix.client import BitrixClient
@@ -200,6 +200,22 @@ def test_bitrix_api_tool_denied_method():
     assert fake_bitrix.calls == []
 
 
+def test_bitrix_warehouse_search_tool_finds_store_and_products():
+    fake_bitrix = FakeBitrixClient()
+    tool = BitrixWarehouseSearchTool(client=fake_bitrix)
+
+    result = anyio_run(
+        tool.execute({"query": "Borisov warehouse", "include_products": True, "limit": 5, "product_limit": 5})
+    )
+
+    assert result.status == ToolStatus.OK
+    assert result.data["matches"][0]["id"] == 10
+    assert result.data["products"]["items"][0]["product_id"] == 1001
+    assert result.data["products"]["items"][0]["product_name"] == "Cable"
+    assert ("catalog.store.list", {}) in fake_bitrix.calls
+    assert any(method == "catalog.storeproduct.list" for method, _ in fake_bitrix.calls)
+
+
 def test_bitrix24_specialist_skips_quality_control_when_disabled(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("QUALITY_CONTROL_WEBHOOK_ENABLED", "false")
@@ -359,6 +375,21 @@ class FakeBitrixClient:
     async def call(self, method, payload=None, *, base_url=None):
         self.calls.append((method, payload or {}))
         return {"result": {"id": 123}}
+
+    async def result(self, method, payload=None, *, base_url=None):
+        self.calls.append((method, payload or {}))
+        if method == "catalog.store.list":
+            return {
+                "stores": [
+                    {"id": 10, "title": "Borisov warehouse", "address": "Borisov"},
+                    {"id": 11, "title": "Minsk warehouse", "address": "Minsk"},
+                ]
+            }
+        if method == "catalog.storeproduct.list":
+            return {"storeProducts": [{"storeId": 10, "productId": 1001, "amount": "7"}]}
+        if method == "catalog.product.list":
+            return {"products": [{"id": 1001, "name": "Cable"}]}
+        return {"id": 123}
 
     async def send_bot_message(self, dialog_id, message, *, bot_id=None, keyboard=None):
         self.messages.append((dialog_id, message, bot_id, keyboard))

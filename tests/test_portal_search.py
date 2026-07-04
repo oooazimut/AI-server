@@ -82,6 +82,25 @@ def test_portal_search_tool_reports_missing_index():
     assert "missing" in result.data["message"].lower()
 
 
+def test_portal_search_tool_supports_store_scope():
+    import asyncio
+
+    index = _create_index()
+    index.upsert_item(
+        entity_type="catalog_store",
+        entity_id="12",
+        title="Borisov warehouse",
+        body="Main stock location",
+        metadata={},
+    )
+    tool = PortalSearchTool(portal_search=index)
+
+    result = asyncio.run(tool.execute({"query": "Borisov", "scope": "stores", "limit": 5}))
+
+    assert result.status == "ok"
+    assert result.data["results"][0]["entity_type"] == "catalog_store"
+
+
 def test_bitrix_search_endpoint(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     index = _create_index()

@@ -16,6 +16,7 @@ from ai_server.agents.bitrix24.quality_control import (
 )
 from ai_server.agents.bitrix24.tools import (
     BitrixApiTool,
+    BitrixWarehouseSearchTool,
     DeleteIncompleteProposalTool,
     PortalSearchTool,
     SaveIncompleteProposalTool,
@@ -44,6 +45,7 @@ logger = logging.getLogger(__name__)
 _LLM_TOOL_NAMES = frozenset(
     {
         "portal_search",
+        "bitrix_warehouse_search",
         "bitrix_api",
         "task_create_draft",
         "task_create_confirm",
@@ -113,6 +115,7 @@ class Bitrix24Specialist(BaseSpecialist):
         _settings = settings or get_settings()
         tools: list[AgentTool] = [
             PortalSearchTool(portal_search=portal_search_index),
+            BitrixWarehouseSearchTool(client=bitrix_client),
             BitrixApiTool(
                 client=bitrix_client,
                 write_client=bitrix_client,
