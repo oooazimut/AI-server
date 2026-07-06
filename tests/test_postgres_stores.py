@@ -252,6 +252,166 @@ def test_vehicle_store_get_day_report_falls_back_to_legacy_parsed_json(monkeypat
 # ---------------------------------------------------------------------------
 
 
+def test_vehicle_store_get_day_report_supplements_missing_vehicles_from_legacy(monkeypatch):
+    store = PostgresVehicleUsageStore("postgresql://fake")
+    parsed = {
+        "staff_entries": [
+            {"full_name": "Borisov Andrey", "status": "worked", "vehicle": "Auto 2"},
+        ],
+        "vehicle_entries": [
+            {"vehicle": "Auto 2", "status": "in_use", "drivers": ["Borisov Andrey", "Karasev Alexey"]},
+        ],
+    }
+    row_sets = [
+        [
+            {
+                "status_date": "2026-07-06",
+                "employee_id": 1,
+                "full_name": "Borisov Andrey",
+                "status": "worked",
+                "vehicle_name": None,
+                "notes": "",
+            }
+        ],
+        [],
+        [],
+        [
+            {
+                "id": 98,
+                "request_date": "2026-07-06",
+                "status": "answered",
+                "parsed_json": json.dumps(parsed),
+                "response_text": "Auto 2 - Borisov Andrey, Karasev Alexey / in_use",
+            }
+        ],
+    ]
+    factory, conn = _sequenced_sync_conn_factory(row_sets)
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    report = store.get_day_report(report_date="2026-07-06")
+
+    assert report["source"] == "normalized_tables+vehicle_usage_requests.parsed_json"
+    assert report["employee_statuses"][0]["vehicle_name"] == "Auto 2"
+    assert report["vehicle_assignments"][0]["vehicle_name"] == "Auto 2"
+    assert report["vehicle_drivers"][0] == {"vehicle_name": "Auto 2", "full_name": "Borisov Andrey"}
+    assert any("vehicle_usage_requests" in sql for sql, _ in conn.calls)
+
+
+def test_vehicle_store_finalize_pending_unknowns_completes_draft(monkeypatch):
+    store = PostgresVehicleUsageStore("postgresql://fake")
+    parsed = {
+        "people": [{"staff_order": 1, "full_name": "Borisov Andrey", "status": "worked"}],
+        "vehicles": [{"vehicle_id": 2, "vehicle_name": "Auto 2", "status": "in_use", "drivers": ["Borisov Andrey"]}],
+    }
+    factory, _conn = _sync_conn_factory(
+        rows=[
+            {
+                "id": 10,
+                "request_date": "2026-07-16",
+                "user_id": 13,
+                "dialog_id": "13",
+                "status": "pending_clarification",
+                "response_text": "Borisov Auto 2",
+                "parsed_json": json.dumps(parsed),
+            }
+        ]
+    )
+    monkeypatch.setattr(store, "_sync_connect", factory)
+    monkeypatch.setattr(
+        store,
+        "staff_roster",
+        lambda: [
+            {"display_order": 1, "full_name": "Borisov Andrey", "user_id": 27},
+            {"display_order": 2, "full_name": "Karasev Alexey", "user_id": 28},
+        ],
+    )
+    monkeypatch.setattr(
+        store,
+        "vehicles",
+        lambda: [
+            {"id": 2, "brand_model": "Auto 2", "registration_number": ""},
+            {"id": 5, "brand_model": "Auto 5", "registration_number": ""},
+        ],
+    )
+    saved: dict = {}
+    replaced: dict = {}
+
+    def _save_draft(**kwargs):
+        saved.update(kwargs)
+        return 55
+
+    def _replace_day_report(**kwargs):
+        replaced.update(kwargs)
+
+    monkeypatch.setattr(store, "save_draft", _save_draft)
+    monkeypatch.setattr(store, "replace_day_report", _replace_day_report)
+
+    result = store.finalize_pending_unknowns(report_date="2026-07-16", reason="cutoff")
+
+    assert result["status"] == "finalized_unknown"
+    assert saved["status"] == "answered"
+    assert saved["parsed"]["auto_completed_unknown"] is True
+    assert saved["parsed"]["people"][1]["full_name"] == "Karasev Alexey"
+    assert saved["parsed"]["people"][1]["status"] == "unknown"
+    assert saved["parsed"]["vehicles"][1]["vehicle_name"] == "Auto 5"
+    assert saved["parsed"]["vehicles"][1]["status"] == "unknown"
+    assert replaced["employee_statuses"] == [(1, "worked", ""), (2, "unknown", "cutoff")]
+    assert replaced["vehicle_assignments"] == [(2, 1, "in_use", ""), (5, None, "unknown", "cutoff")]
+
+
+def test_vehicle_store_auto_close_unanswered_day_uses_operator(monkeypatch):
+    store = PostgresVehicleUsageStore("postgresql://fake")
+    factory, _conn = _sync_conn_factory(
+        rows=[
+            {
+                "id": 10,
+                "request_date": "2026-07-16",
+                "user_id": 13,
+                "dialog_id": "13",
+                "status": "sent",
+                "parsed_json": None,
+            }
+        ]
+    )
+    monkeypatch.setattr(store, "_sync_connect", factory)
+    monkeypatch.setattr(store, "vehicle_usage_operator_ids", lambda: {13})
+    cancelled: dict = {}
+
+    def _cancel_day_report(**kwargs):
+        cancelled.update(kwargs)
+        return 77
+
+    monkeypatch.setattr(store, "cancel_day_report", _cancel_day_report)
+
+    result = store.auto_close_unanswered_day(report_date="2026-07-16", reason="no response")
+
+    assert result == {"status": "closed_day_off", "report_date": "2026-07-16", "request_id": 77, "user_id": 13}
+    assert cancelled == {"report_date": "2026-07-16", "user_id": 13, "dialog_id": "13", "reason": "no response"}
+
+
+def test_vehicle_store_auto_close_unanswered_day_skips_pending_draft(monkeypatch):
+    store = PostgresVehicleUsageStore("postgresql://fake")
+    factory, _conn = _sync_conn_factory(
+        rows=[
+            {
+                "id": 10,
+                "request_date": "2026-07-16",
+                "user_id": 13,
+                "dialog_id": "13",
+                "status": "pending_clarification",
+                "parsed_json": json.dumps({"people": []}),
+            }
+        ]
+    )
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    result = store.auto_close_unanswered_day(report_date="2026-07-16", reason="no response")
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "useful_response_exists"
+    assert result["request_status"] == "pending_clarification"
+
+
 def test_bitrix_store_save_proposal(monkeypatch):
     store = PostgresBitrixAgentStore("postgresql://fake")
     factory, conn = _sync_conn_factory(rows=[{"id": 7}])
