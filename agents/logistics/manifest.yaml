@@ -17,8 +17,16 @@ capabilities:
   - staff_status_tracking
 tools:
   - vehicle_usage_context
+  - vehicle_usage_get_operators
+  - vehicle_usage_set_operators
+  - vehicle_usage_start_day
+  - vehicle_usage_get_report
+  - vehicle_usage_get_employee_period_report
+  - vehicle_usage_get_vehicle_period_report
   - vehicle_usage_save_draft
   - vehicle_usage_save_report
+  - vehicle_usage_update_report
+  - vehicle_usage_cancel_day
 automations:
   - id: logistics_vehicle_usage
     name: Утренний учёт служебных машин
@@ -28,8 +36,8 @@ automations:
     source_project: BitrixAIAgent
     source_modules:
       - app.agent.vehicle_usage
-    entrypoint: backend.ai_server.workers.logistics.vehicle_usage.VehicleUsageWorker
-    schedule_hint: daily request/escalation times from settings
+    entrypoint: backend.ai_server.agent_worker
+    schedule_hint: daily 08:30 request and two reminders at 30/60 minutes from settings
     status_endpoint: /logistics/vehicle-usage/status
     enabled_by_default: false
     uses_llm: true
@@ -38,14 +46,22 @@ automations:
       - llm_gateway
     tools:
       - vehicle_usage_context
+      - vehicle_usage_get_operators
+      - vehicle_usage_set_operators
+      - vehicle_usage_start_day
+      - vehicle_usage_get_report
+      - vehicle_usage_get_employee_period_report
+      - vehicle_usage_get_vehicle_period_report
       - vehicle_usage_save_draft
       - vehicle_usage_save_report
+      - vehicle_usage_update_report
+      - vehicle_usage_cancel_day
     data_scopes:
       - bitrix24_chats
       - bitrix24_users
       - vehicle_usage
     state_paths:
-      - var/vehicle_usage.sqlite
+      - PostgreSQL schema logistics
     emits:
       - vehicle_usage_request_sent
       - vehicle_usage_response_parsed

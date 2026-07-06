@@ -37,7 +37,7 @@ from ai_server.integrations.redis.agent_queue import RedisAgentQueue
 from ai_server.integrations.redis.diagnost_queue import RedisDiagnostQueue
 from ai_server.integrations.redis.event_queue import RedisEventQueue
 from ai_server.llm import build_orchestrator_llm_client
-from ai_server.models import AgentTask
+from ai_server.models import AgentTask, UserContext
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.orchestrators.orchestrator_llm import OrchestratorLLMService
 from ai_server.registry import load_agent_manifests
@@ -45,7 +45,7 @@ from ai_server.runtime import ensure_runtime_dirs
 from ai_server.settings import get_settings
 from ai_server.specialists import SpecialistDeps
 from ai_server.technical_footer import TechnicalFooterService
-from ai_server.tools.vehicle_usage import SentRequestData
+from ai_server.tools.vehicle_usage import SentRequestData, resolve_vehicle_usage_operator_ids
 from ai_server.transcription import build_transcriber
 from ai_server.utils import MOSCOW_TZ
 from ai_server.workers.bitrix.reconciler import run_reconciler
@@ -138,6 +138,9 @@ async def main() -> None:
                 manager_user_id=settings.vehicle_usage_manager_user_id,
                 max_reminders=settings.vehicle_usage_max_reminders,
                 reminder_interval_minutes=settings.vehicle_usage_reminder_interval_minutes,
+                reminder_delays_minutes=settings.resolved_vehicle_usage_reminder_delays_minutes,
+                allowed_user_ids=frozenset(settings.resolved_vehicle_usage_allowed_user_ids),
+                admin_user_ids=frozenset(settings.resolved_vehicle_usage_admin_user_ids),
                 dry_run=settings.vehicle_usage_dry_run,
                 request_time=settings.vehicle_usage_request_time,
             )
@@ -181,34 +184,47 @@ async def main() -> None:
         agent_queue = RedisAgentQueue(settings.redis_url)
 
         if settings.scheduler_enabled and settings.vehicle_usage_enabled:
-            dialog_id = settings.vehicle_usage_dialog_id or ""
             _vu_store_ref = vehicle_usage_store
             _orch_ref = orchestrator
-            _mgr_id = settings.vehicle_usage_manager_user_id
+            _fallback_operator_ids = frozenset(settings.resolved_vehicle_usage_allowed_user_ids)
             _dry_run = settings.vehicle_usage_dry_run
 
-            async def _run_morning() -> None:
+            async def _run_morning_for_operator(started_at: datetime, operator_id: int) -> None:
+                recipient_id = str(operator_id)
                 task = AgentTask(
-                    task_id=f"scheduled_vu_{uuid4().hex[:8]}",
-                    request="Сгенерируй утренний отчёт по использованию служебных автомобилей.",
+                    task_id=f"scheduled_vu_{operator_id}_{uuid4().hex[:8]}",
+                    user=UserContext(id=recipient_id, raw={"dialog_id": recipient_id}),
+                    request="vehicle_usage_morning",
                     context={
                         "channel_id": "bitrix24",
-                        "recipient_id": dialog_id,
+                        "recipient_id": recipient_id,
+                        "dialog_id": recipient_id,
                         "event": "vehicle_usage_morning",
+                        "started_at": started_at.isoformat(),
+                        "reminder_count": 0,
                     },
                 )
                 result = await _orch_ref.handle(task)
                 if result.answer and _vu_store_ref is not None and not _dry_run:
                     _vu_store_ref.create_sent_request(
                         SentRequestData(
-                            request_date=datetime.now(MOSCOW_TZ).date().isoformat(),
-                            user_id=_mgr_id,
-                            dialog_id=dialog_id,
+                            request_date=started_at.date().isoformat(),
+                            user_id=operator_id,
+                            dialog_id=recipient_id,
                             message=result.answer,
-                            sent_at=datetime.now(MOSCOW_TZ).isoformat(),
-                            reminder_count=1,
+                            sent_at=started_at.isoformat(),
+                            reminder_count=0,
                         )
                     )
+
+            async def _run_morning() -> None:
+                started_at = datetime.now(MOSCOW_TZ)
+                operator_ids = resolve_vehicle_usage_operator_ids(_vu_store_ref, _fallback_operator_ids)
+                if not operator_ids:
+                    logger.warning("Morning vehicle-usage skipped: no configured operators")
+                    return
+                for operator_id in operator_ids:
+                    await _run_morning_for_operator(started_at, operator_id)
 
             hour, minute = _parse_hhmm(settings.vehicle_usage_request_time)
             scheduler.add_job_cron(
@@ -217,6 +233,7 @@ async def main() -> None:
                 _run_morning,
                 hour,
                 minute,
+                day_of_week="mon-fri" if settings.vehicle_usage_workday_mode == "weekday" else None,
                 replace_existing=False,
             )
             logger.info("Morning vehicle-usage cron scheduled at %02d:%02d МСК", hour, minute)
@@ -293,7 +310,11 @@ async def main() -> None:
         agent_tasks.append(asyncio.create_task(run_diagnost_event_worker(diagnost_queue, diagnost_store)))
         agent_tasks.append(asyncio.create_task(run_feedback_scheduler_worker(diagnost_store, bitrix)))
 
-    if settings.vehicle_usage_enabled and vehicle_usage_store is not None:
+    if (
+        settings.vehicle_usage_enabled
+        and settings.vehicle_usage_staff_sync_enabled
+        and vehicle_usage_store is not None
+    ):
         _bitrix_ref = bitrix
         _redis_url = settings.redis_url
 

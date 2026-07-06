@@ -1,6 +1,6 @@
 # Утренний учёт служебных машин
 
-Источник переноса: `BitrixAIAgent/app/agent/vehicle_usage.py`.
+Источник переноса: `BitrixAIAgent/app/agent/vehicle_usage.py`; целевой runtime в AI-server — `backend.ai_server.agent_worker` + `LogisticsSpecialist`.
 
 ## Роль
 
@@ -25,13 +25,18 @@
 
 Backend-worker отвечает только за техническое расписание, рабочие дни, dedupe и
 хранение state. Содержательные решения остаются у LLM-Логиста: он формулирует
-сообщение для Переговорщика и выбирает `vehicle_usage_save_draft` или
-`vehicle_usage_save_report`, когда нужно сохранить структурированные данные.
+сообщение для Переговорщика и выбирает `vehicle_usage_save_draft`,
+`vehicle_usage_save_report`, `vehicle_usage_cancel_day` или
+`vehicle_usage_get_report`, когда нужно сохранить, отменить, показать или
+исправить структурированные данные.
 Отправка сообщений людям остаётся в канальном runtime.
 
 ## State
 
-- `var/vehicle_usage.sqlite`.
+- PostgreSQL schema `logistics`.
+- Основные таблицы: `vehicle_usage_requests`, `employee_daily_statuses`,
+  `vehicle_daily_assignments`, `vehicle_daily_drivers`, `vehicles`,
+  `employees`, `vehicle_usage_revisions`.
 
 ## Правило переноса
 

@@ -97,7 +97,7 @@ MIGRATION_ITEMS: tuple[VarMigrationItem, ...] = (
         path="vehicle_usage.sqlite",
         item_type="file",
         category="vehicle_usage",
-        description="Учёт использования служебных машин.",
+        description="Legacy SQLite export for vehicle usage cutover; target runtime storage is PostgreSQL schema logistics.",
         sensitive=True,
     ),
     VarMigrationItem(

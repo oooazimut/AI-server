@@ -46,8 +46,32 @@ class _FakeSyncConn:
         pass
 
 
+class _SequencedSyncConn:
+    """Fake sync connection that returns a different row set for each execute call."""
+
+    def __init__(self, row_sets: list[list[dict] | None]):
+        self._row_sets = list(row_sets)
+        self.calls: list[tuple[str, tuple]] = []
+
+    def execute(self, sql: str, params: tuple = ()) -> _FakeCursor:
+        self.calls.append((str(sql), params))
+        rows = self._row_sets.pop(0) if self._row_sets else []
+        return _FakeCursor(rows)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+
 def _sync_conn_factory(rows=None):
     conn = _FakeSyncConn(rows=rows)
+    return lambda: conn, conn
+
+
+def _sequenced_sync_conn_factory(row_sets):
+    conn = _SequencedSyncConn(row_sets=row_sets)
     return lambda: conn, conn
 
 
@@ -99,6 +123,7 @@ def test_vehicle_store_upsert_employees(monkeypatch):
 
     insert_calls = [sql for sql, _ in conn.calls if "INSERT INTO logistics.employees" in sql]
     assert len(insert_calls) == 2
+    assert any("SET active = FALSE" in sql for sql, _ in conn.calls)
 
 
 def test_vehicle_store_save_draft(monkeypatch):
@@ -181,7 +206,45 @@ def test_vehicle_store_replace_day_report(monkeypatch):
     )
 
     delete_calls = [sql for sql, _ in conn.calls if "DELETE FROM logistics" in sql]
-    assert len(delete_calls) == 2
+    assert any("DELETE FROM logistics.employee_daily_statuses" in sql for sql in delete_calls)
+    assert any("DELETE FROM logistics.vehicle_daily_assignments" in sql for sql in delete_calls)
+    assert any("DELETE FROM logistics.vehicle_daily_drivers" in sql for sql in delete_calls)
+
+
+def test_vehicle_store_get_day_report_falls_back_to_legacy_parsed_json(monkeypatch):
+    store = PostgresVehicleUsageStore("postgresql://fake")
+    parsed = {
+        "staff_entries": [
+            {"full_name": "Борисов Андрей", "status": "на авто", "vehicle": "Авто 2"},
+        ],
+        "vehicle_entries": [
+            {"vehicle": "Авто 2", "status": "в работе", "driver": ["Борисов Андрей", "Карасев Алексей"]},
+        ],
+    }
+    row_sets = [
+        [],
+        [],
+        [],
+        [
+            {
+                "id": 97,
+                "request_date": "2026-07-02",
+                "status": "answered",
+                "parsed_json": json.dumps(parsed),
+                "response_text": "Авто 2 — Борисов Андрей, Карасев Алексей",
+            }
+        ],
+    ]
+    factory, conn = _sequenced_sync_conn_factory(row_sets)
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    report = store.get_day_report(report_date="2026-07-02")
+
+    assert report["source"] == "vehicle_usage_requests.parsed_json"
+    assert report["employee_statuses"][0]["full_name"] == "Борисов Андрей"
+    assert report["vehicle_assignments"][0]["vehicle_name"] == "Авто 2"
+    assert report["vehicle_assignments"][0]["drivers"] == ["Борисов Андрей", "Карасев Алексей"]
+    assert any("vehicle_usage_requests" in sql for sql, _ in conn.calls)
 
 
 # ---------------------------------------------------------------------------

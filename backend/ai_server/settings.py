@@ -113,9 +113,16 @@ class Settings:
     vehicle_usage_dialog_id: str
     vehicle_usage_request_time: str
     vehicle_usage_reminder_interval_minutes: int
+    vehicle_usage_reminder_delays_minutes: str
     vehicle_usage_max_reminders: int
+    vehicle_usage_workday_mode: str
+    vehicle_usage_unknown_fill_time: str
+    vehicle_usage_auto_day_off_time: str
     vehicle_usage_admin_notify_user_ids: str
+    vehicle_usage_admin_user_ids: str
+    vehicle_usage_allowed_user_ids: str
     vehicle_usage_excluded_user_ids: str
+    vehicle_usage_staff_sync_enabled: bool
     vehicle_usage_dry_run: bool
     task_proposal_manager_bitrix_id: int | None
     attachment_max_bytes: int
@@ -287,8 +294,36 @@ class Settings:
         return _id_list(self.vehicle_usage_admin_notify_user_ids)
 
     @property
+    def resolved_vehicle_usage_admin_user_ids(self) -> set[int]:
+        admins = set(_id_list(self.vehicle_usage_admin_user_ids))
+        if admins:
+            return admins
+        return {self.vehicle_usage_manager_user_id} if self.vehicle_usage_manager_user_id is not None else set()
+
+    @property
+    def resolved_vehicle_usage_allowed_user_ids(self) -> set[int]:
+        allowed = set(_id_list(self.vehicle_usage_allowed_user_ids))
+        if allowed:
+            return allowed
+        return {self.vehicle_usage_manager_user_id} if self.vehicle_usage_manager_user_id is not None else set()
+
+    @property
     def resolved_vehicle_usage_excluded_user_ids(self) -> set[int]:
         return set(_id_list(self.vehicle_usage_excluded_user_ids))
+
+    @property
+    def resolved_vehicle_usage_reminder_delays_minutes(self) -> tuple[int, ...]:
+        values: list[int] = []
+        for item in self.vehicle_usage_reminder_delays_minutes.replace(";", ",").split(","):
+            try:
+                value = int(item.strip())
+            except ValueError:
+                continue
+            if value > 0:
+                values.append(value)
+        if values:
+            return tuple(values)
+        return (self.vehicle_usage_reminder_interval_minutes,)
 
     @property
     def search_background_state_path(self) -> Path:
@@ -430,11 +465,18 @@ def get_settings() -> Settings:
         vehicle_usage_enabled=_env_bool("VEHICLE_USAGE_ENABLED", False),
         vehicle_usage_manager_user_id=_env_int("VEHICLE_USAGE_MANAGER_USER_ID"),
         vehicle_usage_dialog_id=_env("VEHICLE_USAGE_DIALOG_ID"),
-        vehicle_usage_request_time=_env("VEHICLE_USAGE_REQUEST_TIME", "08:00"),
+        vehicle_usage_request_time=_env("VEHICLE_USAGE_REQUEST_TIME", "08:30"),
         vehicle_usage_reminder_interval_minutes=_env_int("VEHICLE_USAGE_REMINDER_INTERVAL_MINUTES", 30) or 30,
-        vehicle_usage_max_reminders=_env_int("VEHICLE_USAGE_MAX_REMINDERS", 3) or 3,
+        vehicle_usage_reminder_delays_minutes=_env("VEHICLE_USAGE_REMINDER_DELAYS_MINUTES", "30,60"),
+        vehicle_usage_max_reminders=_env_int("VEHICLE_USAGE_MAX_REMINDERS", 2) or 2,
+        vehicle_usage_workday_mode=_env("VEHICLE_USAGE_WORKDAY_MODE", "weekday"),
+        vehicle_usage_unknown_fill_time=_env("VEHICLE_USAGE_UNKNOWN_FILL_TIME", "12:00"),
+        vehicle_usage_auto_day_off_time=_env("VEHICLE_USAGE_AUTO_DAY_OFF_TIME", "18:00"),
         vehicle_usage_admin_notify_user_ids=_env("VEHICLE_USAGE_ADMIN_NOTIFY_USER_IDS"),
+        vehicle_usage_admin_user_ids=_env("VEHICLE_USAGE_ADMIN_USER_IDS"),
+        vehicle_usage_allowed_user_ids=_env("VEHICLE_USAGE_ALLOWED_USER_IDS"),
         vehicle_usage_excluded_user_ids=_env("VEHICLE_USAGE_EXCLUDED_USER_IDS"),
+        vehicle_usage_staff_sync_enabled=_env_bool("VEHICLE_USAGE_STAFF_SYNC_ENABLED", False),
         vehicle_usage_dry_run=_env_bool("VEHICLE_USAGE_DRY_RUN", True),
         task_proposal_manager_bitrix_id=_env_int("TASK_PROPOSAL_MANAGER_BITRIX_ID"),
         attachment_max_bytes=_env_int("ATTACHMENT_MAX_BYTES", 30 * 1024 * 1024) or (30 * 1024 * 1024),
