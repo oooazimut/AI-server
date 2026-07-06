@@ -12,7 +12,19 @@ from ai_server.agents.logistics.llm import (
     LogisticsLLMService,
     logistics_llm_failure_result,
 )
-from ai_server.agents.logistics.tools import VehicleContextTool, VehicleSaveDraftTool, VehicleSaveReportTool
+from ai_server.agents.logistics.tools import (
+    VehicleCancelReportTool,
+    VehicleContextTool,
+    VehicleGetEmployeePeriodReportTool,
+    VehicleGetOperatorsTool,
+    VehicleGetReportTool,
+    VehicleGetVehiclePeriodReportTool,
+    VehicleSaveDraftTool,
+    VehicleSaveReportTool,
+    VehicleSetOperatorsTool,
+    VehicleStartDayTool,
+    VehicleUpdateReportTool,
+)
 from ai_server.agents.ports import SchedulerPort
 from ai_server.agents.tool import AgentTool
 from ai_server.knowledge import MarkdownKnowledgeBase
@@ -25,13 +37,38 @@ from ai_server.utils import MOSCOW_TZ
 logger = logging.getLogger(__name__)
 
 
+def _next_reminder_run_date(context: dict[str, Any], settings: VehicleUsageSettings, reminder_count: int) -> datetime:
+    delays = settings.reminder_delays_minutes or (settings.reminder_interval_minutes,)
+    index = max(0, min(reminder_count - 1, len(delays) - 1))
+    delay_minutes = delays[index]
+    started_at_raw = str(context.get("started_at") or "").strip()
+    if started_at_raw:
+        try:
+            started_at = datetime.fromisoformat(started_at_raw)
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=MOSCOW_TZ)
+            return started_at.astimezone(MOSCOW_TZ) + timedelta(minutes=delay_minutes)
+        except ValueError:
+            pass
+    return datetime.now(MOSCOW_TZ) + timedelta(minutes=delay_minutes)
+
+
 @dataclass
 class VehicleUsageSettings:
     manager_user_id: int | None
     max_reminders: int
     reminder_interval_minutes: int
+    reminder_delays_minutes: tuple[int, ...] = (30, 60)
+    allowed_user_ids: frozenset[int] = frozenset()
+    admin_user_ids: frozenset[int] = frozenset()
     dry_run: bool = True
-    request_time: str = "08:00"
+    request_time: str = "08:30"
+
+    @property
+    def effective_allowed_user_ids(self) -> frozenset[int]:
+        if self.allowed_user_ids:
+            return self.allowed_user_ids
+        return frozenset({self.manager_user_id}) if self.manager_user_id is not None else frozenset()
 
 
 class LogisticsSpecialist(BaseSpecialist):
@@ -79,10 +116,22 @@ class LogisticsSpecialist(BaseSpecialist):
         specialist_result_publisher: Any | None = None,
         **_: Any,
     ) -> LogisticsSpecialist:
+        allowed_user_ids = (
+            logistics_vu_settings.effective_allowed_user_ids if logistics_vu_settings is not None else frozenset()
+        )
+        admin_user_ids = logistics_vu_settings.admin_user_ids if logistics_vu_settings is not None else frozenset()
         tools: list[AgentTool] = [
             VehicleContextTool(vehicle_usage_store),
-            VehicleSaveDraftTool(vehicle_usage_store),
-            VehicleSaveReportTool(vehicle_usage_store),
+            VehicleGetOperatorsTool(vehicle_usage_store),
+            VehicleSetOperatorsTool(vehicle_usage_store, admin_user_ids=admin_user_ids),
+            VehicleStartDayTool(vehicle_usage_store, allowed_user_ids=allowed_user_ids),
+            VehicleGetReportTool(vehicle_usage_store),
+            VehicleGetEmployeePeriodReportTool(vehicle_usage_store),
+            VehicleGetVehiclePeriodReportTool(vehicle_usage_store),
+            VehicleSaveDraftTool(vehicle_usage_store, allowed_user_ids=allowed_user_ids),
+            VehicleSaveReportTool(vehicle_usage_store, allowed_user_ids=allowed_user_ids),
+            VehicleUpdateReportTool(vehicle_usage_store, allowed_user_ids=allowed_user_ids),
+            VehicleCancelReportTool(vehicle_usage_store, allowed_user_ids=allowed_user_ids),
         ]
         return cls(
             manifest,
@@ -111,11 +160,13 @@ class LogisticsSpecialist(BaseSpecialist):
 
         today = datetime.now(MOSCOW_TZ).date().isoformat()
         request_date = str(task.context.get("request_date") or today)
-        job_id = f"vu_reminder_{request_date}"
+        job_prefix = f"vu_reminder_{request_date}"
+        recipient_key = str(task.user.id or task.context.get("recipient_id") or "unknown").replace(":", "_")
+        job_id = f"{job_prefix}_{recipient_key}"
 
         # Cancel reminder when report is saved
-        if any(a.name == "vehicle_usage_save_report" for a in result.actions_taken):
-            return [ScheduledTask(job_id=job_id, agent_id="logistics", cancel=True)]
+        if any(a.name in ("vehicle_usage_save_report", "vehicle_usage_cancel_day") for a in result.actions_taken):
+            return [ScheduledTask(job_id=job_prefix, agent_id="logistics", cancel=True)]
 
         # Schedule follow-up reminder after initial morning request or previous reminder
         event = str(task.context.get("event") or "")
@@ -123,9 +174,10 @@ class LogisticsSpecialist(BaseSpecialist):
             reminder_count = int(task.context.get("reminder_count") or 0) + 1
             if reminder_count > vu.max_reminders:
                 return []
-            run_date = datetime.now(MOSCOW_TZ) + timedelta(minutes=vu.reminder_interval_minutes)
+            run_date = _next_reminder_run_date(task.context, vu, reminder_count)
             channel_id = str(task.context.get("channel_id") or "")
             recipient_id = str(task.context.get("recipient_id") or "")
+            started_at = str(task.context.get("started_at") or datetime.now(MOSCOW_TZ).isoformat())
             reminder_task = AgentTask(
                 task_id=f"vu_reminder_{uuid4().hex[:6]}",
                 request=task.request,
@@ -135,6 +187,7 @@ class LogisticsSpecialist(BaseSpecialist):
                     "event": "vehicle_usage_reminder_due",
                     "request_date": request_date,
                     "reminder_count": reminder_count,
+                    "started_at": started_at,
                 },
             )
             return [

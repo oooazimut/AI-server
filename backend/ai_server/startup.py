@@ -188,6 +188,9 @@ async def lifespan(app: FastAPI):
         "dialog_id": settings.vehicle_usage_dialog_id,
         "manager_user_id": settings.vehicle_usage_manager_user_id,
         "admin_notify_user_ids": settings.resolved_vehicle_usage_admin_notify_user_ids,
+        "admin_user_ids": sorted(settings.resolved_vehicle_usage_admin_user_ids),
+        "allowed_user_ids": sorted(settings.resolved_vehicle_usage_allowed_user_ids),
+        "staff_sync_enabled": settings.vehicle_usage_staff_sync_enabled,
         "request_time": settings.vehicle_usage_request_time,
         "reminder_interval_minutes": settings.vehicle_usage_reminder_interval_minutes,
         "max_reminders": settings.vehicle_usage_max_reminders,
@@ -224,6 +227,8 @@ async def lifespan(app: FastAPI):
                 manager_user_id=settings.vehicle_usage_manager_user_id,
                 max_reminders=settings.vehicle_usage_max_reminders,
                 reminder_interval_minutes=settings.vehicle_usage_reminder_interval_minutes,
+                allowed_user_ids=frozenset(settings.resolved_vehicle_usage_allowed_user_ids),
+                admin_user_ids=frozenset(settings.resolved_vehicle_usage_admin_user_ids),
                 dry_run=settings.vehicle_usage_dry_run,
                 request_time=settings.vehicle_usage_request_time,
             )

@@ -235,7 +235,9 @@ class InternalOrchestrator(BaseSpecialist):
         for sched in tasks:
             if sched.cancel:
                 if hasattr(self._scheduler, "remove_job"):
-                    self._scheduler.remove_job(sched.agent_id, sched.job_id)  # type: ignore[attr-defined]
+                    removed = self._scheduler.remove_job(sched.agent_id, sched.job_id)  # type: ignore[attr-defined]
+                    if not removed and hasattr(self._scheduler, "remove_jobs_by_prefix"):
+                        self._scheduler.remove_jobs_by_prefix(sched.agent_id, sched.job_id)  # type: ignore[attr-defined]
             elif sched.task is not None:
                 _task = sched.task
 

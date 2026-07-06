@@ -78,7 +78,7 @@ class AgentScheduler:
             misfire_grace_time=misfire_grace_time,
             replace_existing=replace_existing,
         )
-        logger.debug("Scheduled job %s next_run=%s", full_id, job.next_run_time)
+        logger.debug("Scheduled job %s next_run=%s", full_id, getattr(job, "next_run_time", None))
         return job
 
     def add_job_at(
@@ -137,7 +137,7 @@ class AgentScheduler:
         return [
             {
                 "id": j.id,
-                "next_run_time": j.next_run_time.isoformat() if j.next_run_time else None,
+                "next_run_time": _next_run_time_iso(j),
                 "trigger": str(j.trigger),
             }
             for j in jobs
@@ -186,6 +186,11 @@ class AgentScheduler:
 
 def _full_id(agent_id: str, job_id: str) -> str:
     return f"{agent_id}:{job_id}"
+
+
+def _next_run_time_iso(job: Job) -> str | None:
+    next_run_time = getattr(job, "next_run_time", None)
+    return next_run_time.isoformat() if next_run_time else None
 
 
 def _build_trigger(trigger_data: dict[str, Any]) -> CronTrigger | DateTrigger:

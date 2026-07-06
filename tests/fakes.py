@@ -255,8 +255,14 @@ class FakeVehicleUsageStore:
 
     def __init__(self) -> None:
         self._employees: list[dict[str, Any]] = []
+        self._vehicles: list[dict[str, Any]] = [
+            {"id": 1, "brand_model": "Авто 1", "registration_number": ""},
+            {"id": 2, "brand_model": "Авто 2", "registration_number": ""},
+            {"id": 3, "brand_model": "Авто 3", "registration_number": ""},
+        ]
         self._requests: list[dict[str, Any]] = []
         self._day_reports: list[dict[str, Any]] = []
+        self._operator_ids: set[int] = set()
         self._next_id = 1
 
     def upsert_employees(self, members: list[Any]) -> None:
@@ -265,11 +271,23 @@ class FakeVehicleUsageStore:
     def staff_roster(self) -> list[dict[str, Any]]:
         return list(self._employees)
 
+    def vehicles(self) -> list[dict[str, Any]]:
+        return list(self._vehicles)
+
+    def vehicle_usage_operator_ids(self) -> set[int]:
+        return set(self._operator_ids)
+
+    def set_vehicle_usage_operators(self, *, operator_user_ids: list[int], actor_user_id: int | None) -> list[int]:
+        self._operator_ids = set(operator_user_ids)
+        return sorted(self._operator_ids)
+
     def context(self, *, request_date: str, user_id: int | None, dialog_id: str) -> dict[str, Any]:
         return {
             "request_date": request_date,
-            "staff": self.staff_roster(),
+            "staff_roster": self.staff_roster(),
+            "vehicles": self.vehicles(),
             "latest_request": self.latest_request(user_id=user_id, dialog_id=dialog_id),
+            "day_report": self.get_day_report(report_date=request_date),
         }
 
     def latest_request(self, *, user_id: int | None, dialog_id: str) -> dict[str, Any] | None:
@@ -291,9 +309,32 @@ class FakeVehicleUsageStore:
     def latest_requests(self, *, limit: int) -> list[dict[str, Any]]:
         return list(reversed(self._requests))[:limit]
 
+    def get_day_report(self, *, report_date: str) -> dict[str, Any]:
+        for report in reversed(self._day_reports):
+            if report.get("status_date") == report_date:
+                return report
+        return {
+            "report_date": report_date,
+            "employee_statuses": [],
+            "vehicle_assignments": [],
+            "vehicle_drivers": [],
+        }
+
     def create_sent_request(self, data: Any) -> int:
         req_id = self._next_id
         self._next_id += 1
+        self._requests.append(
+            {
+                "id": req_id,
+                "request_date": data.request_date,
+                "user_id": data.user_id,
+                "dialog_id": data.dialog_id,
+                "message": data.message,
+                "sent_at": data.sent_at,
+                "reminder_count": data.reminder_count,
+                "status": "sent",
+            }
+        )
         return req_id
 
     def mark_escalated(self, *, request_date: str, user_id: int | None, escalated_at: str) -> bool:
@@ -333,15 +374,103 @@ class FakeVehicleUsageStore:
         *,
         status_date: str,
         employee_statuses: list[tuple[int, str, str]],
-        vehicle_assignments: list[tuple[int, int | None, str]],
+        vehicle_assignments: list[tuple[int, int | None, str] | tuple[int, int | None, str, str]],
+        actor_user_id: int | None = None,
     ) -> None:
         self._day_reports.append(
             {
                 "status_date": status_date,
                 "employee_statuses": list(employee_statuses),
                 "vehicle_assignments": list(vehicle_assignments),
+                "actor_user_id": actor_user_id,
             }
         )
+
+    def update_day_report(
+        self,
+        *,
+        report_date: str,
+        people: list[dict[str, Any]],
+        vehicles: list[dict[str, Any]],
+        actor_user_id: int | None = None,
+        change_summary: str = "",
+    ) -> dict[str, Any]:
+        return {
+            "report_date": report_date,
+            "employee_updates": len(people),
+            "vehicle_updates": len(vehicles),
+            "actor_user_id": actor_user_id,
+            "change_summary": change_summary,
+        }
+
+    def get_employee_period_report(self, *, employee_name: str, date_from: str, date_to: str) -> dict[str, Any]:
+        return {
+            "subject": "employee",
+            "employee_name": employee_name,
+            "date_from": date_from,
+            "date_to": date_to,
+            "days": [
+                {
+                    "status_date": date_from,
+                    "status": "on_car",
+                    "vehicle_name": "РђРІС‚Рѕ 2",
+                    "notes": "",
+                }
+            ],
+            "summary": {"on_car": 1},
+        }
+
+    def get_vehicle_period_report(self, *, vehicle_name: str, date_from: str, date_to: str) -> dict[str, Any]:
+        return {
+            "subject": "vehicle",
+            "vehicle_name": vehicle_name,
+            "date_from": date_from,
+            "date_to": date_to,
+            "days": [
+                {
+                    "assignment_date": date_from,
+                    "status": "in_use",
+                    "drivers": ["Р‘РѕСЂРёСЃРѕРІ РђРЅРґСЂРµР№"],
+                    "notes": "",
+                }
+            ],
+            "summary": {"in_use": 1},
+        }
+
+    def cancel_day_report(
+        self,
+        *,
+        report_date: str,
+        user_id: int | None,
+        dialog_id: str,
+        reason: str,
+    ) -> int:
+        parsed = {
+            "date": report_date,
+            "status": "day_off",
+            "reason": reason,
+        }
+        request_id = self.save_draft(
+            request_date=report_date,
+            user_id=user_id,
+            dialog_id=dialog_id,
+            response_text=reason,
+            parsed=parsed,
+            status="cancelled_day_off",
+        )
+        self.replace_day_report(
+            status_date=report_date,
+            employee_statuses=[
+                (int(row["display_order"]), "day_off", reason)
+                for row in self._employees
+                if row.get("display_order") is not None
+            ],
+            vehicle_assignments=[
+                (int(row["id"]), None, "not_required", reason) for row in self._vehicles if row.get("id") is not None
+            ],
+            actor_user_id=user_id,
+        )
+        return request_id
 
 
 class FakePortalSearchIndex:
