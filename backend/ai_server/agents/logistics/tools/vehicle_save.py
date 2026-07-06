@@ -329,23 +329,18 @@ class VehicleSaveReportTool:
         roster = self._store.staff_roster()
         vehicles = self._store.vehicles()
         _augment_vehicle_assignments_from_text(parsed, source_text, roster, vehicles)
-        request_id = self._store.save_draft(
-            request_date=request_date,
-            user_id=user_id,
-            dialog_id=dialog_id or "",
-            response_text=source_text,
-            parsed=parsed,
-            status="answered",
-        )
         employees_by_name = _employees_by_name(roster)
         vehicles_by_name = _vehicles_by_name(vehicles)
         employee_statuses_raw: list[tuple[int, str, str]] = []
+        employee_requires_vehicle_ids: set[int] = set()
         for entry in _staff_entries(parsed):
             employee_id = optional_int(entry.get("staff_order")) or employees_by_name.get(
                 str(entry.get("full_name") or "").casefold()
             )
             if employee_id is None:
                 continue
+            if _status_requires_vehicle(entry.get("status")):
+                employee_requires_vehicle_ids.add(employee_id)
             employee_statuses_raw.append(
                 (employee_id, str(entry.get("status") or "unknown"), str(entry.get("notes") or ""))
             )
@@ -361,7 +356,7 @@ class VehicleSaveReportTool:
             notes = str(entry.get("notes") or "")
             driver_ids = _driver_ids(entry, employees_by_name)
             if not driver_ids:
-                vehicle_assignments.append((vehicle_id, None, status or "idle", notes))
+                vehicle_assignments.append((vehicle_id, None, status or "unknown", notes))
                 continue
             driver_employee_ids.update(driver_ids)
             for driver_id in driver_ids:
@@ -375,6 +370,48 @@ class VehicleSaveReportTool:
         employee_statuses = [
             (employee_id, status, notes) for employee_id, (status, notes) in sorted(employee_statuses_by_id.items())
         ]
+        completeness = _validate_report_completeness(
+            roster=roster,
+            vehicles=vehicles,
+            employee_statuses_by_id=employee_statuses_by_id,
+            vehicle_assignments=vehicle_assignments,
+            driver_employee_ids=driver_employee_ids,
+            employee_requires_vehicle_ids=employee_requires_vehicle_ids,
+        )
+        if completeness["needs_clarification"]:
+            draft = dict(parsed)
+            draft["validation"] = completeness
+            request_id = self._store.save_draft(
+                request_date=request_date,
+                user_id=user_id,
+                dialog_id=dialog_id or "",
+                response_text=source_text,
+                parsed=draft,
+                status="pending_clarification",
+            )
+            return ToolResult(
+                status=ToolStatus.OK,
+                tool="vehicle_usage_save_report",
+                data={
+                    "request_id": request_id,
+                    "request_date": request_date,
+                    "draft_saved": True,
+                    "needs_clarification": True,
+                    "missing": completeness["missing"],
+                    "unknown": completeness["unknown"],
+                    "questions": completeness["questions"],
+                    "staff_entries_parsed": len(employee_statuses),
+                    "vehicle_assignments_parsed": len(vehicle_assignments),
+                },
+            )
+        request_id = self._store.save_draft(
+            request_date=request_date,
+            user_id=user_id,
+            dialog_id=dialog_id or "",
+            response_text=source_text,
+            parsed=parsed,
+            status="answered",
+        )
         self._store.replace_day_report(
             status_date=request_date,
             employee_statuses=employee_statuses,
@@ -692,7 +729,7 @@ def _staff_entries(parsed: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _vehicle_entries(parsed: dict[str, Any]) -> list[dict[str, Any]]:
-    vehicles = parsed.get("vehicles") or parsed.get("vehicle_assignments")
+    vehicles = parsed.get("vehicles") or parsed.get("vehicle_entries") or parsed.get("vehicle_assignments")
     return [item for item in vehicles if isinstance(item, dict)] if isinstance(vehicles, list) else []
 
 
@@ -747,7 +784,12 @@ def _augment_vehicle_assignments_from_text(
         return
     vehicle_aliases = _vehicle_aliases(vehicles)
     vehicle_entries = _vehicle_entries(parsed)
-    if not vehicle_aliases or not vehicle_entries:
+    if not vehicle_aliases:
+        return
+    if not vehicle_entries:
+        inferred = _infer_vehicle_entries_from_text(source_text, roster, vehicle_aliases)
+        if inferred:
+            parsed["vehicles"] = inferred
         return
     for entry in vehicle_entries:
         if not _is_blank_vehicle_entry(entry):
@@ -767,6 +809,193 @@ def _augment_vehicle_assignments_from_text(
             entry["vehicle_name"] = vehicle_name
             entry.setdefault("status", "in_use")
             break
+
+
+def _infer_vehicle_entries_from_text(
+    source_text: str,
+    roster: list[dict[str, Any]],
+    vehicle_aliases: list[tuple[str, int, str]],
+) -> list[dict[str, Any]]:
+    employee_aliases = _employee_aliases(roster)
+    result: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for raw_line in source_text.splitlines():
+        line = _norm_name(raw_line)
+        if not line:
+            continue
+        vehicle_match = _vehicle_in_line(line, vehicle_aliases)
+        if vehicle_match is None:
+            continue
+        vehicle_id, vehicle_name = vehicle_match
+        if vehicle_id in seen:
+            continue
+        seen.add(vehicle_id)
+        drivers = _drivers_in_line(line, employee_aliases)
+        status = _vehicle_status_from_line(line, bool(drivers))
+        result.append(
+            {
+                "vehicle_id": vehicle_id,
+                "vehicle_name": vehicle_name,
+                "status": status,
+                "drivers": drivers,
+            }
+        )
+    return result
+
+
+def _employee_aliases(roster: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    result: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for row in roster:
+        name = str(row.get("full_name") or row.get("name") or "").strip()
+        alias = _norm_name(name)
+        if len(alias) < 3 or alias in seen:
+            continue
+        seen.add(alias)
+        result.append((alias, name))
+    return sorted(result, key=lambda item: len(item[0]), reverse=True)
+
+
+def _vehicle_in_line(line: str, vehicle_aliases: list[tuple[str, int, str]]) -> tuple[int, str] | None:
+    for vehicle_alias, vehicle_id, vehicle_name in vehicle_aliases:
+        if re.search(rf"(?<!\w){re.escape(vehicle_alias)}(?!\w)", line):
+            return (vehicle_id, vehicle_name)
+    return None
+
+
+def _drivers_in_line(line: str, employee_aliases: list[tuple[str, str]]) -> list[str]:
+    result: list[str] = []
+    for employee_alias, employee_name in employee_aliases:
+        if employee_name in result:
+            continue
+        if re.search(rf"(?<!\w){re.escape(employee_alias)}(?!\w)", line):
+            result.append(employee_name)
+    return result
+
+
+def _vehicle_status_from_line(line: str, has_drivers: bool) -> str:
+    if any(marker in line for marker in ("простой", "свобод", "не работ", "idle")):
+        return "idle"
+    if any(marker in line for marker in ("ремонт", "repair")):
+        return "repair"
+    if has_drivers or any(marker in line for marker in ("работ", "выезд", "in use", "in_use")):
+        return "in_use"
+    return "unknown"
+
+
+def _validate_report_completeness(
+    *,
+    roster: list[dict[str, Any]],
+    vehicles: list[dict[str, Any]],
+    employee_statuses_by_id: dict[int, tuple[str, str]],
+    vehicle_assignments: list[tuple[int, int | None, str, str]],
+    driver_employee_ids: set[int],
+    employee_requires_vehicle_ids: set[int],
+) -> dict[str, Any]:
+    employees_by_id = _employees_by_id(roster)
+    vehicles_by_id = _vehicles_by_id(vehicles)
+    assigned_vehicle_ids = {vehicle_id for vehicle_id, _, _, _ in vehicle_assignments}
+    missing_employees = [
+        name for employee_id, name in employees_by_id.items() if employee_id not in employee_statuses_by_id
+    ]
+    missing_vehicles = [name for vehicle_id, name in vehicles_by_id.items() if vehicle_id not in assigned_vehicle_ids]
+    unknown_employees = [
+        employees_by_id.get(employee_id, str(employee_id))
+        for employee_id, (status, _) in employee_statuses_by_id.items()
+        if _is_unknown_status(status)
+    ]
+    unknown_vehicles = [
+        vehicles_by_id.get(vehicle_id, str(vehicle_id))
+        for vehicle_id, _, status, _ in vehicle_assignments
+        if _is_unknown_status(status)
+    ]
+    employees_without_vehicle = [
+        employees_by_id.get(employee_id, str(employee_id))
+        for employee_id in sorted(employee_requires_vehicle_ids - driver_employee_ids)
+    ]
+    in_use_without_drivers = [
+        vehicles_by_id.get(vehicle_id, str(vehicle_id))
+        for vehicle_id, employee_id, status, _ in vehicle_assignments
+        if employee_id is None and _norm_name(status) in {"in_use", "used", "work", "worked", "в работе", "работает"}
+    ]
+    missing = []
+    if missing_employees:
+        missing.append({"kind": "employees", "items": missing_employees})
+    if missing_vehicles:
+        missing.append({"kind": "vehicles", "items": missing_vehicles})
+    if employees_without_vehicle:
+        missing.append({"kind": "employee_vehicle_links", "items": employees_without_vehicle})
+    if in_use_without_drivers:
+        missing.append({"kind": "vehicle_drivers", "items": in_use_without_drivers})
+    unknown = []
+    if unknown_employees:
+        unknown.append({"kind": "employee_statuses", "items": unknown_employees})
+    if unknown_vehicles:
+        unknown.append({"kind": "vehicle_statuses", "items": unknown_vehicles})
+    questions = _clarification_questions(missing, unknown)
+    return {
+        "needs_clarification": bool(missing or unknown),
+        "missing": missing,
+        "unknown": unknown,
+        "questions": questions,
+    }
+
+
+def _employees_by_id(roster: list[dict[str, Any]]) -> dict[int, str]:
+    result: dict[int, str] = {}
+    for row in roster:
+        employee_id = optional_int(row.get("display_order") or row.get("id") or row.get("employee_id"))
+        name = str(row.get("full_name") or row.get("name") or employee_id or "").strip()
+        if employee_id is not None and name:
+            result[employee_id] = name
+    return result
+
+
+def _vehicles_by_id(vehicles: list[dict[str, Any]]) -> dict[int, str]:
+    result: dict[int, str] = {}
+    for row in vehicles:
+        vehicle_id = optional_int(row.get("id") or row.get("vehicle_id"))
+        name = str(row.get("brand_model") or row.get("vehicle_name") or row.get("name") or vehicle_id or "").strip()
+        if vehicle_id is not None and name:
+            result[vehicle_id] = name
+    return result
+
+
+def _status_requires_vehicle(value: Any) -> bool:
+    normalized = _norm_name(value)
+    return normalized in {"car", "on_car", "auto", "vehicle"} or "авто" in normalized
+
+
+def _is_unknown_status(value: Any) -> bool:
+    normalized = _norm_name(value)
+    return not normalized or normalized in {"unknown", "неизвестно", "неизвестен", "не распознано"}
+
+
+def _clarification_questions(missing: list[dict[str, Any]], unknown: list[dict[str, Any]]) -> list[str]:
+    questions: list[str] = []
+    for block in missing:
+        items = ", ".join(str(item) for item in block.get("items", []) if str(item).strip())
+        if not items:
+            continue
+        kind = block.get("kind")
+        if kind == "employees":
+            questions.append(f"Уточните статус сотрудников: {items}.")
+        elif kind == "vehicles":
+            questions.append(f"Уточните статус машин: {items}.")
+        elif kind == "employee_vehicle_links":
+            questions.append(f"Уточните машину для сотрудников: {items}.")
+        elif kind == "vehicle_drivers":
+            questions.append(f"Уточните водителей/сотрудников для машин: {items}.")
+    for block in unknown:
+        items = ", ".join(str(item) for item in block.get("items", []) if str(item).strip())
+        if not items:
+            continue
+        kind = block.get("kind")
+        if kind == "employee_statuses":
+            questions.append(f"Статус сотрудников не распознан: {items}.")
+        elif kind == "vehicle_statuses":
+            questions.append(f"Статус машин не распознан: {items}.")
+    return questions
 
 
 def _vehicle_aliases(vehicles: list[dict[str, Any]]) -> list[tuple[str, int, str]]:

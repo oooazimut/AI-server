@@ -59,6 +59,19 @@ class VehicleUsageStorePort(Protocol):
         dialog_id: str,
         reason: str,
     ) -> int: ...
+    def finalize_pending_unknowns(
+        self,
+        *,
+        report_date: str,
+        actor_user_id: int | None = None,
+        reason: str = "",
+    ) -> dict[str, Any]: ...
+    def auto_close_unanswered_day(
+        self,
+        *,
+        report_date: str,
+        reason: str,
+    ) -> dict[str, Any]: ...
 
 
 def resolve_vehicle_usage_operator_ids(

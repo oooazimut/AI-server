@@ -472,6 +472,127 @@ class FakeVehicleUsageStore:
         )
         return request_id
 
+    def finalize_pending_unknowns(
+        self,
+        *,
+        report_date: str,
+        actor_user_id: int | None = None,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        note = reason or "Auto-filled missing vehicle usage data as unknown."
+        request = None
+        for item in reversed(self._requests):
+            if item.get("request_date") == report_date and item.get("status") in {
+                "pending_clarification",
+                "pending_confirmation",
+            }:
+                request = item
+                break
+        if request is None:
+            return {"status": "skipped", "reason": "no_pending_draft", "report_date": report_date}
+        parsed = dict(request.get("parsed") or {})
+        existing_people = {
+            int(item.get("staff_order")): item
+            for item in parsed.get("people", [])
+            if isinstance(item, dict) and item.get("staff_order") is not None
+        }
+        existing_vehicles = {
+            int(item.get("vehicle_id")): item
+            for item in parsed.get("vehicles", [])
+            if isinstance(item, dict) and item.get("vehicle_id") is not None
+        }
+        people = []
+        for employee in self._employees:
+            employee_id = int(employee["display_order"])
+            known = dict(existing_people.get(employee_id, {}))
+            status = str(known.get("status") or "unknown")
+            notes = str(known.get("notes") or "")
+            if status == "unknown":
+                notes = notes or note
+            known.update(
+                {
+                    "staff_order": employee_id,
+                    "full_name": employee.get("full_name"),
+                    "status": status,
+                    "notes": notes,
+                }
+            )
+            people.append(known)
+        vehicles = []
+        for vehicle in self._vehicles:
+            vehicle_id = int(vehicle["id"])
+            known = dict(existing_vehicles.get(vehicle_id, {}))
+            status = str(known.get("status") or "unknown")
+            notes = str(known.get("notes") or "")
+            if status == "unknown":
+                notes = notes or note
+            known.update(
+                {
+                    "vehicle_id": vehicle_id,
+                    "vehicle_name": vehicle.get("brand_model"),
+                    "status": status,
+                    "drivers": known.get("drivers") if isinstance(known.get("drivers"), list) else [],
+                    "notes": notes,
+                }
+            )
+            vehicles.append(known)
+        completed = dict(parsed)
+        completed.update({"date": report_date, "people": people, "vehicles": vehicles, "auto_completed_unknown": True})
+        request_id = self.save_draft(
+            request_date=report_date,
+            user_id=request.get("user_id"),
+            dialog_id=str(request.get("dialog_id") or ""),
+            response_text=str(request.get("response_text") or note),
+            parsed=completed,
+            status="answered",
+        )
+        self.replace_day_report(
+            status_date=report_date,
+            employee_statuses=[
+                (int(item["staff_order"]), str(item["status"]), str(item.get("notes") or "")) for item in people
+            ],
+            vehicle_assignments=[
+                (int(item["vehicle_id"]), None, str(item["status"]), str(item.get("notes") or "")) for item in vehicles
+            ],
+            actor_user_id=actor_user_id or request.get("user_id"),
+        )
+        return {
+            "status": "finalized_unknown",
+            "report_date": report_date,
+            "request_id": request_id,
+            "employee_statuses_saved": len(people),
+            "vehicle_assignments_saved": len(vehicles),
+        }
+
+    def auto_close_unanswered_day(
+        self,
+        *,
+        report_date: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        request = self.get_request(request_date=report_date, user_id=None)
+        if request and request.get("status") in {
+            "answered",
+            "cancelled_day_off",
+            "pending_clarification",
+            "pending_confirmation",
+        }:
+            return {
+                "status": "skipped",
+                "reason": "useful_response_exists",
+                "report_date": report_date,
+                "request_status": request.get("status"),
+            }
+        operator_ids = sorted(self._operator_ids)
+        user_id = operator_ids[0] if operator_ids else request.get("user_id") if request else None
+        request_id = self.cancel_day_report(
+            report_date=report_date,
+            user_id=user_id,
+            dialog_id=str(user_id or ""),
+            reason=reason,
+        )
+        return {"status": "closed_day_off", "report_date": report_date, "request_id": request_id, "user_id": user_id}
+
 
 class FakePortalSearchIndex:
     """In-memory PortalSearchIndex for tests — implements the Protocol structurally."""
