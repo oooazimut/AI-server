@@ -74,6 +74,15 @@ def test_scheduler_can_be_disabled(monkeypatch):
     assert settings.scheduler_enabled is False
 
 
+def test_diagnost_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("DIAGNOST_ENABLED", "false")
+
+    settings = get_settings()
+
+    assert settings.diagnost_enabled is False
+
+
 def test_bitrix_oauth_urls_are_resolved(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://ai.example.com")

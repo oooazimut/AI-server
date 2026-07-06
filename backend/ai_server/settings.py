@@ -48,6 +48,7 @@ class Settings:
     tech_footer_allowed_user_ids: str
     tech_footer_balance_enabled: bool
     tech_footer_balance_cache_seconds: int
+    diagnost_enabled: bool
     learning_events_enabled: bool
     learning_events_capture_text: bool
     learning_events_max_text_chars: int
@@ -394,6 +395,7 @@ def get_settings() -> Settings:
         tech_footer_allowed_user_ids=_env("AI_SERVER_TECH_FOOTER_ALLOWED_USER_IDS"),
         tech_footer_balance_enabled=_env_bool("AI_SERVER_TECH_FOOTER_BALANCE_ENABLED", True),
         tech_footer_balance_cache_seconds=_env_int("AI_SERVER_TECH_FOOTER_BALANCE_CACHE_SECONDS", 300) or 300,
+        diagnost_enabled=_env_bool("DIAGNOST_ENABLED", True),
         learning_events_enabled=_env_bool("LEARNING_EVENTS_ENABLED", True),
         learning_events_capture_text=_env_bool("LEARNING_EVENTS_CAPTURE_TEXT", True),
         learning_events_max_text_chars=_env_int("LEARNING_EVENTS_MAX_TEXT_CHARS", 8000) or 8000,
