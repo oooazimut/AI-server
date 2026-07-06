@@ -516,7 +516,7 @@ def _format_employee_line(item: Any) -> str:
     if isinstance(item, dict):
         name = item.get("full_name") or item.get("employee_name") or item.get("name") or item.get("employee_id")
         status = item.get("status") or ""
-        vehicle = item.get("vehicle") or item.get("vehicle_name") or ""
+        vehicle = item.get("vehicle") or item.get("vehicle_name") or item.get("car_assigned") or ""
         notes = item.get("notes") or ""
     elif isinstance(item, (list, tuple)):
         name = item[2] if len(item) > 2 else item[0] if item else ""
@@ -562,6 +562,7 @@ def _vehicle_usage_status_label(value: Any) -> str:
     raw = str(value or "").strip()
     labels = {
         "worked": "работал",
+        "car": "работал",
         "on_car": "работал",
         "выезд": "работал",
         "на выезде": "работал",
@@ -573,6 +574,7 @@ def _vehicle_usage_status_label(value: Any) -> str:
         "work": "работал",
         "working": "работал",
         "shift": "работал",
+        "on_shift": "работал",
         "object": "работал",
         "on_object": "работал",
         "site": "работал",
