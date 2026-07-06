@@ -199,7 +199,7 @@ class LogisticsLLMService:
         save_answer = _compose_save_report_answer(tool_results)
         if save_answer is not None:
             return LogisticsLLMFinalResult(
-                status="completed",
+                status="needs_clarification" if _save_report_needs_clarification(tool_results) else "completed",
                 answer=save_answer,
                 model_usage=ModelUsageRecord(
                     agent_id=manifest.id,
@@ -498,6 +498,17 @@ def _compose_save_report_answer(tool_results: list[ToolResult]) -> str | None:
             continue
         data = result.data if isinstance(result.data, dict) else {}
         report_date = str(data.get("request_date") or data.get("report_date") or "").strip() or "указанную дату"
+        if data.get("needs_clarification"):
+            lines = [f"Часть отчета по машинам за {report_date} сохранил как черновик.", "", "Не хватает данных:"]
+            questions = data.get("questions") if isinstance(data.get("questions"), list) else []
+            for question in questions:
+                text = str(question or "").strip()
+                if text:
+                    lines.append(f"- {text}")
+            if len(lines) == 3:
+                lines.append("- Уточните недостающих сотрудников и машины.")
+            lines.extend(["", "Уточните только эти пункты."])
+            return "\n".join(lines)
         staff_count = int(data.get("staff_entries_saved") or 0)
         vehicle_count = int(data.get("vehicle_assignments_saved") or 0)
         lines = [f"Финальный отчет по машинам за {report_date} сохранен."]
@@ -510,6 +521,15 @@ def _compose_save_report_answer(tool_results: list[ToolResult]) -> str | None:
             lines.append("Сохранено: " + ", ".join(details) + ".")
         return "\n".join(lines)
     return None
+
+
+def _save_report_needs_clarification(tool_results: list[ToolResult]) -> bool:
+    for result in reversed(tool_results):
+        if result.tool != "vehicle_usage_save_report" or str(result.status) != "ok":
+            continue
+        data = result.data if isinstance(result.data, dict) else {}
+        return bool(data.get("needs_clarification"))
+    return False
 
 
 def _format_employee_line(item: Any) -> str:
