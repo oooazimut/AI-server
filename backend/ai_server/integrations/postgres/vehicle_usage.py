@@ -354,7 +354,13 @@ class PostgresVehicleUsageStore(PostgresAgentSchema):
                 """,
                 (report_date,),
             ).fetchall()
-            if not employees and not vehicles and not drivers:
+            needs_legacy = (
+                (not employees and not vehicles and not drivers)
+                or not vehicles
+                or not drivers
+                or any(not row.get("vehicle_name") for row in employees)
+            )
+            if needs_legacy:
                 request = db.execute(
                     """
                     SELECT * FROM logistics.vehicle_usage_requests
@@ -366,10 +372,45 @@ class PostgresVehicleUsageStore(PostgresAgentSchema):
                 ).fetchone()
             else:
                 request = None
-        if not employees and not vehicles and not drivers:
-            legacy_report = _legacy_day_report(report_date, _parse_row(request))
-            if legacy_report is not None:
+        legacy_report = _legacy_day_report(report_date, _parse_row(request))
+        if legacy_report is not None:
+            if not employees and not vehicles and not drivers:
                 return legacy_report
+            legacy_employees = (
+                legacy_report.get("employee_statuses")
+                if isinstance(legacy_report.get("employee_statuses"), list)
+                else []
+            )
+            legacy_vehicles = (
+                legacy_report.get("vehicle_assignments")
+                if isinstance(legacy_report.get("vehicle_assignments"), list)
+                else []
+            )
+            employee_statuses = _merge_legacy_employee_vehicles(
+                list(employees),
+                legacy_employees,
+                legacy_vehicles,
+            )
+            vehicle_assignments = list(vehicles)
+            vehicle_drivers = list(drivers)
+            supplemented = False
+            if not vehicle_assignments and legacy_report.get("vehicle_assignments"):
+                vehicle_assignments = list(legacy_report["vehicle_assignments"])
+                supplemented = True
+            if not vehicle_drivers and legacy_report.get("vehicle_drivers"):
+                vehicle_drivers = list(legacy_report["vehicle_drivers"])
+                supplemented = True
+            if employee_statuses != list(employees):
+                supplemented = True
+            if supplemented:
+                return {
+                    "report_date": report_date,
+                    "source": "normalized_tables+vehicle_usage_requests.parsed_json",
+                    "employee_statuses": employee_statuses,
+                    "vehicle_assignments": vehicle_assignments,
+                    "vehicle_drivers": vehicle_drivers,
+                    "request": legacy_report.get("request"),
+                }
         return {
             "report_date": report_date,
             "source": "normalized_tables",
@@ -1039,7 +1080,10 @@ def _legacy_staff_entries(parsed: dict[str, Any]) -> list[dict[str, Any]]:
             {
                 "full_name": str(name or "").strip(),
                 "status": str(item.get("status") or "").strip(),
-                "vehicle": item.get("vehicle") or item.get("vehicle_name") or item.get("car"),
+                "vehicle": item.get("vehicle")
+                or item.get("vehicle_name")
+                or item.get("car_assigned")
+                or item.get("car"),
                 "notes": str(item.get("notes") or "").strip(),
             }
         )
@@ -1088,6 +1132,44 @@ def _legacy_vehicle_drivers(vehicles: list[dict[str, Any]]) -> list[dict[str, An
     for vehicle in vehicles:
         for driver in vehicle.get("drivers") or []:
             result.append({"vehicle_name": vehicle.get("vehicle_name"), "full_name": driver})
+    return result
+
+
+def _merge_legacy_employee_vehicles(
+    employees: list[Any],
+    legacy_employees: list[dict[str, Any]],
+    legacy_vehicles: list[dict[str, Any]],
+) -> list[Any]:
+    vehicle_by_employee: dict[str, str] = {}
+    for item in legacy_employees:
+        name = _norm_name(item.get("full_name") or item.get("employee_name") or item.get("name"))
+        vehicle = str(item.get("vehicle") or item.get("vehicle_name") or "").strip()
+        if name and vehicle:
+            vehicle_by_employee[name] = vehicle
+    for item in legacy_vehicles:
+        vehicle = str(item.get("vehicle_name") or item.get("vehicle") or item.get("name") or "").strip()
+        if not vehicle:
+            continue
+        drivers = item.get("drivers") if isinstance(item.get("drivers"), list) else []
+        for driver in drivers:
+            name = _norm_name(driver)
+            if name:
+                vehicle_by_employee.setdefault(name, vehicle)
+    if not vehicle_by_employee:
+        return employees
+    result: list[Any] = []
+    for row in employees:
+        if not isinstance(row, dict):
+            result.append(row)
+            continue
+        item = dict(row)
+        if not item.get("vehicle_name"):
+            vehicle = vehicle_by_employee.get(
+                _norm_name(item.get("full_name") or item.get("employee_name") or item.get("name"))
+            )
+            if vehicle:
+                item["vehicle_name"] = vehicle
+        result.append(item)
     return result
 
 

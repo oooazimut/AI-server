@@ -819,6 +819,68 @@ def test_logistics_specialist_saves_report_from_production_style_payload(monkeyp
     assert (2, 2, "in_use", "") in report["vehicle_assignments"]
 
 
+def test_logistics_specialist_infers_vehicle_entries_from_report_text(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    manifest = get_agent_manifest("logistics")
+    assert manifest is not None
+    store = FakeVehicleUsageStore()
+    store.upsert_employees(
+        [
+            StaffMember(order=1, user_id=15, name="Borisov Andrey"),
+            StaffMember(order=2, user_id=16, name="Karasev Alexey"),
+        ]
+    )
+    store._vehicles = [
+        {"id": 2, "brand_model": "Auto 2", "registration_number": ""},
+        {"id": 5, "brand_model": "Auto 5", "registration_number": ""},
+    ]
+    fake_llm = FakeLogisticsLLM(
+        tool_call_steps=[
+            [LogisticsLLMToolCall(name="vehicle_usage_context", args={"request_date": "2026-07-06"})],
+            [
+                LogisticsLLMToolCall(
+                    name="vehicle_usage_save_report",
+                    args={
+                        "request_date": "2026-07-06",
+                        "source_text": "\n".join(
+                            [
+                                "Employees:",
+                                "- Borisov Andrey - car",
+                                "- Karasev Alexey - car",
+                                "Vehicles:",
+                                "- Auto 2 - Borisov Andrey, Karasev Alexey / in use",
+                                "- Auto 5 - idle",
+                            ]
+                        ),
+                        "parsed": {
+                            "date": "2026-07-06",
+                            "people": [
+                                {"full_name": "Borisov Andrey", "status": "car"},
+                                {"full_name": "Karasev Alexey", "status": "car"},
+                            ],
+                        },
+                    },
+                )
+            ],
+            [LogisticsLLMToolCall(name="none")],
+        ],
+        final_answer="Saved.",
+    )
+
+    anyio_run(
+        _specialist(manifest, store, llm=fake_llm).handle(
+            AgentTask(task_id="infer-vehicles", request="confirm", user=UserContext(id="9"))
+        )
+    )
+
+    assert store._requests[-1]["parsed"]["vehicles"][0]["vehicle_name"] == "Auto 2"
+    report = store._day_reports[-1]
+    assert report["employee_statuses"] == [(1, "worked", ""), (2, "worked", "")]
+    assert (2, 1, "in_use", "") in report["vehicle_assignments"]
+    assert (2, 2, "in_use", "") in report["vehicle_assignments"]
+    assert (5, None, "idle", "") in report["vehicle_assignments"]
+
+
 def test_logistics_specialist_cancels_report_as_day_off(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     manifest = get_agent_manifest("logistics")

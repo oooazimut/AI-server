@@ -692,7 +692,7 @@ def _staff_entries(parsed: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _vehicle_entries(parsed: dict[str, Any]) -> list[dict[str, Any]]:
-    vehicles = parsed.get("vehicles") or parsed.get("vehicle_assignments")
+    vehicles = parsed.get("vehicles") or parsed.get("vehicle_entries") or parsed.get("vehicle_assignments")
     return [item for item in vehicles if isinstance(item, dict)] if isinstance(vehicles, list) else []
 
 
@@ -747,7 +747,12 @@ def _augment_vehicle_assignments_from_text(
         return
     vehicle_aliases = _vehicle_aliases(vehicles)
     vehicle_entries = _vehicle_entries(parsed)
-    if not vehicle_aliases or not vehicle_entries:
+    if not vehicle_aliases:
+        return
+    if not vehicle_entries:
+        inferred = _infer_vehicle_entries_from_text(source_text, roster, vehicle_aliases)
+        if inferred:
+            parsed["vehicles"] = inferred
         return
     for entry in vehicle_entries:
         if not _is_blank_vehicle_entry(entry):
@@ -767,6 +772,78 @@ def _augment_vehicle_assignments_from_text(
             entry["vehicle_name"] = vehicle_name
             entry.setdefault("status", "in_use")
             break
+
+
+def _infer_vehicle_entries_from_text(
+    source_text: str,
+    roster: list[dict[str, Any]],
+    vehicle_aliases: list[tuple[str, int, str]],
+) -> list[dict[str, Any]]:
+    employee_aliases = _employee_aliases(roster)
+    result: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for raw_line in source_text.splitlines():
+        line = _norm_name(raw_line)
+        if not line:
+            continue
+        vehicle_match = _vehicle_in_line(line, vehicle_aliases)
+        if vehicle_match is None:
+            continue
+        vehicle_id, vehicle_name = vehicle_match
+        if vehicle_id in seen:
+            continue
+        seen.add(vehicle_id)
+        drivers = _drivers_in_line(line, employee_aliases)
+        status = _vehicle_status_from_line(line, bool(drivers))
+        result.append(
+            {
+                "vehicle_id": vehicle_id,
+                "vehicle_name": vehicle_name,
+                "status": status,
+                "drivers": drivers,
+            }
+        )
+    return result
+
+
+def _employee_aliases(roster: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    result: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for row in roster:
+        name = str(row.get("full_name") or row.get("name") or "").strip()
+        alias = _norm_name(name)
+        if len(alias) < 3 or alias in seen:
+            continue
+        seen.add(alias)
+        result.append((alias, name))
+    return sorted(result, key=lambda item: len(item[0]), reverse=True)
+
+
+def _vehicle_in_line(line: str, vehicle_aliases: list[tuple[str, int, str]]) -> tuple[int, str] | None:
+    for vehicle_alias, vehicle_id, vehicle_name in vehicle_aliases:
+        if re.search(rf"(?<!\w){re.escape(vehicle_alias)}(?!\w)", line):
+            return (vehicle_id, vehicle_name)
+    return None
+
+
+def _drivers_in_line(line: str, employee_aliases: list[tuple[str, str]]) -> list[str]:
+    result: list[str] = []
+    for employee_alias, employee_name in employee_aliases:
+        if employee_name in result:
+            continue
+        if re.search(rf"(?<!\w){re.escape(employee_alias)}(?!\w)", line):
+            result.append(employee_name)
+    return result
+
+
+def _vehicle_status_from_line(line: str, has_drivers: bool) -> str:
+    if any(marker in line for marker in ("простой", "свобод", "не работ", "idle")):
+        return "idle"
+    if any(marker in line for marker in ("ремонт", "repair")):
+        return "repair"
+    if has_drivers or any(marker in line for marker in ("работ", "выезд", "in use", "in_use")):
+        return "in_use"
+    return "unknown"
 
 
 def _vehicle_aliases(vehicles: list[dict[str, Any]]) -> list[tuple[str, int, str]]:
