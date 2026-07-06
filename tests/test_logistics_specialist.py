@@ -175,8 +175,10 @@ def test_logistics_llm_compose_translates_normalized_vehicle_usage_statuses(monk
                         "source": "normalized_tables",
                         "employee_statuses": [
                             {"full_name": "Борисов Андрей", "status": "worked", "vehicle_name": "Авто 2"},
+                            {"full_name": "Ивашин Павел", "status": "car", "car_assigned": "Авто 3"},
                             {"full_name": "Абдураимова Галина", "status": "on_leave"},
                             {"full_name": "Марат", "status": "in_office"},
+                            {"full_name": "Никаненок Алексейи", "status": "on_shift"},
                         ],
                         "vehicle_assignments": [
                             {
@@ -200,8 +202,10 @@ def test_logistics_llm_compose_translates_normalized_vehicle_usage_statuses(monk
     )
 
     assert "Борисов Андрей — работал / Авто 2" in result.answer
+    assert "Ивашин Павел — работал / Авто 3" in result.answer
     assert "Абдураимова Галина — отпуск" in result.answer
     assert "Марат — работал" in result.answer
+    assert "Никаненок Алексейи — работал" in result.answer
     assert "Авто 2 — Борисов Андрей / в работе" in result.answer
     assert "Авто 5 — простой" in result.answer
     assert "Авто 5 — простой / простой" not in result.answer
@@ -209,6 +213,8 @@ def test_logistics_llm_compose_translates_normalized_vehicle_usage_statuses(monk
     assert "idle" not in result.answer
     assert "on_leave" not in result.answer
     assert "in_office" not in result.answer
+    assert "on_shift" not in result.answer
+    assert " car" not in result.answer
 
 
 def test_logistics_llm_compose_formats_update_report_without_llm(monkeypatch):
