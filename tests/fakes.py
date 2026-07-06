@@ -548,7 +548,9 @@ class FakeVehicleUsageStore:
         )
         self.replace_day_report(
             status_date=report_date,
-            employee_statuses=[(int(item["staff_order"]), str(item["status"]), str(item.get("notes") or "")) for item in people],
+            employee_statuses=[
+                (int(item["staff_order"]), str(item["status"]), str(item.get("notes") or "")) for item in people
+            ],
             vehicle_assignments=[
                 (int(item["vehicle_id"]), None, str(item["status"]), str(item.get("notes") or "")) for item in vehicles
             ],
@@ -569,7 +571,12 @@ class FakeVehicleUsageStore:
         reason: str,
     ) -> dict[str, Any]:
         request = self.get_request(request_date=report_date, user_id=None)
-        if request and request.get("status") in {"answered", "cancelled_day_off", "pending_clarification", "pending_confirmation"}:
+        if request and request.get("status") in {
+            "answered",
+            "cancelled_day_off",
+            "pending_clarification",
+            "pending_confirmation",
+        }:
             return {
                 "status": "skipped",
                 "reason": "useful_response_exists",
