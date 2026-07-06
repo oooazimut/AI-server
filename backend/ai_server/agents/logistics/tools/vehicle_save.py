@@ -13,7 +13,6 @@ from ai_server.tools.vehicle_usage import (
 )
 from ai_server.utils import optional_int
 
-
 DEFAULT_START_MESSAGE = (
     "Доброе утро. Подготовьте, пожалуйста, отчет по машинам и людям за сегодня: "
     "кто работает, кто выходной/болеет/в отпуске, кто на какой машине, "
@@ -135,8 +134,7 @@ class VehicleGetOperatorsTool:
             if optional_int(row.get("user_id")) is not None
         }
         operators = [
-            {"user_id": operator_id, "full_name": names_by_user_id.get(operator_id, "")}
-            for operator_id in operator_ids
+            {"user_id": operator_id, "full_name": names_by_user_id.get(operator_id, "")} for operator_id in operator_ids
         ]
         return ToolResult(
             status=ToolStatus.OK,
@@ -148,7 +146,9 @@ class VehicleGetOperatorsTool:
 class VehicleStartDayTool:
     name = "vehicle_usage_start_day"
 
-    def __init__(self, store: VehicleUsageStorePort | None = None, *, allowed_user_ids: frozenset[int] = frozenset()) -> None:
+    def __init__(
+        self, store: VehicleUsageStorePort | None = None, *, allowed_user_ids: frozenset[int] = frozenset()
+    ) -> None:
         self._store = store
         self._allowed_user_ids = allowed_user_ids
 
@@ -210,7 +210,9 @@ class VehicleStartDayTool:
 class VehicleSaveDraftTool:
     name = "vehicle_usage_save_draft"
 
-    def __init__(self, store: VehicleUsageStorePort | None = None, *, allowed_user_ids: frozenset[int] = frozenset()) -> None:
+    def __init__(
+        self, store: VehicleUsageStorePort | None = None, *, allowed_user_ids: frozenset[int] = frozenset()
+    ) -> None:
         self._store = store
         self._allowed_user_ids = allowed_user_ids
 
@@ -256,7 +258,9 @@ class VehicleSaveDraftTool:
             )
         request_date = _request_date(args.get("request_date") or parsed.get("date"))
         response_text = str(args.get("response_text") or "")
-        _augment_vehicle_assignments_from_text(parsed, response_text, self._store.staff_roster(), self._store.vehicles())
+        _augment_vehicle_assignments_from_text(
+            parsed, response_text, self._store.staff_roster(), self._store.vehicles()
+        )
         request_id = self._store.save_draft(
             request_date=request_date,
             user_id=user_id,
@@ -275,7 +279,9 @@ class VehicleSaveDraftTool:
 class VehicleSaveReportTool:
     name = "vehicle_usage_save_report"
 
-    def __init__(self, store: VehicleUsageStorePort | None = None, *, allowed_user_ids: frozenset[int] = frozenset()) -> None:
+    def __init__(
+        self, store: VehicleUsageStorePort | None = None, *, allowed_user_ids: frozenset[int] = frozenset()
+    ) -> None:
         self._store = store
         self._allowed_user_ids = allowed_user_ids
 
@@ -367,8 +373,7 @@ class VehicleSaveReportTool:
         for employee_id in driver_employee_ids:
             employee_statuses_by_id.setdefault(employee_id, ("worked", ""))
         employee_statuses = [
-            (employee_id, status, notes)
-            for employee_id, (status, notes) in sorted(employee_statuses_by_id.items())
+            (employee_id, status, notes) for employee_id, (status, notes) in sorted(employee_statuses_by_id.items())
         ]
         self._store.replace_day_report(
             status_date=request_date,
@@ -391,7 +396,9 @@ class VehicleSaveReportTool:
 class VehicleCancelReportTool:
     name = "vehicle_usage_cancel_day"
 
-    def __init__(self, store: VehicleUsageStorePort | None = None, *, allowed_user_ids: frozenset[int] = frozenset()) -> None:
+    def __init__(
+        self, store: VehicleUsageStorePort | None = None, *, allowed_user_ids: frozenset[int] = frozenset()
+    ) -> None:
         self._store = store
         self._allowed_user_ids = allowed_user_ids
 
@@ -586,7 +593,9 @@ class VehicleGetVehiclePeriodReportTool:
 class VehicleUpdateReportTool:
     name = "vehicle_usage_update_report"
 
-    def __init__(self, store: VehicleUsageStorePort | None = None, *, allowed_user_ids: frozenset[int] = frozenset()) -> None:
+    def __init__(
+        self, store: VehicleUsageStorePort | None = None, *, allowed_user_ids: frozenset[int] = frozenset()
+    ) -> None:
         self._store = store
         self._allowed_user_ids = allowed_user_ids
 

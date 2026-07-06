@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import json
 
-from ai_server.agents.logistics import LogisticsLLMDecision, LogisticsLLMService, LogisticsLLMToolCall, LogisticsSpecialist
+from ai_server.agents.logistics import (
+    LogisticsLLMDecision,
+    LogisticsLLMService,
+    LogisticsLLMToolCall,
+    LogisticsSpecialist,
+)
 from ai_server.agents.logistics.specialist import VehicleUsageSettings
 from ai_server.agents.logistics.tools import (
     VehicleCancelReportTool,
     VehicleContextTool,
-    VehicleGetReportTool,
     VehicleGetOperatorsTool,
+    VehicleGetReportTool,
     VehicleSaveDraftTool,
     VehicleSaveReportTool,
     VehicleSetOperatorsTool,
@@ -174,8 +179,19 @@ def test_logistics_llm_compose_translates_normalized_vehicle_usage_statuses(monk
                             {"full_name": "Марат", "status": "in_office"},
                         ],
                         "vehicle_assignments": [
-                            {"vehicle_id": 2, "vehicle_name": "Авто 2", "status": "in_use", "drivers": ["Борисов Андрей"]},
-                            {"vehicle_id": 5, "vehicle_name": "Авто 5", "status": "idle", "drivers": [], "notes": "простой"},
+                            {
+                                "vehicle_id": 2,
+                                "vehicle_name": "Авто 2",
+                                "status": "in_use",
+                                "drivers": ["Борисов Андрей"],
+                            },
+                            {
+                                "vehicle_id": 5,
+                                "vehicle_name": "Авто 5",
+                                "status": "idle",
+                                "drivers": [],
+                                "notes": "простой",
+                            },
                         ],
                     },
                 )
@@ -499,9 +515,7 @@ def test_vehicle_usage_admin_can_replace_operators(monkeypatch):
     store = FakeVehicleUsageStore()
     tool = VehicleSetOperatorsTool(store, admin_user_ids=frozenset({1}))
 
-    result = anyio_run(
-        tool.execute({"operator_user_ids": [13, 15, 13]}, user_id=1, dialog_id="1")
-    )
+    result = anyio_run(tool.execute({"operator_user_ids": [13, 15, 13]}, user_id=1, dialog_id="1"))
 
     assert result.status == ToolStatus.OK
     assert result.data == {"operator_user_ids": [13, 15]}
@@ -576,9 +590,7 @@ def test_vehicle_usage_non_admin_cannot_replace_operators(monkeypatch):
     store = FakeVehicleUsageStore()
     tool = VehicleSetOperatorsTool(store, admin_user_ids=frozenset({1}))
 
-    result = anyio_run(
-        tool.execute({"operator_user_ids": [13]}, user_id=2, dialog_id="2")
-    )
+    result = anyio_run(tool.execute({"operator_user_ids": [13]}, user_id=2, dialog_id="2"))
 
     assert result.status == ToolStatus.DENIED
     assert store.vehicle_usage_operator_ids() == set()

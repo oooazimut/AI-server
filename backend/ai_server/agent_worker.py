@@ -310,11 +310,7 @@ async def main() -> None:
         agent_tasks.append(asyncio.create_task(run_diagnost_event_worker(diagnost_queue, diagnost_store)))
         agent_tasks.append(asyncio.create_task(run_feedback_scheduler_worker(diagnost_store, bitrix)))
 
-    if (
-        settings.vehicle_usage_enabled
-        and settings.vehicle_usage_staff_sync_enabled
-        and vehicle_usage_store is not None
-    ):
+    if settings.vehicle_usage_enabled and settings.vehicle_usage_staff_sync_enabled and vehicle_usage_store is not None:
         _bitrix_ref = bitrix
         _redis_url = settings.redis_url
 

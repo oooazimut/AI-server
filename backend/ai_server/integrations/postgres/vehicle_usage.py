@@ -159,7 +159,9 @@ class PostgresVehicleUsageStore(PostgresAgentSchema):
         db.execute("ALTER TABLE logistics.vehicle_usage_requests ADD COLUMN IF NOT EXISTS updated_by_user_id INTEGER")
         db.execute("ALTER TABLE logistics.vehicle_usage_requests ADD COLUMN IF NOT EXISTS finalized_by_user_id INTEGER")
         db.execute("ALTER TABLE logistics.vehicle_usage_requests ADD COLUMN IF NOT EXISTS cancelled_at TEXT")
-        db.execute("ALTER TABLE logistics.vehicle_usage_requests ADD COLUMN IF NOT EXISTS cancel_reason TEXT NOT NULL DEFAULT ''")
+        db.execute(
+            "ALTER TABLE logistics.vehicle_usage_requests ADD COLUMN IF NOT EXISTS cancel_reason TEXT NOT NULL DEFAULT ''"
+        )
 
     def upsert_employees(self, members: list[Any]) -> None:
         with self._sync_connect() as db:
@@ -461,8 +463,10 @@ class PostgresVehicleUsageStore(PostgresAgentSchema):
                 """,
                 (date_from, date_to),
             ).fetchall()
-        days = _group_vehicle_period_rows(list(rows)) if rows else _legacy_vehicle_period_rows(
-            vehicle_name, [_parse_row(row) for row in legacy_requests]
+        days = (
+            _group_vehicle_period_rows(list(rows))
+            if rows
+            else _legacy_vehicle_period_rows(vehicle_name, [_parse_row(row) for row in legacy_requests])
         )
         return {
             "subject": "vehicle",
@@ -728,9 +732,7 @@ class PostgresVehicleUsageStore(PostgresAgentSchema):
                 for row in db.execute("SELECT id, full_name FROM logistics.employees").fetchall()
             }
             vehicles_by_name = {}
-            for row in db.execute(
-                "SELECT id, brand_model, registration_number FROM logistics.vehicles"
-            ).fetchall():
+            for row in db.execute("SELECT id, brand_model, registration_number FROM logistics.vehicles").fetchall():
                 vehicles_by_name[_norm_name(row.get("brand_model"))] = row
                 vehicles_by_name[_norm_name(row.get("registration_number"))] = row
 
@@ -799,9 +801,7 @@ class PostgresVehicleUsageStore(PostgresAgentSchema):
                     (report_date, vehicle_id),
                 ).fetchall()
                 existing_driver_ids = [
-                    int(row["employee_id"])
-                    for row in existing_driver_rows
-                    if row.get("employee_id") is not None
+                    int(row["employee_id"]) for row in existing_driver_rows if row.get("employee_id") is not None
                 ]
                 replace_drivers = bool(item.get("replace_drivers"))
                 merged_driver_ids = list(driver_ids if replace_drivers else existing_driver_ids)
@@ -973,9 +973,7 @@ class PostgresVehicleUsageStore(PostgresAgentSchema):
                 if row.get("display_order") is not None
             ],
             vehicle_assignments=[
-                (int(row["id"]), None, "not_required", reason)
-                for row in vehicles
-                if row.get("id") is not None
+                (int(row["id"]), None, "not_required", reason) for row in vehicles if row.get("id") is not None
             ],
             actor_user_id=user_id,
         )

@@ -466,9 +466,7 @@ class FakeVehicleUsageStore:
                 if row.get("display_order") is not None
             ],
             vehicle_assignments=[
-                (int(row["id"]), None, "not_required", reason)
-                for row in self._vehicles
-                if row.get("id") is not None
+                (int(row["id"]), None, "not_required", reason) for row in self._vehicles if row.get("id") is not None
             ],
             actor_user_id=user_id,
         )

@@ -414,10 +414,14 @@ def _compose_get_report_answer(tool_results: list[ToolResult]) -> str | None:
 
 def _compose_period_report_answer(tool_results: list[ToolResult]) -> str | None:
     for result in reversed(tool_results):
-        if result.tool not in {
-            "vehicle_usage_get_employee_period_report",
-            "vehicle_usage_get_vehicle_period_report",
-        } or str(result.status) != "ok":
+        if (
+            result.tool
+            not in {
+                "vehicle_usage_get_employee_period_report",
+                "vehicle_usage_get_vehicle_period_report",
+            }
+            or str(result.status) != "ok"
+        ):
             continue
         data = result.data if isinstance(result.data, dict) else {}
         days = data.get("days") if isinstance(data.get("days"), list) else []
@@ -434,7 +438,9 @@ def _compose_period_report_answer(tool_results: list[ToolResult]) -> str | None:
                 status = _vehicle_usage_status_label(item.get("status") or "unknown")
                 vehicle = item.get("vehicle_name") or item.get("vehicle") or ""
                 notes = item.get("notes") or ""
-                details = " / ".join(str(value).strip() for value in (status, vehicle, notes) if str(value or "").strip())
+                details = " / ".join(
+                    str(value).strip() for value in (status, vehicle, notes) if str(value or "").strip()
+                )
                 lines.append(f"- {report_date} — {details}")
         else:
             subject = str(data.get("vehicle_name") or "").strip() or "машине"
