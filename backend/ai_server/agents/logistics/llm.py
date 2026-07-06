@@ -199,7 +199,7 @@ class LogisticsLLMService:
         save_answer = _compose_save_report_answer(tool_results)
         if save_answer is not None:
             return LogisticsLLMFinalResult(
-                status="completed",
+                status="needs_clarification" if _save_report_needs_clarification(tool_results) else "completed",
                 answer=save_answer,
                 model_usage=ModelUsageRecord(
                     agent_id=manifest.id,
@@ -414,10 +414,14 @@ def _compose_get_report_answer(tool_results: list[ToolResult]) -> str | None:
 
 def _compose_period_report_answer(tool_results: list[ToolResult]) -> str | None:
     for result in reversed(tool_results):
-        if result.tool not in {
-            "vehicle_usage_get_employee_period_report",
-            "vehicle_usage_get_vehicle_period_report",
-        } or str(result.status) != "ok":
+        if (
+            result.tool
+            not in {
+                "vehicle_usage_get_employee_period_report",
+                "vehicle_usage_get_vehicle_period_report",
+            }
+            or str(result.status) != "ok"
+        ):
             continue
         data = result.data if isinstance(result.data, dict) else {}
         days = data.get("days") if isinstance(data.get("days"), list) else []
@@ -434,7 +438,9 @@ def _compose_period_report_answer(tool_results: list[ToolResult]) -> str | None:
                 status = _vehicle_usage_status_label(item.get("status") or "unknown")
                 vehicle = item.get("vehicle_name") or item.get("vehicle") or ""
                 notes = item.get("notes") or ""
-                details = " / ".join(str(value).strip() for value in (status, vehicle, notes) if str(value or "").strip())
+                details = " / ".join(
+                    str(value).strip() for value in (status, vehicle, notes) if str(value or "").strip()
+                )
                 lines.append(f"- {report_date} — {details}")
         else:
             subject = str(data.get("vehicle_name") or "").strip() or "машине"
@@ -492,6 +498,17 @@ def _compose_save_report_answer(tool_results: list[ToolResult]) -> str | None:
             continue
         data = result.data if isinstance(result.data, dict) else {}
         report_date = str(data.get("request_date") or data.get("report_date") or "").strip() or "указанную дату"
+        if data.get("needs_clarification"):
+            lines = [f"Часть отчета по машинам за {report_date} сохранил как черновик.", "", "Не хватает данных:"]
+            questions = data.get("questions") if isinstance(data.get("questions"), list) else []
+            for question in questions:
+                text = str(question or "").strip()
+                if text:
+                    lines.append(f"- {text}")
+            if len(lines) == 3:
+                lines.append("- Уточните недостающих сотрудников и машины.")
+            lines.extend(["", "Уточните только эти пункты."])
+            return "\n".join(lines)
         staff_count = int(data.get("staff_entries_saved") or 0)
         vehicle_count = int(data.get("vehicle_assignments_saved") or 0)
         lines = [f"Финальный отчет по машинам за {report_date} сохранен."]
@@ -506,11 +523,20 @@ def _compose_save_report_answer(tool_results: list[ToolResult]) -> str | None:
     return None
 
 
+def _save_report_needs_clarification(tool_results: list[ToolResult]) -> bool:
+    for result in reversed(tool_results):
+        if result.tool != "vehicle_usage_save_report" or str(result.status) != "ok":
+            continue
+        data = result.data if isinstance(result.data, dict) else {}
+        return bool(data.get("needs_clarification"))
+    return False
+
+
 def _format_employee_line(item: Any) -> str:
     if isinstance(item, dict):
         name = item.get("full_name") or item.get("employee_name") or item.get("name") or item.get("employee_id")
         status = item.get("status") or ""
-        vehicle = item.get("vehicle") or item.get("vehicle_name") or ""
+        vehicle = item.get("vehicle") or item.get("vehicle_name") or item.get("car_assigned") or ""
         notes = item.get("notes") or ""
     elif isinstance(item, (list, tuple)):
         name = item[2] if len(item) > 2 else item[0] if item else ""
@@ -556,6 +582,7 @@ def _vehicle_usage_status_label(value: Any) -> str:
     raw = str(value or "").strip()
     labels = {
         "worked": "работал",
+        "car": "работал",
         "on_car": "работал",
         "выезд": "работал",
         "на выезде": "работал",
@@ -567,6 +594,7 @@ def _vehicle_usage_status_label(value: Any) -> str:
         "work": "работал",
         "working": "работал",
         "shift": "работал",
+        "on_shift": "работал",
         "object": "работал",
         "on_object": "работал",
         "site": "работал",

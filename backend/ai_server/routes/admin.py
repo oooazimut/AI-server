@@ -37,6 +37,7 @@ def health(request: Request) -> dict[str, Any]:
         "tech_footer_enabled": settings.tech_footer_enabled,
         "tech_footer_allowed_user_ids": settings.resolved_tech_footer_allowed_user_ids,
         "deepseek_balance_configured": bool(settings.deepseek_api_key),
+        "diagnost_enabled": settings.diagnost_enabled,
         "learning_events_enabled": settings.learning_events_enabled,
         "learning_events_path": str(settings.learning_events_path),
         "bitrix_webhook_queue_enabled": settings.webhook_event_queue_enabled,
