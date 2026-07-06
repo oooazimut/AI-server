@@ -307,8 +307,11 @@ async def main() -> None:
         for sp in orchestrator.specialists.values():
             agent_tasks.append(asyncio.create_task(sp.run(agent_queue)))  # type: ignore[union-attr]
         agent_tasks.append(asyncio.create_task(portal_search_indexer.run(agent_queue)))
-        agent_tasks.append(asyncio.create_task(run_diagnost_event_worker(diagnost_queue, diagnost_store)))
-        agent_tasks.append(asyncio.create_task(run_feedback_scheduler_worker(diagnost_store, bitrix)))
+        if settings.diagnost_enabled:
+            agent_tasks.append(asyncio.create_task(run_diagnost_event_worker(diagnost_queue, diagnost_store)))
+            agent_tasks.append(asyncio.create_task(run_feedback_scheduler_worker(diagnost_store, bitrix)))
+        else:
+            logger.info("Diagnost workers disabled by DIAGNOST_ENABLED=false")
 
     if settings.vehicle_usage_enabled and settings.vehicle_usage_staff_sync_enabled and vehicle_usage_store is not None:
         _bitrix_ref = bitrix
