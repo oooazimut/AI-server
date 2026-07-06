@@ -226,17 +226,77 @@ async def main() -> None:
                 for operator_id in operator_ids:
                     await _run_morning_for_operator(started_at, operator_id)
 
+            async def _finalize_pending_unknowns() -> None:
+                report_date = datetime.now(MOSCOW_TZ).date().isoformat()
+                if _vu_store_ref is None:
+                    logger.warning("Vehicle-usage unknown finalization skipped: store is not configured")
+                    return
+                if _dry_run:
+                    logger.info("Vehicle-usage unknown finalization dry-run skipped for %s", report_date)
+                    return
+                result = _vu_store_ref.finalize_pending_unknowns(
+                    report_date=report_date,
+                    reason="Auto-filled missing vehicle usage data as unknown.",
+                )
+                logger.info("Vehicle-usage unknown finalization result: %s", result)
+
+            async def _auto_close_unanswered_day() -> None:
+                report_date = datetime.now(MOSCOW_TZ).date().isoformat()
+                if _vu_store_ref is None:
+                    logger.warning("Vehicle-usage day-off auto close skipped: store is not configured")
+                    return
+                if _dry_run:
+                    logger.info("Vehicle-usage day-off auto close dry-run skipped for %s", report_date)
+                    return
+                result = _vu_store_ref.auto_close_unanswered_day(
+                    report_date=report_date,
+                    reason="Auto-closed as day off because no useful vehicle usage response was received by cutoff.",
+                )
+                logger.info("Vehicle-usage day-off auto close result: %s", result)
+
             hour, minute = _parse_hhmm(settings.vehicle_usage_request_time)
+            unknown_hour, unknown_minute = _parse_hhmm(settings.vehicle_usage_unknown_fill_time)
+            day_off_hour, day_off_minute = _parse_hhmm(settings.vehicle_usage_auto_day_off_time)
+            vehicle_usage_day_of_week = "mon-fri" if settings.vehicle_usage_workday_mode == "weekday" else None
             scheduler.add_job_cron(
                 "logistics",
                 "morning_report",
                 _run_morning,
                 hour,
                 minute,
-                day_of_week="mon-fri" if settings.vehicle_usage_workday_mode == "weekday" else None,
+                day_of_week=vehicle_usage_day_of_week,
                 replace_existing=False,
             )
             logger.info("Morning vehicle-usage cron scheduled at %02d:%02d МСК", hour, minute)
+
+            scheduler.add_job_cron(
+                "logistics",
+                "vehicle_usage_unknown_finalize",
+                _finalize_pending_unknowns,
+                unknown_hour,
+                unknown_minute,
+                day_of_week=vehicle_usage_day_of_week,
+                replace_existing=False,
+            )
+            logger.info(
+                "Vehicle-usage unknown finalization cron scheduled at %02d:%02d MSK",
+                unknown_hour,
+                unknown_minute,
+            )
+            scheduler.add_job_cron(
+                "logistics",
+                "vehicle_usage_auto_day_off",
+                _auto_close_unanswered_day,
+                day_off_hour,
+                day_off_minute,
+                day_of_week=vehicle_usage_day_of_week,
+                replace_existing=False,
+            )
+            logger.info(
+                "Vehicle-usage day-off auto close cron scheduled at %02d:%02d MSK",
+                day_off_hour,
+                day_off_minute,
+            )
 
         manager_id = settings.task_proposal_manager_bitrix_id
         _aq_ref = agent_queue

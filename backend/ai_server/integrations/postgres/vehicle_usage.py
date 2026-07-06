@@ -964,6 +964,109 @@ class PostgresVehicleUsageStore(PostgresAgentSchema):
             "change_summary": change_summary,
         }
 
+    def finalize_pending_unknowns(
+        self,
+        *,
+        report_date: str,
+        actor_user_id: int | None = None,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        note = reason or "Auto-filled missing vehicle usage data as unknown."
+        with self._sync_connect() as db:
+            row = db.execute(
+                """
+                SELECT * FROM logistics.vehicle_usage_requests
+                WHERE request_date = %s
+                  AND status IN ('pending_clarification', 'pending_confirmation')
+                  AND parsed_json IS NOT NULL
+                ORDER BY responded_at DESC NULLS LAST, id DESC
+                LIMIT 1
+                """,
+                (report_date,),
+            ).fetchone()
+        request = _parse_row(row)
+        if not request or not isinstance(request.get("parsed"), dict):
+            return {"status": "skipped", "reason": "no_pending_draft", "report_date": report_date}
+
+        employees = self.staff_roster()
+        vehicles = self.vehicles()
+        completed = _complete_pending_report_with_unknowns(
+            request["parsed"],
+            report_date=report_date,
+            employees=employees,
+            vehicles=vehicles,
+            note=note,
+        )
+        employee_statuses, vehicle_assignments = _report_rows_from_completed(
+            completed,
+            employees=employees,
+            vehicles=vehicles,
+        )
+        request_id = self.save_draft(
+            request_date=report_date,
+            user_id=_optional_int(request.get("user_id")),
+            dialog_id=str(request.get("dialog_id") or ""),
+            response_text=str(request.get("response_text") or note),
+            parsed=completed,
+            status="answered",
+        )
+        self.replace_day_report(
+            status_date=report_date,
+            employee_statuses=employee_statuses,
+            vehicle_assignments=vehicle_assignments,
+            actor_user_id=actor_user_id or _optional_int(request.get("user_id")),
+        )
+        return {
+            "status": "finalized_unknown",
+            "report_date": report_date,
+            "request_id": request_id,
+            "employee_statuses_saved": len(employee_statuses),
+            "vehicle_assignments_saved": len(vehicle_assignments),
+            "unknown_employees": completed.get("unknown_employees", []),
+            "unknown_vehicles": completed.get("unknown_vehicles", []),
+        }
+
+    def auto_close_unanswered_day(
+        self,
+        *,
+        report_date: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        with self._sync_connect() as db:
+            row = db.execute(
+                """
+                SELECT * FROM logistics.vehicle_usage_requests
+                WHERE request_date = %s
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (report_date,),
+            ).fetchone()
+        request = _parse_row(row)
+        if _has_useful_vehicle_usage_response(request):
+            return {
+                "status": "skipped",
+                "reason": "useful_response_exists",
+                "report_date": report_date,
+                "request_status": request.get("status") if request else None,
+            }
+
+        operator_ids = sorted(self.vehicle_usage_operator_ids())
+        user_id = operator_ids[0] if operator_ids else _optional_int(request.get("user_id")) if request else None
+        dialog_id = str(request.get("dialog_id") or user_id or "") if request else str(user_id or "")
+        request_id = self.cancel_day_report(
+            report_date=report_date,
+            user_id=user_id,
+            dialog_id=dialog_id,
+            reason=reason,
+        )
+        return {
+            "status": "closed_day_off",
+            "report_date": report_date,
+            "request_id": request_id,
+            "user_id": user_id,
+        }
+
     def cancel_day_report(
         self,
         *,
@@ -1040,6 +1143,324 @@ def _parse_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
         except (json.JSONDecodeError, TypeError):
             result["parsed"] = None
     return result
+
+
+def _complete_pending_report_with_unknowns(
+    parsed: dict[str, Any],
+    *,
+    report_date: str,
+    employees: list[dict[str, Any]],
+    vehicles: list[dict[str, Any]],
+    note: str,
+) -> dict[str, Any]:
+    employee_by_id = {_employee_row_id(row): row for row in employees if _employee_row_id(row) is not None}
+    vehicle_by_id = {_vehicle_row_id(row): row for row in vehicles if _vehicle_row_id(row) is not None}
+    employees_by_name = {
+        _norm_name(row.get("full_name") or row.get("name")): employee_id
+        for employee_id, row in employee_by_id.items()
+        if _norm_name(row.get("full_name") or row.get("name"))
+    }
+    vehicles_by_name = {}
+    for vehicle_id, row in vehicle_by_id.items():
+        for value in (row.get("brand_model"), row.get("registration_number"), row.get("vehicle_name"), row.get("name")):
+            name = _norm_name(value)
+            if name:
+                vehicles_by_name[name] = vehicle_id
+
+    known_people: dict[int, dict[str, Any]] = {}
+    vehicle_ids_by_employee: dict[int, int] = {}
+    for entry in _raw_people_entries(parsed):
+        employee_id = _entry_employee_id(entry, employees_by_name)
+        if employee_id is None:
+            continue
+        known_people[employee_id] = dict(entry)
+        vehicle_id = _entry_vehicle_id(entry, vehicles_by_name)
+        if vehicle_id is not None:
+            vehicle_ids_by_employee[employee_id] = vehicle_id
+
+    known_vehicles: dict[int, dict[str, Any]] = {}
+    for entry in _raw_vehicle_entries(parsed):
+        vehicle_id = _entry_vehicle_id(entry, vehicles_by_name)
+        if vehicle_id is None:
+            continue
+        item = dict(entry)
+        item["vehicle_id"] = vehicle_id
+        item["drivers"] = _driver_names(entry, employees_by_name, employee_by_id)
+        known_vehicles[vehicle_id] = item
+        for driver_name in item["drivers"]:
+            employee_id = employees_by_name.get(_norm_name(driver_name))
+            if employee_id is not None:
+                vehicle_ids_by_employee[employee_id] = vehicle_id
+
+    for employee_id, vehicle_id in vehicle_ids_by_employee.items():
+        vehicle = vehicle_by_id.get(vehicle_id)
+        employee = employee_by_id.get(employee_id)
+        if not vehicle or not employee:
+            continue
+        vehicle_entry = known_vehicles.setdefault(
+            vehicle_id,
+            {
+                "vehicle_id": vehicle_id,
+                "vehicle_name": _vehicle_name(vehicle),
+                "status": "in_use",
+                "drivers": [],
+                "notes": "",
+            },
+        )
+        drivers = vehicle_entry.setdefault("drivers", [])
+        employee_name = _employee_name(employee)
+        if employee_name and employee_name not in drivers:
+            drivers.append(employee_name)
+
+    people: list[dict[str, Any]] = []
+    unknown_employees: list[str] = []
+    assigned_employee_ids = set(vehicle_ids_by_employee)
+    for employee_id in sorted(employee_by_id):
+        employee = employee_by_id[employee_id]
+        known = known_people.get(employee_id, {})
+        has_vehicle = employee_id in assigned_employee_ids
+        status = _final_employee_status(known.get("status"), has_vehicle=has_vehicle)
+        notes = str(known.get("notes") or "")
+        if status == "unknown":
+            notes = notes or note
+            unknown_employees.append(_employee_name(employee))
+        item = dict(known)
+        item.update(
+            {
+                "staff_order": employee_id,
+                "full_name": _employee_name(employee),
+                "status": status,
+                "notes": notes,
+            }
+        )
+        vehicle_id = vehicle_ids_by_employee.get(employee_id)
+        if vehicle_id is not None and vehicle_id in vehicle_by_id:
+            item["vehicle"] = _vehicle_name(vehicle_by_id[vehicle_id])
+        people.append(item)
+
+    completed_vehicles: list[dict[str, Any]] = []
+    unknown_vehicles: list[str] = []
+    for vehicle_id in sorted(vehicle_by_id):
+        vehicle = vehicle_by_id[vehicle_id]
+        known = known_vehicles.get(vehicle_id)
+        if known is None:
+            completed_vehicles.append(
+                {
+                    "vehicle_id": vehicle_id,
+                    "vehicle_name": _vehicle_name(vehicle),
+                    "status": "unknown",
+                    "drivers": [],
+                    "notes": note,
+                }
+            )
+            unknown_vehicles.append(_vehicle_name(vehicle))
+            continue
+        drivers = [str(item).strip() for item in known.get("drivers", []) if str(item or "").strip()]
+        status = _final_vehicle_status(known.get("status") or known.get("assignment_status"), has_drivers=bool(drivers))
+        notes = str(known.get("notes") or "")
+        if status == "unknown":
+            notes = notes or note
+            unknown_vehicles.append(_vehicle_name(vehicle))
+        item = dict(known)
+        item.update(
+            {
+                "vehicle_id": vehicle_id,
+                "vehicle_name": _vehicle_name(vehicle),
+                "status": status,
+                "drivers": drivers,
+                "notes": notes,
+            }
+        )
+        completed_vehicles.append(item)
+
+    completed = dict(parsed)
+    completed.update(
+        {
+            "date": report_date,
+            "people": people,
+            "vehicles": completed_vehicles,
+            "auto_completed_unknown": True,
+            "unknown_fill_note": note,
+            "unknown_employees": unknown_employees,
+            "unknown_vehicles": unknown_vehicles,
+        }
+    )
+    return completed
+
+
+def _report_rows_from_completed(
+    completed: dict[str, Any],
+    *,
+    employees: list[dict[str, Any]],
+    vehicles: list[dict[str, Any]],
+) -> tuple[list[tuple[int, str, str]], list[tuple[int, int | None, str, str]]]:
+    employee_ids = {_employee_row_id(row) for row in employees}
+    vehicle_ids = {_vehicle_row_id(row) for row in vehicles}
+    employees_by_name = {
+        _norm_name(row.get("full_name") or row.get("name")): _employee_row_id(row)
+        for row in employees
+        if _employee_row_id(row) is not None and _norm_name(row.get("full_name") or row.get("name"))
+    }
+    employee_statuses: list[tuple[int, str, str]] = []
+    for entry in _raw_people_entries(completed):
+        employee_id = _entry_employee_id(entry, employees_by_name)
+        if employee_id is None or employee_id not in employee_ids:
+            continue
+        employee_statuses.append((employee_id, str(entry.get("status") or "unknown"), str(entry.get("notes") or "")))
+
+    vehicle_assignments: list[tuple[int, int | None, str, str]] = []
+    vehicles_by_name = {}
+    for row in vehicles:
+        vehicle_id = _vehicle_row_id(row)
+        if vehicle_id is None:
+            continue
+        for value in (row.get("brand_model"), row.get("registration_number"), row.get("vehicle_name"), row.get("name")):
+            name = _norm_name(value)
+            if name:
+                vehicles_by_name[name] = vehicle_id
+    for entry in _raw_vehicle_entries(completed):
+        vehicle_id = _entry_vehicle_id(entry, vehicles_by_name)
+        if vehicle_id is None or vehicle_id not in vehicle_ids:
+            continue
+        status = str(entry.get("status") or entry.get("assignment_status") or "unknown")
+        notes = str(entry.get("notes") or "")
+        raw_drivers = entry.get("drivers")
+        if not isinstance(raw_drivers, list):
+            raw_drivers = [entry.get("driver") or entry.get("employee_name") or entry.get("assigned_to")]
+        driver_ids = []
+        for driver_name in raw_drivers:
+            employee_id = employees_by_name.get(_norm_name(driver_name))
+            if employee_id is not None and employee_id not in driver_ids:
+                driver_ids.append(employee_id)
+        if not driver_ids:
+            vehicle_assignments.append((vehicle_id, None, status, notes))
+            continue
+        for employee_id in driver_ids:
+            vehicle_assignments.append((vehicle_id, employee_id, status, notes))
+    return employee_statuses, vehicle_assignments
+
+
+def _has_useful_vehicle_usage_response(request: dict[str, Any] | None) -> bool:
+    if not request:
+        return False
+    status = str(request.get("status") or "").strip()
+    if status in {"answered", "cancelled_day_off"}:
+        return True
+    return status in {"pending_clarification", "pending_confirmation"} and isinstance(request.get("parsed"), dict)
+
+
+def _raw_people_entries(parsed: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = parsed.get("people") or parsed.get("staff_entries") or parsed.get("staff") or parsed.get("employees")
+    return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+
+
+def _raw_vehicle_entries(parsed: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = parsed.get("vehicles") or parsed.get("vehicle_entries") or parsed.get("vehicle_assignments")
+    return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+
+
+def _entry_employee_id(entry: dict[str, Any], employees_by_name: dict[str, int]) -> int | None:
+    direct = _optional_int(entry.get("staff_order") or entry.get("employee_id") or entry.get("id"))
+    if direct is not None:
+        return direct
+    return employees_by_name.get(_norm_name(entry.get("full_name") or entry.get("name") or entry.get("employee_name")))
+
+
+def _entry_vehicle_id(entry: dict[str, Any], vehicles_by_name: dict[str, int]) -> int | None:
+    direct = _optional_int(entry.get("vehicle_id") or entry.get("id"))
+    if direct is not None:
+        return direct
+    return vehicles_by_name.get(
+        _norm_name(entry.get("vehicle_name") or entry.get("vehicle") or entry.get("name") or entry.get("brand_model"))
+    )
+
+
+def _driver_names(
+    entry: dict[str, Any],
+    employees_by_name: dict[str, int],
+    employees_by_id: dict[int, dict[str, Any]],
+) -> list[str]:
+    raw_drivers = entry.get("drivers")
+    if not isinstance(raw_drivers, list):
+        raw_drivers = [entry.get("driver") or entry.get("employee_name") or entry.get("assigned_to")]
+    result: list[str] = []
+    for raw_name in raw_drivers:
+        employee_id = employees_by_name.get(_norm_name(raw_name))
+        if employee_id is not None:
+            name = _employee_name(employees_by_id.get(employee_id, {}))
+        else:
+            name = str(raw_name or "").strip()
+        if name and name not in result:
+            result.append(name)
+    return result
+
+
+def _employee_row_id(row: dict[str, Any]) -> int | None:
+    return _optional_int(row.get("display_order") or row.get("id") or row.get("employee_id"))
+
+
+def _vehicle_row_id(row: dict[str, Any]) -> int | None:
+    return _optional_int(row.get("id") or row.get("vehicle_id"))
+
+
+def _employee_name(row: dict[str, Any]) -> str:
+    return str(row.get("full_name") or row.get("name") or row.get("employee_name") or "").strip()
+
+
+def _vehicle_name(row: dict[str, Any]) -> str:
+    return str(row.get("brand_model") or row.get("vehicle_name") or row.get("name") or "").strip()
+
+
+def _final_employee_status(value: Any, *, has_vehicle: bool) -> str:
+    raw = str(value or "").strip()
+    lowered = raw.casefold()
+    if not lowered or lowered == "unknown":
+        return "worked" if has_vehicle else "unknown"
+    if lowered in {"vacation", "on_leave", "leave", "holiday"}:
+        return "vacation"
+    if lowered in {"sick"}:
+        return "sick"
+    if lowered in {"day_off"}:
+        return "day_off"
+    if lowered in {"not_required"}:
+        return "not_required"
+    if has_vehicle or lowered in _WORK_STATUS_VALUES:
+        return "worked"
+    return raw or "unknown"
+
+
+def _final_vehicle_status(value: Any, *, has_drivers: bool) -> str:
+    raw = str(value or "").strip()
+    lowered = raw.casefold()
+    if lowered in {"idle", "repair", "not_working", "not_required"}:
+        return lowered
+    if has_drivers or lowered in {"in_use", "working", "work", "worked", "car", "on_car"}:
+        return "in_use"
+    return raw or "unknown"
+
+
+_WORK_STATUS_VALUES = {
+    "",
+    "unknown",
+    "office",
+    "in_office",
+    "at_office",
+    "work",
+    "worked",
+    "working",
+    "car",
+    "on_car",
+    "auto",
+    "vehicle",
+    "shift",
+    "on_shift",
+    "object",
+    "on_object",
+    "site",
+    "on_site",
+    "field",
+    "trip",
+}
 
 
 def _legacy_day_report(report_date: str, request: dict[str, Any] | None) -> dict[str, Any] | None:
