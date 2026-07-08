@@ -210,6 +210,7 @@ def run_test(args: argparse.Namespace, *, run_id: str, test: TestCase) -> dict[s
     deadline = time.time() + test.timeout_seconds
     last_status: dict[str, Any] = {}
     last_messages: list[dict[str, Any]] = []
+    last_new_messages: list[dict[str, Any]] = []
     while time.time() < deadline:
         time.sleep(args.poll_interval)
         last_status = request_json(args.status_url, timeout=10)
@@ -220,8 +221,13 @@ def run_test(args: argparse.Namespace, *, run_id: str, test: TestCase) -> dict[s
         ]
         if not new_messages:
             continue
+        last_new_messages = new_messages
 
-        joined = "\n".join(message_text(message) for message in new_messages)
+        response_messages = matching_response_messages(new_messages, test)
+        if not response_messages:
+            continue
+
+        joined = "\n".join(message_text(message) for message in response_messages)
         lower_joined = joined.casefold()
         matched = not test.expect_any or any(item.casefold() in lower_joined for item in test.expect_any)
         rejected = any(item.casefold() in lower_joined for item in test.reject_any)
@@ -234,6 +240,7 @@ def run_test(args: argparse.Namespace, *, run_id: str, test: TestCase) -> dict[s
             "event_id": enqueue.get("event_id"),
             "new_message_ids": [message_id(message) for message in new_messages],
             "new_message_count": len(new_messages),
+            "response_message_ids": [message_id(message) for message in response_messages],
             "expect_any": list(test.expect_any),
             "reject_any": list(test.reject_any),
             "matched": matched,
@@ -249,8 +256,17 @@ def run_test(args: argparse.Namespace, *, run_id: str, test: TestCase) -> dict[s
         "stage": "timeout",
         "event_id": enqueue.get("event_id"),
         "last_message_count": len(last_messages),
+        "last_new_message_ids": [message_id(message) for message in last_new_messages],
+        "last_new_response_preview": "\n".join(message_text(message) for message in last_new_messages)[:1200],
         "worker_latest": compact_status(last_status),
     }
+
+
+def matching_response_messages(messages: list[dict[str, Any]], test: TestCase) -> list[dict[str, Any]]:
+    if not test.expect_any:
+        return messages
+    needles = [item.casefold() for item in test.expect_any]
+    return [message for message in messages if any(needle in message_text(message).casefold() for needle in needles)]
 
 
 def compact_status(status: dict[str, Any]) -> dict[str, Any]:
