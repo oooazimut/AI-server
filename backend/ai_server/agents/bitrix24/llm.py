@@ -321,9 +321,7 @@ def _format_warehouse_answer(data: dict[str, Any], *, portal_base_url: str = "")
                 f"Показаны позиции {start}-{end} из {total}. Остальные позиции есть; можно запросить следующие."
             )
         else:
-            lines.append(
-                f"Показаны позиции {start}-{end} из {total}. Остальных позиций нет."
-            )
+            lines.append(f"Показаны позиции {start}-{end} из {total}. Остальных позиций нет.")
     elif offset == 0 and shown >= limit:
         lines.append(
             f"Показаны первые {shown} {_ru_position_word(shown)}. Если нужно, можно запросить следующие позиции."
