@@ -11,12 +11,14 @@ from ai_server.agents.bitrix24.tools.task_create import (
     TaskCreateDraftTool,
     TaskDraftDiscardTool,
 )
-from ai_server.agents.bitrix24.tools.tasks import BitrixMyTasksTool
+from ai_server.agents.bitrix24.tools.tasks import BitrixMyTasksTool, BitrixProjectSearchTool, BitrixTaskSearchTool
 from ai_server.agents.bitrix24.tools.warehouse import BitrixWarehouseSearchTool
 
 __all__ = [
     "BitrixApiTool",
     "BitrixMyTasksTool",
+    "BitrixProjectSearchTool",
+    "BitrixTaskSearchTool",
     "BitrixWarehouseSearchTool",
     "PortalSearchTool",
     "TaskCreateDraftTool",

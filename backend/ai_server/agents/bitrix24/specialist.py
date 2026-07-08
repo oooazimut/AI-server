@@ -18,6 +18,8 @@ from ai_server.agents.bitrix24.quality_control import (
 from ai_server.agents.bitrix24.tools import (
     BitrixApiTool,
     BitrixMyTasksTool,
+    BitrixProjectSearchTool,
+    BitrixTaskSearchTool,
     BitrixWarehouseSearchTool,
     DeleteIncompleteProposalTool,
     PortalSearchTool,
@@ -49,6 +51,8 @@ _LLM_TOOL_NAMES = frozenset(
         "portal_search",
         "bitrix_warehouse_search",
         "bitrix_my_tasks",
+        "bitrix_task_search",
+        "bitrix_project_search",
         "bitrix_api",
         "task_create_draft",
         "task_create_confirm",
@@ -120,6 +124,8 @@ class Bitrix24Specialist(BaseSpecialist):
             PortalSearchTool(portal_search=portal_search_index),
             BitrixWarehouseSearchTool(client=bitrix_client),
             BitrixMyTasksTool(client=bitrix_client),
+            BitrixTaskSearchTool(client=bitrix_client),
+            BitrixProjectSearchTool(client=bitrix_client),
             BitrixApiTool(
                 client=bitrix_client,
                 write_client=bitrix_client,

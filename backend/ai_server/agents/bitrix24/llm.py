@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 ALLOWED_TOOL_NAMES = {
     "bitrix_warehouse_search",
     "bitrix_my_tasks",
+    "bitrix_task_search",
+    "bitrix_project_search",
     "bitrix_api",
     "task_create_draft",
     "task_create_confirm",
@@ -233,6 +235,18 @@ def _direct_task_create_response(
                 answer=_format_my_tasks_answer(result.data, portal_base_url=portal_base_url),
                 model_usage=_local_model_usage(agent_id, "my_tasks_response"),
             )
+        if result.tool == "bitrix_task_search":
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer=_format_task_search_answer(result.data, portal_base_url=portal_base_url),
+                model_usage=_local_model_usage(agent_id, "task_search_response"),
+            )
+        if result.tool == "bitrix_project_search":
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer=_format_project_search_answer(result.data, portal_base_url=portal_base_url),
+                model_usage=_local_model_usage(agent_id, "project_search_response"),
+            )
         if result.tool == "task_create_draft":
             return BitrixLLMFinalResult(
                 status="needs_human",
@@ -360,10 +374,114 @@ def _format_my_tasks_answer(data: dict[str, Any], *, portal_base_url: str = "") 
     return "\n".join(lines)
 
 
+def _format_task_search_answer(data: dict[str, Any], *, portal_base_url: str = "") -> str:
+    mode = _text(data.get("mode")) or "list"
+    if mode == "detail":
+        item = data.get("item") if isinstance(data.get("item"), dict) else None
+        if not item:
+            return "Задача не найдена."
+        title = _text(item.get("title")) or "задача"
+        label = _task_link(title, _text(item.get("id")), portal_base_url=portal_base_url)
+        details = _task_details(item, include_roles=True)
+        if not details:
+            return f"Задача найдена: {label}."
+        return f"Задача найдена: {label}.\n" + "\n".join(details)
+
+    project_query = _text(data.get("project_query"))
+    if data.get("project_not_found"):
+        return f"Проект «{project_query}» не найден." if project_query else "Проект не найден."
+
+    items = data.get("items") if isinstance(data.get("items"), list) else []
+    title = _task_search_title(data)
+    if not items:
+        return title.replace(":", " не найдены.")
+
+    lines = [title]
+    offset = _int_value(data.get("offset")) or 0
+    scope = _text(data.get("scope"))
+    for index, item in enumerate(items, start=offset + 1):
+        if not isinstance(item, dict):
+            continue
+        task_title = _text(item.get("title")) or "задача"
+        label = _task_link(task_title, _text(item.get("id")), portal_base_url=portal_base_url)
+        details = _task_details(item, include_roles=scope not in {"responsible", "created_by"})
+        suffix = f" — {', '.join(details)}" if details else ""
+        lines.append(f"{index}. {label}{suffix}")
+
+    shown = len(items)
+    total = _int_value(data.get("total"))
+    if total and total > offset + shown:
+        if offset == 0:
+            lines.append(f"Показаны первые {shown} задач из {total}. Если нужно, можно запросить следующие.")
+        else:
+            lines.append(f"Показаны задачи {offset + 1}-{offset + shown} из {total}.")
+    return "\n".join(lines)
+
+
+def _format_project_search_answer(data: dict[str, Any], *, portal_base_url: str = "") -> str:
+    query = _text(data.get("query"))
+    items = data.get("items") if isinstance(data.get("items"), list) else []
+    if not items:
+        return f"Проект «{query}» не найден." if query else "Проект не найден."
+    lines = ["Найденные проекты:" if len(items) > 1 else "Найден проект:"]
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            continue
+        name = _text(item.get("name")) or "проект"
+        lines.append(f"{index}. {_project_link(name, _text(item.get('id')), portal_base_url=portal_base_url)}")
+    return "\n".join(lines)
+
+
+def _task_search_title(data: dict[str, Any]) -> str:
+    project = data.get("project") if isinstance(data.get("project"), dict) else {}
+    project_name = _text(project.get("name")) if isinstance(project, dict) else ""
+    scope_label = _text(data.get("scope_label")) or "задачи"
+    status = _text(data.get("status")) or "active"
+    query = _text(data.get("query"))
+    if project_name:
+        base = f"Задачи в проекте {project_name}"
+    elif status == "overdue":
+        base = f"Просроченные {scope_label}"
+    elif status == "closed":
+        base = f"Завершённые {scope_label}"
+    elif status == "all":
+        base = scope_label
+    else:
+        base = f"Активные {scope_label}"
+    if query:
+        base = f"{base} по запросу «{query}»"
+    return _capitalize_first(base) + ":"
+
+
+def _task_details(item: dict[str, Any], *, include_roles: bool) -> list[str]:
+    details = [f"срок: {_text(item.get('deadline_label')) or 'без срока'}"]
+    status_label = _text(item.get("status_label"))
+    if status_label:
+        details.append(status_label)
+    roles = item.get("roles") if isinstance(item.get("roles"), list) else []
+    roles_label = ", ".join(_text(role) for role in roles if _text(role))
+    if include_roles and roles_label:
+        details.append(roles_label)
+    return details
+
+
+def _capitalize_first(value: str) -> str:
+    if not value:
+        return value
+    return value[:1].upper() + value[1:]
+
+
 def _task_link(title: str, task_id: str, *, portal_base_url: str = "") -> str:
     if not portal_base_url or not task_id:
         return title
     url = f"{portal_base_url.rstrip('/')}/company/personal/user/0/tasks/task/view/{task_id}/"
+    return f"[URL={url}]{title}[/URL]"
+
+
+def _project_link(title: str, project_id: str, *, portal_base_url: str = "") -> str:
+    if not portal_base_url or not project_id:
+        return title
+    url = f"{portal_base_url.rstrip('/')}/workgroups/group/{project_id}/"
     return f"[URL={url}]{title}[/URL]"
 
 
@@ -496,7 +614,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
-        '"tool_calls":[{"name":"bitrix_warehouse_search|bitrix_my_tasks|bitrix_api|task_create_draft|task_create_confirm|task_draft_discard|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
+        '"tool_calls":[{"name":"bitrix_warehouse_search|bitrix_my_tasks|bitrix_task_search|bitrix_project_search|bitrix_api|task_create_draft|task_create_confirm|task_draft_discard|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
         "Перед каждым tool_call сам проверь, хватает ли данных для его корректного вызова. "
         "Нельзя вызывать tool с надеждой, что backend или tool сам разберётся с недостающими данными. "
         'Если данных не хватает, не вызывай tool: верни status=needs_clarification, tool_calls=[{"name":"none"}], '
@@ -504,10 +622,12 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Данные о текущем пользователе уже есть в permission_context.bitrix_current_user_profile. "
         "Для общей фразы 'мои задачи' или 'мои открытые задачи' используй bitrix_my_tasks: он включает задачи, "
         "где текущий пользователь исполнитель, постановщик, соисполнитель или другой участник Bitrix, "
-        "возвращает 10 по умолчанию и сортирует по сроку. "
-        "Для остальных поисков задач используй bitrix_api с tasks.task.list/tasks.task.get. "
+        "возвращает 10 по умолчанию, берёт только активные статусы 1-4 и сортирует по сроку. "
+        "Для 'задачи на мне', 'я исполнитель' используй bitrix_task_search со scope=responsible. "
+        "Для 'задачи, поставленные мной' используй bitrix_task_search со scope=created_by. "
+        "Для поиска задачи по ID, названию, сроку, просрочке или проекту используй bitrix_task_search, а не свободный bitrix_api. "
         "Для поиска сотрудника по имени — bitrix_api с user.search, получи numeric ID. "
-        "Для поиска проекта по названию — bitrix_api с sonet_group.get, получи numeric ID. "
+        "Для чтения/поиска проекта по названию используй bitrix_project_search. "
         "Для поиска складов, остатков и запросов вида 'найди склад Борисов' используй bitrix_warehouse_search, "
         "а не свободный bitrix_api. Если пользователь просит что есть на складе/остатки, передай include_products=true "
         "и product_limit=10, если пользователь не попросил другое количество. Для следующих позиций используй product_offset. "
@@ -519,7 +639,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Если знаешь имя ответственного после поиска, тоже передай его в responsible_name "
         "только для человекочитаемого черновика. "
         "Если ответственный указан по имени — сначала вызови bitrix_api(user.search), получи ID, затем task_create_draft. "
-        "Если проект указан по названию — сначала вызови bitrix_api(sonet_group.get), получи ID, затем task_create_draft. "
+        "Если проект указан по названию — сначала вызови bitrix_project_search, получи ID, затем task_create_draft. "
         "Если пользователь сказал относительный срок, вычисли deadline_iso сам по current_datetime. "
         "Если срок не указан, не спрашивай уточнение: backend поставит срок по умолчанию три рабочих дня, 19:00 МСК. "
         "Передавай no_deadline=true только если пользователь явно сказал, что задача должна быть без срока. "
