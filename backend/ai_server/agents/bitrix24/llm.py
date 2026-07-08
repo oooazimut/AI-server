@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_TOOL_NAMES = {
     "bitrix_warehouse_search",
+    "bitrix_my_tasks",
     "bitrix_api",
     "task_create_draft",
     "task_create_confirm",
@@ -226,6 +227,12 @@ def _direct_task_create_response(
                 answer=_format_warehouse_answer(result.data, portal_base_url=portal_base_url),
                 model_usage=_local_model_usage(agent_id, "warehouse_response"),
             )
+        if result.tool == "bitrix_my_tasks":
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer=_format_my_tasks_answer(result.data, portal_base_url=portal_base_url),
+                model_usage=_local_model_usage(agent_id, "my_tasks_response"),
+            )
         if result.tool == "task_create_draft":
             return BitrixLLMFinalResult(
                 status="needs_human",
@@ -311,6 +318,53 @@ def _warehouse_product_link(name: str, url: str, *, portal_base_url: str = "") -
     else:
         return name
     return f"[URL={resolved}]{name}[/URL]"
+
+
+def _format_my_tasks_answer(data: dict[str, Any], *, portal_base_url: str = "") -> str:
+    items = data.get("items") if isinstance(data.get("items"), list) else []
+    status = _text(data.get("status")) or "open"
+    title = {
+        "open": "Мои открытые задачи:",
+        "closed": "Мои завершённые задачи:",
+        "all": "Мои задачи:",
+    }.get(status, "Мои задачи:")
+    if not items:
+        return title.replace(":", " не найдены.")
+
+    lines = [title]
+    offset = _int_value(data.get("offset")) or 0
+    for index, item in enumerate(items, start=offset + 1):
+        if not isinstance(item, dict):
+            continue
+        task_title = _text(item.get("title")) or "задача"
+        task_id = _text(item.get("id"))
+        label = _task_link(task_title, task_id, portal_base_url=portal_base_url)
+        deadline = _text(item.get("deadline_label")) or "без срока"
+        roles = item.get("roles") if isinstance(item.get("roles"), list) else []
+        roles_label = ", ".join(_text(role) for role in roles if _text(role))
+        status_label = _text(item.get("status_label"))
+        details = [f"срок: {deadline}"]
+        if status_label:
+            details.append(status_label)
+        if roles_label:
+            details.append(roles_label)
+        lines.append(f"{index}. {label} — {', '.join(details)}")
+
+    shown = len(items)
+    total = _int_value(data.get("total"))
+    if total and total > offset + shown:
+        if offset == 0:
+            lines.append(f"Показаны первые {shown} задач из {total}. Если нужно, можно запросить следующие.")
+        else:
+            lines.append(f"Показаны задачи {offset + 1}-{offset + shown} из {total}.")
+    return "\n".join(lines)
+
+
+def _task_link(title: str, task_id: str, *, portal_base_url: str = "") -> str:
+    if not portal_base_url or not task_id:
+        return title
+    url = f"{portal_base_url.rstrip('/')}/company/personal/user/0/tasks/task/view/{task_id}/"
+    return f"[URL={url}]{title}[/URL]"
 
 
 def _format_stock_amount(value: object) -> str:
@@ -442,13 +496,16 @@ def _decision_system_prompt(instructions: str = "") -> str:
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
-        '"tool_calls":[{"name":"bitrix_warehouse_search|bitrix_api|task_create_draft|task_create_confirm|task_draft_discard|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
+        '"tool_calls":[{"name":"bitrix_warehouse_search|bitrix_my_tasks|bitrix_api|task_create_draft|task_create_confirm|task_draft_discard|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
         "Перед каждым tool_call сам проверь, хватает ли данных для его корректного вызова. "
         "Нельзя вызывать tool с надеждой, что backend или tool сам разберётся с недостающими данными. "
         'Если данных не хватает, не вызывай tool: верни status=needs_clarification, tool_calls=[{"name":"none"}], '
         "а в answer задай короткий уточняющий вопрос. "
         "Данные о текущем пользователе уже есть в permission_context.bitrix_current_user_profile. "
-        "Для поиска задач используй bitrix_api с tasks.task.list/tasks.task.get. "
+        "Для общей фразы 'мои задачи' или 'мои открытые задачи' используй bitrix_my_tasks: он включает задачи, "
+        "где текущий пользователь исполнитель, постановщик, соисполнитель или другой участник Bitrix, "
+        "возвращает 10 по умолчанию и сортирует по сроку. "
+        "Для остальных поисков задач используй bitrix_api с tasks.task.list/tasks.task.get. "
         "Для поиска сотрудника по имени — bitrix_api с user.search, получи numeric ID. "
         "Для поиска проекта по названию — bitrix_api с sonet_group.get, получи numeric ID. "
         "Для поиска складов, остатков и запросов вида 'найди склад Борисов' используй bitrix_warehouse_search, "
