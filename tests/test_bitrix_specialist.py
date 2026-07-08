@@ -355,7 +355,9 @@ def test_bitrix_llm_decision_payload_includes_permission_context(monkeypatch):
     assert permission["current_user_write_profile"] == "member_write"
     assert permission["bitrix_current_user_profile"] == context["bitrix_current_user_profile"]
     assert permission["permission_policy_context"] == context["permission_policy_context"]
-    assert any("read_only users should not prepare write-tools" in rule for rule in permission["rules"])
+    assert any("business writes must be prepared as drafts" in rule for rule in permission["rules"])
+    assert any("confirmed writes execute only through OAuth" in rule for rule in permission["rules"])
+    assert any("Bitrix itself decides final permissions" in rule for rule in permission["rules"])
 
 
 def test_bitrix_llm_service_uses_injected_settings_not_global_at_call_time(monkeypatch):
