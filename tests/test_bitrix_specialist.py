@@ -600,6 +600,59 @@ def test_bitrix_llm_compose_formats_warehouse_products_with_links_and_more(monke
     assert "#1001" not in result.answer
 
 
+def test_bitrix_llm_compose_marks_limit_sized_warehouse_page_as_first_page(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_REST_WEBHOOK_URL", "https://asutp-expert.bitrix24.ru/rest/1/token/")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="покажи остатки по складу Борисов"),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="bitrix_warehouse_search",
+                    data={
+                        "query": "Борисов",
+                        "matches": [{"id": 10, "title": "Борисов А.А.", "address": "Российская,8"}],
+                        "products": {
+                            "status": "ok",
+                            "items": [
+                                {
+                                    "product_id": 1001,
+                                    "product_name": "Коробка ответвительная",
+                                    "product_url": "/shop/documents-catalog/7/product/1001/",
+                                    "amount": "1",
+                                },
+                                {
+                                    "product_id": 1002,
+                                    "product_name": "Селектор",
+                                    "product_url": "/shop/documents-catalog/7/product/1002/",
+                                    "amount": "9",
+                                },
+                            ],
+                            "limit": 2,
+                            "offset": 0,
+                            "available_items_with_names": 2,
+                            "available_items_seen": 2,
+                            "has_more": False,
+                        },
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "completed"
+    assert "Показаны первые 2 позиции" in result.answer
+    assert "Если нужно, можно запросить следующие позиции" in result.answer
+    assert "Остальные позиции есть" not in result.answer
+
+
 def test_bitrix_llm_service_uses_injected_settings_not_global_at_call_time(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("BITRIX_REST_WEBHOOK_URL", "https://injected.bitrix24.ru/rest/1/token/")
