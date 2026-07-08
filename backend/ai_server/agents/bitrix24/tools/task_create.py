@@ -214,6 +214,13 @@ class TaskCreateConfirmTool:
                 tool=self.name,
                 error="no pending task draft found for this dialog",
             )
+        if draft_params.get("_draft_type") not in (None, "task_create"):
+            return ToolResult(
+                status=ToolStatus.NOT_FOUND,
+                tool=self.name,
+                error="no pending task creation draft found for this dialog",
+                data={"draft_type": draft_params.get("_draft_type")},
+            )
         if self._dry_run:
             return ToolResult(
                 status=ToolStatus.DRY_RUN,

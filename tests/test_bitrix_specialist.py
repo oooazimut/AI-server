@@ -551,6 +551,59 @@ def test_bitrix_llm_exposes_and_accepts_task_draft_confirmation_tools(monkeypatc
     assert [call.name for call in result.decision.tool_calls] == ["task_create_confirm", "task_draft_discard"]
 
 
+def test_bitrix_llm_exposes_and_accepts_task_close_confirmation_tools(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient(
+        json.dumps(
+            {
+                "status": "completed",
+                "answer": "",
+                "confidence": 0.7,
+                "tool_calls": [
+                    {"name": "task_close_confirm", "args": {}, "summary": "confirmed"},
+                    {"name": "task_close_discard", "args": {}, "summary": "discarded"},
+                ],
+            }
+        )
+    )
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_close_draft", "description": "", "parameters": {}},
+        {"name": "task_close_confirm", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request="да, закрывай",
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "task_close",
+                        "task_id": 139,
+                        "task_title": "Обучение сотрудников",
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert {"task_close_draft", "task_close_confirm", "task_close_discard"} <= ALLOWED_TOOL_NAMES
+    payload = json.loads(client.calls[0]["messages"][1]["content"])
+    prompt = client.calls[0]["messages"][0]["content"]
+    assert {"task_close_confirm", "task_close_discard"} <= {tool["name"] for tool in payload["tools"]}
+    assert payload["permission_context"]["pending_task_draft"]["_draft_type"] == "task_close"
+    assert "task_close_confirm" in prompt
+    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" in prompt
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_confirm", "task_close_discard"]
+
+
 def test_bitrix_llm_compose_formats_task_draft_without_profile_links(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
@@ -628,6 +681,88 @@ def test_bitrix_llm_compose_formats_task_confirm_with_task_link_only(monkeypatch
         "Задача создана: "
         "[URL=https://asutp-expert.bitrix24.ru/company/personal/user/0/tasks/task/view/8851/]"
         "тест подтверждения[/URL]."
+    )
+    assert "/company/personal/user/13/" not in result.answer
+
+
+def test_bitrix_llm_compose_formats_task_close_draft(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="закрой задачу", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="task_close_draft",
+                    data={
+                        "draft": {
+                            "_draft_type": "task_close",
+                            "task_id": 139,
+                            "task_title": "Обучение сотрудников",
+                            "action": "complete",
+                            "completion_summary": "Пользователь подтвердил выполнение.",
+                            "unresolved_items": ["не приложен акт проверки"],
+                        },
+                        "preview": {
+                            "task_title": "Обучение сотрудников",
+                            "action_label": "отметить задачу выполненной",
+                            "completion_summary": "Пользователь подтвердил выполнение.",
+                            "unresolved_items": ["не приложен акт проверки"],
+                        },
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert "Черновик закрытия задачи" in result.answer
+    assert "Обучение сотрудников" in result.answer
+    assert "не приложен акт проверки" in result.answer
+    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" in result.answer
+    assert "[URL" not in result.answer
+
+
+def test_bitrix_llm_compose_formats_task_close_confirm_with_task_link(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_REST_WEBHOOK_URL", "https://asutp-expert.bitrix24.ru/rest/1/token/")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="да, закрывай", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="task_close_confirm",
+                    data={
+                        "task_id": 139,
+                        "task_title": "Обучение сотрудников",
+                        "action": "complete",
+                        "unresolved_items": ["не приложен акт проверки"],
+                        "draft": {"task_id": 139, "task_title": "Обучение сотрудников"},
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "completed"
+    assert result.answer == (
+        "Задача отмечена выполненной: "
+        "[URL=https://asutp-expert.bitrix24.ru/company/personal/user/0/tasks/task/view/139/]"
+        "Обучение сотрудников[/URL]. С непроверенными пунктами добавлена метка "
+        "AI_SERVER_TASK_CLOSE_INCOMPLETE."
     )
     assert "/company/personal/user/13/" not in result.answer
 
