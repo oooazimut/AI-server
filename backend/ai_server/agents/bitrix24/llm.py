@@ -4,6 +4,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
 from ai_server.agents.specialist_llm_shared import (
@@ -219,6 +220,12 @@ def _direct_task_create_response(
     for result in reversed(tool_results):
         if result.status != "ok":
             continue
+        if result.tool == "bitrix_warehouse_search":
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer=_format_warehouse_answer(result.data, portal_base_url=portal_base_url),
+                model_usage=_local_model_usage(agent_id, "warehouse_response"),
+            )
         if result.tool == "task_create_draft":
             return BitrixLLMFinalResult(
                 status="needs_human",
@@ -238,6 +245,92 @@ def _direct_task_create_response(
                 model_usage=_local_model_usage(agent_id, "task_draft_discard_response"),
             )
     return None
+
+
+def _format_warehouse_answer(data: dict[str, Any], *, portal_base_url: str = "") -> str:
+    matches = data.get("matches") if isinstance(data.get("matches"), list) else []
+    if not matches:
+        query = _text(data.get("query"))
+        return f"Склад по запросу «{query}» не найден." if query else "Склад не найден."
+    store = matches[0] if isinstance(matches[0], dict) else {}
+    store_title = _text(store.get("title")) or "склад"
+    address = _text(store.get("address"))
+    store_label = f"{store_title} ({address})" if address else store_title
+
+    products = data.get("products") if isinstance(data.get("products"), dict) else {}
+    if not products:
+        return f"Найден склад: {store_label}."
+    if products.get("status") != "ok":
+        error = _text(products.get("error")) or _text(products.get("message")) or "остатки недоступны"
+        return f"Склад найден: {store_label}. Не удалось получить остатки: {error}."
+
+    items = products.get("items") if isinstance(products.get("items"), list) else []
+    if not items:
+        return f"На складе {store_label} положительных остатков не найдено."
+
+    lines = [f"Остатки по складу {store_label}:"]
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            continue
+        name = _text(item.get("product_name")) or "товар"
+        title = _warehouse_product_link(name, _text(item.get("product_url")), portal_base_url=portal_base_url)
+        amount = _format_stock_amount(item.get("amount"))
+        suffix = f" — {amount} шт." if amount else ""
+        lines.append(f"{index}. {title}{suffix}")
+
+    total = _int_value(products.get("available_items_with_names")) or _int_value(products.get("available_items_seen"))
+    offset = _int_value(products.get("offset")) or 0
+    shown = len(items)
+    if total and (products.get("has_more") or offset > 0 or total > shown):
+        start = offset + 1
+        end = offset + shown
+        if offset == 0:
+            lines.append(
+                f"Показаны первые {shown} {_ru_position_word(shown)} из {total}. "
+                "Остальные позиции есть; можно запросить следующие."
+            )
+        else:
+            lines.append(
+                f"Показаны позиции {start}-{end} из {total}. Остальные позиции есть; можно запросить следующие."
+            )
+    return "\n".join(lines)
+
+
+def _warehouse_product_link(name: str, url: str, *, portal_base_url: str = "") -> str:
+    if not url:
+        return name
+    if url.startswith("http://") or url.startswith("https://"):
+        resolved = url
+    elif url.startswith("/") and portal_base_url:
+        resolved = portal_base_url.rstrip("/") + url
+    else:
+        return name
+    return f"[URL={resolved}]{name}[/URL]"
+
+
+def _format_stock_amount(value: object) -> str:
+    text = _text(value)
+    if not text:
+        return ""
+    try:
+        amount = Decimal(text.replace(",", "."))
+    except (InvalidOperation, ValueError):
+        return text
+    if amount == amount.to_integral_value():
+        return str(int(amount))
+    return format(amount.normalize(), "f").rstrip("0").rstrip(".")
+
+
+def _ru_position_word(count: int) -> str:
+    count = abs(count)
+    if count % 100 in (11, 12, 13, 14):
+        return "позиций"
+    last = count % 10
+    if last == 1:
+        return "позиция"
+    if last in (2, 3, 4):
+        return "позиции"
+    return "позиций"
 
 
 def _format_task_create_draft_answer(data: dict[str, Any]) -> str:
@@ -306,11 +399,18 @@ def _text(value: object) -> str:
     return str(value or "").strip()
 
 
+def _int_value(value: object) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _local_model_usage(agent_id: str, note: str) -> ModelUsageRecord:
     return ModelUsageRecord(
         agent_id=agent_id,
         provider="local",
-        model="bitrix_task_create_response",
+        model="bitrix_direct_response",
         status="skipped",
         notes=[note],
     )
@@ -347,7 +447,8 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Для поиска сотрудника по имени — bitrix_api с user.search, получи numeric ID. "
         "Для поиска проекта по названию — bitrix_api с sonet_group.get, получи numeric ID. "
         "Для поиска складов, остатков и запросов вида 'найди склад Борисов' используй bitrix_warehouse_search, "
-        "а не свободный bitrix_api. Если пользователь просит что есть на складе/остатки, передай include_products=true. "
+        "а не свободный bitrix_api. Если пользователь просит что есть на складе/остатки, передай include_products=true "
+        "и product_limit=10, если пользователь не попросил другое количество. Для следующих позиций используй product_offset. "
         "Не вызывай search.search: этот метод в текущем Bitrix недоступен. "
         "Для создания задачи используй task_create_draft. "
         "Для task_create_draft именно ты распознаёшь title, responsible_id/responsible_self, "

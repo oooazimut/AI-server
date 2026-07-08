@@ -299,6 +299,7 @@ def test_bitrix_warehouse_search_tool_finds_store_and_products():
     assert result.data["matches"][0]["id"] == 10
     assert result.data["products"]["items"][0]["product_id"] == 1001
     assert result.data["products"]["items"][0]["product_name"] == "Cable"
+    assert result.data["products"]["items"][0]["product_url"] == "/shop/documents-catalog/7/product/1001/"
     assert ("catalog.store.list", {}) in fake_bitrix.calls
     assert any(method == "catalog.storeproduct.list" for method, _ in fake_bitrix.calls)
 
@@ -322,8 +323,8 @@ def test_bitrix_warehouse_search_tool_filters_non_available_products_before_limi
             if method == "catalog.product.list":
                 return {
                     "products": [
-                        {"id": 1003, "name": "Cable"},
-                        {"id": 1004, "name": "Switch"},
+                        {"id": 1003, "iblockId": 7, "name": "Cable"},
+                        {"id": 1004, "iblockId": 7, "name": "Switch"},
                     ]
                 }
             return {}
@@ -515,7 +516,7 @@ class FakeBitrixClient:
         if method == "catalog.storeproduct.list":
             return {"storeProducts": [{"storeId": 10, "productId": 1001, "amount": "7"}]}
         if method == "catalog.product.list":
-            return {"products": [{"id": 1001, "name": "Cable"}]}
+            return {"products": [{"id": 1001, "iblockId": 7, "name": "Cable"}]}
         return {"id": 123}
 
     async def send_bot_message(self, dialog_id, message, *, bot_id=None, keyboard=None):
