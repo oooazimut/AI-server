@@ -36,6 +36,9 @@ ALLOWED_TOOL_NAMES = {
     "task_create_draft",
     "task_create_confirm",
     "task_draft_discard",
+    "task_close_draft",
+    "task_close_confirm",
+    "task_close_discard",
     "save_incomplete_proposal",
     "delete_incomplete_proposal",
     "save_responsible_response",
@@ -266,6 +269,24 @@ def _direct_task_create_response(
                 status="completed",
                 answer="Черновик задачи удалён.",
                 model_usage=_local_model_usage(agent_id, "task_draft_discard_response"),
+            )
+        if result.tool == "task_close_draft":
+            return BitrixLLMFinalResult(
+                status="needs_human",
+                answer=_format_task_close_draft_answer(result.data),
+                model_usage=_local_model_usage(agent_id, "task_close_draft_response"),
+            )
+        if result.tool == "task_close_confirm":
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer=_format_task_close_confirm_answer(result.data, portal_base_url=portal_base_url),
+                model_usage=_local_model_usage(agent_id, "task_close_confirm_response"),
+            )
+        if result.tool == "task_close_discard":
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer="Черновик закрытия задачи удалён.",
+                model_usage=_local_model_usage(agent_id, "task_close_discard_response"),
             )
     return None
 
@@ -548,6 +569,43 @@ def _format_task_create_confirm_answer(data: dict[str, Any], *, portal_base_url:
     return f"Задача создана: {title}."
 
 
+def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
+    preview = data.get("preview") if isinstance(data.get("preview"), dict) else {}
+    draft = data.get("draft") if isinstance(data.get("draft"), dict) else {}
+    task_title = _text(preview.get("task_title")) or _text(draft.get("task_title")) or "указанная задача"
+    action_label = _text(preview.get("action_label")) or "отметить задачу выполненной"
+    result_text = _text(preview.get("completion_summary")) or _text(draft.get("completion_summary"))
+    unresolved = preview.get("unresolved_items") if isinstance(preview.get("unresolved_items"), list) else []
+    unresolved = [_text(item) for item in unresolved if _text(item)]
+    lines = [
+        "Черновик закрытия задачи:",
+        f"Задача: {task_title}",
+        f"Действие: {action_label}",
+    ]
+    if result_text:
+        lines.append(f"Результат: {result_text}")
+    if unresolved:
+        lines.append("Непроверенные пункты:")
+        lines.extend(f"- {item}" for item in unresolved)
+        lines.append("При подтверждении будет добавлена метка AI_SERVER_TASK_CLOSE_INCOMPLETE.")
+    lines.append("")
+    lines.append("Если всё верно, напишите: да, закрывай.")
+    return "\n".join(lines)
+
+
+def _format_task_close_confirm_answer(data: dict[str, Any], *, portal_base_url: str = "") -> str:
+    draft = data.get("draft") if isinstance(data.get("draft"), dict) else {}
+    task_id = _text(data.get("task_id")) or _text(draft.get("task_id"))
+    task_title = _text(data.get("task_title")) or _text(draft.get("task_title")) or "задача"
+    action = _text(data.get("action")) or _text(draft.get("action"))
+    label = _task_link(task_title, task_id, portal_base_url=portal_base_url)
+    unresolved = data.get("unresolved_items") if isinstance(data.get("unresolved_items"), list) else []
+    suffix = " С непроверенными пунктами добавлена метка AI_SERVER_TASK_CLOSE_INCOMPLETE." if unresolved else ""
+    if action == "approve":
+        return f"Задача закрыта: {label}.{suffix}"
+    return f"Задача отмечена выполненной: {label}.{suffix}"
+
+
 def _created_task_id(value: object) -> str:
     if not isinstance(value, dict):
         return ""
@@ -621,7 +679,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
-        '"tool_calls":[{"name":"bitrix_warehouse_search|bitrix_my_tasks|bitrix_task_search|bitrix_project_search|bitrix_api|task_create_draft|task_create_confirm|task_draft_discard|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
+        '"tool_calls":[{"name":"bitrix_warehouse_search|bitrix_my_tasks|bitrix_task_search|bitrix_project_search|bitrix_api|task_create_draft|task_create_confirm|task_draft_discard|task_close_draft|task_close_confirm|task_close_discard|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
         "Перед каждым tool_call сам проверь, хватает ли данных для его корректного вызова. "
         "Нельзя вызывать tool с надеждой, что backend или tool сам разберётся с недостающими данными. "
         'Если данных не хватает, не вызывай tool: верни status=needs_clarification, tool_calls=[{"name":"none"}], '
@@ -651,14 +709,18 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Если срок не указан, не спрашивай уточнение: backend поставит срок по умолчанию три рабочих дня, 19:00 МСК. "
         "Передавай no_deadline=true только если пользователь явно сказал, что задача должна быть без срока. "
         "Не вызывай task_create_draft без title и одного из responsible_id/responsible_self. "
-        "If permission_context.pending_task_draft exists and the current user explicitly confirms creation, call task_create_confirm. "
-        "If the current user explicitly cancels or rejects the pending draft, call task_draft_discard. "
-        "Do not call task_create_confirm for ambiguous replies; ask a short clarification instead. "
-        "Закрытие задачи исполнителем: вызови tasks.task.result.add (добавить результат) + tasks.task.complete "
-        "(завершить). Если TASK_CONTROL=Y, задача перейдёт в STATUS=4 (ждёт контроля). "
-        "Закрытие задачи постановщиком: вызови tasks.task.approve напрямую — STATUS=5, без проверки результата. "
+        "If permission_context.pending_task_draft._draft_type is absent/task_create and the current user explicitly confirms creation, call task_create_confirm. "
+        "If permission_context.pending_task_draft._draft_type is task_close and the current user explicitly confirms closing, call task_close_confirm. "
+        "If the current user explicitly cancels or rejects a task creation draft, call task_draft_discard. "
+        "If the current user explicitly cancels or rejects a task closing draft, call task_close_discard. "
+        "Do not call confirm tools for ambiguous replies; ask a short clarification instead. "
+        "Для закрытия задачи не вызывай tasks.task.result.add/tasks.task.complete/tasks.task.approve через bitrix_api напрямую. "
+        "Сначала найди задачу через bitrix_task_search, собери результат выполнения, затем вызови task_close_draft. "
+        "Если после уточнений пользователь явно разрешает закрыть с непроверенными пунктами, передай их в unresolved_items: "
+        "backend добавит метку AI_SERVER_TASK_CLOSE_INCOMPLETE для будущей индексации. "
         "Для уведомления пользователя используй bitrix_api с im.notify.system.add. "
-        "Все Bitrix-методы (approve/disapprove/complete/result.add/commentitem.add) вызывай через bitrix_api. "
+        "Методы закрытия задач complete/approve/result.add не вызывай через bitrix_api: для них есть task_close_* tools. "
+        "Остальные разрешённые Bitrix-методы вызывай через bitrix_api. "
         "Для поиска документов/файлов используй portal_search. Если данных не хватает, status=needs_clarification."
         f"{extra}"
     )
@@ -685,6 +747,8 @@ def _compose_system_prompt(portal_base_url: str = "") -> str:
         "Не выдумывай данные, которых нет в tool_results. "
         "Для результата task_create_draft черновик должен быть обычным текстом без ссылок: название, ответственный, срок, описание, запрос подтверждения. "
         "Для результата task_create_confirm дай ссылку только на созданную задачу; ссылки на профиль сотрудника запрещены. "
+        "Для результата task_close_draft покажи обычный текст без ссылок: задача, действие, результат, непроверенные пункты, запрос подтверждения. "
+        "Для результата task_close_confirm дай ссылку только на задачу; ссылки на профиль сотрудника запрещены. "
         "Если есть approval_actions, скажи, что действие подготовлено и требуется подтверждение. "
         f"{links_rule} "
         "Верни только JSON-объект без markdown: "
@@ -725,6 +789,9 @@ _WRITE_TOOL_NAMES = frozenset(
         "task_create_draft",
         "task_create_confirm",
         "task_draft_discard",
+        "task_close_draft",
+        "task_close_confirm",
+        "task_close_discard",
         "save_incomplete_proposal",
         "delete_incomplete_proposal",
         "save_responsible_response",
@@ -910,7 +977,7 @@ def _permission_context(task: AgentTask, settings: Settings) -> dict[str, Any]:
                 "Use sonet_group.user.get and Bitrix read methods for context, but do not replace Bitrix"
                 " permission checks with local guesses."
             ),
-            "task closure via bitrix_api: responsible uses tasks.task.complete, creator uses tasks.task.approve.",
+            "task closure must use task_close_draft first, then task_close_confirm after explicit chat confirmation.",
         ],
     }
 
