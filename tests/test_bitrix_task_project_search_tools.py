@@ -186,6 +186,46 @@ def test_task_search_comment_query_requires_comment_match():
     assert result.data["comment_query"] == "акт сверки"
 
 
+def test_task_search_comment_snippets_hide_bitrix_user_markup():
+    client = _FakeBitrixSearchClient()
+    client.comments["101"] = [{"POST_MESSAGE": "Before [USER=13]Dmitry[/USER], added observer."}]
+    tool = BitrixTaskSearchTool(client=client)
+
+    result = anyio.run(lambda: tool.execute({"scope": "responsible", "comment_query": "observer"}, user_id=13))
+
+    assert result.status == "ok"
+    snippet = result.data["items"][0]["comment_snippets"][0]
+    assert snippet == "Before Dmitry, added observer."
+    assert "[USER=13]" not in snippet
+    assert "[/USER]" not in snippet
+
+
+def test_task_search_filters_dates_before_loading_comments():
+    client = _FakeBitrixSearchClient()
+    client.comments["104"] = [{"POST_MESSAGE": "closed observer comment"}]
+    tool = BitrixTaskSearchTool(client=client)
+
+    result = anyio.run(
+        lambda: tool.execute(
+            {
+                "scope": "all",
+                "status": "closed",
+                "include_closed": True,
+                "closed_from": "2026-07-08",
+                "closed_to": "2026-07-08",
+                "comment_query": "observer",
+                "comment_lookup_task_limit": 50,
+            },
+            user_id=13,
+        )
+    )
+
+    assert result.status == "ok"
+    assert [item["id"] for item in result.data["items"]] == ["104"]
+    comment_calls = [payload for method, payload in client.calls if method == "task.commentitem.getlist"]
+    assert comment_calls == [{"TASKID": "104"}]
+
+
 def test_task_search_closed_date_range_includes_date_only_upper_bound():
     client = _FakeBitrixSearchClient()
     tool = BitrixTaskSearchTool(client=client)
