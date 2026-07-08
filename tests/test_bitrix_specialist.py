@@ -276,7 +276,6 @@ def test_bitrix_specialist_rejects_incomplete_task_create_tool_call():
     assert tool_action.status == "contract_violation"
     assert tool_action.details["data"]["contract_errors"] == [
         "task_create_draft requires one of responsible_id or responsible_self",
-        "task_create_draft requires deadline_iso or no_deadline=true",
     ]
 
 
@@ -413,6 +412,86 @@ def test_bitrix_llm_exposes_and_accepts_task_draft_confirmation_tools(monkeypatc
     assert "task_create_confirm" in prompt
     assert "task_draft_discard" in prompt
     assert [call.name for call in result.decision.tool_calls] == ["task_create_confirm", "task_draft_discard"]
+
+
+def test_bitrix_llm_compose_formats_task_draft_without_profile_links(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="создай задачу", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="task_create_draft",
+                    data={
+                        "params": {
+                            "fields": {
+                                "TITLE": "тест подтверждения",
+                                "DESCRIPTION": "Краткое содержание: тест подтверждения",
+                                "RESPONSIBLE_ID": 13,
+                                "DEADLINE": "2026-07-13T19:00:00+03:00",
+                            }
+                        },
+                        "preview": {
+                            "title": "тест подтверждения",
+                            "responsible": "Дмитрий",
+                            "deadline": "13.07.2026 19:00 МСК",
+                            "description": "Краткое содержание: тест подтверждения",
+                        },
+                        "notes": ["Срок по умолчанию: три рабочих дня от даты создания, 19:00 МСК."],
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert "Черновик задачи" in result.answer
+    assert "по умолчанию: 3 рабочих дня" in result.answer
+    assert "Краткое содержание: тест подтверждения" in result.answer
+    assert "[URL" not in result.answer
+    assert "company/personal/user" not in result.answer
+    assert "#13" not in result.answer
+
+
+def test_bitrix_llm_compose_formats_task_confirm_with_task_link_only(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_REST_WEBHOOK_URL", "https://asutp-expert.bitrix24.ru/rest/1/token/")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="да, создай", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="task_create_confirm",
+                    data={
+                        "result": {"result": {"task": {"id": 8851}}},
+                        "params": {"fields": {"TITLE": "тест подтверждения", "RESPONSIBLE_ID": 13}},
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "completed"
+    assert result.answer == (
+        "Задача создана: "
+        "[URL=https://asutp-expert.bitrix24.ru/company/personal/user/0/tasks/task/view/8851/]"
+        "тест подтверждения[/URL]."
+    )
+    assert "/company/personal/user/13/" not in result.answer
 
 
 def test_bitrix_llm_service_uses_injected_settings_not_global_at_call_time(monkeypatch):

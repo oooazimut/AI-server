@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from typing import Any
 
 from ai_server.agents.bitrix24.ports import TaskDraftStorePort
@@ -10,7 +10,10 @@ from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthT
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.tools.bitrix_policy import apply_write_policy
 from ai_server.tools.bitrix_ports import BitrixWritePort
-from ai_server.utils import compact_text, optional_int, unique
+from ai_server.utils import MOSCOW_TZ, compact_text, optional_int, unique
+
+DEFAULT_TASK_DEADLINE_WORKING_DAYS = 3
+DEFAULT_TASK_DEADLINE_HOUR = 19
 
 
 @dataclass(frozen=True)
@@ -18,6 +21,7 @@ class BitrixTaskCreateDraft:
     method: str = "tasks.task.add"
     params: dict[str, Any] = field(default_factory=dict)
     summary: str = ""
+    preview: dict[str, str] = field(default_factory=dict)
     contract_errors: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -30,6 +34,7 @@ class BitrixTaskCreateDraft:
             "method": self.method,
             "params": self.params,
             "summary": self.summary,
+            "preview": self.preview,
             "contract_errors": self.contract_errors,
             "notes": self.notes,
         }
@@ -40,6 +45,7 @@ def build_task_create_draft_from_args(args: dict[str, Any], *, user_id: int | No
     title = compact_text(str(args.get("title") or "")).strip(" .,:;-")
     description = compact_text(str(args.get("description") or ""))
     responsible_id = optional_int(args.get("responsible_id"))
+    responsible_label = compact_text(str(args.get("responsible_name") or args.get("responsible_label") or ""))
     responsible_note = ""
     group_id = optional_int(args.get("group_id"))
 
@@ -49,6 +55,10 @@ def build_task_create_draft_from_args(args: dict[str, Any], *, user_id: int | No
             responsible_note = "Ответственным выбран текущий пользователь."
         else:
             responsible_note = "LLM выбрала текущего пользователя, но канал не передал Bitrix user id."
+    if not responsible_label and responsible_id is not None:
+        responsible_label = (
+            "текущий пользователь" if user_id is not None and responsible_id == user_id else "указанный сотрудник"
+        )
 
     deadline, deadline_note, no_deadline, deadline_error = _deadline_from_args(args)
 
@@ -58,8 +68,7 @@ def build_task_create_draft_from_args(args: dict[str, Any], *, user_id: int | No
 
     if title:
         fields["TITLE"] = title
-        if description:
-            fields["DESCRIPTION"] = description
+        fields["DESCRIPTION"] = description or _default_description(title)
     else:
         contract_errors.append("task_create_draft.title is required")
 
@@ -86,6 +95,7 @@ def build_task_create_draft_from_args(args: dict[str, Any], *, user_id: int | No
     return BitrixTaskCreateDraft(
         params={"fields": fields} if fields else {},
         summary=_summary(title=title, responsible_id=responsible_id, deadline=deadline, group_id=group_id),
+        preview=_draft_preview(fields, responsible_label=responsible_label) if fields else {},
         contract_errors=unique(contract_errors),
         notes=notes,
     )
@@ -112,6 +122,7 @@ class TaskCreateDraftTool:
                     "description": {"type": "string"},
                     "responsible_id": {"type": "integer"},
                     "responsible_self": {"type": "boolean"},
+                    "responsible_name": {"type": "string"},
                     "group_id": {"type": "integer"},
                     "deadline_iso": {"type": "string"},
                     "no_deadline": {"type": "boolean"},
@@ -119,7 +130,6 @@ class TaskCreateDraftTool:
                 "required": ["title"],
                 "allOf": [
                     {"anyOf": [{"required": ["responsible_id"]}, {"required": ["responsible_self"]}]},
-                    {"anyOf": [{"required": ["deadline_iso"]}, {"required": ["no_deadline"]}]},
                 ],
             },
         )
@@ -145,7 +155,12 @@ class TaskCreateDraftTool:
         return ToolResult(
             status=ToolStatus.OK,
             tool=self.name,
-            data={"summary": draft.summary, "params": draft.params, "notes": draft.notes},
+            data={
+                "summary": draft.summary,
+                "params": draft.params,
+                "preview": draft.preview,
+                "notes": draft.notes,
+            },
         )
 
 
@@ -313,12 +328,56 @@ def _deadline_from_args(args: dict[str, Any]) -> tuple[str | None, str, bool, st
         return None, "LLM explicitly selected no_deadline.", True, ""
     raw_deadline = str(args.get("deadline") or args.get("deadline_iso") or "").strip()
     if not raw_deadline:
-        return None, "", False, "task_create_draft requires deadline_iso or no_deadline=true"
+        return (
+            _default_deadline_iso(),
+            "Срок по умолчанию: три рабочих дня от даты создания, 19:00 МСК.",
+            False,
+            "",
+        )
     try:
         datetime.fromisoformat(raw_deadline.replace("Z", "+00:00"))
     except ValueError:
         return None, "", False, "task_create_draft.deadline_iso must be ISO 8601"
     return raw_deadline, "LLM provided deadline_iso.", False, ""
+
+
+def _default_deadline_iso(*, now: datetime | None = None) -> str:
+    current = (now or datetime.now(MOSCOW_TZ)).astimezone(MOSCOW_TZ)
+    day = current.date()
+    remaining = DEFAULT_TASK_DEADLINE_WORKING_DAYS
+    while remaining > 0:
+        day += timedelta(days=1)
+        if day.weekday() < 5:
+            remaining -= 1
+    return datetime.combine(day, time(DEFAULT_TASK_DEADLINE_HOUR, 0), tzinfo=MOSCOW_TZ).isoformat()
+
+
+def _default_description(title: str) -> str:
+    return f"Краткое содержание: {title}"
+
+
+def _draft_preview(fields: dict[str, Any], *, responsible_label: str = "") -> dict[str, str]:
+    title = compact_text(str(fields.get("TITLE") or "задача"))
+    description = compact_text(str(fields.get("DESCRIPTION") or ""))
+    deadline = str(fields.get("DEADLINE") or "")
+    no_deadline = _truthy(fields.get("NO_DEADLINE"))
+    deadline_label = "без срока" if no_deadline else _format_deadline_for_preview(deadline)
+    return {
+        "title": title,
+        "description": description,
+        "responsible": responsible_label or "указанный сотрудник",
+        "deadline": deadline_label,
+    }
+
+
+def _format_deadline_for_preview(deadline: str) -> str:
+    if not deadline:
+        return "не указан"
+    try:
+        parsed = datetime.fromisoformat(deadline.replace("Z", "+00:00")).astimezone(MOSCOW_TZ)
+    except ValueError:
+        return deadline
+    return parsed.strftime("%d.%m.%Y %H:%M МСК")
 
 
 def _summary(*, title: str, responsible_id: int | None, deadline: str | None, group_id: int | None) -> str:
@@ -339,7 +398,7 @@ def _truthy(value: object) -> bool:
     if isinstance(value, (int, float)):
         return value != 0
     if isinstance(value, str):
-        return value.strip().casefold() in {"1", "true", "yes", "y", "да", "on"}
+        return value.strip().casefold() in {"1", "true", "yes", "y", "да", "on", "без срока", "бессрочно"}
     return bool(value)
 
 

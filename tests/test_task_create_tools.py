@@ -41,6 +41,23 @@ def test_draft_tool_saves_to_store():
     assert store._drafts["d:42"]["fields"]["TITLE"] == "Тест"
 
 
+def test_draft_tool_returns_plain_preview_without_user_id():
+    store = FakeTaskDraftStore()
+    tool = TaskCreateDraftTool(store=store)
+    result = _exec(
+        tool,
+        {"title": "Тест", "responsible_self": True},
+        user_id=9,
+        dialog_key="d:42",
+    )
+    preview = result.data["preview"]
+
+    assert result.status == ToolStatus.OK
+    assert preview["responsible"] == "текущий пользователь"
+    assert "#9" not in " ".join(preview.values())
+    assert preview["deadline"].endswith("МСК")
+
+
 def test_draft_tool_contract_violation():
     store = FakeTaskDraftStore()
     tool = TaskCreateDraftTool(store=store)
