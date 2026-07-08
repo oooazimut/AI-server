@@ -729,6 +729,47 @@ def test_bitrix_llm_compose_formats_task_close_draft(monkeypatch):
     assert "[URL" not in result.answer
 
 
+def test_bitrix_llm_compose_formats_task_close_draft_with_id_fallback(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="закрой задачу 139", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="task_close_draft",
+                    data={
+                        "draft": {
+                            "_draft_type": "task_close",
+                            "task_id": 139,
+                            "task_title": "",
+                            "action": "complete",
+                            "completion_summary": "Готово.",
+                            "unresolved_items": [],
+                        },
+                        "preview": {
+                            "task_title": "",
+                            "action_label": "отметить задачу выполненной",
+                            "completion_summary": "Готово.",
+                            "unresolved_items": [],
+                        },
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert "Задача: задача #139" in result.answer
+    assert "Задача: указанная задача" not in result.answer
+
+
 def test_bitrix_llm_compose_formats_task_close_confirm_with_task_link(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("BITRIX_REST_WEBHOOK_URL", "https://asutp-expert.bitrix24.ru/rest/1/token/")

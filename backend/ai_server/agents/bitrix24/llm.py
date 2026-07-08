@@ -572,7 +572,8 @@ def _format_task_create_confirm_answer(data: dict[str, Any], *, portal_base_url:
 def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
     preview = data.get("preview") if isinstance(data.get("preview"), dict) else {}
     draft = data.get("draft") if isinstance(data.get("draft"), dict) else {}
-    task_title = _text(preview.get("task_title")) or _text(draft.get("task_title")) or "указанная задача"
+    task_id = _text(draft.get("task_id"))
+    task_title = _text(preview.get("task_title")) or _text(draft.get("task_title")) or _task_fallback_title(task_id)
     action_label = _text(preview.get("action_label")) or "отметить задачу выполненной"
     result_text = _text(preview.get("completion_summary")) or _text(draft.get("completion_summary"))
     unresolved = preview.get("unresolved_items") if isinstance(preview.get("unresolved_items"), list) else []
@@ -596,7 +597,7 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
 def _format_task_close_confirm_answer(data: dict[str, Any], *, portal_base_url: str = "") -> str:
     draft = data.get("draft") if isinstance(data.get("draft"), dict) else {}
     task_id = _text(data.get("task_id")) or _text(draft.get("task_id"))
-    task_title = _text(data.get("task_title")) or _text(draft.get("task_title")) or "задача"
+    task_title = _text(data.get("task_title")) or _text(draft.get("task_title")) or _task_fallback_title(task_id)
     action = _text(data.get("action")) or _text(draft.get("action"))
     label = _task_link(task_title, task_id, portal_base_url=portal_base_url)
     unresolved = data.get("unresolved_items") if isinstance(data.get("unresolved_items"), list) else []
@@ -604,6 +605,10 @@ def _format_task_close_confirm_answer(data: dict[str, Any], *, portal_base_url: 
     if action == "approve":
         return f"Задача закрыта: {label}.{suffix}"
     return f"Задача отмечена выполненной: {label}.{suffix}"
+
+
+def _task_fallback_title(task_id: str) -> str:
+    return f"задача #{task_id}" if task_id else "указанная задача"
 
 
 def _created_task_id(value: object) -> str:
