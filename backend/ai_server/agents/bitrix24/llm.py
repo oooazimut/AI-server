@@ -29,6 +29,8 @@ ALLOWED_TOOL_NAMES = {
     "bitrix_warehouse_search",
     "bitrix_api",
     "task_create_draft",
+    "task_create_confirm",
+    "task_draft_discard",
     "save_incomplete_proposal",
     "delete_incomplete_proposal",
     "save_responsible_response",
@@ -222,7 +224,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
-        '"tool_calls":[{"name":"bitrix_warehouse_search|bitrix_api|task_create_draft|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
+        '"tool_calls":[{"name":"bitrix_warehouse_search|bitrix_api|task_create_draft|task_create_confirm|task_draft_discard|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
         "Перед каждым tool_call сам проверь, хватает ли данных для его корректного вызова. "
         "Нельзя вызывать tool с надеждой, что backend или tool сам разберётся с недостающими данными. "
         'Если данных не хватает, не вызывай tool: верни status=needs_clarification, tool_calls=[{"name":"none"}], '
@@ -243,6 +245,9 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Если срок не указан, применяй правила из retrieval_context; если правило неясно, спроси уточнение. "
         "Не вызывай task_create_draft без title, одного из responsible_id/responsible_self, "
         "и одного из deadline_iso/no_deadline=true. "
+        "If permission_context.pending_task_draft exists and the current user explicitly confirms creation, call task_create_confirm. "
+        "If the current user explicitly cancels or rejects the pending draft, call task_draft_discard. "
+        "Do not call task_create_confirm for ambiguous replies; ask a short clarification instead. "
         "Закрытие задачи исполнителем: вызови tasks.task.result.add (добавить результат) + tasks.task.complete "
         "(завершить). Если TASK_CONTROL=Y, задача перейдёт в STATUS=4 (ждёт контроля). "
         "Закрытие задачи постановщиком: вызови tasks.task.approve напрямую — STATUS=5, без проверки результата. "
@@ -309,12 +314,15 @@ def _parse_decision(data: dict[str, Any]) -> BitrixLLMDecision:
 
 def _permission_context(task: AgentTask, settings: Settings) -> dict[str, Any]:
     user_id = optional_int(task.user.id)
+    dialog_id = str(task.context.get("dialog_id") or (task.user.raw or {}).get("dialog_id") or "")
     profile_result = task.context.get("bitrix_current_user_profile")
     write_profile = _write_profile_from_bitrix_profile(profile_result)
     return {
         "current_user_id": user_id,
+        "current_dialog_id": dialog_id,
         "current_user_write_profile": write_profile,
         "oauth_required_for_writes": settings.bitrix_oauth_required_for_writes,
+        "pending_task_draft": task.context.get("pending_task_draft"),
         "bitrix_current_user_profile": profile_result,
         "permission_policy_context": task.context.get("permission_policy_context", []),
         "rules": [
