@@ -174,7 +174,7 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
             db.execute("DELETE FROM bitrix24.incomplete_proposals WHERE id = %s", (proposal_id,))
 
     # ------------------------------------------------------------------
-    # Pending task draft
+    # Pending Bitrix write draft
     # ------------------------------------------------------------------
 
     async def save_task_draft(self, dialog_key: str, params: dict[str, Any]) -> None:

@@ -604,6 +604,59 @@ def test_bitrix_llm_exposes_and_accepts_task_close_confirmation_tools(monkeypatc
     assert [call.name for call in result.decision.tool_calls] == ["task_close_confirm", "task_close_discard"]
 
 
+def test_bitrix_llm_exposes_and_accepts_calendar_confirmation_tools(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient(
+        json.dumps(
+            {
+                "status": "completed",
+                "answer": "",
+                "confidence": 0.7,
+                "tool_calls": [
+                    {"name": "calendar_event_confirm", "args": {}, "summary": "confirmed"},
+                    {"name": "calendar_event_discard", "args": {}, "summary": "discarded"},
+                ],
+            }
+        )
+    )
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "calendar_event_draft", "description": "", "parameters": {}},
+        {"name": "calendar_event_confirm", "description": "", "parameters": {}},
+        {"name": "calendar_event_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request="да, добавь в календарь",
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "calendar_event",
+                        "title": "позвонить Борисову",
+                        "start_iso": "2026-07-09T12:00:00+03:00",
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert {"calendar_event_draft", "calendar_event_confirm", "calendar_event_discard"} <= ALLOWED_TOOL_NAMES
+    payload = json.loads(client.calls[0]["messages"][1]["content"])
+    prompt = client.calls[0]["messages"][0]["content"]
+    assert {"calendar_event_confirm", "calendar_event_discard"} <= {tool["name"] for tool in payload["tools"]}
+    assert payload["permission_context"]["pending_task_draft"]["_draft_type"] == "calendar_event"
+    assert "calendar_event_confirm" in prompt
+    assert "calendar.event.add" in prompt
+    assert [call.name for call in result.decision.tool_calls] == ["calendar_event_confirm", "calendar_event_discard"]
+
+
 def test_bitrix_llm_compose_formats_task_draft_without_profile_links(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
@@ -806,6 +859,80 @@ def test_bitrix_llm_compose_formats_task_close_confirm_with_task_link(monkeypatc
         "AI_SERVER_TASK_CLOSE_INCOMPLETE."
     )
     assert "/company/personal/user/13/" not in result.answer
+
+
+def test_bitrix_llm_compose_formats_calendar_event_draft(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="напомни завтра позвонить Борисову", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="calendar_event_draft",
+                    data={
+                        "draft": {
+                            "_draft_type": "calendar_event",
+                            "title": "позвонить Борисову",
+                            "description": "Позвонить Борисову",
+                            "start_iso": "2026-07-09T12:00:00+03:00",
+                            "end_iso": "2026-07-09T12:30:00+03:00",
+                        },
+                        "preview": {
+                            "title": "позвонить Борисову",
+                            "description": "Позвонить Борисову",
+                            "start": "09.07.2026 12:00 МСК",
+                            "end": "09.07.2026 12:30 МСК",
+                            "participants": "только текущий пользователь",
+                            "reminder": "по настройкам календаря Bitrix",
+                        },
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert "Черновик события календаря" in result.answer
+    assert "09.07.2026 12:00 МСК" in result.answer
+    assert "только текущий пользователь" in result.answer
+    assert "[URL" not in result.answer
+
+
+def test_bitrix_llm_compose_formats_calendar_event_confirm_without_fake_link(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="да, добавь в календарь", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="calendar_event_confirm",
+                    data={
+                        "event_id": "444",
+                        "title": "позвонить Борисову",
+                        "start_label": "09.07.2026 12:00 МСК",
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "completed"
+    assert result.answer == "Событие добавлено в календарь: позвонить Борисову. Начало: 09.07.2026 12:00 МСК."
+    assert "[URL" not in result.answer
 
 
 def test_bitrix_llm_compose_formats_my_tasks_with_task_links(monkeypatch):

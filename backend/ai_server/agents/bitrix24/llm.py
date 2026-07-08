@@ -39,6 +39,9 @@ ALLOWED_TOOL_NAMES = {
     "task_close_draft",
     "task_close_confirm",
     "task_close_discard",
+    "calendar_event_draft",
+    "calendar_event_confirm",
+    "calendar_event_discard",
     "save_incomplete_proposal",
     "delete_incomplete_proposal",
     "save_responsible_response",
@@ -287,6 +290,24 @@ def _direct_task_create_response(
                 status="completed",
                 answer="Черновик закрытия задачи удалён.",
                 model_usage=_local_model_usage(agent_id, "task_close_discard_response"),
+            )
+        if result.tool == "calendar_event_draft":
+            return BitrixLLMFinalResult(
+                status="needs_human",
+                answer=_format_calendar_event_draft_answer(result.data),
+                model_usage=_local_model_usage(agent_id, "calendar_event_draft_response"),
+            )
+        if result.tool == "calendar_event_confirm":
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer=_format_calendar_event_confirm_answer(result.data),
+                model_usage=_local_model_usage(agent_id, "calendar_event_confirm_response"),
+            )
+        if result.tool == "calendar_event_discard":
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer="Черновик события календаря удалён.",
+                model_usage=_local_model_usage(agent_id, "calendar_event_discard_response"),
             )
     return None
 
@@ -607,6 +628,45 @@ def _format_task_close_confirm_answer(data: dict[str, Any], *, portal_base_url: 
     return f"Задача отмечена выполненной: {label}.{suffix}"
 
 
+def _format_calendar_event_draft_answer(data: dict[str, Any]) -> str:
+    preview = data.get("preview") if isinstance(data.get("preview"), dict) else {}
+    draft = data.get("draft") if isinstance(data.get("draft"), dict) else {}
+    params = draft.get("params") if isinstance(draft.get("params"), dict) else {}
+    title = _text(preview.get("title")) or _text(draft.get("title")) or _text(params.get("name")) or "событие"
+    start = _text(preview.get("start")) or _text(draft.get("start_iso")) or _text(params.get("from"))
+    end = _text(preview.get("end")) or _text(draft.get("end_iso")) or _text(params.get("to"))
+    description = (
+        _text(preview.get("description")) or _text(draft.get("description")) or _text(params.get("description"))
+    )
+    participants = _text(preview.get("participants")) or "только текущий пользователь"
+    reminder = _text(preview.get("reminder")) or "по настройкам календаря Bitrix"
+    lines = [
+        "Черновик события календаря:",
+        f"Название: {title}",
+        f"Начало: {start}",
+        f"Окончание: {end}",
+        f"Участники: {participants}",
+        f"Напоминание: {reminder}",
+    ]
+    if description:
+        lines.append(f"Описание: {description}")
+    lines.append("")
+    lines.append("Если всё верно, напишите: да, добавь в календарь.")
+    return "\n".join(lines)
+
+
+def _format_calendar_event_confirm_answer(data: dict[str, Any]) -> str:
+    title = _text(data.get("title"))
+    draft = data.get("draft") if isinstance(data.get("draft"), dict) else {}
+    params = data.get("params") if isinstance(data.get("params"), dict) else {}
+    if not title:
+        title = _text(draft.get("title")) or _text(params.get("name")) or "событие"
+    start_label = _text(data.get("start_label"))
+    if start_label:
+        return f"Событие добавлено в календарь: {title}. Начало: {start_label}."
+    return f"Событие добавлено в календарь: {title}."
+
+
 def _task_fallback_title(task_id: str) -> str:
     return f"задача #{task_id}" if task_id else "указанная задача"
 
@@ -684,7 +744,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
-        '"tool_calls":[{"name":"bitrix_warehouse_search|bitrix_my_tasks|bitrix_task_search|bitrix_project_search|bitrix_api|task_create_draft|task_create_confirm|task_draft_discard|task_close_draft|task_close_confirm|task_close_discard|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
+        '"tool_calls":[{"name":"bitrix_warehouse_search|bitrix_my_tasks|bitrix_task_search|bitrix_project_search|bitrix_api|task_create_draft|task_create_confirm|task_draft_discard|task_close_draft|task_close_confirm|task_close_discard|calendar_event_draft|calendar_event_confirm|calendar_event_discard|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
         "Перед каждым tool_call сам проверь, хватает ли данных для его корректного вызова. "
         "Нельзя вызывать tool с надеждой, что backend или tool сам разберётся с недостающими данными. "
         'Если данных не хватает, не вызывай tool: верни status=needs_clarification, tool_calls=[{"name":"none"}], '
@@ -716,9 +776,15 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Не вызывай task_create_draft без title и одного из responsible_id/responsible_self. "
         "If permission_context.pending_task_draft._draft_type is absent/task_create and the current user explicitly confirms creation, call task_create_confirm. "
         "If permission_context.pending_task_draft._draft_type is task_close and the current user explicitly confirms closing, call task_close_confirm. "
+        "If permission_context.pending_task_draft._draft_type is calendar_event and the current user explicitly confirms calendar creation, call calendar_event_confirm. "
         "If the current user explicitly cancels or rejects a task creation draft, call task_draft_discard. "
         "If the current user explicitly cancels or rejects a task closing draft, call task_close_discard. "
+        "If the current user explicitly cancels or rejects a calendar event draft, call calendar_event_discard. "
         "Do not call confirm tools for ambiguous replies; ask a short clarification instead. "
+        "Для фраз вида 'напомни мне завтра позвонить Борисову' используй календарь: подготовь calendar_event_draft, а не задачу и не прямой bitrix_api. "
+        "Если время напоминания не указано, передай date_iso или start_iso с датой без времени: backend поставит 12:00 МСК. "
+        "Если участники прямо не указаны, не передавай attendee_ids: событие будет только для текущего пользователя. "
+        "Метод calendar.event.add не вызывай через bitrix_api: для него есть calendar_event_* tools. "
         "Для закрытия задачи не вызывай tasks.task.result.add/tasks.task.complete/tasks.task.approve через bitrix_api напрямую. "
         "Сначала найди задачу через bitrix_task_search, собери результат выполнения, затем вызови task_close_draft. "
         "Если после уточнений пользователь явно разрешает закрыть с непроверенными пунктами, передай их в unresolved_items: "
@@ -754,6 +820,8 @@ def _compose_system_prompt(portal_base_url: str = "") -> str:
         "Для результата task_create_confirm дай ссылку только на созданную задачу; ссылки на профиль сотрудника запрещены. "
         "Для результата task_close_draft покажи обычный текст без ссылок: задача, действие, результат, непроверенные пункты, запрос подтверждения. "
         "Для результата task_close_confirm дай ссылку только на задачу; ссылки на профиль сотрудника запрещены. "
+        "Для результата calendar_event_draft покажи обычный текст без ссылок: название, начало, окончание, участники, описание, запрос подтверждения. "
+        "Для результата calendar_event_confirm не выдумывай ссылку на календарь; если готовой ссылки нет, дай обычный текст. "
         "Если есть approval_actions, скажи, что действие подготовлено и требуется подтверждение. "
         f"{links_rule} "
         "Верни только JSON-объект без markdown: "
@@ -797,13 +865,26 @@ _WRITE_TOOL_NAMES = frozenset(
         "task_close_draft",
         "task_close_confirm",
         "task_close_discard",
+        "calendar_event_draft",
+        "calendar_event_confirm",
+        "calendar_event_discard",
         "save_incomplete_proposal",
         "delete_incomplete_proposal",
         "save_responsible_response",
     }
 )
 _READ_MARKERS = ("покажи", "найди", "найти", "выведи", "список", "какие", "ищи")
-_WRITE_MARKERS = ("создай", "создать", "закрой", "закрыть", "измени", "изменить", "удали", "удалить")
+_WRITE_MARKERS = (
+    "создай",
+    "создать",
+    "закрой",
+    "закрыть",
+    "измени",
+    "изменить",
+    "удали",
+    "удалить",
+    "напомни",
+)
 
 
 def _normalize_common_read_decision(decision: BitrixLLMDecision, request: str) -> BitrixLLMDecision:
@@ -983,6 +1064,7 @@ def _permission_context(task: AgentTask, settings: Settings) -> dict[str, Any]:
                 " permission checks with local guesses."
             ),
             "task closure must use task_close_draft first, then task_close_confirm after explicit chat confirmation.",
+            "calendar reminders/events must use calendar_event_draft first, then calendar_event_confirm after explicit chat confirmation.",
         ],
     }
 
