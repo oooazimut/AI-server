@@ -275,6 +275,7 @@ class BitrixTaskSearchTool:
             task
             for task in sorted_tasks
             if _matches_text_query(task, query)
+            and _matches_task_status(task, status)
             and _matches_deadline_range(
                 task,
                 from_value=_first_arg_text(args, "deadline_from", "deadline_start"),
@@ -484,7 +485,7 @@ def _task_search_calls(
     project_id: int | None,
     query: str = "",
 ) -> list[dict[str, Any]]:
-    base_filter: dict[str, Any] = dict(_task_search_status_filter(status))
+    base_filter: dict[str, Any] = {} if query else dict(_task_search_status_filter(status))
     if project_id is not None:
         base_filter["GROUP_ID"] = project_id
     if query:
@@ -643,6 +644,21 @@ def _matches_text_query(task: dict[str, Any], query: str) -> bool:
         ]
     ).casefold()
     return needle in haystack
+
+
+def _matches_task_status(task: dict[str, Any], status: str) -> bool:
+    if status == "all":
+        return True
+    task_status = _safe_int(_first_text(task, "status", "STATUS"))
+    if task_status is None:
+        return False
+    if status == "closed":
+        return task_status == 5
+    if status == "deferred":
+        return task_status == 6
+    if status == "declined":
+        return task_status == 7
+    return task_status in ACTIVE_STATUS_VALUES
 
 
 def _matches_deadline_range(task: dict[str, Any], *, from_value: str, to_value: str) -> bool:
