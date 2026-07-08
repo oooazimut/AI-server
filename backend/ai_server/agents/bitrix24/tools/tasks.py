@@ -153,6 +153,10 @@ class BitrixTaskSearchTool:
                         "enum": ["active", "open", "closed", "overdue", "deferred", "declined", "all"],
                         "description": "Task status filter. Default: active/open.",
                     },
+                    "include_closed": {
+                        "type": "boolean",
+                        "description": "Set true only when the user explicitly asks to include closed/deferred/declined tasks.",
+                    },
                     "task_id": {"type": "integer", "description": "Exact task ID lookup."},
                     "query": {
                         "type": "string",
@@ -214,6 +218,8 @@ class BitrixTaskSearchTool:
         )
         offset = _bounded_int(args.get("offset"), default=0, minimum=0, maximum=10_000)
         status = _task_search_status_arg(args.get("status"))
+        if status == "all" and not _truthy(args.get("include_closed")):
+            status = "active"
         query = _first_arg_text(args, "query", "text", "title")
         project_id = _safe_int(args.get("project_id") or args.get("group_id") or args.get("GROUP_ID"))
         project_query = _first_arg_text(args, "project_name", "project", "group_name")
@@ -714,6 +720,16 @@ def _safe_int(value: object) -> int | None:
         return int(str(value).strip())
     except (TypeError, ValueError):
         return None
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().casefold() in {"1", "true", "yes", "y", "да", "on"}
+    return bool(value)
 
 
 __all__ = ["BitrixMyTasksTool", "BitrixProjectSearchTool", "BitrixTaskSearchTool"]

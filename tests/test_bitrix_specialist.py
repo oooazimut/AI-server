@@ -27,6 +27,13 @@ def _bitrix_specialist(*, tools=None, llm=None) -> Bitrix24Specialist:
     )
 
 
+def _bitrix_read_tool_definitions() -> list[dict]:
+    return [
+        ToolDefinition(name=name, description="", parameters={}).model_dump()
+        for name in ("bitrix_my_tasks", "bitrix_task_search", "bitrix_project_search", "bitrix_api", "none")
+    ]
+
+
 def test_bitrix_specialist_loads_available_skills_and_rag_context():
     result = asyncio.run(
         _bitrix_specialist(tools=FakeResolverTools()).handle(
@@ -155,6 +162,92 @@ def test_bitrix_specialist_searches_my_open_tasks():
     assert result.status == "completed"
     assert tools.my_tasks_calls[0] == {"status": "open", "limit": 10}
     assert "Проверить камеру" in result.answer
+
+
+def test_bitrix_llm_decide_routes_created_by_task_read_to_deterministic_tool(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient(
+        json.dumps(
+            {
+                "status": "completed",
+                "answer": "",
+                "confidence": 0.2,
+                "tool_calls": [{"name": "bitrix_task_search", "args": {"scope": "created_by", "status": "all"}}],
+            }
+        )
+    )
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t1", request="Битрикс покажи задачи, поставленные мной.", user={"id": "13"}),
+            retrieval_hits=[],
+            tool_definitions=_bitrix_read_tool_definitions(),
+        )
+    )
+
+    assert [call.name for call in result.decision.tool_calls] == ["bitrix_task_search"]
+    assert result.decision.tool_calls[0].args == {"scope": "created_by", "status": "active", "limit": 10}
+
+
+def test_bitrix_llm_decide_routes_task_text_search_even_when_model_answers_from_history(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient(
+        json.dumps(
+            {
+                "status": "completed",
+                "answer": "Задача уже найдена. ID 139.",
+                "confidence": 0.2,
+                "tool_calls": [{"name": "none", "args": {}}],
+            }
+        )
+    )
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t1", request="Битрикс найди задачу Обучение сотрудников.", user={"id": "13"}),
+            retrieval_hits=[],
+            tool_definitions=_bitrix_read_tool_definitions(),
+        )
+    )
+
+    assert [call.name for call in result.decision.tool_calls] == ["bitrix_task_search"]
+    assert result.decision.tool_calls[0].args == {
+        "scope": "my",
+        "status": "active",
+        "limit": 10,
+        "query": "Обучение сотрудников",
+    }
+
+
+def test_bitrix_llm_decide_routes_project_search_to_deterministic_tool(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient(
+        json.dumps(
+            {
+                "status": "completed",
+                "answer": "",
+                "confidence": 0.2,
+                "tool_calls": [{"name": "bitrix_api", "args": {"method": "sonet_group.get", "params": {}}}],
+            }
+        )
+    )
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t1", request="Битрикс найди проект Ларгус 2.", user={"id": "13"}),
+            retrieval_hits=[],
+            tool_definitions=_bitrix_read_tool_definitions(),
+        )
+    )
+
+    assert [call.name for call in result.decision.tool_calls] == ["bitrix_project_search"]
+    assert result.decision.tool_calls[0].args == {"query": "Ларгус 2", "limit": 10}
 
 
 def test_bitrix_specialist_passes_user_profile_and_permission_rag_to_llm():
