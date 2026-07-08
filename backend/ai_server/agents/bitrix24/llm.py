@@ -247,7 +247,9 @@ def _format_task_create_draft_answer(data: dict[str, Any]) -> str:
     title = _text(preview.get("title")) or _text(fields.get("TITLE")) or "задача"
     responsible = _text(preview.get("responsible")) or "указанный сотрудник"
     deadline = _text(preview.get("deadline")) or _deadline_label_from_fields(fields)
-    description = _text(preview.get("description")) or _text(fields.get("DESCRIPTION")) or f"Краткое содержание: {title}"
+    description = (
+        _text(preview.get("description")) or _text(fields.get("DESCRIPTION")) or f"Краткое содержание: {title}"
+    )
     notes = data.get("notes") if isinstance(data.get("notes"), list) else []
     if deadline != "без срока" and any("Срок по умолчанию" in str(note) for note in notes):
         deadline = f"{deadline} (по умолчанию: 3 рабочих дня)"
