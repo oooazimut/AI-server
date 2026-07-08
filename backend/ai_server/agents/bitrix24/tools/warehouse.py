@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
@@ -19,7 +21,8 @@ class BitrixWarehouseSearchTool:
             description=(
                 "Read-only warehouse/store lookup in Bitrix catalog. Use it for requests about warehouses, "
                 "stores, stock locations, inventory leftovers, or phrases like 'find warehouse Borisov'. "
-                "It calls catalog.store.list and optionally catalog.storeproduct.list."
+                "It calls catalog.store.list and optionally catalog.storeproduct.list. Product rows include "
+                "only items with a positive available amount."
             ),
             parameters={
                 "type": "object",
@@ -99,22 +102,41 @@ class BitrixWarehouseSearchTool:
                 "items": [],
             }
 
-        rows = _extract_items(raw, "storeProducts")[:limit]
-        product_ids = [_first(row, "productId", "PRODUCT_ID", "product_id") for row in rows]
+        rows = _extract_items(raw, "storeProducts")
+        available_rows = [
+            row for row in rows if _positive_amount(_first(row, "amount", "AMOUNT", "quantity", "QUANTITY")) is not None
+        ]
+        product_ids = [_first(row, "productId", "PRODUCT_ID", "product_id") for row in available_rows]
         product_names = await self._product_names([pid for pid in product_ids if pid not in (None, "")])
 
-        items = []
-        for row in rows:
+        named_items = []
+        missing_name_count = 0
+        for row in available_rows:
             product_id = _first(row, "productId", "PRODUCT_ID", "product_id")
-            items.append(
+            product_name = product_names.get(str(product_id), "")
+            if not product_name:
+                missing_name_count += 1
+                continue
+            named_items.append(
                 {
                     "product_id": product_id,
-                    "product_name": product_names.get(str(product_id), ""),
+                    "product_name": product_name,
                     "amount": _first(row, "amount", "AMOUNT", "quantity", "QUANTITY"),
                     "raw": row,
                 }
             )
-        return {"status": "ok", "store_id": store_id, "items": items, "limit": limit}
+        items = named_items[:limit]
+        return {
+            "status": "ok",
+            "store_id": store_id,
+            "items": items,
+            "limit": limit,
+            "total_rows_seen": len(rows),
+            "available_items_seen": len(available_rows),
+            "filtered_non_positive_count": len(rows) - len(available_rows),
+            "filtered_missing_name_count": missing_name_count,
+            "has_more": len(named_items) > len(items),
+        }
 
     async def _product_names(self, product_ids: list[object]) -> dict[str, str]:
         if not product_ids or self._client is None:
@@ -242,3 +264,29 @@ def _first(data: dict[str, Any], *keys: str) -> Any:
         if key in data and data[key] not in (None, ""):
             return data[key]
     return None
+
+
+_AMOUNT_RE = re.compile(r"-?\d+(?:[.,]\d+)?")
+
+
+def _positive_amount(value: Any) -> Decimal | None:
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    if isinstance(value, int | float | Decimal):
+        try:
+            amount = Decimal(str(value))
+        except InvalidOperation:
+            return None
+        return amount if amount > 0 else None
+    text = str(value).strip()
+    if not text:
+        return None
+    compact = text.replace("\xa0", "").replace(" ", "")
+    match = _AMOUNT_RE.search(compact)
+    if not match:
+        return None
+    try:
+        amount = Decimal(match.group(0).replace(",", "."))
+    except InvalidOperation:
+        return None
+    return amount if amount > 0 else None

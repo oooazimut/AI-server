@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
@@ -84,6 +85,8 @@ class BitrixApiTool:
             return ToolResult(status=ToolStatus.NOT_CONFIGURED, tool="bitrix_api", error="BitrixClient is not injected")
         try:
             result = await self._client.result(method, params)
+            if method.casefold() == "sonet_group.get":
+                result = await _sonet_group_get_with_normalized_fallback(self._client, params, result)
         except (BitrixApiError, BitrixConfigError) as exc:
             return ToolResult(
                 status=ToolStatus.NOT_CONFIGURED if isinstance(exc, BitrixConfigError) else ToolStatus.ERROR,
@@ -209,3 +212,151 @@ def _write_context_error(*, user_id: int | None, dialog_id: str | None) -> str:
     if not str(dialog_id or "").strip():
         return "Bitrix write operation denied: current Bitrix dialog_id is missing."
     return ""
+
+
+async def _sonet_group_get_with_normalized_fallback(
+    client: BitrixToolClientPort,
+    params: dict[str, Any],
+    initial_result: Any,
+) -> Any:
+    if _extract_sonet_groups(initial_result):
+        return initial_result
+
+    query = _extract_sonet_group_query(params)
+    if not query:
+        return initial_result
+
+    fallback_params = _sonet_group_fallback_params(params)
+    fallback_result = await client.result("sonet_group.get", fallback_params)
+    matches = _match_sonet_groups(_extract_sonet_groups(fallback_result), query=query, limit=_sonet_group_limit(params))
+    if not matches:
+        return initial_result
+    return _replace_empty_sonet_group_result(initial_result, matches)
+
+
+def _extract_sonet_group_query(params: dict[str, Any]) -> str:
+    values: list[str] = []
+
+    def visit(value: Any, *, parent_key: str = "") -> None:
+        if isinstance(value, dict):
+            if parent_key.casefold() in {"order", "sort", "select"}:
+                return
+            for key, item in value.items():
+                key_text = str(key)
+                normalized_key = key_text.upper().lstrip("%=?")
+                if normalized_key in {"NAME", "TITLE", "SEARCH_INDEX", "QUERY", "Q", "SEARCH"}:
+                    if isinstance(item, str) and item.strip():
+                        values.append(item.strip())
+                    continue
+                visit(item, parent_key=key_text)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item, parent_key=parent_key)
+
+    visit(params)
+    if not values:
+        return ""
+    return max(values, key=len)
+
+
+def _sonet_group_fallback_params(params: dict[str, Any]) -> dict[str, Any]:
+    fallback = dict(params)
+    for filter_key in ("FILTER", "filter"):
+        value = fallback.get(filter_key)
+        if isinstance(value, dict):
+            fallback[filter_key] = _strip_sonet_group_name_filters(value)
+    if "ORDER" not in fallback and "order" not in fallback:
+        fallback["ORDER"] = {"NAME": "ASC"}
+    return fallback
+
+
+def _strip_sonet_group_name_filters(value: dict[str, Any]) -> dict[str, Any]:
+    cleaned: dict[str, Any] = {}
+    for key, item in value.items():
+        normalized_key = str(key).upper().lstrip("%=?")
+        if normalized_key in {"NAME", "TITLE", "SEARCH_INDEX", "QUERY", "Q", "SEARCH"}:
+            continue
+        cleaned[key] = item
+    return cleaned
+
+
+def _sonet_group_limit(params: dict[str, Any]) -> int:
+    candidates = [params.get("limit"), params.get("LIMIT")]
+    nav = params.get("NAV_PARAMS") or params.get("nav_params") or params.get("NavParams")
+    if isinstance(nav, dict):
+        candidates.extend([nav.get("nPageSize"), nav.get("nTopCount"), nav.get("pageSize")])
+    for candidate in candidates:
+        try:
+            value = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return max(1, min(value, 20))
+    return 10
+
+
+def _extract_sonet_groups(result: Any) -> list[dict[str, Any]]:
+    if isinstance(result, list):
+        return [item for item in result if isinstance(item, dict)]
+    if isinstance(result, dict):
+        for key in ("groups", "workgroups", "items", "result"):
+            value = result.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                nested = _extract_sonet_groups(value)
+                if nested:
+                    return nested
+    return []
+
+
+def _match_sonet_groups(groups: list[dict[str, Any]], *, query: str, limit: int) -> list[dict[str, Any]]:
+    normalized_query = _normalize_project_name(query)
+    query_terms = set(normalized_query.split())
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for group in groups:
+        name = str(group.get("NAME") or group.get("name") or group.get("TITLE") or group.get("title") or "")
+        normalized_name = _normalize_project_name(name)
+        if not normalized_name:
+            continue
+        score = 0
+        if normalized_name == normalized_query:
+            score = 100
+        elif normalized_query and normalized_query in normalized_name:
+            score = 80
+        elif query_terms and query_terms.issubset(set(normalized_name.split())):
+            score = 70
+        if score:
+            scored.append((score, group))
+    scored.sort(key=lambda item: (-item[0], _normalize_project_name(str(item[1].get("NAME") or ""))))
+    return [group for _, group in scored[:limit]]
+
+
+_PROJECT_ALIASES = {
+    "almira": "альмера",
+    "almera": "альмера",
+    "largus": "ларгус",
+    "logan": "логан",
+}
+
+
+def _normalize_project_name(value: str) -> str:
+    text = value.casefold().replace("ё", "е")
+    for source, target in _PROJECT_ALIASES.items():
+        text = re.sub(rf"\b{re.escape(source)}\b", target, text)
+    text = re.sub(r"[-–—_/\\]+", " ", text)
+    text = re.sub(r"[^\w\s]+", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _replace_empty_sonet_group_result(initial_result: Any, matches: list[dict[str, Any]]) -> Any:
+    if isinstance(initial_result, dict):
+        replaced = dict(initial_result)
+        for key in ("groups", "workgroups", "items", "result"):
+            value = replaced.get(key)
+            if isinstance(value, list):
+                replaced[key] = matches
+                replaced["normalized_fallback"] = True
+                return replaced
+        return {"groups": matches, "normalized_fallback": True}
+    return matches

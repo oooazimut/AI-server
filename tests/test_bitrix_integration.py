@@ -257,6 +257,36 @@ def test_bitrix_api_tool_denied_method():
     assert fake_bitrix.calls == []
 
 
+def test_bitrix_api_tool_sonet_group_get_normalizes_hyphenated_project_name():
+    class FakeProjectClient:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def result(self, method, payload=None, *, base_url=None):
+            self.calls.append((method, payload or {}))
+            if method == "sonet_group.get" and (payload or {}).get("FILTER", {}).get("%NAME"):
+                return []
+            if method == "sonet_group.get":
+                return [
+                    {"ID": "39", "NAME": "Логан"},
+                    {"ID": "45", "NAME": "Ларгус 2"},
+                    {"ID": "53", "NAME": "ларгус 3"},
+                ]
+            return []
+
+    fake_bitrix = FakeProjectClient()
+    tool = BitrixApiTool(client=fake_bitrix)
+
+    result = anyio_run(tool.execute({"method": "sonet_group.get", "params": {"FILTER": {"%NAME": "Ларгус-2"}}}))
+
+    assert result.status == ToolStatus.OK
+    assert result.data["result"] == [{"ID": "45", "NAME": "Ларгус 2"}]
+    assert fake_bitrix.calls == [
+        ("sonet_group.get", {"FILTER": {"%NAME": "Ларгус-2"}}),
+        ("sonet_group.get", {"FILTER": {}, "ORDER": {"NAME": "ASC"}}),
+    ]
+
+
 def test_bitrix_warehouse_search_tool_finds_store_and_products():
     fake_bitrix = FakeBitrixClient()
     tool = BitrixWarehouseSearchTool(client=fake_bitrix)
@@ -271,6 +301,46 @@ def test_bitrix_warehouse_search_tool_finds_store_and_products():
     assert result.data["products"]["items"][0]["product_name"] == "Cable"
     assert ("catalog.store.list", {}) in fake_bitrix.calls
     assert any(method == "catalog.storeproduct.list" for method, _ in fake_bitrix.calls)
+
+
+def test_bitrix_warehouse_search_tool_filters_non_available_products_before_limit():
+    class FakeWarehouseClient(FakeBitrixClient):
+        async def result(self, method, payload=None, *, base_url=None):
+            self.calls.append((method, payload or {}))
+            if method == "catalog.store.list":
+                return {"stores": [{"id": 10, "title": "Borisov warehouse", "address": "Borisov"}]}
+            if method == "catalog.storeproduct.list":
+                return {
+                    "storeProducts": [
+                        {"storeId": 10, "productId": 1001, "amount": "0"},
+                        {"storeId": 10, "productId": 1002},
+                        {"storeId": 10, "productId": 1003, "amount": "2"},
+                        {"storeId": 10, "productId": 1004, "amount": "5"},
+                        {"storeId": 10, "productId": 1005, "amount": ""},
+                    ]
+                }
+            if method == "catalog.product.list":
+                return {
+                    "products": [
+                        {"id": 1003, "name": "Cable"},
+                        {"id": 1004, "name": "Switch"},
+                    ]
+                }
+            return {}
+
+    fake_bitrix = FakeWarehouseClient()
+    tool = BitrixWarehouseSearchTool(client=fake_bitrix)
+
+    result = anyio_run(
+        tool.execute({"query": "Borisov warehouse", "include_products": True, "limit": 5, "product_limit": 1})
+    )
+
+    assert result.status == ToolStatus.OK
+    products = result.data["products"]
+    assert [item["product_id"] for item in products["items"]] == [1003]
+    assert products["filtered_non_positive_count"] == 3
+    assert products["available_items_seen"] == 2
+    assert products["has_more"] is True
 
 
 def test_bitrix24_specialist_skips_quality_control_when_disabled(monkeypatch, tmp_path):
