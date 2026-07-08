@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import Any
 
 from ai_server.agents.base import BaseSpecialist
@@ -169,6 +170,20 @@ class Bitrix24Specialist(BaseSpecialist):
             )
         return await super().handle(task)
 
+    async def _execute_tool_call(
+        self,
+        tool_call: Any,
+        task: AgentTask,
+    ) -> tuple[ToolResult | None, Any | None, list[Any]]:
+        if tool_call.name == "task_create_draft":
+            args = _task_create_args_with_actor_label(dict(tool_call.args or {}), task)
+            tool_call = SimpleNamespace(
+                name=tool_call.name,
+                args=args,
+                summary=getattr(tool_call, "summary", ""),
+            )
+        return await super()._execute_tool_call(tool_call, task)
+
     def tool_definitions(self) -> list[dict]:
         return [t.definition().model_dump() for t in self._tool_registry.values() if t.name in _LLM_TOOL_NAMES]
 
@@ -280,3 +295,43 @@ def _tool_context_status(value: object) -> str:
     if isinstance(value, dict):
         return str(value.get("status") or "")
     return ""
+
+
+def _task_create_args_with_actor_label(args: dict[str, Any], task: AgentTask) -> dict[str, Any]:
+    if str(args.get("responsible_name") or args.get("responsible_label") or "").strip():
+        return args
+    user_id = optional_int(task.user.id)
+    responsible_id = optional_int(args.get("responsible_id"))
+    responsible_self = _truthy(args.get("responsible_self"))
+    if not responsible_self and (user_id is None or responsible_id != user_id):
+        return args
+    label = _current_user_label(task)
+    if label:
+        return {**args, "responsible_name": label}
+    return args
+
+
+def _current_user_label(task: AgentTask) -> str:
+    display_name = str(task.user.display_name or "").strip()
+    if display_name:
+        return display_name
+    profile_result = task.context.get("bitrix_current_user_profile")
+    if not isinstance(profile_result, dict):
+        return ""
+    data = profile_result.get("data")
+    if not isinstance(data, dict):
+        return ""
+    profile = data.get("profile")
+    if not isinstance(profile, dict):
+        return ""
+    return str(profile.get("label") or "").strip()
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().casefold() in {"1", "true", "yes", "y", "да", "on"}
+    return bool(value)

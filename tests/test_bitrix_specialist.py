@@ -232,6 +232,51 @@ def test_bitrix_specialist_task_create_draft_saves_to_store():
     assert draft_fields["DEADLINE"]
 
 
+def test_bitrix_specialist_task_create_draft_uses_current_user_profile_label():
+    store = FakeTaskDraftStore()
+    llm = FakeBitrixLLM(
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="task_create_draft",
+                args={
+                    "title": "проверить IP-камеру",
+                    "responsible_self": True,
+                },
+            )
+        ],
+        final_status="needs_human",
+        final_answer="Подготовил черновик задачи, нужно подтверждение.",
+    )
+
+    class _FakeUserClient:
+        async def get_user(self, user_id: int):
+            return {"ID": str(user_id), "NAME": "Дмитрий", "LAST_NAME": "Кулинич"}
+
+    specialist = Bitrix24Specialist(
+        get_agent_manifest("bitrix24"),
+        retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
+        agent_tools=[TaskCreateDraftTool(store=store)],
+        bitrix_user_client=_FakeUserClient(),
+        llm=llm,
+    )
+
+    result = asyncio.run(
+        specialist.handle(
+            AgentTask(
+                task_id="t1",
+                request="Создай задачу на меня проверить IP-камеру",
+                user={"id": "13"},
+                context={"dialog_key": "d:13"},
+            )
+        )
+    )
+
+    assert result.status == "needs_human"
+    preview = llm.compose_calls[0]["tool_results"][0].data["preview"]
+    assert preview["responsible"] == "Кулинич Дмитрий"
+    assert "текущий пользователь" not in preview["responsible"]
+
+
 def test_bitrix_specialist_asks_for_responsible_before_task_create():
     result = asyncio.run(
         _bitrix_specialist(
@@ -453,7 +498,8 @@ def test_bitrix_llm_compose_formats_task_draft_without_profile_links(monkeypatch
     assert client.calls == []
     assert result.status == "needs_human"
     assert "Черновик задачи" in result.answer
-    assert "по умолчанию: 3 рабочих дня" in result.answer
+    assert "по умолчанию: 3 рабочих дня" not in result.answer
+    assert "13.07.2026 19:00 МСК" in result.answer
     assert "Краткое содержание: тест подтверждения" in result.answer
     assert "[URL" not in result.answer
     assert "company/personal/user" not in result.answer

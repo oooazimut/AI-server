@@ -46,14 +46,15 @@ def test_draft_tool_returns_plain_preview_without_user_id():
     tool = TaskCreateDraftTool(store=store)
     result = _exec(
         tool,
-        {"title": "Тест", "responsible_self": True},
+        {"title": "Тест", "responsible_self": True, "responsible_name": "Кулинич Валерий"},
         user_id=9,
         dialog_key="d:42",
     )
     preview = result.data["preview"]
 
     assert result.status == ToolStatus.OK
-    assert preview["responsible"] == "текущий пользователь"
+    assert preview["responsible"] == "Кулинич Валерий"
+    assert "текущий пользователь" not in " ".join(preview.values())
     assert "#9" not in " ".join(preview.values())
     assert preview["deadline"].endswith("МСК")
 
