@@ -223,6 +223,50 @@ def test_bitrix_llm_decide_routes_task_text_search_even_when_model_answers_from_
     }
 
 
+def test_bitrix_llm_decide_routes_advanced_comment_closed_search(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient(
+        json.dumps(
+            {
+                "status": "completed",
+                "answer": "",
+                "confidence": 0.2,
+                "tool_calls": [{"name": "bitrix_task_search", "args": {"scope": "my", "status": "closed"}}],
+            }
+        )
+    )
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request=(
+                    "Битрикс найди закрытые задачи, закрытые с 01.01.2025 по 31.12.2025, "
+                    "где в комментариях есть слово наблюдателем. Покажи не больше 5."
+                ),
+                user={"id": "13"},
+            ),
+            retrieval_hits=[],
+            tool_definitions=_bitrix_read_tool_definitions(),
+        )
+    )
+
+    assert [call.name for call in result.decision.tool_calls] == ["bitrix_task_search"]
+    assert result.decision.tool_calls[0].args == {
+        "scope": "all",
+        "status": "closed",
+        "limit": 5,
+        "include_closed": True,
+        "comment_query": "наблюдателем",
+        "include_comments": True,
+        "comment_lookup_task_limit": 200,
+        "closed_from": "2025-01-01",
+        "closed_to": "2025-12-31",
+    }
+
+
 def test_bitrix_llm_decide_routes_project_search_to_deterministic_tool(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient(
