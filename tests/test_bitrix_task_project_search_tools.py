@@ -46,6 +46,15 @@ class _FakeBitrixSearchClient:
                 "deadline": "2026-07-07T19:00:00+03:00",
                 "groupId": "45",
             },
+            {
+                "id": "139",
+                "title": "Обучение сотрудников",
+                "status": "2",
+                "responsibleId": "35",
+                "createdBy": "35",
+                "deadline": None,
+                "groupId": "45",
+            },
         ]
 
     async def result(self, method: str, params: dict):
@@ -89,6 +98,18 @@ def test_task_search_status_all_requires_explicit_include_closed_flag():
     assert [item["title"] for item in result.data["items"]] == ["Поставленная мной"]
     assert result.data["status"] == "active"
     assert client.calls[0][1]["filter"] == {"STATUS": [1, 2, 3, 4], "CREATED_BY": 13}
+
+
+def test_task_search_text_query_uses_title_filter_for_all_scope():
+    client = _FakeBitrixSearchClient()
+    tool = BitrixTaskSearchTool(client=client)
+
+    result = anyio.run(lambda: tool.execute({"scope": "all", "query": "Обучение сотрудников"}, user_id=13))
+
+    assert result.status == "ok"
+    assert [item["title"] for item in result.data["items"]] == ["Обучение сотрудников"]
+    assert result.data["total"] == 1
+    assert client.calls[0][1]["filter"] == {"STATUS": [1, 2, 3, 4], "%TITLE": "Обучение сотрудников"}
 
 
 def test_task_search_defaults_to_ten_and_reports_more_after_sorting():
@@ -152,6 +173,8 @@ def _matches_task_filter(task: dict, task_filter: dict) -> bool:
     if task_filter.get("CREATED_BY") and str(task["createdBy"]) != str(task_filter["CREATED_BY"]):
         return False
     if task_filter.get("GROUP_ID") and str(task.get("groupId")) != str(task_filter["GROUP_ID"]):
+        return False
+    if task_filter.get("%TITLE") and str(task_filter["%TITLE"]).casefold() not in str(task.get("title")).casefold():
         return False
     if task_filter.get("MEMBER"):
         user_id = str(task_filter["MEMBER"])

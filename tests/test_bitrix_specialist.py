@@ -216,7 +216,7 @@ def test_bitrix_llm_decide_routes_task_text_search_even_when_model_answers_from_
 
     assert [call.name for call in result.decision.tool_calls] == ["bitrix_task_search"]
     assert result.decision.tool_calls[0].args == {
-        "scope": "my",
+        "scope": "all",
         "status": "active",
         "limit": 10,
         "query": "Обучение сотрудников",

@@ -259,6 +259,7 @@ class BitrixTaskSearchTool:
             status=status,
             user_id=user_id,
             project_id=project_id,
+            query=query,
         )
         sorted_tasks, task_errors = await _fetch_merged_tasks(self._client, calls)
         errors.extend(task_errors)
@@ -481,10 +482,13 @@ def _task_search_calls(
     status: str,
     user_id: int | None,
     project_id: int | None,
+    query: str = "",
 ) -> list[dict[str, Any]]:
     base_filter: dict[str, Any] = dict(_task_search_status_filter(status))
     if project_id is not None:
         base_filter["GROUP_ID"] = project_id
+    if query:
+        base_filter["%TITLE"] = query
     if scope == "responsible":
         return [{"role_source": "responsible", "filter": {**base_filter, "RESPONSIBLE_ID": user_id}}]
     if scope == "created_by":

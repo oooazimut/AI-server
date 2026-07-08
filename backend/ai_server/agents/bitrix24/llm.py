@@ -768,15 +768,18 @@ def _common_task_read_args(request: str) -> dict[str, Any] | None:
     if task_id is not None:
         return {"task_id": task_id}
 
+    query = _extract_task_query(request)
+    scope = _task_scope_from_text(lowered)
+    if query and scope == "my" and not _has_explicit_user_task_scope(lowered):
+        scope = "all"
     args: dict[str, Any] = {
-        "scope": _task_scope_from_text(lowered),
+        "scope": scope,
         "status": _task_status_from_text(lowered),
         "limit": 10,
     }
     project_name = _extract_project_name_from_task_request(request)
     if project_name:
         args["project_name"] = project_name
-    query = _extract_task_query(request)
     if query:
         args["query"] = query
     return args
@@ -798,6 +801,23 @@ def _task_scope_from_text(lowered: str) -> str:
     if "на мне" in lowered or "я исполнитель" in lowered or "где я исполнитель" in lowered:
         return "responsible"
     return "my"
+
+
+def _has_explicit_user_task_scope(lowered: str) -> bool:
+    return any(
+        marker in lowered
+        for marker in (
+            "мои",
+            "мой",
+            "моя",
+            "мою",
+            "мной",
+            "на мне",
+            "я исполнитель",
+            "где я исполнитель",
+            "поставлен",
+        )
+    )
 
 
 def _task_status_from_text(lowered: str) -> str:
