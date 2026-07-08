@@ -102,6 +102,17 @@ def test_task_search_status_all_requires_explicit_include_closed_flag():
 
 def test_task_search_text_query_uses_title_filter_for_all_scope():
     client = _FakeBitrixSearchClient()
+    client.tasks.append(
+        {
+            "id": "140",
+            "title": "Обучение сотрудников",
+            "status": "5",
+            "responsibleId": "35",
+            "createdBy": "35",
+            "deadline": None,
+            "groupId": "45",
+        }
+    )
     tool = BitrixTaskSearchTool(client=client)
 
     result = anyio.run(lambda: tool.execute({"scope": "all", "query": "Обучение сотрудников"}, user_id=13))
@@ -109,7 +120,7 @@ def test_task_search_text_query_uses_title_filter_for_all_scope():
     assert result.status == "ok"
     assert [item["title"] for item in result.data["items"]] == ["Обучение сотрудников"]
     assert result.data["total"] == 1
-    assert client.calls[0][1]["filter"] == {"STATUS": [1, 2, 3, 4], "%TITLE": "Обучение сотрудников"}
+    assert client.calls[0][1]["filter"] == {"%TITLE": "Обучение сотрудников"}
 
 
 def test_task_search_defaults_to_ten_and_reports_more_after_sorting():
