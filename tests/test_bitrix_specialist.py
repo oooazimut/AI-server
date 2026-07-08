@@ -2,6 +2,7 @@ import asyncio
 import json
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist, BitrixLLMDecision, BitrixLLMService, BitrixLLMToolCall
+from ai_server.agents.bitrix24.llm import ALLOWED_TOOL_NAMES
 from ai_server.agents.bitrix24.tools.task_create import TaskCreateDraftTool
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import AgentTask, ToolDefinition, ToolResult
@@ -352,12 +353,66 @@ def test_bitrix_llm_decision_payload_includes_permission_context(monkeypatch):
     payload = json.loads(client.calls[0]["messages"][1]["content"])
     permission = payload["permission_context"]
     assert permission["current_user_id"] == 15
+    assert permission["current_dialog_id"] == ""
     assert permission["current_user_write_profile"] == "member_write"
+    assert permission["pending_task_draft"] is None
     assert permission["bitrix_current_user_profile"] == context["bitrix_current_user_profile"]
     assert permission["permission_policy_context"] == context["permission_policy_context"]
     assert any("business writes must be prepared as drafts" in rule for rule in permission["rules"])
     assert any("confirmed writes execute only through OAuth" in rule for rule in permission["rules"])
     assert any("Bitrix itself decides final permissions" in rule for rule in permission["rules"])
+
+
+def test_bitrix_llm_exposes_and_accepts_task_draft_confirmation_tools(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient(
+        json.dumps(
+            {
+                "status": "completed",
+                "answer": "",
+                "confidence": 0.7,
+                "tool_calls": [
+                    {"name": "task_create_confirm", "args": {}, "summary": "confirmed"},
+                    {"name": "task_draft_discard", "args": {}, "summary": "discarded"},
+                ],
+            }
+        )
+    )
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_create_draft", "description": "", "parameters": {}},
+        {"name": "task_create_confirm", "description": "", "parameters": {}},
+        {"name": "task_draft_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request="да, создай",
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "fields": {"TITLE": "test", "RESPONSIBLE_ID": 15, "CREATED_BY": 15, "NO_DEADLINE": True}
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert {"task_create_confirm", "task_draft_discard"} <= ALLOWED_TOOL_NAMES
+    payload = json.loads(client.calls[0]["messages"][1]["content"])
+    prompt = client.calls[0]["messages"][0]["content"]
+    assert {"task_create_confirm", "task_draft_discard"} <= {tool["name"] for tool in payload["tools"]}
+    assert payload["permission_context"]["current_dialog_id"] == "chat4321"
+    assert payload["permission_context"]["pending_task_draft"]["fields"]["TITLE"] == "test"
+    assert "task_create_confirm" in prompt
+    assert "task_draft_discard" in prompt
+    assert [call.name for call in result.decision.tool_calls] == ["task_create_confirm", "task_draft_discard"]
 
 
 def test_bitrix_llm_service_uses_injected_settings_not_global_at_call_time(monkeypatch):
