@@ -940,19 +940,97 @@ def _common_task_read_args(request: str) -> dict[str, Any] | None:
 
     query = _extract_task_query(request)
     scope = _task_scope_from_text(lowered)
-    if query and scope == "my" and not _has_explicit_user_task_scope(lowered):
+    if scope == "my" and not _has_explicit_user_task_scope(lowered):
         scope = "all"
+    status = _task_status_from_text(lowered)
     args: dict[str, Any] = {
         "scope": scope,
-        "status": _task_status_from_text(lowered),
-        "limit": 10,
+        "status": status,
+        "limit": _extract_task_limit(lowered) or 10,
     }
+    if status in {"closed", "deferred", "declined", "all"}:
+        args["include_closed"] = True
     project_name = _extract_project_name_from_task_request(request)
     if project_name:
         args["project_name"] = project_name
     if query:
         args["query"] = query
+    comment_query = _extract_comment_query(request)
+    if comment_query:
+        args["comment_query"] = comment_query
+        args["include_comments"] = True
+        args["comment_lookup_task_limit"] = 200
+    closed_from, closed_to = _extract_closed_date_range(request)
+    if closed_from:
+        args["closed_from"] = closed_from
+        args["status"] = "closed"
+        args["include_closed"] = True
+    if closed_to:
+        args["closed_to"] = closed_to
+        args["status"] = "closed"
+        args["include_closed"] = True
     return args
+
+
+def _extract_task_limit(lowered: str) -> int | None:
+    match = re.search(r"(?:не\s+больше|до|покажи)\s+(\d{1,2})\b", lowered, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        limit = int(match.group(1))
+    except ValueError:
+        return None
+    return max(1, min(limit, 50))
+
+
+def _extract_comment_query(request: str) -> str:
+    patterns = (
+        r"комментари[а-яё]*[^.?!]*(?:слово|фраз[ау]|текст)\s+(.+?)(?:[.?!]|$)",
+        r"комментари[а-яё]*[^.?!]*\bесть\s+(.+?)(?:[.?!]|$)",
+        r"с\s+комментари[а-яё]*\s+(.+?)(?:[.?!]|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, request, flags=re.IGNORECASE)
+        if not match:
+            continue
+        value = _clean_comment_query(match.group(1))
+        if value:
+            return value
+    return ""
+
+
+def _clean_comment_query(value: str) -> str:
+    text = str(value or "").strip(" \t\r\n\"'«».,!?")
+    text = re.split(r"\s+покажи\b", text, maxsplit=1, flags=re.IGNORECASE)[0]
+    text = re.sub(r"^(?:слово|фраз[ау]|текст)\s+", "", text, flags=re.IGNORECASE)
+    return text.strip(" \t\r\n\"'«».,!?")
+
+
+def _extract_closed_date_range(request: str) -> tuple[str, str]:
+    lowered = request.casefold()
+    if not any(marker in lowered for marker in ("закрыт", "заверш")):
+        return "", ""
+    match = re.search(
+        r"\bс\s+(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4})\s+по\s+(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4})",
+        request,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return "", ""
+    return _normalize_task_date(match.group(1)), _normalize_task_date(match.group(2))
+
+
+def _normalize_task_date(value: str) -> str:
+    match = re.fullmatch(r"(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})", value.strip())
+    if not match:
+        return ""
+    day, month, year = match.groups()
+    if len(year) == 2:
+        year = "20" + year
+    try:
+        return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+    except ValueError:
+        return ""
 
 
 def _common_project_query(request: str) -> str:

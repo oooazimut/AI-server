@@ -1,6 +1,17 @@
+import asyncio
+import json
+
 import pytest
 
-from ai_server.orchestrators.orchestrator_llm import _parse_decision, _status
+from ai_server.models import AgentTask, ToolResult
+from ai_server.orchestrators.orchestrator_llm import (
+    OrchestratorDecision,
+    OrchestratorLLMService,
+    _parse_decision,
+    _status,
+)
+from ai_server.registry import get_agent_manifest
+from tests.fakes import RecordingLLMClient
 
 
 def _tool_defs(*names: str) -> list[dict]:
@@ -113,3 +124,31 @@ def test_parse_decision_multiple_tool_calls():
 )
 def test_status_normalization(value, expected):
     assert _status(value) == expected
+
+
+def test_orchestrator_compose_passes_through_specialist_answer_without_llm():
+    client = RecordingLLMClient(json.dumps({"answer": "wrong rewrite", "status": "completed"}))
+    service = OrchestratorLLMService(client)
+
+    result = asyncio.run(
+        service.compose(
+            manifest=get_agent_manifest("internal_orchestrator"),
+            task=AgentTask(task_id="t1", request="Битрикс покажи задачи"),
+            decision=OrchestratorDecision(status="completed", answer="", tool_calls=[]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="call_specialist",
+                    data={
+                        "specialist": "bitrix24",
+                        "answer": "Готовый ответ Bitrix specialist",
+                        "status": "completed",
+                    },
+                )
+            ],
+        )
+    )
+
+    assert result.answer == "Готовый ответ Bitrix specialist"
+    assert result.status == "completed"
+    assert client.calls == []
