@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -146,8 +147,9 @@ class BitrixLLMService:
             ],
             json_mode=True,
         )
+        decision = _normalize_common_read_decision(_parse_decision(completion.json_content()), task.request)
         return BitrixLLMDecisionResult(
-            decision=_parse_decision(completion.json_content()),
+            decision=decision,
             model_usage=completion.model_usage,
             raw=completion.raw,
         )
@@ -711,6 +713,144 @@ def _parse_decision(data: dict[str, Any]) -> BitrixLLMDecision:
         confidence=confidence(data.get("confidence")),
         tool_calls=tool_calls,
     )
+
+
+_WRITE_TOOL_NAMES = frozenset(
+    {
+        "task_create_draft",
+        "task_create_confirm",
+        "task_draft_discard",
+        "save_incomplete_proposal",
+        "delete_incomplete_proposal",
+        "save_responsible_response",
+    }
+)
+_READ_MARKERS = ("покажи", "найди", "найти", "выведи", "список", "какие", "ищи")
+_WRITE_MARKERS = ("создай", "создать", "закрой", "закрыть", "измени", "изменить", "удали", "удалить")
+
+
+def _normalize_common_read_decision(decision: BitrixLLMDecision, request: str) -> BitrixLLMDecision:
+    if any(call.name in _WRITE_TOOL_NAMES for call in decision.tool_calls):
+        return decision
+    clean_request = _strip_command_prefix(request)
+    lowered = clean_request.casefold()
+    if not any(marker in lowered for marker in _READ_MARKERS):
+        return decision
+    if any(marker in lowered for marker in _WRITE_MARKERS):
+        return decision
+
+    task_args = _common_task_read_args(clean_request)
+    if task_args is not None:
+        return _replace_decision_tool(decision, "bitrix_task_search", task_args)
+
+    project_query = _common_project_query(clean_request)
+    if project_query:
+        return _replace_decision_tool(decision, "bitrix_project_search", {"query": project_query, "limit": 10})
+
+    return decision
+
+
+def _replace_decision_tool(decision: BitrixLLMDecision, name: str, args: dict[str, Any]) -> BitrixLLMDecision:
+    return BitrixLLMDecision(
+        status="completed",
+        answer=decision.answer,
+        confidence=max(decision.confidence, 0.8),
+        tool_calls=[BitrixLLMToolCall(name=name, args=args, summary="deterministic common Bitrix read routing")],
+    )
+
+
+def _common_task_read_args(request: str) -> dict[str, Any] | None:
+    lowered = request.casefold()
+    if "задач" not in lowered:
+        return None
+
+    task_id = _extract_task_id(request)
+    if task_id is not None:
+        return {"task_id": task_id}
+
+    args: dict[str, Any] = {
+        "scope": _task_scope_from_text(lowered),
+        "status": _task_status_from_text(lowered),
+        "limit": 10,
+    }
+    project_name = _extract_project_name_from_task_request(request)
+    if project_name:
+        args["project_name"] = project_name
+    query = _extract_task_query(request)
+    if query:
+        args["query"] = query
+    return args
+
+
+def _common_project_query(request: str) -> str:
+    lowered = request.casefold()
+    if "проект" not in lowered or "задач" in lowered:
+        return ""
+    match = re.search(r"\bпроект[а-яё]*\s+(.+?)(?:[.?!]|$)", request, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return _clean_read_query(match.group(1))
+
+
+def _task_scope_from_text(lowered: str) -> str:
+    if "поставлен" in lowered and "мной" in lowered:
+        return "created_by"
+    if "на мне" in lowered or "я исполнитель" in lowered or "где я исполнитель" in lowered:
+        return "responsible"
+    return "my"
+
+
+def _task_status_from_text(lowered: str) -> str:
+    if "просроч" in lowered:
+        return "overdue"
+    if "отлож" in lowered:
+        return "deferred"
+    if "отклон" in lowered:
+        return "declined"
+    if "закрыт" in lowered or "заверш" in lowered:
+        return "closed"
+    if "включая закрыт" in lowered or "включая заверш" in lowered:
+        return "all"
+    return "active"
+
+
+def _extract_task_id(request: str) -> int | None:
+    match = re.search(r"\bзадач[ауы]?\s+#?(\d{1,10})\b", request, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _extract_project_name_from_task_request(request: str) -> str:
+    match = re.search(r"\bв\s+проекте\s+(.+?)(?:[.?!]|$)", request, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return _clean_read_query(match.group(1))
+
+
+def _extract_task_query(request: str) -> str:
+    match = re.search(r"\bнайд[иите]*\s+задач[ауы]?\s+(.+?)(?:[.?!]|$)", request, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    query = _clean_read_query(match.group(1))
+    if not query or query.isdigit():
+        return ""
+    return query
+
+
+def _strip_command_prefix(request: str) -> str:
+    text = re.sub(r"^\[[^\]]+\]\s*", "", str(request or "")).strip()
+    return re.sub(r"^битрикс[:,]?\s*", "", text, flags=re.IGNORECASE).strip()
+
+
+def _clean_read_query(value: str) -> str:
+    text = str(value or "").strip(" \t\r\n\"'«».,!?")
+    text = re.split(r"\s+(?:со|с)\s+(?:статусом|сроком)\b", text, maxsplit=1, flags=re.IGNORECASE)[0]
+    text = re.split(r"\s+в\s+проекте\b", text, maxsplit=1, flags=re.IGNORECASE)[0]
+    return text.strip(" \t\r\n\"'«».,!?")
 
 
 def _permission_context(task: AgentTask, settings: Settings) -> dict[str, Any]:

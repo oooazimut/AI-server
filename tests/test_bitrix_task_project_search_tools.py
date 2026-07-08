@@ -79,6 +79,18 @@ def test_task_search_responsible_scope_uses_current_user_and_active_statuses():
     assert client.calls[0][1]["filter"] == {"STATUS": [1, 2, 3, 4], "RESPONSIBLE_ID": 13}
 
 
+def test_task_search_status_all_requires_explicit_include_closed_flag():
+    client = _FakeBitrixSearchClient()
+    tool = BitrixTaskSearchTool(client=client)
+
+    result = anyio.run(lambda: tool.execute({"scope": "created_by", "status": "all"}, user_id=13))
+
+    assert result.status == "ok"
+    assert [item["title"] for item in result.data["items"]] == ["Поставленная мной"]
+    assert result.data["status"] == "active"
+    assert client.calls[0][1]["filter"] == {"STATUS": [1, 2, 3, 4], "CREATED_BY": 13}
+
+
 def test_task_search_defaults_to_ten_and_reports_more_after_sorting():
     client = _FakeBitrixSearchClient()
     client.tasks = [
