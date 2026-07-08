@@ -52,13 +52,11 @@ def build_task_create_draft_from_args(args: dict[str, Any], *, user_id: int | No
     if responsible_id is None and _truthy(args.get("responsible_self")):
         responsible_id = user_id
         if responsible_id is not None:
-            responsible_note = "Ответственным выбран текущий пользователь."
+            responsible_note = "Ответственным выбран пользователь Bitrix из текущего диалога."
         else:
             responsible_note = "LLM выбрала текущего пользователя, но канал не передал Bitrix user id."
     if not responsible_label and responsible_id is not None:
-        responsible_label = (
-            "текущий пользователь" if user_id is not None and responsible_id == user_id else "указанный сотрудник"
-        )
+        responsible_label = "указанный сотрудник"
 
     deadline, deadline_note, no_deadline, deadline_error = _deadline_from_args(args)
 

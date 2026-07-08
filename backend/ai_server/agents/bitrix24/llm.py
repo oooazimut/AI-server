@@ -250,9 +250,6 @@ def _format_task_create_draft_answer(data: dict[str, Any]) -> str:
     description = (
         _text(preview.get("description")) or _text(fields.get("DESCRIPTION")) or f"Краткое содержание: {title}"
     )
-    notes = data.get("notes") if isinstance(data.get("notes"), list) else []
-    if deadline != "без срока" and any("Срок по умолчанию" in str(note) for note in notes):
-        deadline = f"{deadline} (по умолчанию: 3 рабочих дня)"
     return (
         "Черновик задачи:\n"
         f"Название: {title}\n"
@@ -354,7 +351,9 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Не вызывай search.search: этот метод в текущем Bitrix недоступен. "
         "Для создания задачи используй task_create_draft. "
         "Для task_create_draft именно ты распознаёшь title, responsible_id/responsible_self, "
-        "group_id, deadline_iso или no_deadline. Если знаешь имя ответственного после поиска, передай его в responsible_name "
+        "group_id, deadline_iso или no_deadline. Если ответственный — текущий пользователь, возьми имя из "
+        "permission_context.bitrix_current_user_profile.data.profile.label и передай его в responsible_name. "
+        "Если знаешь имя ответственного после поиска, тоже передай его в responsible_name "
         "только для человекочитаемого черновика. "
         "Если ответственный указан по имени — сначала вызови bitrix_api(user.search), получи ID, затем task_create_draft. "
         "Если проект указан по названию — сначала вызови bitrix_api(sonet_group.get), получи ID, затем task_create_draft. "
