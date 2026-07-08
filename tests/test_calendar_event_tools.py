@@ -45,6 +45,26 @@ def test_calendar_draft_uses_date_only_default_noon():
     assert result.data["preview"]["participants"] == "только текущий пользователь"
 
 
+def test_calendar_draft_uses_owner_name_for_single_participant_preview():
+    store = FakeTaskDraftStore()
+    tool = CalendarEventDraftTool(store=store)
+
+    result = _exec(
+        tool,
+        {
+            "title": "позвонить Борисову",
+            "date_iso": "2026-07-09",
+            "owner_name": "Коверга Дмитрий Владимирович",
+        },
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+
+    assert result.status == ToolStatus.OK
+    assert result.data["preview"]["participants"] == "Коверга Дмитрий Владимирович"
+
+
 def test_calendar_draft_denies_missing_dialog_id():
     store = FakeTaskDraftStore()
     tool = CalendarEventDraftTool(store=store)

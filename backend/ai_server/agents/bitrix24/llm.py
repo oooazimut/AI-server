@@ -403,14 +403,16 @@ def _format_my_tasks_answer(data: dict[str, Any], *, portal_base_url: str = "") 
         task_id = _text(item.get("id"))
         label = _task_link(task_title, task_id, portal_base_url=portal_base_url)
         deadline = _text(item.get("deadline_label")) or "без срока"
-        roles = item.get("roles") if isinstance(item.get("roles"), list) else []
-        roles_label = ", ".join(_text(role) for role in roles if _text(role))
         status_label = _text(item.get("status_label"))
         details = [f"срок: {deadline}"]
         if status_label:
             details.append(status_label)
-        if roles_label:
-            details.append(roles_label)
+        responsible = _text(item.get("responsible_label"))
+        creator = _text(item.get("creator_label"))
+        if responsible:
+            details.append(f"исполнитель: {responsible}")
+        if creator:
+            details.append(f"постановщик: {creator}")
         lines.append(f"{index}. {label} — {', '.join(details)}")
 
     shown = len(items)
@@ -431,7 +433,7 @@ def _format_task_search_answer(data: dict[str, Any], *, portal_base_url: str = "
             return "Задача не найдена."
         title = _text(item.get("title")) or "задача"
         label = _task_link(title, _text(item.get("id")), portal_base_url=portal_base_url)
-        details = _task_details(item, include_roles=True)
+        details = _task_details(item, include_roles=False)
         if not details:
             return f"Задача найдена: {label}."
         return f"Задача найдена: {label}.\n" + "\n".join(details)
@@ -447,13 +449,12 @@ def _format_task_search_answer(data: dict[str, Any], *, portal_base_url: str = "
 
     lines = [title]
     offset = _int_value(data.get("offset")) or 0
-    scope = _text(data.get("scope"))
     for index, item in enumerate(items, start=offset + 1):
         if not isinstance(item, dict):
             continue
         task_title = _text(item.get("title")) or "задача"
         label = _task_link(task_title, _text(item.get("id")), portal_base_url=portal_base_url)
-        details = _task_details(item, include_roles=scope not in {"responsible", "created_by"})
+        details = _task_details(item, include_roles=False)
         suffix = f" — {', '.join(details)}" if details else ""
         lines.append(f"{index}. {label}{suffix}")
 
@@ -510,6 +511,12 @@ def _task_details(item: dict[str, Any], *, include_roles: bool) -> list[str]:
     status_label = _text(item.get("status_label"))
     if status_label:
         details.append(status_label)
+    responsible = _text(item.get("responsible_label"))
+    creator = _text(item.get("creator_label"))
+    if responsible:
+        details.append(f"исполнитель: {responsible}")
+    if creator:
+        details.append(f"постановщик: {creator}")
     roles = item.get("roles") if isinstance(item.get("roles"), list) else []
     roles_label = ", ".join(_text(role) for role in roles if _text(role))
     if include_roles and roles_label:
@@ -573,7 +580,7 @@ def _format_task_create_draft_answer(data: dict[str, Any]) -> str:
     title = _text(preview.get("title")) or _text(fields.get("TITLE")) or "задача"
     responsible = _text(preview.get("responsible")) or "указанный сотрудник"
     deadline = _text(preview.get("deadline")) or _deadline_label_from_fields(fields)
-    description = (
+    description = _clean_task_description(
         _text(preview.get("description")) or _text(fields.get("DESCRIPTION")) or f"Краткое содержание: {title}"
     )
     return (
@@ -652,9 +659,11 @@ def _format_calendar_event_draft_answer(data: dict[str, Any]) -> str:
         f"Название: {title}",
         f"Начало: {start}",
         f"Окончание: {end}",
-        f"Участники: {participants}",
-        f"Напоминание: {reminder}",
     ]
+    if participants and not _is_default_calendar_participant_label(participants):
+        lines.append(f"Участники: {participants}")
+    if reminder and not _is_default_calendar_reminder_label(reminder):
+        lines.append(f"Напоминание: {reminder}")
     if description:
         lines.append(f"Описание: {description}")
     lines.append("")
@@ -676,6 +685,22 @@ def _format_calendar_event_confirm_answer(data: dict[str, Any]) -> str:
 
 def _task_fallback_title(task_id: str) -> str:
     return f"задача #{task_id}" if task_id else "указанная задача"
+
+
+def _clean_task_description(value: str) -> str:
+    text = _text(value)
+    for prefix in ("Краткое содержание:", "Описание:"):
+        if text.casefold().startswith(prefix.casefold()):
+            return text[len(prefix) :].strip()
+    return text
+
+
+def _is_default_calendar_participant_label(value: str) -> bool:
+    return _text(value).casefold() in {"только текущий пользователь", "текущий пользователь"}
+
+
+def _is_default_calendar_reminder_label(value: str) -> bool:
+    return _text(value).casefold() == "по настройкам календаря bitrix"
 
 
 def _created_task_id(value: object) -> str:

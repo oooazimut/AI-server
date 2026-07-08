@@ -742,7 +742,8 @@ def test_bitrix_llm_compose_formats_task_draft_without_profile_links(monkeypatch
     assert "Черновик задачи" in result.answer
     assert "по умолчанию: 3 рабочих дня" not in result.answer
     assert "13.07.2026 19:00 МСК" in result.answer
-    assert "Краткое содержание: тест подтверждения" in result.answer
+    assert "Описание: тест подтверждения" in result.answer
+    assert "Описание: Краткое содержание:" not in result.answer
     assert "[URL" not in result.answer
     assert "company/personal/user" not in result.answer
     assert "#13" not in result.answer
@@ -945,7 +946,8 @@ def test_bitrix_llm_compose_formats_calendar_event_draft(monkeypatch):
     assert result.status == "needs_human"
     assert "Черновик события календаря" in result.answer
     assert "09.07.2026 12:00 МСК" in result.answer
-    assert "только текущий пользователь" in result.answer
+    assert "по настройкам календаря Bitrix" not in result.answer
+    assert "Участники: только текущий пользователь" not in result.answer
     assert "[URL" not in result.answer
 
 
@@ -1045,6 +1047,8 @@ def test_bitrix_llm_compose_formats_task_search_comment_snippet(monkeypatch):
                                 "deadline_label": "10.07.2026 19:00",
                                 "status_label": "выполняется",
                                 "roles": ["исполнитель"],
+                                "responsible_label": "Марат",
+                                "creator_label": "Валерий Кулинич",
                                 "comment_snippets": ["Нужен акт сверки по объекту."],
                             }
                         ],
@@ -1060,6 +1064,8 @@ def test_bitrix_llm_compose_formats_task_search_comment_snippet(monkeypatch):
 
     assert result.status == "completed"
     assert "с комментарием «акт сверки»" in result.answer
+    assert "исполнитель: Марат" in result.answer
+    assert "постановщик: Валерий Кулинич" in result.answer
     assert "комментарий: Нужен акт сверки по объекту." in result.answer
     assert (
         "[URL=https://asutp-expert.bitrix24.ru/company/personal/user/0/tasks/task/view/101/]Проверить документы[/URL]"
@@ -1153,6 +1159,7 @@ def test_bitrix_llm_compose_formats_task_search_detail_without_visible_id(monkey
     )
     assert "(ID:" not in result.answer
     assert "#139" not in result.answer
+    assert "наблюдатель" not in result.answer.casefold()
 
 
 def test_bitrix_llm_compose_formats_project_search_with_project_link(monkeypatch):

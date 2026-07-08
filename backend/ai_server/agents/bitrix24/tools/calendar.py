@@ -50,6 +50,7 @@ def build_calendar_event_draft_from_args(
     start_at, start_error = _start_from_args(args)
     end_at, end_error = _end_from_args(args, start_at)
     attendee_ids = _int_list(args.get("attendee_ids") or args.get("attendees"))
+    owner_name = compact_text(str(args.get("owner_name") or args.get("owner_label") or ""))
     reminder_minutes = optional_int(args.get("reminder_minutes"))
 
     contract_errors: list[str] = []
@@ -100,7 +101,11 @@ def build_calendar_event_draft_from_args(
         "description": description,
         "start": _format_datetime_for_preview(start_at),
         "end": _format_datetime_for_preview(end_at),
-        "participants": "только текущий пользователь" if not attendee_ids else f"{len(attendee_ids)} участник(а)",
+        "participants": owner_name
+        if not attendee_ids and owner_name
+        else "только текущий пользователь"
+        if not attendee_ids
+        else f"{len(attendee_ids)} участник(а)",
         "reminder": _format_reminder_for_preview(reminder_minutes),
     }
     return BitrixCalendarEventDraft(

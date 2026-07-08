@@ -31,7 +31,9 @@ TASK_SELECT = [
     "DESCRIPTION",
     "STATUS",
     "RESPONSIBLE_ID",
+    "RESPONSIBLE",
     "CREATED_BY",
+    "CREATOR",
     "CREATED_DATE",
     "CLOSED_DATE",
     "DEADLINE",
@@ -663,6 +665,8 @@ def _task_summary(task: dict[str, Any], *, user_id: int) -> dict[str, Any]:
         "deadline_label": _deadline_label(deadline),
         "group_id": group_id,
         "roles": _task_roles(task, user_id=user_id) if user_id else [],
+        "responsible_label": _person_label(task.get("responsible") or task.get("RESPONSIBLE")),
+        "creator_label": _person_label(task.get("creator") or task.get("CREATOR")),
         "comment_snippets": list(task.get("_comment_snippets") or []),
         "matched_comment_count": len(task.get("_matched_comments") or []),
     }
@@ -676,6 +680,20 @@ def _project_summary(group: dict[str, Any]) -> dict[str, Any]:
         "name": name,
         "description": _first_text(group, "DESCRIPTION", "description"),
     }
+
+
+def _person_label(value: object) -> str:
+    if not isinstance(value, dict):
+        return ""
+    name = _first_text(value, "name", "NAME")
+    if name:
+        return name
+    parts = [
+        _first_text(value, "lastName", "LAST_NAME", "last_name"),
+        _first_text(value, "name", "NAME", "firstName", "FIRST_NAME"),
+        _first_text(value, "secondName", "SECOND_NAME", "second_name"),
+    ]
+    return " ".join(part for part in parts if part)
 
 
 def _task_roles(task: dict[str, Any], *, user_id: int) -> list[str]:
@@ -880,6 +898,7 @@ def _extract_comments(result: Any) -> list[dict[str, Any]]:
 
 
 def _matched_comments(comments: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    comments = [comment for comment in comments if not _is_system_comment(comment)]
     if not query:
         return comments
     needle = query.casefold().strip()
@@ -889,7 +908,11 @@ def _matched_comments(comments: list[dict[str, Any]], query: str) -> list[dict[s
 def _comment_texts(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
-    return [_comment_text(comment) for comment in value if isinstance(comment, dict) and _comment_text(comment)]
+    return [
+        _comment_text(comment)
+        for comment in value
+        if isinstance(comment, dict) and _comment_text(comment) and not _is_system_comment(comment)
+    ]
 
 
 def _comment_text(comment: dict[str, Any]) -> str:
@@ -907,6 +930,28 @@ def _clean_comment_text(value: str) -> str:
     text = _BITRIX_SINGLE_TAG_RE.sub("", text)
     text = _HTML_TAG_RE.sub("", text)
     return " ".join(text.split())
+
+
+def _is_system_comment(comment: dict[str, Any]) -> bool:
+    text = _comment_text(comment).casefold().strip()
+    if not text:
+        return True
+    normalized = text.rstrip(".")
+    if normalized.startswith("крайний срок изменен на:"):
+        return True
+    if normalized in {
+        "задача завершена",
+        "задача возвращена в работу",
+        "задача почти просрочена",
+    }:
+        return True
+    system_fragments = (
+        "вы добавлены наблюдателем",
+        "вы назначены исполнителем",
+        "задача почти просрочена",
+        "завершите задачу или передвиньте срок",
+    )
+    return any(fragment in normalized for fragment in system_fragments)
 
 
 def _comment_snippet(comment: dict[str, Any], *, query: str) -> str:

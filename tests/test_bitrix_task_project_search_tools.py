@@ -186,6 +186,42 @@ def test_task_search_comment_query_requires_comment_match():
     assert result.data["comment_query"] == "акт сверки"
 
 
+def test_task_search_comment_query_ignores_system_comment_match():
+    client = _FakeBitrixSearchClient()
+    client.comments["101"] = [{"POST_MESSAGE": "[USER=13]Дмитрий[/USER], вы добавлены наблюдателем."}]
+    tool = BitrixTaskSearchTool(client=client)
+
+    result = anyio.run(lambda: tool.execute({"scope": "responsible", "comment_query": "наблюдателем"}, user_id=13))
+
+    assert result.status == "ok"
+    assert result.data["items"] == []
+
+
+def test_task_search_comment_query_matches_real_user_comment():
+    client = _FakeBitrixSearchClient()
+    client.comments["101"] = [{"POST_MESSAGE": "Внес изменения, нужно понаблюдать хотя бы до завтра"}]
+    tool = BitrixTaskSearchTool(client=client)
+
+    result = anyio.run(lambda: tool.execute({"scope": "responsible", "comment_query": "понаблюдать"}, user_id=13))
+
+    assert result.status == "ok"
+    assert [item["title"] for item in result.data["items"]] == ["Ответственная задача"]
+    assert result.data["items"][0]["comment_snippets"] == ["Внес изменения, нужно понаблюдать хотя бы до завтра"]
+
+
+def test_task_search_exposes_responsible_and_creator_names_when_bitrix_returns_them():
+    client = _FakeBitrixSearchClient()
+    client.tasks[0]["responsible"] = {"name": "Марат"}
+    client.tasks[0]["creator"] = {"name": "Валерий Кулинич"}
+    tool = BitrixTaskSearchTool(client=client)
+
+    result = anyio.run(lambda: tool.execute({"scope": "responsible"}, user_id=13))
+
+    item = result.data["items"][0]
+    assert item["responsible_label"] == "Марат"
+    assert item["creator_label"] == "Валерий Кулинич"
+
+
 def test_task_search_comment_snippets_hide_bitrix_user_markup():
     client = _FakeBitrixSearchClient()
     client.comments["101"] = [{"POST_MESSAGE": "Before [USER=13]Dmitry[/USER], added observer."}]

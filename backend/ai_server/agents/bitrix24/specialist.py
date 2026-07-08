@@ -223,6 +223,13 @@ class Bitrix24Specialist(BaseSpecialist):
                 args=args,
                 summary=getattr(tool_call, "summary", ""),
             )
+        elif tool_call.name == "calendar_event_draft":
+            args = _calendar_event_args_with_actor_label(dict(tool_call.args or {}), task)
+            tool_call = SimpleNamespace(
+                name=tool_call.name,
+                args=args,
+                summary=getattr(tool_call, "summary", ""),
+            )
         return await super()._execute_tool_call(tool_call, task)
 
     def tool_definitions(self) -> list[dict]:
@@ -349,6 +356,17 @@ def _task_create_args_with_actor_label(args: dict[str, Any], task: AgentTask) ->
     label = _current_user_label(task)
     if label:
         return {**args, "responsible_name": label}
+    return args
+
+
+def _calendar_event_args_with_actor_label(args: dict[str, Any], task: AgentTask) -> dict[str, Any]:
+    if str(args.get("owner_name") or args.get("owner_label") or "").strip():
+        return args
+    if args.get("attendee_ids") or args.get("attendees"):
+        return args
+    label = _current_user_label(task)
+    if label:
+        return {**args, "owner_name": label}
     return args
 
 
