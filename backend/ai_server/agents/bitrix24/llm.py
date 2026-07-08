@@ -159,6 +159,13 @@ class BitrixLLMService:
     ) -> BitrixLLMFinalResult:
         agent_id = manifest.id if manifest is not None else "bitrix24"
         portal_base_url = self.settings.bitrix_portal_base_url
+        direct_result = _direct_task_create_response(
+            agent_id=agent_id,
+            tool_results=tool_results,
+            portal_base_url=portal_base_url,
+        )
+        if direct_result is not None:
+            return direct_result
         completion = await self.client.complete(
             agent_id=agent_id,
             messages=[
@@ -203,6 +210,115 @@ def llm_failure_result(message: str, agent_id: str = "bitrix24") -> BitrixLLMFin
     )
 
 
+def _direct_task_create_response(
+    *,
+    agent_id: str,
+    tool_results: list[ToolResult],
+    portal_base_url: str = "",
+) -> BitrixLLMFinalResult | None:
+    for result in reversed(tool_results):
+        if result.status != "ok":
+            continue
+        if result.tool == "task_create_draft":
+            return BitrixLLMFinalResult(
+                status="needs_human",
+                answer=_format_task_create_draft_answer(result.data),
+                model_usage=_local_model_usage(agent_id, "task_create_draft_response"),
+            )
+        if result.tool == "task_create_confirm":
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer=_format_task_create_confirm_answer(result.data, portal_base_url=portal_base_url),
+                model_usage=_local_model_usage(agent_id, "task_create_confirm_response"),
+            )
+        if result.tool == "task_draft_discard":
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer="Черновик задачи удалён.",
+                model_usage=_local_model_usage(agent_id, "task_draft_discard_response"),
+            )
+    return None
+
+
+def _format_task_create_draft_answer(data: dict[str, Any]) -> str:
+    preview = data.get("preview") if isinstance(data.get("preview"), dict) else {}
+    params = data.get("params") if isinstance(data.get("params"), dict) else {}
+    fields = params.get("fields") if isinstance(params.get("fields"), dict) else {}
+    title = _text(preview.get("title")) or _text(fields.get("TITLE")) or "задача"
+    responsible = _text(preview.get("responsible")) or "указанный сотрудник"
+    deadline = _text(preview.get("deadline")) or _deadline_label_from_fields(fields)
+    description = (
+        _text(preview.get("description")) or _text(fields.get("DESCRIPTION")) or f"Краткое содержание: {title}"
+    )
+    notes = data.get("notes") if isinstance(data.get("notes"), list) else []
+    if deadline != "без срока" and any("Срок по умолчанию" in str(note) for note in notes):
+        deadline = f"{deadline} (по умолчанию: 3 рабочих дня)"
+    return (
+        "Черновик задачи:\n"
+        f"Название: {title}\n"
+        f"Ответственный: {responsible}\n"
+        f"Срок: {deadline}\n"
+        f"Описание: {description}\n\n"
+        "Если всё верно, напишите: да, создай."
+    )
+
+
+def _format_task_create_confirm_answer(data: dict[str, Any], *, portal_base_url: str = "") -> str:
+    params = data.get("params") if isinstance(data.get("params"), dict) else {}
+    fields = params.get("fields") if isinstance(params.get("fields"), dict) else {}
+    title = _text(fields.get("TITLE")) or "задача"
+    task_id = _created_task_id(data.get("result"))
+    if portal_base_url and task_id:
+        url = f"{portal_base_url.rstrip('/')}/company/personal/user/0/tasks/task/view/{task_id}/"
+        return f"Задача создана: [URL={url}]{title}[/URL]."
+    return f"Задача создана: {title}."
+
+
+def _created_task_id(value: object) -> str:
+    if not isinstance(value, dict):
+        return ""
+    candidates: list[object] = [value.get("id"), value.get("ID")]
+    for key in ("task", "TASK", "result"):
+        nested = value.get(key)
+        if isinstance(nested, dict):
+            candidates.extend([nested.get("id"), nested.get("ID")])
+            nested_task = nested.get("task") or nested.get("TASK")
+            if isinstance(nested_task, dict):
+                candidates.extend([nested_task.get("id"), nested_task.get("ID")])
+    for candidate in candidates:
+        text = _text(candidate)
+        if text:
+            return text
+    return ""
+
+
+def _deadline_label_from_fields(fields: dict[str, Any]) -> str:
+    if fields.get("NO_DEADLINE"):
+        return "без срока"
+    deadline = _text(fields.get("DEADLINE"))
+    if not deadline:
+        return "не указан"
+    try:
+        parsed = datetime.fromisoformat(deadline.replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        return deadline
+    return parsed.strftime("%d.%m.%Y %H:%M")
+
+
+def _text(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _local_model_usage(agent_id: str, note: str) -> ModelUsageRecord:
+    return ModelUsageRecord(
+        agent_id=agent_id,
+        provider="local",
+        model="bitrix_task_create_response",
+        status="skipped",
+        notes=[note],
+    )
+
+
 def _decision_system_prompt(instructions: str = "") -> str:
     extra = f"\n\nДополнительные инструкции:\n{instructions}" if instructions else ""
     return (
@@ -238,13 +354,14 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Не вызывай search.search: этот метод в текущем Bitrix недоступен. "
         "Для создания задачи используй task_create_draft. "
         "Для task_create_draft именно ты распознаёшь title, responsible_id/responsible_self, "
-        "group_id, deadline_iso или no_deadline. "
+        "group_id, deadline_iso или no_deadline. Если знаешь имя ответственного после поиска, передай его в responsible_name "
+        "только для человекочитаемого черновика. "
         "Если ответственный указан по имени — сначала вызови bitrix_api(user.search), получи ID, затем task_create_draft. "
         "Если проект указан по названию — сначала вызови bitrix_api(sonet_group.get), получи ID, затем task_create_draft. "
         "Если пользователь сказал относительный срок, вычисли deadline_iso сам по current_datetime. "
-        "Если срок не указан, применяй правила из retrieval_context; если правило неясно, спроси уточнение. "
-        "Не вызывай task_create_draft без title, одного из responsible_id/responsible_self, "
-        "и одного из deadline_iso/no_deadline=true. "
+        "Если срок не указан, не спрашивай уточнение: backend поставит срок по умолчанию три рабочих дня, 19:00 МСК. "
+        "Передавай no_deadline=true только если пользователь явно сказал, что задача должна быть без срока. "
+        "Не вызывай task_create_draft без title и одного из responsible_id/responsible_self. "
         "If permission_context.pending_task_draft exists and the current user explicitly confirms creation, call task_create_confirm. "
         "If the current user explicitly cancels or rejects the pending draft, call task_draft_discard. "
         "Do not call task_create_confirm for ambiguous replies; ask a short clarification instead. "
@@ -260,12 +377,12 @@ def _decision_system_prompt(instructions: str = "") -> str:
 
 def _compose_system_prompt(portal_base_url: str = "") -> str:
     links_rule = (
-        "Если в ответе перечисляешь сущности портала (сотрудников, проекты/рабочие группы, задачи, "
-        "лиды, сделки) — каждую сущность оформляй как markdown-ссылку на её страницу в портале, "
-        "используя поле portal_base_url из payload и ID сущности из tool_results:\n"
-        "- задача: {base}/company/personal/user/{RESPONSIBLE_ID}/tasks/task/view/{ID}/\n"
+        "Если в ответе перечисляешь сущности портала (проекты/рабочие группы, задачи, "
+        "лиды, сделки) — каждую сущность оформляй как Bitrix-ссылку [URL=...]название[/URL] на её страницу в портале, "
+        "используя поле portal_base_url из payload и ID сущности из tool_results. "
+        "Не оформляй сотрудников/пользователей ссылками на профиль и не показывай ID пользователя в тексте.\n"
+        "- задача: {base}/company/personal/user/0/tasks/task/view/{ID}/\n"
         "- проект/рабочая группа: {base}/workgroups/group/{ID}/\n"
-        "- сотрудник: {base}/company/personal/user/{ID}/\n"
         "- лид CRM: {base}/crm/lead/details/{ID}/\n"
         "- сделка CRM: {base}/crm/deal/details/{ID}/\n"
         "Текст ссылки — название/ФИО сущности (или название+ID, если имени нет). "
@@ -277,6 +394,8 @@ def _compose_system_prompt(portal_base_url: str = "") -> str:
     return (
         "Ты тот же LLM-субагент Bitrix24. Сформируй итоговый ответ человеку по результатам tools. "
         "Не выдумывай данные, которых нет в tool_results. "
+        "Для результата task_create_draft черновик должен быть обычным текстом без ссылок: название, ответственный, срок, описание, запрос подтверждения. "
+        "Для результата task_create_confirm дай ссылку только на созданную задачу; ссылки на профиль сотрудника запрещены. "
         "Если есть approval_actions, скажи, что действие подготовлено и требуется подтверждение. "
         f"{links_rule} "
         "Верни только JSON-объект без markdown: "
