@@ -277,9 +277,7 @@ def test_bitrix_api_tool_sonet_group_get_normalizes_hyphenated_project_name():
     fake_bitrix = FakeProjectClient()
     tool = BitrixApiTool(client=fake_bitrix)
 
-    result = anyio_run(
-        tool.execute({"method": "sonet_group.get", "params": {"FILTER": {"%NAME": "Ларгус-2"}}})
-    )
+    result = anyio_run(tool.execute({"method": "sonet_group.get", "params": {"FILTER": {"%NAME": "Ларгус-2"}}}))
 
     assert result.status == ToolStatus.OK
     assert result.data["result"] == [{"ID": "45", "NAME": "Ларгус 2"}]
