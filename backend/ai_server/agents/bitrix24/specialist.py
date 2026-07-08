@@ -130,6 +130,7 @@ class Bitrix24Specialist(BaseSpecialist):
                 bitrix_oauth=bitrix_oauth,
                 dry_run=_settings.agent_dry_run,
                 oauth_required_for_writes=_settings.bitrix_oauth_required_for_writes,
+                draft_ttl_minutes=_settings.bitrix_task_draft_ttl_minutes,
             ),
             TaskDraftDiscardTool(store=bitrix_store),
             SaveIncompleteProposalTool(store=bitrix_store),
@@ -178,7 +179,10 @@ class Bitrix24Specialist(BaseSpecialist):
         draft_context: dict[str, Any] = {}
         dialog_key = str(task.context.get("dialog_key") or "")
         if dialog_key and self._draft_store is not None:
-            pending = await self._draft_store.get_task_draft(dialog_key)
+            pending = await self._draft_store.get_task_draft(
+                dialog_key,
+                ttl_minutes=self._settings_for_qc.bitrix_task_draft_ttl_minutes if self._settings_for_qc else None,
+            )
             if pending:
                 draft_context = {"pending_task_draft": pending}
         merged_task = task.model_copy(

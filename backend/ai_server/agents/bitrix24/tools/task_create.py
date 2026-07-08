@@ -160,12 +160,14 @@ class TaskCreateConfirmTool:
         bitrix_oauth: BitrixOAuthService | None = None,
         dry_run: bool = False,
         oauth_required_for_writes: bool = True,
+        draft_ttl_minutes: int | None = None,
     ) -> None:
         self._store = store
         self._write_client = write_client
         self._bitrix_oauth = bitrix_oauth
         self._dry_run = dry_run
         self._oauth_required_for_writes = oauth_required_for_writes
+        self._draft_ttl_minutes = draft_ttl_minutes
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -192,7 +194,7 @@ class TaskCreateConfirmTool:
                 tool=self.name,
                 error="task_create_confirm requires dialog_key",
             )
-        draft_params = await self._store.get_task_draft(dialog_key)
+        draft_params = await self._store.get_task_draft(dialog_key, ttl_minutes=self._draft_ttl_minutes)
         if not draft_params:
             return ToolResult(
                 status=ToolStatus.NOT_FOUND,
