@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import html
+import re
 from datetime import UTC, date, datetime, time
 from typing import Any
 
@@ -18,6 +20,11 @@ MAX_MY_TASKS_LIMIT = 50
 MAX_TASK_SEARCH_LIMIT = 50
 MAX_PROJECT_SEARCH_LIMIT = 20
 ACTIVE_STATUS_VALUES = [1, 2, 3, 4]
+_BITRIX_PAIRED_TAG_RE = re.compile(
+    r"\[(USER|URL|B|I|U|S|QUOTE|CODE|COLOR|SIZE)[^\]]*\](.*?)\[/\1\]", re.IGNORECASE | re.DOTALL
+)
+_BITRIX_SINGLE_TAG_RE = re.compile(r"\[/?[A-Z][A-Z0-9_]*(?:=[^\]]*)?\]", re.IGNORECASE)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
 TASK_SELECT = [
     "ID",
     "TITLE",
@@ -313,21 +320,10 @@ class BitrixTaskSearchTool:
                 data={"scope": scope, "status": status, "errors": errors},
             )
 
-        if include_comments:
-            comment_errors = await _attach_task_comments(
-                self._client,
-                sorted_tasks,
-                query=comment_query or query,
-                limit=comment_lookup_limit,
-            )
-            errors.extend(comment_errors)
-
-        filtered = [
+        pre_comment_filtered = [
             task
             for task in sorted_tasks
-            if _matches_text_query(task, query, include_comments=include_comments)
-            and _matches_comment_query(task, comment_query)
-            and _matches_task_status(task, status)
+            if _matches_task_status(task, status)
             and _matches_date_range(
                 task,
                 keys=("createdDate", "CREATED_DATE"),
@@ -346,6 +342,22 @@ class BitrixTaskSearchTool:
                 to_value=_first_arg_text(args, "closed_to", "closed_end"),
             )
             and (status != "overdue" or _is_overdue(task))
+        ]
+
+        if include_comments:
+            comment_errors = await _attach_task_comments(
+                self._client,
+                pre_comment_filtered,
+                query=comment_query or query,
+                limit=comment_lookup_limit,
+            )
+            errors.extend(comment_errors)
+
+        filtered = [
+            task
+            for task in pre_comment_filtered
+            if _matches_text_query(task, query, include_comments=include_comments)
+            and _matches_comment_query(task, comment_query)
         ]
         page = filtered[offset : offset + limit]
         items = [_task_summary(task, user_id=user_id or 0) for task in page]
@@ -881,11 +893,24 @@ def _comment_texts(value: object) -> list[str]:
 
 
 def _comment_text(comment: dict[str, Any]) -> str:
-    return _first_text(comment, "POST_MESSAGE", "POST_MESSAGE_HTML", "POST_MESSAGE_TEXT", "text", "message")
+    return _clean_comment_text(
+        _first_text(comment, "POST_MESSAGE", "POST_MESSAGE_HTML", "POST_MESSAGE_TEXT", "text", "message")
+    )
+
+
+def _clean_comment_text(value: str) -> str:
+    text = html.unescape(str(value or ""))
+    previous = None
+    while previous != text:
+        previous = text
+        text = _BITRIX_PAIRED_TAG_RE.sub(r"\2", text)
+    text = _BITRIX_SINGLE_TAG_RE.sub("", text)
+    text = _HTML_TAG_RE.sub("", text)
+    return " ".join(text.split())
 
 
 def _comment_snippet(comment: dict[str, Any], *, query: str) -> str:
-    text = " ".join(_comment_text(comment).split())
+    text = _comment_text(comment)
     if not text:
         return ""
     if not query:
