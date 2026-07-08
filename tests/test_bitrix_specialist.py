@@ -976,6 +976,53 @@ def test_bitrix_llm_compose_formats_my_tasks_with_task_links(monkeypatch):
     assert "/company/personal/user/13/" not in result.answer
 
 
+def test_bitrix_llm_compose_formats_task_search_comment_snippet(monkeypatch):
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    service = BitrixLLMService(client=RecordingLLMClient("{}"), settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="найди задачу с комментарием акт сверки", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="bitrix_task_search",
+                    data={
+                        "mode": "list",
+                        "scope": "my",
+                        "scope_label": "мои задачи",
+                        "status": "active",
+                        "comment_query": "акт сверки",
+                        "items": [
+                            {
+                                "id": "101",
+                                "title": "Проверить документы",
+                                "deadline_label": "10.07.2026 19:00",
+                                "status_label": "выполняется",
+                                "roles": ["исполнитель"],
+                                "comment_snippets": ["Нужен акт сверки по объекту."],
+                            }
+                        ],
+                        "total": 1,
+                        "limit": 10,
+                        "offset": 0,
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert result.status == "completed"
+    assert "с комментарием «акт сверки»" in result.answer
+    assert "комментарий: Нужен акт сверки по объекту." in result.answer
+    assert (
+        "[URL=https://asutp-expert.bitrix24.ru/company/personal/user/0/tasks/task/view/101/]Проверить документы[/URL]"
+        in result.answer
+    )
+
+
 def test_bitrix_llm_compose_formats_task_search_list_without_duplicate_detail_or_ids(monkeypatch):
     monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
     service = BitrixLLMService(client=RecordingLLMClient("{}"), settings=get_settings())

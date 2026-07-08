@@ -487,6 +487,7 @@ def _task_search_title(data: dict[str, Any]) -> str:
     scope_label = _text(data.get("scope_label")) or "задачи"
     status = _text(data.get("status")) or "active"
     query = _text(data.get("query"))
+    comment_query = _text(data.get("comment_query"))
     if project_name:
         base = f"Задачи в проекте {project_name}"
     elif status == "overdue":
@@ -499,6 +500,8 @@ def _task_search_title(data: dict[str, Any]) -> str:
         base = f"Активные {scope_label}"
     if query:
         base = f"{base} по запросу «{query}»"
+    if comment_query:
+        base = f"{base} с комментарием «{comment_query}»"
     return _capitalize_first(base) + ":"
 
 
@@ -511,6 +514,10 @@ def _task_details(item: dict[str, Any], *, include_roles: bool) -> list[str]:
     roles_label = ", ".join(_text(role) for role in roles if _text(role))
     if include_roles and roles_label:
         details.append(roles_label)
+    snippets = item.get("comment_snippets") if isinstance(item.get("comment_snippets"), list) else []
+    first_snippet = next((_text(snippet) for snippet in snippets if _text(snippet)), "")
+    if first_snippet:
+        details.append(f"комментарий: {first_snippet}")
     return details
 
 
@@ -756,6 +763,11 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Для 'задачи на мне', 'я исполнитель' используй bitrix_task_search со scope=responsible. "
         "Для 'задачи, поставленные мной' используй bitrix_task_search со scope=created_by. "
         "Для поиска задачи по ID, названию, сроку, просрочке или проекту используй bitrix_task_search, а не свободный bitrix_api. "
+        "Для сложного поиска задач по нескольким критериям тоже используй bitrix_task_search: "
+        "deadline_from/deadline_to для срока, created_from/created_to для даты создания, "
+        "closed_from/closed_to для даты закрытия, comment_query для текста в комментариях, "
+        "include_comments=true если общий query нужно искать и в комментариях. "
+        "Если пользователь просит закрытые задачи или дату закрытия, передай status=closed и include_closed=true. "
         "Для поиска сотрудника по имени — bitrix_api с user.search, получи numeric ID. "
         "Для чтения/поиска проекта по названию используй bitrix_project_search. "
         "Для поиска складов, остатков и запросов вида 'найди склад Борисов' используй bitrix_warehouse_search, "
