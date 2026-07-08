@@ -574,8 +574,7 @@ def test_bitrix_llm_compose_formats_my_tasks_with_task_links(monkeypatch):
 
     assert result.status == "completed"
     assert (
-        "[URL=https://asutp-expert.bitrix24.ru/company/personal/user/0/tasks/task/view/101/]"
-        "Проверить камеру[/URL]"
+        "[URL=https://asutp-expert.bitrix24.ru/company/personal/user/0/tasks/task/view/101/]Проверить камеру[/URL]"
     ) in result.answer
     assert "срок: 10.07.2026 19:00" in result.answer
     assert "/company/personal/user/13/" not in result.answer
