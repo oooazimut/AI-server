@@ -8,6 +8,7 @@ from ai_server.agents.bitrix24.tools.tasks import BitrixProjectSearchTool, Bitri
 class _FakeBitrixSearchClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
+        self.comments: dict[str, list[dict]] = {}
         self.tasks = [
             {
                 "id": "101",
@@ -15,6 +16,7 @@ class _FakeBitrixSearchClient:
                 "status": "2",
                 "responsibleId": "13",
                 "createdBy": "9",
+                "createdDate": "2026-06-01T09:00:00+03:00",
                 "deadline": "2026-07-10T19:00:00+03:00",
                 "groupId": "45",
             },
@@ -24,6 +26,7 @@ class _FakeBitrixSearchClient:
                 "status": "3",
                 "responsibleId": "9",
                 "createdBy": "13",
+                "createdDate": "2026-06-15T09:00:00+03:00",
                 "deadline": "2026-07-09T19:00:00+03:00",
                 "groupId": "45",
             },
@@ -34,6 +37,7 @@ class _FakeBitrixSearchClient:
                 "responsibleId": "9",
                 "createdBy": "9",
                 "auditors": ["13"],
+                "createdDate": "2026-06-20T09:00:00+03:00",
                 "deadline": "2026-07-08T19:00:00+03:00",
                 "groupId": "39",
             },
@@ -43,6 +47,8 @@ class _FakeBitrixSearchClient:
                 "status": "5",
                 "responsibleId": "13",
                 "createdBy": "13",
+                "createdDate": "2026-05-20T09:00:00+03:00",
+                "closedDate": "2026-07-08T10:00:00+03:00",
                 "deadline": "2026-07-07T19:00:00+03:00",
                 "groupId": "45",
             },
@@ -52,6 +58,7 @@ class _FakeBitrixSearchClient:
                 "status": "2",
                 "responsibleId": "35",
                 "createdBy": "35",
+                "createdDate": "2026-06-25T09:00:00+03:00",
                 "deadline": None,
                 "groupId": "45",
             },
@@ -65,6 +72,8 @@ class _FakeBitrixSearchClient:
         if method == "tasks.task.list":
             task_filter = params.get("filter") or {}
             return {"tasks": [task for task in self.tasks if _matches_task_filter(task, task_filter)]}
+        if method == "task.commentitem.getlist":
+            return {"comments": self.comments.get(str(params.get("TASKID")), [])}
         if method == "sonet_group.get" and (params.get("FILTER") or {}).get("%NAME"):
             return []
         if method == "sonet_group.get":
@@ -132,6 +141,7 @@ def test_task_search_defaults_to_ten_and_reports_more_after_sorting():
             "status": "2",
             "responsibleId": "13",
             "createdBy": "9",
+            "createdDate": "2026-06-01T09:00:00+03:00",
             "deadline": f"2026-07-{index + 1:02d}T19:00:00+03:00",
         }
         for index in range(12)
@@ -143,6 +153,59 @@ def test_task_search_defaults_to_ten_and_reports_more_after_sorting():
     assert len(result.data["items"]) == 10
     assert result.data["total"] == 12
     assert result.data["has_more"] is True
+
+
+def test_task_search_can_match_query_in_comments_without_title_filter():
+    client = _FakeBitrixSearchClient()
+    client.comments["101"] = [{"POST_MESSAGE": "В комментарии есть фраза шкаф автоматики."}]
+    tool = BitrixTaskSearchTool(client=client)
+
+    result = anyio.run(
+        lambda: tool.execute({"scope": "responsible", "query": "шкаф автоматики", "include_comments": True}, user_id=13)
+    )
+
+    assert result.status == "ok"
+    assert [item["title"] for item in result.data["items"]] == ["Ответственная задача"]
+    assert result.data["items"][0]["matched_comment_count"] == 1
+    assert "шкаф автоматики" in result.data["items"][0]["comment_snippets"][0]
+    task_call = next(payload for method, payload in client.calls if method == "tasks.task.list")
+    assert "%TITLE" not in task_call["filter"]
+    assert ("task.commentitem.getlist", {"TASKID": "101"}) in client.calls
+
+
+def test_task_search_comment_query_requires_comment_match():
+    client = _FakeBitrixSearchClient()
+    client.comments["101"] = [{"POST_MESSAGE": "Неподходящий комментарий"}]
+    client.comments["102"] = [{"POST_MESSAGE": "Нужен акт сверки по задаче"}]
+    tool = BitrixTaskSearchTool(client=client)
+
+    result = anyio.run(lambda: tool.execute({"scope": "my", "comment_query": "акт сверки"}, user_id=13))
+
+    assert result.status == "ok"
+    assert [item["title"] for item in result.data["items"]] == ["Поставленная мной"]
+    assert result.data["comment_query"] == "акт сверки"
+
+
+def test_task_search_closed_date_range_includes_date_only_upper_bound():
+    client = _FakeBitrixSearchClient()
+    tool = BitrixTaskSearchTool(client=client)
+
+    result = anyio.run(
+        lambda: tool.execute(
+            {
+                "scope": "all",
+                "status": "closed",
+                "include_closed": True,
+                "closed_from": "2026-07-08",
+                "closed_to": "2026-07-08",
+            },
+            user_id=13,
+        )
+    )
+
+    assert result.status == "ok"
+    assert [item["title"] for item in result.data["items"]] == ["Закрытая задача"]
+    assert result.data["items"][0]["closed_date"] == "2026-07-08T10:00:00+03:00"
 
 
 def test_task_search_resolves_hyphenated_project_name_before_task_lookup():

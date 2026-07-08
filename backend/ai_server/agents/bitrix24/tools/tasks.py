@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time
 from typing import Any
 
 from ai_server.agents.bitrix24.tools.bitrix_api import (
@@ -25,11 +25,15 @@ TASK_SELECT = [
     "STATUS",
     "RESPONSIBLE_ID",
     "CREATED_BY",
+    "CREATED_DATE",
+    "CLOSED_DATE",
     "DEADLINE",
     "GROUP_ID",
     "ACCOMPLICES",
     "AUDITORS",
 ]
+DEFAULT_COMMENT_LOOKUP_TASK_LIMIT = 50
+MAX_COMMENT_LOOKUP_TASK_LIMIT = 200
 
 
 class BitrixMyTasksTool:
@@ -162,10 +166,26 @@ class BitrixTaskSearchTool:
                         "type": "string",
                         "description": "Text to match in task title or description after Bitrix returns candidates.",
                     },
+                    "include_comments": {
+                        "type": "boolean",
+                        "description": "Also search the query text in task comments. Default: false.",
+                    },
+                    "comment_query": {
+                        "type": "string",
+                        "description": "Text that must be present in at least one task comment.",
+                    },
                     "project_id": {"type": "integer", "description": "Bitrix workgroup/project ID."},
                     "project_name": {
                         "type": "string",
                         "description": "Project/workgroup name. The tool normalizes hyphens, case, and known aliases.",
+                    },
+                    "created_from": {
+                        "type": "string",
+                        "description": "Optional ISO date/datetime lower bound for task creation date.",
+                    },
+                    "created_to": {
+                        "type": "string",
+                        "description": "Optional ISO date/datetime upper bound for task creation date.",
                     },
                     "deadline_from": {
                         "type": "string",
@@ -174,6 +194,14 @@ class BitrixTaskSearchTool:
                     "deadline_to": {
                         "type": "string",
                         "description": "Optional ISO date/datetime upper bound for task deadline.",
+                    },
+                    "closed_from": {
+                        "type": "string",
+                        "description": "Optional ISO date/datetime lower bound for task close date.",
+                    },
+                    "closed_to": {
+                        "type": "string",
+                        "description": "Optional ISO date/datetime upper bound for task close date.",
                     },
                     "limit": {
                         "type": "integer",
@@ -185,6 +213,12 @@ class BitrixTaskSearchTool:
                         "type": "integer",
                         "minimum": 0,
                         "description": "Offset after sorting, for the next page.",
+                    },
+                    "comment_lookup_task_limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_COMMENT_LOOKUP_TASK_LIMIT,
+                        "description": "Safety cap for how many candidate tasks may load comments. Default: 50.",
                     },
                 },
             },
@@ -221,6 +255,14 @@ class BitrixTaskSearchTool:
         if status == "all" and not _truthy(args.get("include_closed")):
             status = "active"
         query = _first_arg_text(args, "query", "text", "title")
+        comment_query = _first_arg_text(args, "comment_query", "comments_query", "comment_text", "comment")
+        include_comments = _truthy(args.get("include_comments")) or bool(comment_query)
+        comment_lookup_limit = _bounded_int(
+            args.get("comment_lookup_task_limit"),
+            default=DEFAULT_COMMENT_LOOKUP_TASK_LIMIT,
+            minimum=1,
+            maximum=MAX_COMMENT_LOOKUP_TASK_LIMIT,
+        )
         project_id = _safe_int(args.get("project_id") or args.get("group_id") or args.get("GROUP_ID"))
         project_query = _first_arg_text(args, "project_name", "project", "group_name")
         project: dict[str, Any] | None = None
@@ -259,7 +301,7 @@ class BitrixTaskSearchTool:
             status=status,
             user_id=user_id,
             project_id=project_id,
-            query=query,
+            query="" if include_comments else query,
         )
         sorted_tasks, task_errors = await _fetch_merged_tasks(self._client, calls)
         errors.extend(task_errors)
@@ -271,15 +313,37 @@ class BitrixTaskSearchTool:
                 data={"scope": scope, "status": status, "errors": errors},
             )
 
+        if include_comments:
+            comment_errors = await _attach_task_comments(
+                self._client,
+                sorted_tasks,
+                query=comment_query or query,
+                limit=comment_lookup_limit,
+            )
+            errors.extend(comment_errors)
+
         filtered = [
             task
             for task in sorted_tasks
-            if _matches_text_query(task, query)
+            if _matches_text_query(task, query, include_comments=include_comments)
+            and _matches_comment_query(task, comment_query)
             and _matches_task_status(task, status)
+            and _matches_date_range(
+                task,
+                keys=("createdDate", "CREATED_DATE"),
+                from_value=_first_arg_text(args, "created_from", "created_start"),
+                to_value=_first_arg_text(args, "created_to", "created_end"),
+            )
             and _matches_deadline_range(
                 task,
                 from_value=_first_arg_text(args, "deadline_from", "deadline_start"),
                 to_value=_first_arg_text(args, "deadline_to", "deadline_end"),
+            )
+            and _matches_date_range(
+                task,
+                keys=("closedDate", "CLOSED_DATE"),
+                from_value=_first_arg_text(args, "closed_from", "closed_start"),
+                to_value=_first_arg_text(args, "closed_to", "closed_end"),
             )
             and (status != "overdue" or _is_overdue(task))
         ]
@@ -295,6 +359,9 @@ class BitrixTaskSearchTool:
                 "scope_label": _scope_label(scope),
                 "status": status,
                 "query": query,
+                "comment_query": comment_query,
+                "include_comments": include_comments,
+                "comment_lookup_task_limit": comment_lookup_limit if include_comments else 0,
                 "project": project,
                 "project_query": project_query,
                 "items": items,
@@ -567,6 +634,8 @@ def _task_summary(task: dict[str, Any], *, user_id: int) -> dict[str, Any]:
     title = _first_text(task, "title", "TITLE") or "задача"
     status = _first_text(task, "status", "STATUS")
     deadline = _first_text(task, "deadline", "DEADLINE")
+    created_date = _first_text(task, "createdDate", "CREATED_DATE")
+    closed_date = _first_text(task, "closedDate", "CLOSED_DATE")
     group_id = _first_text(task, "groupId", "GROUP_ID")
     return {
         "id": task_id,
@@ -574,10 +643,16 @@ def _task_summary(task: dict[str, Any], *, user_id: int) -> dict[str, Any]:
         "description": _first_text(task, "description", "DESCRIPTION"),
         "status": status,
         "status_label": _status_label(status),
+        "created_date": created_date,
+        "created_label": _date_label(created_date),
+        "closed_date": closed_date,
+        "closed_label": _date_label(closed_date),
         "deadline": deadline,
         "deadline_label": _deadline_label(deadline),
         "group_id": group_id,
         "roles": _task_roles(task, user_id=user_id) if user_id else [],
+        "comment_snippets": list(task.get("_comment_snippets") or []),
+        "matched_comment_count": len(task.get("_matched_comments") or []),
     }
 
 
@@ -633,17 +708,25 @@ def _first_text(task: dict[str, Any], *keys: str) -> str:
     return ""
 
 
-def _matches_text_query(task: dict[str, Any], query: str) -> bool:
+def _matches_text_query(task: dict[str, Any], query: str, *, include_comments: bool = False) -> bool:
     if not query:
         return True
     needle = query.casefold().strip()
-    haystack = " ".join(
-        [
-            _first_text(task, "title", "TITLE"),
-            _first_text(task, "description", "DESCRIPTION"),
-        ]
-    ).casefold()
+    parts = [
+        _first_text(task, "title", "TITLE"),
+        _first_text(task, "description", "DESCRIPTION"),
+    ]
+    if include_comments:
+        parts.extend(_comment_texts(task.get("_comments")))
+    haystack = " ".join([part for part in parts if part]).casefold()
     return needle in haystack
+
+
+def _matches_comment_query(task: dict[str, Any], query: str) -> bool:
+    if not query:
+        return True
+    needle = query.casefold().strip()
+    return any(needle in text.casefold() for text in _comment_texts(task.get("_comments")))
 
 
 def _matches_task_status(task: dict[str, Any], status: str) -> bool:
@@ -662,16 +745,26 @@ def _matches_task_status(task: dict[str, Any], status: str) -> bool:
 
 
 def _matches_deadline_range(task: dict[str, Any], *, from_value: str, to_value: str) -> bool:
+    return _matches_date_range(task, keys=("deadline", "DEADLINE"), from_value=from_value, to_value=to_value)
+
+
+def _matches_date_range(
+    task: dict[str, Any],
+    *,
+    keys: tuple[str, str],
+    from_value: str,
+    to_value: str,
+) -> bool:
     if not from_value and not to_value:
         return True
-    deadline = _parse_datetime(_first_text(task, "deadline", "DEADLINE"))
-    if deadline is None:
+    value = _parse_datetime(_first_text(task, *keys))
+    if value is None:
         return False
-    from_dt = _parse_datetime(from_value)
-    to_dt = _parse_datetime(to_value)
-    if from_dt is not None and deadline < from_dt:
+    from_dt = _parse_range_datetime(from_value, is_end=False)
+    to_dt = _parse_range_datetime(to_value, is_end=True)
+    if from_dt is not None and value < from_dt:
         return False
-    return not (to_dt is not None and deadline > to_dt)
+    return not (to_dt is not None and value > to_dt)
 
 
 def _is_overdue(task: dict[str, Any]) -> bool:
@@ -704,6 +797,20 @@ def _parse_datetime(value: str) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
+def _parse_range_datetime(value: str, *, is_end: bool) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if len(text) == 10:
+        try:
+            parsed_date = date.fromisoformat(text)
+        except ValueError:
+            return None
+        boundary_time = time.max if is_end else time.min
+        return datetime.combine(parsed_date, boundary_time, tzinfo=UTC)
+    return _parse_datetime(text)
+
+
 def _deadline_label(deadline: str) -> str:
     if not deadline:
         return "без срока"
@@ -711,6 +818,87 @@ def _deadline_label(deadline: str) -> str:
     if parsed is None:
         return deadline
     return parsed.astimezone().strftime("%d.%m.%Y %H:%M")
+
+
+def _date_label(value: str) -> str:
+    parsed = _parse_datetime(value)
+    if parsed is None:
+        return value
+    return parsed.astimezone().strftime("%d.%m.%Y %H:%M")
+
+
+async def _attach_task_comments(
+    client: BitrixToolClientPort,
+    tasks: list[dict[str, Any]],
+    *,
+    query: str,
+    limit: int,
+) -> list[dict[str, str]]:
+    errors: list[dict[str, str]] = []
+    for task in tasks[:limit]:
+        task_id = _task_id(task)
+        if not task_id:
+            continue
+        try:
+            result = await client.result("task.commentitem.getlist", {"TASKID": task_id})
+        except (BitrixApiError, BitrixConfigError) as exc:
+            errors.append({"source": f"task.commentitem.getlist:{task_id}", "error": str(exc)})
+            continue
+        comments = _extract_comments(result)
+        task["_comments"] = comments
+        matched = _matched_comments(comments, query)
+        task["_matched_comments"] = matched
+        task["_comment_snippets"] = [_comment_snippet(comment, query=query) for comment in matched[:2]]
+    return errors
+
+
+def _extract_comments(result: Any) -> list[dict[str, Any]]:
+    if isinstance(result, list):
+        return [item for item in result if isinstance(item, dict)]
+    if isinstance(result, dict):
+        for key in ("comments", "COMMENTS", "items", "result"):
+            value = result.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                nested = _extract_comments(value)
+                if nested:
+                    return nested
+    return []
+
+
+def _matched_comments(comments: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    if not query:
+        return comments
+    needle = query.casefold().strip()
+    return [comment for comment in comments if needle in _comment_text(comment).casefold()]
+
+
+def _comment_texts(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [_comment_text(comment) for comment in value if isinstance(comment, dict) and _comment_text(comment)]
+
+
+def _comment_text(comment: dict[str, Any]) -> str:
+    return _first_text(comment, "POST_MESSAGE", "POST_MESSAGE_HTML", "POST_MESSAGE_TEXT", "text", "message")
+
+
+def _comment_snippet(comment: dict[str, Any], *, query: str) -> str:
+    text = " ".join(_comment_text(comment).split())
+    if not text:
+        return ""
+    if not query:
+        return text[:180]
+    lower = text.casefold()
+    pos = lower.find(query.casefold().strip())
+    if pos < 0:
+        return text[:180]
+    start = max(0, pos - 60)
+    end = min(len(text), pos + len(query) + 100)
+    prefix = "..." if start else ""
+    suffix = "..." if end < len(text) else ""
+    return f"{prefix}{text[start:end]}{suffix}"
 
 
 def _status_label(status: str) -> str:
