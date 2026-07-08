@@ -81,5 +81,5 @@ def test_my_tasks_merges_created_and_member_tasks_sorted_by_deadline():
     assert result.data["items"][0]["roles"] == ["постановщик"]
     assert result.data["items"][1]["roles"] == ["исполнитель", "постановщик"]
     assert result.data["items"][2]["roles"] == ["соисполнитель"]
-    assert client.calls[0][1]["filter"] == {"!STATUS": 5, "MEMBER": 9}
-    assert client.calls[1][1]["filter"] == {"!STATUS": 5, "CREATED_BY": 9}
+    assert client.calls[0][1]["filter"] == {"STATUS": [1, 2, 3, 4], "MEMBER": 9}
+    assert client.calls[1][1]["filter"] == {"STATUS": [1, 2, 3, 4], "CREATED_BY": 9}

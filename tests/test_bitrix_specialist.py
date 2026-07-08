@@ -580,6 +580,118 @@ def test_bitrix_llm_compose_formats_my_tasks_with_task_links(monkeypatch):
     assert "/company/personal/user/13/" not in result.answer
 
 
+def test_bitrix_llm_compose_formats_task_search_list_without_duplicate_detail_or_ids(monkeypatch):
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    service = BitrixLLMService(client=RecordingLLMClient("{}"), settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="покажи задачи на мне", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="bitrix_task_search",
+                    data={
+                        "mode": "list",
+                        "scope": "responsible",
+                        "scope_label": "задачи на мне",
+                        "status": "active",
+                        "items": [
+                            {
+                                "id": "101",
+                                "title": "Обучение сотрудников",
+                                "deadline_label": "10.07.2026 19:00",
+                                "status_label": "выполняется",
+                                "roles": ["исполнитель"],
+                            }
+                        ],
+                        "total": 11,
+                        "limit": 10,
+                        "offset": 0,
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert result.status == "completed"
+    assert (
+        "[URL=https://asutp-expert.bitrix24.ru/company/personal/user/0/tasks/task/view/101/]Обучение сотрудников[/URL]"
+        in result.answer
+    )
+    assert result.answer.count("Обучение сотрудников") == 1
+    assert "Показаны первые 1 задач из 11" in result.answer
+    assert "(ID:" not in result.answer
+    assert "#101" not in result.answer
+    assert "]([URL=" not in result.answer
+    assert "/company/personal/user/13/" not in result.answer
+
+
+def test_bitrix_llm_compose_formats_task_search_detail_without_visible_id(monkeypatch):
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    service = BitrixLLMService(client=RecordingLLMClient("{}"), settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="найди задачу 139", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="bitrix_task_search",
+                    data={
+                        "mode": "detail",
+                        "task_id": "139",
+                        "item": {
+                            "id": "139",
+                            "title": "Обучение сотрудников",
+                            "deadline_label": "без срока",
+                            "status_label": "ждёт выполнения",
+                            "roles": ["наблюдатель"],
+                        },
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert result.status == "completed"
+    assert "Задача найдена" in result.answer
+    assert (
+        "[URL=https://asutp-expert.bitrix24.ru/company/personal/user/0/tasks/task/view/139/]Обучение сотрудников[/URL]"
+        in result.answer
+    )
+    assert "(ID:" not in result.answer
+    assert "#139" not in result.answer
+
+
+def test_bitrix_llm_compose_formats_project_search_with_project_link(monkeypatch):
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    service = BitrixLLMService(client=RecordingLLMClient("{}"), settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="найди проект Ларгус 2", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="bitrix_project_search",
+                    data={"query": "Ларгус 2", "items": [{"id": "45", "name": "Ларгус 2"}], "total": 1},
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert result.status == "completed"
+    assert "[URL=https://asutp-expert.bitrix24.ru/workgroups/group/45/]Ларгус 2[/URL]" in result.answer
+    assert "(ID:" not in result.answer
+
+
 def test_bitrix_llm_compose_formats_warehouse_products_with_links_and_more(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("BITRIX_REST_WEBHOOK_URL", "https://asutp-expert.bitrix24.ru/rest/1/token/")
