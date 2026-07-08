@@ -22,7 +22,8 @@ class BitrixWarehouseSearchTool:
                 "Read-only warehouse/store lookup in Bitrix catalog. Use it for requests about warehouses, "
                 "stores, stock locations, inventory leftovers, or phrases like 'find warehouse Borisov'. "
                 "It calls catalog.store.list and optionally catalog.storeproduct.list. Product rows include "
-                "only items with a positive available amount."
+                "only items with a positive available amount. Use product_limit=10 by default and product_offset "
+                "for follow-up requests asking for the next items."
             ),
             parameters={
                 "type": "object",
@@ -31,6 +32,7 @@ class BitrixWarehouseSearchTool:
                     "include_products": {"type": "boolean"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20},
                     "product_limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                    "product_offset": {"type": "integer", "minimum": 0},
                 },
                 "required": ["query"],
             },
@@ -55,7 +57,8 @@ class BitrixWarehouseSearchTool:
             return ToolResult(status=ToolStatus.INVALID_TOOL_CALL, tool=self.name, error="query is required")
 
         limit = max(1, min(int(args.get("limit") or 10), 20))
-        product_limit = max(1, min(int(args.get("product_limit") or 20), 50))
+        product_limit = max(1, min(int(args.get("product_limit") or 10), 50))
+        product_offset = max(0, int(args.get("product_offset") or args.get("offset") or 0))
         include_products = bool(args.get("include_products"))
 
         try:
@@ -79,12 +82,12 @@ class BitrixWarehouseSearchTool:
 
         if include_products and matches:
             store_id = matches[0].get("id")
-            products_result = await self._store_products(store_id, limit=product_limit)
+            products_result = await self._store_products(store_id, limit=product_limit, offset=product_offset)
             data["products"] = products_result
 
         return ToolResult(status=ToolStatus.OK, tool=self.name, data=data)
 
-    async def _store_products(self, store_id: object, *, limit: int) -> dict[str, Any]:
+    async def _store_products(self, store_id: object, *, limit: int, offset: int = 0) -> dict[str, Any]:
         if store_id in (None, "") or self._client is None:
             return {"status": "not_available", "items": [], "message": "store id is missing"}
 
@@ -107,13 +110,14 @@ class BitrixWarehouseSearchTool:
             row for row in rows if _positive_amount(_first(row, "amount", "AMOUNT", "quantity", "QUANTITY")) is not None
         ]
         product_ids = [_first(row, "productId", "PRODUCT_ID", "product_id") for row in available_rows]
-        product_names = await self._product_names([pid for pid in product_ids if pid not in (None, "")])
+        product_details = await self._product_details([pid for pid in product_ids if pid not in (None, "")])
 
         named_items = []
         missing_name_count = 0
         for row in available_rows:
             product_id = _first(row, "productId", "PRODUCT_ID", "product_id")
-            product_name = product_names.get(str(product_id), "")
+            product = product_details.get(str(product_id), {})
+            product_name = str(product.get("name") or "").strip()
             if not product_name:
                 missing_name_count += 1
                 continue
@@ -121,24 +125,28 @@ class BitrixWarehouseSearchTool:
                 {
                     "product_id": product_id,
                     "product_name": product_name,
+                    "iblock_id": product.get("iblock_id"),
+                    "product_url": product.get("url") or "",
                     "amount": _first(row, "amount", "AMOUNT", "quantity", "QUANTITY"),
                     "raw": row,
                 }
             )
-        items = named_items[:limit]
+        items = named_items[offset : offset + limit]
         return {
             "status": "ok",
             "store_id": store_id,
             "items": items,
             "limit": limit,
+            "offset": offset,
             "total_rows_seen": len(rows),
             "available_items_seen": len(available_rows),
+            "available_items_with_names": len(named_items),
             "filtered_non_positive_count": len(rows) - len(available_rows),
             "filtered_missing_name_count": missing_name_count,
-            "has_more": len(named_items) > len(items),
+            "has_more": offset + len(items) < len(named_items),
         }
 
-    async def _product_names(self, product_ids: list[object]) -> dict[str, str]:
+    async def _product_details(self, product_ids: list[object]) -> dict[str, dict[str, Any]]:
         if not product_ids or self._client is None:
             return {}
         try:
@@ -149,30 +157,30 @@ class BitrixWarehouseSearchTool:
         except (BitrixApiError, BitrixConfigError):
             raw = None
         products = _extract_items(raw, "products")
-        names: dict[str, str] = {}
+        details: dict[str, dict[str, Any]] = {}
         for product in products:
-            product_id = _first(product, "id", "ID")
-            name = str(_first(product, "name", "NAME") or "").strip()
-            if product_id not in (None, "") and name:
-                names[str(product_id)] = name
-        missing_ids = [product_id for product_id in product_ids if str(product_id) not in names]
+            detail = _compact_product(product)
+            product_id = detail.get("id")
+            if product_id not in (None, "") and detail.get("name"):
+                details[str(product_id)] = detail
+        missing_ids = [product_id for product_id in product_ids if str(product_id) not in details]
         for product_id in missing_ids[:10]:
-            name = await self._product_name(product_id)
-            if name:
-                names[str(product_id)] = name
-        return names
+            detail = await self._product_detail(product_id)
+            if detail.get("name"):
+                details[str(product_id)] = detail
+        return details
 
-    async def _product_name(self, product_id: object) -> str:
+    async def _product_detail(self, product_id: object) -> dict[str, Any]:
         if self._client is None:
-            return ""
+            return {}
         try:
             raw = await self._client.result("catalog.product.get", {"id": product_id})
         except (BitrixApiError, BitrixConfigError):
-            return ""
+            return {}
         if isinstance(raw, dict):
             product = raw.get("product") if isinstance(raw.get("product"), dict) else raw
-            return str(_first(product, "name", "NAME") or "").strip()
-        return ""
+            return _compact_product(product)
+        return {}
 
 
 def _match_stores(stores: list[dict[str, Any]], *, query: str, limit: int) -> list[dict[str, Any]]:
@@ -204,6 +212,25 @@ def _compact_store(store: dict[str, Any]) -> dict[str, Any]:
         "is_default": _first(store, "isDefault", "IS_DEFAULT"),
         "raw": store,
     }
+
+
+def _compact_product(product: dict[str, Any]) -> dict[str, Any]:
+    product_id = _first(product, "id", "ID")
+    iblock_id = _first(product, "iblockId", "IBLOCK_ID", "iblock_id")
+    name = str(_first(product, "name", "NAME") or "").strip()
+    return {
+        "id": product_id,
+        "name": name,
+        "iblock_id": iblock_id,
+        "url": _catalog_product_url(iblock_id, product_id),
+        "raw": product,
+    }
+
+
+def _catalog_product_url(iblock_id: object, product_id: object) -> str:
+    if iblock_id in (None, "") or product_id in (None, ""):
+        return ""
+    return f"/shop/documents-catalog/{iblock_id}/product/{product_id}/"
 
 
 def _stores_summary(matches: list[dict[str, Any]], *, query: str) -> str:
