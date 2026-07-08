@@ -281,6 +281,7 @@ def _format_warehouse_answer(data: dict[str, Any], *, portal_base_url: str = "")
     total = _int_value(products.get("available_items_with_names")) or _int_value(products.get("available_items_seen"))
     offset = _int_value(products.get("offset")) or 0
     shown = len(items)
+    limit = _int_value(products.get("limit")) or shown
     if total and (products.get("has_more") or offset > 0 or total > shown):
         start = offset + 1
         end = offset + shown
@@ -293,6 +294,10 @@ def _format_warehouse_answer(data: dict[str, Any], *, portal_base_url: str = "")
             lines.append(
                 f"Показаны позиции {start}-{end} из {total}. Остальные позиции есть; можно запросить следующие."
             )
+    elif offset == 0 and shown >= limit:
+        lines.append(
+            f"Показаны первые {shown} {_ru_position_word(shown)}. Если нужно, можно запросить следующие позиции."
+        )
     return "\n".join(lines)
 
 
