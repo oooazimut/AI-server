@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
-from ai_server.integrations.bitrix.oauth import BitrixOAuthService
+from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.tools.bitrix_policy import apply_write_policy, decide_bitrix_method_policy
 from ai_server.tools.bitrix_ports import BitrixToolClientPort, BitrixWritePort
@@ -19,11 +19,13 @@ class BitrixApiTool:
         write_client: BitrixWritePort | None = None,
         bitrix_oauth: BitrixOAuthService | None = None,
         dry_run: bool = False,
+        oauth_required_for_writes: bool = True,
     ) -> None:
         self._client = client
         self._write_client = write_client
         self._bitrix_oauth = bitrix_oauth
         self._dry_run = dry_run
+        self._oauth_required_for_writes = oauth_required_for_writes
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -31,6 +33,7 @@ class BitrixApiTool:
             description=(
                 "Bitrix24 REST API access. Read methods (ending in .get/.list/.search) execute immediately. "
                 "Write methods execute after explicit user confirmation in the conversation. "
+                "When OAuth is required, writes execute only as the current Bitrix user. "
                 "Dangerous methods (user management, bots) are denied."
             ),
             parameters={
@@ -55,9 +58,17 @@ class BitrixApiTool:
         method = str(args.get("method") or "").strip()
         params = args.get("params") if isinstance(args.get("params"), dict) else {}
         summary = str(args.get("summary") or method).strip()
-        return await self._call_api(method, params, summary, user_id=user_id)
+        return await self._call_api(method, params, summary, user_id=user_id, dialog_id=dialog_id)
 
-    async def _call_api(self, method: str, params: dict[str, Any], summary: str, *, user_id: int | None) -> ToolResult:
+    async def _call_api(
+        self,
+        method: str,
+        params: dict[str, Any],
+        summary: str,
+        *,
+        user_id: int | None,
+        dialog_id: str | None,
+    ) -> ToolResult:
         if self._client is None and self._write_client is None:
             return ToolResult(status=ToolStatus.NOT_CONFIGURED, tool="bitrix_api", error="BitrixClient is not injected")
         decision = decide_bitrix_method_policy(method)
@@ -68,7 +79,7 @@ class BitrixApiTool:
                 data={"method": method, "policy_reason": decision.reason},
             )
         if decision.decision == "confirm":
-            return await self._execute_write(method, params, summary, user_id=user_id)
+            return await self._execute_write(method, params, summary, user_id=user_id, dialog_id=dialog_id)
         if self._client is None:
             return ToolResult(status=ToolStatus.NOT_CONFIGURED, tool="bitrix_api", error="BitrixClient is not injected")
         try:
@@ -85,7 +96,13 @@ class BitrixApiTool:
         )
 
     async def _execute_write(
-        self, method: str, params: dict[str, Any], summary: str, *, user_id: int | None
+        self,
+        method: str,
+        params: dict[str, Any],
+        summary: str,
+        *,
+        user_id: int | None,
+        dialog_id: str | None,
     ) -> ToolResult:
         if not params:
             return ToolResult(
@@ -102,7 +119,24 @@ class BitrixApiTool:
             )
         params = apply_write_policy(method, params)
 
-        # Attempt OAuth per-user write
+        if self._oauth_required_for_writes:
+            context_error = _write_context_error(user_id=user_id, dialog_id=dialog_id)
+            if context_error:
+                return ToolResult(
+                    status=ToolStatus.DENIED,
+                    tool="bitrix_api",
+                    error=context_error,
+                    data={"method": method},
+                )
+            if self._bitrix_oauth is None:
+                return ToolResult(
+                    status=ToolStatus.NOT_CONFIGURED,
+                    tool="bitrix_api",
+                    error="Bitrix OAuth is required for write operations.",
+                    data={"method": method},
+                )
+
+        # Attempt OAuth per-user write.
         if self._bitrix_oauth is not None and user_id is not None:
             try:
                 oauth_client = await self._bitrix_oauth.client_for_user(user_id)
@@ -113,6 +147,14 @@ class BitrixApiTool:
                     tool="bitrix_api",
                     data={"method": method, "params": params, "result": result},
                 )
+            except BitrixOAuthTokenMissing as exc:
+                if self._oauth_required_for_writes:
+                    return ToolResult(
+                        status=ToolStatus.NOT_CONFIGURED,
+                        tool="bitrix_api",
+                        error=str(exc),
+                        data={"method": method, "params": params},
+                    )
             except (BitrixApiError, BitrixConfigError) as exc:
                 return ToolResult(
                     status=ToolStatus.NOT_CONFIGURED if isinstance(exc, BitrixConfigError) else ToolStatus.ERROR,
@@ -120,10 +162,24 @@ class BitrixApiTool:
                     error=str(exc),
                     data={"method": method, "params": params},
                 )
-            except Exception:
-                pass  # OAuth unavailable — fall through to write_client
+            except Exception as exc:
+                if self._oauth_required_for_writes:
+                    return ToolResult(
+                        status=ToolStatus.ERROR,
+                        tool="bitrix_api",
+                        error=f"{type(exc).__name__}: {exc}",
+                        data={"method": method, "params": params},
+                    )
 
-        # Fallback: dedicated write client (BitrixWritePort)
+        if self._oauth_required_for_writes:
+            return ToolResult(
+                status=ToolStatus.NOT_CONFIGURED,
+                tool="bitrix_api",
+                error="OAuth write client is not available for the current Bitrix user.",
+                data={"method": method},
+            )
+
+        # Legacy fallback: dedicated write client (BitrixWritePort).
         write_cl = self._write_client
         if write_cl is None:
             return ToolResult(
@@ -145,3 +201,11 @@ class BitrixApiTool:
         return ToolResult(
             status=ToolStatus.OK, tool="bitrix_api", data={"method": method, "params": params, "result": result}
         )
+
+
+def _write_context_error(*, user_id: int | None, dialog_id: str | None) -> str:
+    if user_id is None:
+        return "Bitrix write operation denied: current Bitrix user_id is missing."
+    if not str(dialog_id or "").strip():
+        return "Bitrix write operation denied: current Bitrix dialog_id is missing."
+    return ""

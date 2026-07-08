@@ -5,6 +5,8 @@ from datetime import datetime
 from typing import Any
 
 from ai_server.agents.bitrix24.ports import TaskDraftStorePort
+from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
+from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.tools.bitrix_policy import apply_write_policy
 from ai_server.tools.bitrix_ports import BitrixWritePort
@@ -155,18 +157,23 @@ class TaskCreateConfirmTool:
         store: TaskDraftStorePort,
         write_client: BitrixWritePort | None = None,
         *,
+        bitrix_oauth: BitrixOAuthService | None = None,
         dry_run: bool = False,
+        oauth_required_for_writes: bool = True,
     ) -> None:
         self._store = store
         self._write_client = write_client
+        self._bitrix_oauth = bitrix_oauth
         self._dry_run = dry_run
+        self._oauth_required_for_writes = oauth_required_for_writes
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="task_create_confirm",
             description=(
                 "Confirm and execute the pending task creation draft. "
-                "Call this after the user explicitly confirms they want to create the task."
+                "Call this after the user explicitly confirms they want to create the task. "
+                "When OAuth is required, creation executes only as the current Bitrix user."
             ),
             parameters={"type": "object", "properties": {}, "required": []},
         )
@@ -198,13 +205,61 @@ class TaskCreateConfirmTool:
                 tool=self.name,
                 data={"params": draft_params},
             )
+        sanitized = apply_write_policy("tasks.task.add", draft_params)
+
+        if self._oauth_required_for_writes:
+            context_error = _write_context_error(user_id=user_id, dialog_id=dialog_id)
+            if context_error:
+                return ToolResult(
+                    status=ToolStatus.DENIED,
+                    tool=self.name,
+                    error=context_error,
+                    data={"params": sanitized},
+                )
+            if self._bitrix_oauth is None:
+                return ToolResult(
+                    status=ToolStatus.NOT_CONFIGURED,
+                    tool=self.name,
+                    error="Bitrix OAuth is required for task creation.",
+                    data={"params": sanitized},
+                )
+            try:
+                oauth_client = await self._bitrix_oauth.client_for_user(user_id)
+                result = await oauth_client.call("tasks.task.add", sanitized)
+            except BitrixOAuthTokenMissing as exc:
+                return ToolResult(
+                    status=ToolStatus.NOT_CONFIGURED,
+                    tool=self.name,
+                    error=str(exc),
+                    data={"params": sanitized},
+                )
+            except (BitrixApiError, BitrixConfigError) as exc:
+                return ToolResult(
+                    status=ToolStatus.NOT_CONFIGURED if isinstance(exc, BitrixConfigError) else ToolStatus.ERROR,
+                    tool=self.name,
+                    error=str(exc),
+                    data={"params": sanitized},
+                )
+            except Exception as exc:
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool=self.name,
+                    error=f"{type(exc).__name__}: {exc}",
+                    data={"params": sanitized},
+                )
+            await self._store.delete_task_draft(dialog_key)
+            return ToolResult(
+                status=ToolStatus.OK,
+                tool=self.name,
+                data={"result": result, "params": sanitized},
+            )
+
         if self._write_client is None:
             return ToolResult(
                 status=ToolStatus.NOT_CONFIGURED,
                 tool=self.name,
                 error="write_client is not configured",
             )
-        sanitized = apply_write_policy("tasks.task.add", draft_params)
         try:
             result = await self._write_client.call("tasks.task.add", sanitized)
         except Exception as exc:
@@ -284,6 +339,14 @@ def _truthy(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().casefold() in {"1", "true", "yes", "y", "да", "on"}
     return bool(value)
+
+
+def _write_context_error(*, user_id: int | None, dialog_id: str | None) -> str:
+    if user_id is None:
+        return "Bitrix task creation denied: current Bitrix user_id is missing."
+    if not str(dialog_id or "").strip():
+        return "Bitrix task creation denied: current Bitrix dialog_id is missing."
+    return ""
 
 
 __all__ = [

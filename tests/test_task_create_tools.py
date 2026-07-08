@@ -15,9 +15,9 @@ from ai_server.models import ToolStatus
 from tests.fakes import FakeTaskDraftStore
 
 
-def _exec(tool, args, *, user_id=None, dialog_key=None):
+def _exec(tool, args, *, user_id=None, dialog_key=None, dialog_id=None):
     async def _run():
-        return await tool.execute(args, user_id=user_id, dialog_key=dialog_key)
+        return await tool.execute(args, user_id=user_id, dialog_key=dialog_key, dialog_id=dialog_id)
 
     return anyio.run(_run)
 
@@ -79,12 +79,88 @@ def test_confirm_tool_creates_task():
     write_client = AsyncMock()
     write_client.call = AsyncMock(return_value={"task": {"id": 777}})
 
-    tool = TaskCreateConfirmTool(store=store, write_client=write_client, dry_run=False)
+    tool = TaskCreateConfirmTool(
+        store=store,
+        write_client=write_client,
+        dry_run=False,
+        oauth_required_for_writes=False,
+    )
     result = _exec(tool, {}, dialog_key="d:1")
 
     assert result.status == ToolStatus.OK
     assert result.data["result"]["task"]["id"] == 777
     assert "d:1" not in store._drafts
+
+
+def test_confirm_tool_uses_oauth_when_required():
+    store = FakeTaskDraftStore()
+    anyio.run(lambda: store.save_task_draft("d:1", {"fields": {"TITLE": "Задача", "RESPONSIBLE_ID": 9}}))
+
+    write_client = AsyncMock()
+    write_client.call = AsyncMock(return_value={"task": {"id": 111}})
+    oauth_client = AsyncMock()
+    oauth_client.call = AsyncMock(return_value={"task": {"id": 777}})
+    oauth = FakeBitrixOAuth(oauth_client)
+
+    tool = TaskCreateConfirmTool(
+        store=store,
+        write_client=write_client,
+        bitrix_oauth=oauth,
+        dry_run=False,
+        oauth_required_for_writes=True,
+    )
+    result = _exec(tool, {}, user_id=9, dialog_key="d:1", dialog_id="chat99")
+
+    assert result.status == ToolStatus.OK
+    assert result.data["result"]["task"]["id"] == 777
+    assert oauth.user_ids == [9]
+    oauth_client.call.assert_awaited_once()
+    write_client.call.assert_not_called()
+    assert "d:1" not in store._drafts
+
+
+def test_confirm_tool_required_oauth_blocks_missing_dialog_id():
+    store = FakeTaskDraftStore()
+    anyio.run(lambda: store.save_task_draft("d:1", {"fields": {"TITLE": "Задача", "RESPONSIBLE_ID": 9}}))
+
+    write_client = AsyncMock()
+    write_client.call = AsyncMock(return_value={"task": {"id": 111}})
+    oauth = FakeBitrixOAuth(AsyncMock())
+
+    tool = TaskCreateConfirmTool(
+        store=store,
+        write_client=write_client,
+        bitrix_oauth=oauth,
+        dry_run=False,
+        oauth_required_for_writes=True,
+    )
+    result = _exec(tool, {}, user_id=9, dialog_key="d:1", dialog_id=None)
+
+    assert result.status == ToolStatus.DENIED
+    assert oauth.user_ids == []
+    write_client.call.assert_not_called()
+    assert "d:1" in store._drafts
+
+
+def test_confirm_tool_required_oauth_does_not_fallback_to_write_client():
+    store = FakeTaskDraftStore()
+    anyio.run(lambda: store.save_task_draft("d:1", {"fields": {"TITLE": "Задача", "RESPONSIBLE_ID": 9}}))
+
+    write_client = AsyncMock()
+    write_client.call = AsyncMock(return_value={"task": {"id": 111}})
+
+    tool = TaskCreateConfirmTool(
+        store=store,
+        write_client=write_client,
+        bitrix_oauth=None,
+        dry_run=False,
+        oauth_required_for_writes=True,
+    )
+    result = _exec(tool, {}, user_id=9, dialog_key="d:1", dialog_id="chat99")
+
+    assert result.status == ToolStatus.NOT_CONFIGURED
+    write_client.call.assert_not_called()
+    assert "d:1" in store._drafts
 
 
 def test_confirm_tool_dry_run():
@@ -126,3 +202,13 @@ def test_discard_tool_deletes_draft():
 
     assert result.status == ToolStatus.OK
     assert "d:5" not in store._drafts
+
+
+class FakeBitrixOAuth:
+    def __init__(self, client) -> None:
+        self.client = client
+        self.user_ids = []
+
+    async def client_for_user(self, user_id: int):
+        self.user_ids.append(user_id)
+        return self.client

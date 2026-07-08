@@ -318,18 +318,24 @@ def _permission_context(task: AgentTask, settings: Settings) -> dict[str, Any]:
         "bitrix_current_user_profile": profile_result,
         "permission_policy_context": task.context.get("permission_policy_context", []),
         "rules": [
-            "full_bitrix_write users may prepare any Bitrix write-tools, still requiring chat confirmation.",
             (
-                "member_write users may prepare task write-tools (tasks.task.add/update/delete) only for projects"
-                " where they hold manager or owner role (ROLE=A or ROLE=E) —"
-                " verify with sonet_group.user.get before preparing a write."
+                "All Bitrix business writes must be prepared as drafts first and executed only after explicit"
+                " chat confirmation."
             ),
             (
-                "member_write users may prepare disk write-tools only on their personal storage"
-                " (entity_type=user, entity_id={current_user_id}) —"
-                " call disk.storage.getlist to identify personal storage if needed."
+                "When oauth_required_for_writes is true, confirmed writes execute only through OAuth of"
+                " current_user_id; if current_user_id or dialog_id is missing, do not prepare/execute writes."
             ),
-            "read_only users should not prepare write-tools; ask for an authorized user or human handoff.",
+            "Bitrix itself decides final permissions for the OAuth user; return the Bitrix denial if it refuses.",
+            "Regular users must not create arbitrary projects; only admins may prepare arbitrary project creation.",
+            (
+                "Regular users may prepare task writes only for existing allowed projects or their own personal"
+                " project according to the agreed naming rules."
+            ),
+            (
+                "Use sonet_group.user.get and Bitrix read methods for context, but do not replace Bitrix"
+                " permission checks with local guesses."
+            ),
             "task closure via bitrix_api: responsible uses tasks.task.complete, creator uses tasks.task.approve.",
         ],
     }

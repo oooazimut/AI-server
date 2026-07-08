@@ -146,10 +146,10 @@ def test_build_agent_task_from_bitrix_chat_transcribes_voice(tmp_path):
     assert task.context["transcriptions"][0]["text"] == "Создай задачу по камере"
 
 
-def test_bitrix_api_tool_write_executes_directly():
-    """BitrixApiTool should execute write methods directly via write_client.call()."""
+def test_bitrix_api_tool_write_executes_directly_when_oauth_not_required():
+    """Legacy mode may execute write methods via write_client.call()."""
     fake_bitrix = FakeBitrixClient()
-    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix)
+    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=False)
 
     result = anyio_run(
         tool.execute(
@@ -160,6 +160,63 @@ def test_bitrix_api_tool_write_executes_directly():
 
     assert result.status == ToolStatus.OK
     assert any(method == "tasks.task.add" for method, _ in fake_bitrix.calls)
+
+
+def test_bitrix_api_tool_write_uses_oauth_when_required():
+    fallback_bitrix = FakeBitrixClient()
+    oauth_bitrix = FakeBitrixClient()
+    oauth = FakeBitrixOAuth(oauth_bitrix)
+    tool = BitrixApiTool(
+        client=fallback_bitrix,
+        write_client=fallback_bitrix,
+        bitrix_oauth=oauth,
+        oauth_required_for_writes=True,
+    )
+
+    result = anyio_run(
+        tool.execute(
+            {"method": "tasks.task.add", "params": {"fields": {"TITLE": "Тест"}}, "summary": "создать задачу"},
+            user_id=9,
+            dialog_id="chat99",
+        )
+    )
+
+    assert result.status == ToolStatus.OK
+    assert oauth.user_ids == [9]
+    assert any(method == "tasks.task.add" for method, _ in oauth_bitrix.calls)
+    assert fallback_bitrix.calls == []
+
+
+def test_bitrix_api_tool_required_oauth_blocks_missing_dialog_id():
+    fake_bitrix = FakeBitrixClient()
+    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=True)
+
+    result = anyio_run(
+        tool.execute(
+            {"method": "tasks.task.add", "params": {"fields": {"TITLE": "Тест"}}, "summary": "создать задачу"},
+            user_id=9,
+            dialog_id=None,
+        )
+    )
+
+    assert result.status == ToolStatus.DENIED
+    assert fake_bitrix.calls == []
+
+
+def test_bitrix_api_tool_required_oauth_does_not_fallback_to_write_client():
+    fake_bitrix = FakeBitrixClient()
+    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=True)
+
+    result = anyio_run(
+        tool.execute(
+            {"method": "tasks.task.add", "params": {"fields": {"TITLE": "Тест"}}, "summary": "создать задачу"},
+            user_id=9,
+            dialog_id="chat99",
+        )
+    )
+
+    assert result.status == ToolStatus.NOT_CONFIGURED
+    assert fake_bitrix.calls == []
 
 
 def test_bitrix_api_tool_dry_run_blocks_write():
@@ -174,7 +231,7 @@ def test_bitrix_api_tool_dry_run_blocks_write():
 
 def test_bitrix_api_tool_write_no_write_client_returns_not_configured():
     fake_bitrix = FakeBitrixClient()
-    tool = BitrixApiTool(client=fake_bitrix, write_client=None)
+    tool = BitrixApiTool(client=fake_bitrix, write_client=None, oauth_required_for_writes=False)
 
     result = anyio_run(tool.execute({"method": "tasks.task.add", "params": {"fields": {"TITLE": "Тест"}}}, user_id=9))
 
@@ -183,7 +240,7 @@ def test_bitrix_api_tool_write_no_write_client_returns_not_configured():
 
 def test_bitrix_api_tool_write_empty_params_returns_invalid():
     fake_bitrix = FakeBitrixClient()
-    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix)
+    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=False)
 
     result = anyio_run(tool.execute({"method": "tasks.task.add", "params": {}}))
 
@@ -452,6 +509,16 @@ class FakeBitrixClient:
             )
         )
         return 1
+
+
+class FakeBitrixOAuth:
+    def __init__(self, client) -> None:
+        self.client = client
+        self.user_ids = []
+
+    async def client_for_user(self, user_id: int):
+        self.user_ids.append(user_id)
+        return self.client
 
 
 class RecordingCreateChatClient(BitrixClient):
