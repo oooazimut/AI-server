@@ -914,11 +914,17 @@ class FakeInternalOrchestratorLLM:
 class FakeTaskDraftStore:
     def __init__(self) -> None:
         self._drafts: dict[str, dict] = {}
+        self._expired: set[str] = set()
 
     async def save_task_draft(self, dialog_key: str, params: dict[str, Any]) -> None:
         self._drafts[dialog_key] = params
+        self._expired.discard(dialog_key)
 
-    async def get_task_draft(self, dialog_key: str) -> dict[str, Any] | None:
+    async def get_task_draft(self, dialog_key: str, *, ttl_minutes: int | None = None) -> dict[str, Any] | None:
+        if ttl_minutes is not None and dialog_key in self._expired:
+            self._drafts.pop(dialog_key, None)
+            self._expired.discard(dialog_key)
+            return None
         return self._drafts.get(dialog_key)
 
     async def delete_task_draft(self, dialog_key: str) -> None:

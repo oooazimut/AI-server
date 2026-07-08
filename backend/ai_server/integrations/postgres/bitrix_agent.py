@@ -183,13 +183,24 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                 """
                 INSERT INTO bitrix24.pending_task_draft (dialog_key, params_json)
                 VALUES (%s, %s)
-                ON CONFLICT (dialog_key) DO UPDATE SET params_json = EXCLUDED.params_json
+                ON CONFLICT (dialog_key) DO UPDATE
+                SET params_json = EXCLUDED.params_json,
+                    created_at = now()
                 """,
                 (dialog_key, json.dumps(params, ensure_ascii=False)),
             )
 
-    async def get_task_draft(self, dialog_key: str) -> dict[str, Any] | None:
+    async def get_task_draft(self, dialog_key: str, *, ttl_minutes: int | None = None) -> dict[str, Any] | None:
         async with await self._connect() as db:
+            if ttl_minutes is not None and ttl_minutes > 0:
+                await db.execute(
+                    """
+                    DELETE FROM bitrix24.pending_task_draft
+                    WHERE dialog_key = %s
+                      AND created_at < now() - make_interval(mins => %s)
+                    """,
+                    (dialog_key, ttl_minutes),
+                )
             cur = await db.execute(
                 "SELECT params_json FROM bitrix24.pending_task_draft WHERE dialog_key = %s",
                 (dialog_key,),

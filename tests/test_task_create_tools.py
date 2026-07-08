@@ -181,6 +181,28 @@ def test_confirm_tool_no_draft():
     assert result.status == ToolStatus.NOT_FOUND
 
 
+def test_confirm_tool_expired_draft_is_not_created():
+    store = FakeTaskDraftStore()
+    anyio.run(lambda: store.save_task_draft("d:1", {"fields": {"TITLE": "Задача", "RESPONSIBLE_ID": 9}}))
+    store._expired.add("d:1")
+
+    write_client = AsyncMock()
+    write_client.call = AsyncMock(return_value={"task": {"id": 111}})
+
+    tool = TaskCreateConfirmTool(
+        store=store,
+        write_client=write_client,
+        dry_run=False,
+        oauth_required_for_writes=False,
+        draft_ttl_minutes=1,
+    )
+    result = _exec(tool, {}, dialog_key="d:1")
+
+    assert result.status == ToolStatus.NOT_FOUND
+    write_client.call.assert_not_called()
+    assert "d:1" not in store._drafts
+
+
 def test_confirm_tool_no_dialog_key():
     store = FakeTaskDraftStore()
     tool = TaskCreateConfirmTool(store=store, write_client=None, dry_run=False)
