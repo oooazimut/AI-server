@@ -115,20 +115,24 @@ def test_bitrix_specialist_searches_task_by_id():
 
 def test_bitrix_specialist_searches_my_open_tasks():
     tools = FakeResolverTools(
-        bitrix_api_result=ToolResult(
+        my_tasks_result=ToolResult(
             status="ok",
-            tool="bitrix_api",
+            tool="bitrix_my_tasks",
             data={
-                "method": "tasks.task.list",
-                "params": {"filter": {"!STATUS": 5, "RESPONSIBLE_ID": 9}},
-                "result": [
+                "status": "open",
+                "items": [
                     {
                         "id": "101",
                         "title": "Проверить камеру",
                         "status": "3",
-                        "responsibleId": "9",
+                        "status_label": "выполняется",
+                        "deadline_label": "10.07.2026 19:00",
+                        "roles": ["исполнитель"],
                     }
                 ],
+                "total": 1,
+                "limit": 10,
+                "offset": 0,
             },
         )
     )
@@ -139,12 +143,8 @@ def test_bitrix_specialist_searches_my_open_tasks():
             llm=FakeBitrixLLM(
                 tool_calls=[
                     BitrixLLMToolCall(
-                        name="bitrix_api",
-                        args={
-                            "action": "call",
-                            "method": "tasks.task.list",
-                            "params": {"filter": {"!STATUS": 5, "RESPONSIBLE_ID": 9}},
-                        },
+                        name="bitrix_my_tasks",
+                        args={"status": "open", "limit": 10},
                     )
                 ],
                 final_answer="Нашёл задачу: Проверить камеру.",
@@ -153,8 +153,7 @@ def test_bitrix_specialist_searches_my_open_tasks():
     )
 
     assert result.status == "completed"
-    assert tools.bitrix_api_calls[0]["method"] == "tasks.task.list"
-    assert tools.bitrix_api_calls[0]["params"]["filter"] == {"!STATUS": 5, "RESPONSIBLE_ID": 9}
+    assert tools.my_tasks_calls[0] == {"status": "open", "limit": 10}
     assert "Проверить камеру" in result.answer
 
 
@@ -540,6 +539,48 @@ def test_bitrix_llm_compose_formats_task_confirm_with_task_link_only(monkeypatch
     assert "/company/personal/user/13/" not in result.answer
 
 
+def test_bitrix_llm_compose_formats_my_tasks_with_task_links(monkeypatch):
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    service = BitrixLLMService(client=RecordingLLMClient("{}"), settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="покажи мои задачи", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="bitrix_my_tasks",
+                    data={
+                        "status": "open",
+                        "items": [
+                            {
+                                "id": "101",
+                                "title": "Проверить камеру",
+                                "deadline_label": "10.07.2026 19:00",
+                                "status_label": "выполняется",
+                                "roles": ["исполнитель"],
+                            }
+                        ],
+                        "total": 1,
+                        "limit": 10,
+                        "offset": 0,
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert result.status == "completed"
+    assert (
+        "[URL=https://asutp-expert.bitrix24.ru/company/personal/user/0/tasks/task/view/101/]"
+        "Проверить камеру[/URL]"
+    ) in result.answer
+    assert "срок: 10.07.2026 19:00" in result.answer
+    assert "/company/personal/user/13/" not in result.answer
+
+
 def test_bitrix_llm_compose_formats_warehouse_products_with_links_and_more(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("BITRIX_REST_WEBHOOK_URL", "https://asutp-expert.bitrix24.ru/rest/1/token/")
@@ -724,17 +765,38 @@ class _FakeBitrixApiTool:
         return self._result
 
 
+class _FakeMyTasksTool:
+    name = "bitrix_my_tasks"
+
+    def __init__(self, result: ToolResult, calls: list):
+        self._result = result
+        self._calls = calls
+
+    def definition(self):
+        return ToolDefinition(name="bitrix_my_tasks", description="", parameters={})
+
+    async def execute(self, args, *, user_id=None, dialog_key=None, dialog_id=None):
+        self._calls.append(args)
+        return self._result
+
+
 class FakeResolverTools:
     def __init__(
         self,
         *,
         bitrix_api_result: ToolResult | None = None,
+        my_tasks_result: ToolResult | None = None,
         raw_user: dict | None = None,
     ) -> None:
         self.bitrix_api_calls: list = []
+        self.my_tasks_calls: list = []
         self._raw_user = raw_user
         self._tools = [
             _FakePortalSearchTool(),
+            _FakeMyTasksTool(
+                my_tasks_result or ToolResult(status="not_configured", tool="bitrix_my_tasks"),
+                self.my_tasks_calls,
+            ),
             _FakeBitrixApiTool(
                 bitrix_api_result or ToolResult(status="not_configured", tool="bitrix_api"),
                 self.bitrix_api_calls,
