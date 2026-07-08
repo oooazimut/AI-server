@@ -845,7 +845,7 @@ def test_bitrix_llm_compose_formats_warehouse_products_with_links_and_more(monke
     assert "#1001" not in result.answer
 
 
-def test_bitrix_llm_compose_marks_limit_sized_warehouse_page_as_first_page(monkeypatch):
+def test_bitrix_llm_compose_marks_limit_sized_warehouse_page_as_complete_when_total_known(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("BITRIX_REST_WEBHOOK_URL", "https://asutp-expert.bitrix24.ru/rest/1/token/")
     client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
@@ -893,8 +893,8 @@ def test_bitrix_llm_compose_marks_limit_sized_warehouse_page_as_first_page(monke
 
     assert client.calls == []
     assert result.status == "completed"
-    assert "Показаны первые 2 позиции" in result.answer
-    assert "Если нужно, можно запросить следующие позиции" in result.answer
+    assert "Показаны все 2 позиции с положительным остатком" in result.answer
+    assert "следующие позиции" not in result.answer
     assert "Остальные позиции есть" not in result.answer
 
 

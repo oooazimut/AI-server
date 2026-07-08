@@ -305,18 +305,23 @@ def _format_warehouse_answer(data: dict[str, Any], *, portal_base_url: str = "")
     offset = _int_value(products.get("offset")) or 0
     shown = len(items)
     limit = _int_value(products.get("limit")) or shown
-    if total and (products.get("has_more") or offset > 0 or total > shown):
+    if total:
         start = offset + 1
         end = offset + shown
-        if offset == 0:
+        has_more = bool(products.get("has_more")) or end < total
+        if offset == 0 and not has_more:
+            lines.append(f"Показаны все {shown} {_ru_position_word(shown)} с положительным остатком.")
+        elif offset == 0:
             lines.append(
                 f"Показаны первые {shown} {_ru_position_word(shown)} из {total}. "
                 "Остальные позиции есть; можно запросить следующие."
             )
-        else:
+        elif has_more:
             lines.append(
                 f"Показаны позиции {start}-{end} из {total}. Остальные позиции есть; можно запросить следующие."
             )
+        else:
+            lines.append(f"Показаны позиции {start}-{end} из {total}. Остальных позиций нет.")
     elif offset == 0 and shown >= limit:
         lines.append(
             f"Показаны первые {shown} {_ru_position_word(shown)}. Если нужно, можно запросить следующие позиции."
