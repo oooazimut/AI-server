@@ -48,16 +48,29 @@ class _FakeBitrixFiles:
     def __init__(self, *, allowed_files: set[int] | None = None, allowed_attachments: set[int] | None = None) -> None:
         self.allowed_files = allowed_files if allowed_files is not None else {101}
         self.allowed_attachments = allowed_attachments if allowed_attachments is not None else set()
+        self.calls: list[tuple[str, int]] = []
 
     async def get_disk_file_download_url(self, file_id: int) -> str:
+        self.calls.append(("get_disk_file_download_url", file_id))
         if file_id not in self.allowed_files:
             raise RuntimeError("access denied")
         return f"https://example.test/download/{file_id}"
 
     async def get_attached_object(self, attached_object_id: int):
+        self.calls.append(("get_attached_object", attached_object_id))
         if attached_object_id not in self.allowed_attachments:
             raise RuntimeError("access denied")
         return {"ID": attached_object_id, "DOWNLOAD_URL": f"https://example.test/attached/{attached_object_id}"}
+
+
+class _FakeBitrixOAuth:
+    def __init__(self, client: _FakeBitrixFiles) -> None:
+        self.client = client
+        self.user_ids: list[int] = []
+
+    async def client_for_user(self, user_id: int):
+        self.user_ids.append(user_id)
+        return self.client
 
 
 def test_portal_search_index_searches_old_schema():
@@ -118,6 +131,49 @@ def test_portal_search_tool_filters_inaccessible_documents():
     assert [item["entity_id"] for item in result.data["results"]] == ["101"]
     assert result.data["access_checked"] is True
     assert result.data["access_filtered_count"] == 1
+
+
+def test_portal_search_tool_uses_oauth_client_for_document_access_check():
+    import asyncio
+
+    index = _create_index()
+    fallback_files = _FakeBitrixFiles()
+    oauth_files = _FakeBitrixFiles()
+    oauth = _FakeBitrixOAuth(oauth_files)
+    tool = PortalSearchTool(portal_search=index, bitrix_files=fallback_files, bitrix_oauth=oauth)
+
+    result = asyncio.run(
+        tool.execute({"query": "С‚СЂР°РЅР·РёС‚ РґРѕРіРѕРІРѕСЂ", "scope": "documents", "limit": 5}, user_id=13)
+    )
+
+    assert result.status == "ok"
+    if not result.data["results"]:
+        result = asyncio.run(tool.execute({"query": "docx", "scope": "documents", "limit": 5}, user_id=13))
+    assert result.data["access_checked"] is True
+    assert result.data["access_actor"] == "oauth_current_user"
+    assert oauth.user_ids
+    assert set(oauth.user_ids) == {13}
+    assert fallback_files.calls == []
+    assert oauth_files.calls == [("get_disk_file_download_url", 101)]
+
+
+def test_portal_search_tool_oauth_document_access_denies_without_user_id():
+    import asyncio
+
+    index = _create_index()
+    fallback_files = _FakeBitrixFiles()
+    oauth_files = _FakeBitrixFiles()
+    tool = PortalSearchTool(
+        portal_search=index,
+        bitrix_files=fallback_files,
+        bitrix_oauth=_FakeBitrixOAuth(oauth_files),
+    )
+
+    result = asyncio.run(tool.execute({"query": "С‚СЂР°РЅР·РёС‚ РґРѕРіРѕРІРѕСЂ", "scope": "documents"}))
+
+    assert result.status == "denied"
+    assert fallback_files.calls == []
+    assert oauth_files.calls == []
 
 
 def test_portal_search_tool_reports_missing_index():

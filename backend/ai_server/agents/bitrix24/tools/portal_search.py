@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ai_server.integrations.bitrix.oauth import BitrixOAuthError, BitrixOAuthService, BitrixOAuthTokenMissing
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.tools.bitrix_ports import BitrixFileDownloadPort
 from ai_server.tools.bitrix_search import PortalSearchPort, entity_types_for_scope, format_portal_search_results
@@ -19,9 +20,11 @@ class PortalSearchTool:
         self,
         portal_search: PortalSearchPort | None = None,
         bitrix_files: BitrixFileDownloadPort | None = None,
+        bitrix_oauth: BitrixOAuthService | None = None,
     ) -> None:
         self._portal_search = portal_search
         self._bitrix_files = bitrix_files
+        self._bitrix_oauth = bitrix_oauth
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -100,13 +103,20 @@ class PortalSearchTool:
                     "message": "Local portal search index is missing. Run cutover var import or indexing first.",
                 },
             )
-        if scope in _ACCESS_CHECKED_SCOPES and self._bitrix_files is None:
-            return ToolResult(
-                status=ToolStatus.DENIED,
-                tool="portal_search",
-                error="portal_search document/file lookup requires Bitrix live access check.",
-                data={"query": query, "scope": scope, "limit": limit},
+        access_client: BitrixFileDownloadPort | None = None
+        access_actor = "not_checked"
+        if scope in _ACCESS_CHECKED_SCOPES:
+            access_client, access_actor, access_error = await _resolve_document_access_client(
+                tool_name=self.name,
+                fallback_client=self._bitrix_files,
+                bitrix_oauth=self._bitrix_oauth,
+                user_id=user_id,
+                query=query,
+                scope=scope,
+                limit=limit,
             )
+            if access_error is not None:
+                return access_error
 
         search_limit = min(100, max(limit, limit * 3)) if scope in _ACCESS_CHECKED_SCOPES else limit
         results = self._portal_search.search(query, entity_types=entity_types, limit=search_limit)
@@ -117,7 +127,7 @@ class PortalSearchTool:
                 if item.entity_type not in _DOCUMENT_ENTITY_TYPES:
                     access_filtered_count += 1
                     continue
-                if await _document_item_is_accessible(self._bitrix_files, item):
+                if await _document_item_is_accessible(access_client, item):
                     checked_results.append(item)
                     if len(checked_results) >= limit:
                         break
@@ -133,10 +143,73 @@ class PortalSearchTool:
                 "limit": limit,
                 "index_path": str(stats.path),
                 "access_checked": scope in _ACCESS_CHECKED_SCOPES,
+                "access_actor": access_actor,
                 "access_filtered_count": access_filtered_count,
                 "summary": format_portal_search_results(results, query=query),
                 "results": [result.as_dict() for result in results],
             },
+        )
+
+
+async def _resolve_document_access_client(
+    *,
+    tool_name: str,
+    fallback_client: BitrixFileDownloadPort | None,
+    bitrix_oauth: BitrixOAuthService | None,
+    user_id: int | None,
+    query: str,
+    scope: str,
+    limit: int,
+) -> tuple[BitrixFileDownloadPort | None, str, ToolResult | None]:
+    if bitrix_oauth is None:
+        if fallback_client is None:
+            return (
+                None,
+                "none",
+                ToolResult(
+                    status=ToolStatus.DENIED,
+                    tool=tool_name,
+                    error="portal_search document/file lookup requires Bitrix live access check.",
+                    data={"query": query, "scope": scope, "limit": limit},
+                ),
+            )
+        return fallback_client, "configured_client", None
+
+    if user_id is None:
+        return (
+            None,
+            "none",
+            ToolResult(
+                status=ToolStatus.DENIED,
+                tool=tool_name,
+                error="portal_search document/file lookup denied: current Bitrix user_id is missing.",
+                data={"query": query, "scope": scope, "limit": limit},
+            ),
+        )
+
+    try:
+        return await bitrix_oauth.client_for_user(user_id), "oauth_current_user", None
+    except BitrixOAuthTokenMissing as exc:
+        return (
+            None,
+            "none",
+            ToolResult(
+                status=ToolStatus.DENIED,
+                tool=tool_name,
+                error=f"portal_search document/file lookup denied: OAuth token for user {exc.user_id} is missing.",
+                data={"query": query, "scope": scope, "limit": limit},
+            ),
+        )
+    except BitrixOAuthError as exc:
+        return (
+            None,
+            "none",
+            ToolResult(
+                status=ToolStatus.ERROR,
+                tool=tool_name,
+                error=f"portal_search document/file OAuth access check failed: {exc}",
+                data={"query": query, "scope": scope, "limit": limit},
+            ),
         )
 
 
