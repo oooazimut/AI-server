@@ -319,6 +319,7 @@ def test_bitrix_llm_decide_routes_hyphenated_project_search_to_deterministic_too
 
     assert [call.name for call in result.decision.tool_calls] == ["bitrix_project_search"]
     assert result.decision.tool_calls[0].args == {"query": "Ларгус-2", "limit": 10}
+    assert client.calls == []
 
 
 def test_bitrix_specialist_passes_user_profile_and_permission_rag_to_llm():
