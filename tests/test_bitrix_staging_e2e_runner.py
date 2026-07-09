@@ -95,6 +95,13 @@ def test_tests_for_suite_all_stays_read_only_by_default() -> None:
     assert all(test.kind in {"read", "smoke"} for test in tests)
 
 
+def test_tests_for_suite_quick_uses_small_read_only_subset() -> None:
+    tests = runner_tests_for_suite("quick", include_draft=False)
+
+    assert [test.test_id for test in tests] == ["BITRIX-SMOKE-01", "BITRIX-PROJECT-HYPHEN-01"]
+    assert all(test.kind in {"read", "smoke"} for test in tests)
+
+
 def test_tests_for_suite_drafts_adds_cleanup_steps() -> None:
     tests = runner_tests_for_suite("drafts", include_draft=False)
 
