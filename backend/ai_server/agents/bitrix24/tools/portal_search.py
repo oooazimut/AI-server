@@ -3,16 +3,25 @@ from __future__ import annotations
 from typing import Any
 
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
+from ai_server.tools.bitrix_ports import BitrixFileDownloadPort
 from ai_server.tools.bitrix_search import PortalSearchPort, entity_types_for_scope, format_portal_search_results
+from ai_server.utils import optional_int
 
 _DENIED_AGENT_SCOPES = {"", "all", "tasks"}
+_ACCESS_CHECKED_SCOPES = {"documents", "files"}
+_DOCUMENT_ENTITY_TYPES = {"disk_file", "task_attachment"}
 
 
 class PortalSearchTool:
     name = "portal_search"
 
-    def __init__(self, portal_search: PortalSearchPort | None = None) -> None:
+    def __init__(
+        self,
+        portal_search: PortalSearchPort | None = None,
+        bitrix_files: BitrixFileDownloadPort | None = None,
+    ) -> None:
         self._portal_search = portal_search
+        self._bitrix_files = bitrix_files
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -72,7 +81,6 @@ class PortalSearchTool:
                 ),
                 data={"query": query, "scope": scope, "limit": limit},
             )
-
         entity_types = entity_types_for_scope(scope)
         if entity_types is None and scope not in {"", "all"}:
             return ToolResult(
@@ -92,8 +100,30 @@ class PortalSearchTool:
                     "message": "Local portal search index is missing. Run cutover var import or indexing first.",
                 },
             )
+        if scope in _ACCESS_CHECKED_SCOPES and self._bitrix_files is None:
+            return ToolResult(
+                status=ToolStatus.DENIED,
+                tool="portal_search",
+                error="portal_search document/file lookup requires Bitrix live access check.",
+                data={"query": query, "scope": scope, "limit": limit},
+            )
 
-        results = self._portal_search.search(query, entity_types=entity_types, limit=limit)
+        search_limit = min(100, max(limit, limit * 3)) if scope in _ACCESS_CHECKED_SCOPES else limit
+        results = self._portal_search.search(query, entity_types=entity_types, limit=search_limit)
+        access_filtered_count = 0
+        if scope in _ACCESS_CHECKED_SCOPES:
+            checked_results = []
+            for item in results:
+                if item.entity_type not in _DOCUMENT_ENTITY_TYPES:
+                    access_filtered_count += 1
+                    continue
+                if await _document_item_is_accessible(self._bitrix_files, item):
+                    checked_results.append(item)
+                    if len(checked_results) >= limit:
+                        break
+                else:
+                    access_filtered_count += 1
+            results = checked_results
         return ToolResult(
             status=ToolStatus.OK,
             tool="portal_search",
@@ -102,7 +132,33 @@ class PortalSearchTool:
                 "scope": scope,
                 "limit": limit,
                 "index_path": str(stats.path),
+                "access_checked": scope in _ACCESS_CHECKED_SCOPES,
+                "access_filtered_count": access_filtered_count,
                 "summary": format_portal_search_results(results, query=query),
                 "results": [result.as_dict() for result in results],
             },
         )
+
+
+async def _document_item_is_accessible(bitrix_files: BitrixFileDownloadPort | None, item: Any) -> bool:
+    if bitrix_files is None:
+        return False
+    if item.entity_type == "disk_file":
+        file_id = optional_int(item.metadata.get("disk_object_id")) or optional_int(item.entity_id)
+        if file_id is None:
+            return False
+        try:
+            await bitrix_files.get_disk_file_download_url(file_id)
+        except Exception:
+            return False
+        return True
+    if item.entity_type == "task_attachment":
+        attached_id = optional_int(item.metadata.get("attached_object_id")) or optional_int(item.entity_id)
+        if attached_id is None:
+            return False
+        try:
+            attached = await bitrix_files.get_attached_object(attached_id)
+        except Exception:
+            return False
+        return isinstance(attached, dict) and bool(attached)
+    return False

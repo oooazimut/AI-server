@@ -44,6 +44,22 @@ def _create_index() -> FakePortalSearchIndex:
     return index
 
 
+class _FakeBitrixFiles:
+    def __init__(self, *, allowed_files: set[int] | None = None, allowed_attachments: set[int] | None = None) -> None:
+        self.allowed_files = allowed_files if allowed_files is not None else {101}
+        self.allowed_attachments = allowed_attachments if allowed_attachments is not None else set()
+
+    async def get_disk_file_download_url(self, file_id: int) -> str:
+        if file_id not in self.allowed_files:
+            raise RuntimeError("access denied")
+        return f"https://example.test/download/{file_id}"
+
+    async def get_attached_object(self, attached_object_id: int):
+        if attached_object_id not in self.allowed_attachments:
+            raise RuntimeError("access denied")
+        return {"ID": attached_object_id, "DOWNLOAD_URL": f"https://example.test/attached/{attached_object_id}"}
+
+
 def test_portal_search_index_searches_old_schema():
     index = _create_index()
 
@@ -62,13 +78,46 @@ def test_portal_search_tool_returns_results():
     import asyncio
 
     index = _create_index()
-    tool = PortalSearchTool(portal_search=index)
+    tool = PortalSearchTool(portal_search=index, bitrix_files=_FakeBitrixFiles())
 
     result = asyncio.run(tool.execute({"query": "транзит договор", "scope": "documents", "limit": 5}))
 
     assert result.status == "ok"
     assert result.data["results"][0]["entity_type"] == "disk_file"
     assert "Нашёл по порталу" in result.data["summary"]
+
+
+def test_portal_search_tool_requires_live_access_check_for_documents():
+    import asyncio
+
+    tool = PortalSearchTool(portal_search=_create_index())
+
+    result = asyncio.run(tool.execute({"query": "транзит договор", "scope": "documents", "limit": 5}))
+
+    assert result.status == "denied"
+    assert "live access check" in result.error
+
+
+def test_portal_search_tool_filters_inaccessible_documents():
+    import asyncio
+
+    index = _create_index()
+    index.upsert_item(
+        entity_type="disk_file",
+        entity_id="303",
+        title="Скрытый договор.docx",
+        body="Текст договора с компанией Транзит-Экспресс.",
+        url="https://example.test/docs/303",
+        metadata={"disk_object_id": 303},
+    )
+    tool = PortalSearchTool(portal_search=index, bitrix_files=_FakeBitrixFiles(allowed_files={101}))
+
+    result = asyncio.run(tool.execute({"query": "транзит договор", "scope": "documents", "limit": 5}))
+
+    assert result.status == "ok"
+    assert [item["entity_id"] for item in result.data["results"]] == ["101"]
+    assert result.data["access_checked"] is True
+    assert result.data["access_filtered_count"] == 1
 
 
 def test_portal_search_tool_reports_missing_index():
@@ -144,7 +193,7 @@ def test_bitrix_specialist_uses_portal_search_for_document_requests():
     specialist = Bitrix24Specialist(
         manifest,
         retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
-        agent_tools=[PortalSearchTool(portal_search=index)],
+        agent_tools=[PortalSearchTool(portal_search=index, bitrix_files=_FakeBitrixFiles())],
         llm=FakeBitrixLLM(
             tool_calls=[
                 BitrixLLMToolCall(
