@@ -206,6 +206,50 @@ def test_portal_search_tool_supports_store_scope():
     assert result.data["results"][0]["entity_type"] == "catalog_store"
 
 
+def test_portal_search_tool_uses_oauth_actor_for_store_scope():
+    import asyncio
+
+    index = _create_index()
+    index.upsert_item(
+        entity_type="catalog_store",
+        entity_id="12",
+        title="Borisov warehouse",
+        body="Main stock location",
+        metadata={},
+    )
+    oauth_files = _FakeBitrixFiles()
+    oauth = _FakeBitrixOAuth(oauth_files)
+    tool = PortalSearchTool(portal_search=index, bitrix_oauth=oauth)
+
+    result = asyncio.run(tool.execute({"query": "Borisov", "scope": "stores", "limit": 5}, user_id=13))
+
+    assert result.status == "ok"
+    assert result.data["access_actor"] == "oauth_current_user"
+    assert result.data["results"][0]["entity_type"] == "catalog_store"
+    assert oauth.user_ids == [13]
+    assert oauth_files.calls == []
+
+
+def test_portal_search_tool_oauth_store_scope_denies_without_user_id():
+    import asyncio
+
+    index = _create_index()
+    index.upsert_item(
+        entity_type="catalog_store",
+        entity_id="12",
+        title="Borisov warehouse",
+        body="Main stock location",
+        metadata={},
+    )
+    oauth_files = _FakeBitrixFiles()
+    tool = PortalSearchTool(portal_search=index, bitrix_oauth=_FakeBitrixOAuth(oauth_files))
+
+    result = asyncio.run(tool.execute({"query": "Borisov", "scope": "stores", "limit": 5}))
+
+    assert result.status == "denied"
+    assert oauth_files.calls == []
+
+
 def test_portal_search_tool_denies_unrestricted_all_scope():
     import asyncio
 

@@ -117,6 +117,17 @@ class PortalSearchTool:
             )
             if access_error is not None:
                 return access_error
+        elif self._bitrix_oauth is not None:
+            access_actor, access_error = await _resolve_index_access_actor(
+                tool_name=self.name,
+                bitrix_oauth=self._bitrix_oauth,
+                user_id=user_id,
+                query=query,
+                scope=scope,
+                limit=limit,
+            )
+            if access_error is not None:
+                return access_error
 
         search_limit = min(100, max(limit, limit * 3)) if scope in _ACCESS_CHECKED_SCOPES else limit
         results = self._portal_search.search(query, entity_types=entity_types, limit=search_limit)
@@ -149,6 +160,51 @@ class PortalSearchTool:
                 "results": [result.as_dict() for result in results],
             },
         )
+
+
+async def _resolve_index_access_actor(
+    *,
+    tool_name: str,
+    bitrix_oauth: BitrixOAuthService,
+    user_id: int | None,
+    query: str,
+    scope: str,
+    limit: int,
+) -> tuple[str, ToolResult | None]:
+    if user_id is None:
+        return (
+            "none",
+            ToolResult(
+                status=ToolStatus.DENIED,
+                tool=tool_name,
+                error="portal_search lookup denied: current Bitrix user_id is missing.",
+                data={"query": query, "scope": scope, "limit": limit},
+            ),
+        )
+
+    try:
+        await bitrix_oauth.client_for_user(user_id)
+    except BitrixOAuthTokenMissing as exc:
+        return (
+            "none",
+            ToolResult(
+                status=ToolStatus.DENIED,
+                tool=tool_name,
+                error=f"portal_search lookup denied: OAuth token for user {exc.user_id} is missing.",
+                data={"query": query, "scope": scope, "limit": limit},
+            ),
+        )
+    except BitrixOAuthError as exc:
+        return (
+            "none",
+            ToolResult(
+                status=ToolStatus.ERROR,
+                tool=tool_name,
+                error=f"portal_search OAuth actor check failed: {exc}",
+                data={"query": query, "scope": scope, "limit": limit},
+            ),
+        )
+    return "oauth_current_user", None
 
 
 async def _resolve_document_access_client(
