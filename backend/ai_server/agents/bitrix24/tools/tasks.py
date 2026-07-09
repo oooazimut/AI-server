@@ -11,6 +11,7 @@ from ai_server.agents.bitrix24.tools.bitrix_api import (
     _normalize_project_name,
 )
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
+from ai_server.integrations.bitrix.oauth import BitrixOAuthError, BitrixOAuthService, BitrixOAuthTokenMissing
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.tools.bitrix_ports import BitrixToolClientPort
 from ai_server.tools.bitrix_search import PortalSearchPort
@@ -47,11 +48,68 @@ DEFAULT_COMMENT_LOOKUP_TASK_LIMIT = 50
 MAX_COMMENT_LOOKUP_TASK_LIMIT = 200
 
 
+async def _resolve_current_user_read_client(
+    tool_name: str,
+    *,
+    fallback_client: BitrixToolClientPort | None,
+    bitrix_oauth: BitrixOAuthService | None,
+    user_id: int | None,
+) -> tuple[BitrixToolClientPort, str, ToolResult | None]:
+    if bitrix_oauth is None:
+        if fallback_client is None:
+            return (
+                _MissingBitrixClient(),
+                "none",
+                ToolResult(status=ToolStatus.NOT_CONFIGURED, tool=tool_name, error="BitrixClient is not injected"),
+            )
+        return fallback_client, "configured_client", None
+
+    if user_id is None:
+        return (
+            _MissingBitrixClient(),
+            "none",
+            ToolResult(
+                status=ToolStatus.DENIED,
+                tool=tool_name,
+                error="Bitrix read denied: current Bitrix user_id is missing.",
+            ),
+        )
+
+    try:
+        return await bitrix_oauth.client_for_user(user_id), "oauth_current_user", None
+    except BitrixOAuthTokenMissing as exc:
+        return (
+            _MissingBitrixClient(),
+            "none",
+            ToolResult(
+                status=ToolStatus.DENIED,
+                tool=tool_name,
+                error=f"Bitrix read denied: OAuth token for user {exc.user_id} is missing.",
+            ),
+        )
+    except (BitrixOAuthError, BitrixConfigError) as exc:
+        return (
+            _MissingBitrixClient(),
+            "none",
+            ToolResult(status=ToolStatus.ERROR, tool=tool_name, error=f"Bitrix OAuth read client failed: {exc}"),
+        )
+
+
+class _MissingBitrixClient:
+    async def result(self, method: str, params: dict[str, Any]) -> Any:
+        raise BitrixConfigError("BitrixClient is not injected")
+
+
 class BitrixMyTasksTool:
     name = "bitrix_my_tasks"
 
-    def __init__(self, client: BitrixToolClientPort | None = None) -> None:
+    def __init__(
+        self,
+        client: BitrixToolClientPort | None = None,
+        bitrix_oauth: BitrixOAuthService | None = None,
+    ) -> None:
         self._client = client
+        self._bitrix_oauth = bitrix_oauth
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -110,7 +168,16 @@ class BitrixMyTasksTool:
             {"role_source": "created_by", "filter": {**_status_filter(status), "CREATED_BY": user_id}},
         ]
 
-        sorted_tasks, errors = await _fetch_merged_tasks(self._client, calls)
+        read_client, access_actor, access_error = await _resolve_current_user_read_client(
+            self.name,
+            fallback_client=self._client,
+            bitrix_oauth=self._bitrix_oauth,
+            user_id=user_id,
+        )
+        if access_error is not None:
+            return access_error
+
+        sorted_tasks, errors = await _fetch_merged_tasks(read_client, calls)
         if errors and not sorted_tasks:
             return ToolResult(
                 status=ToolStatus.ERROR,
@@ -126,6 +193,7 @@ class BitrixMyTasksTool:
             tool=self.name,
             data={
                 "source": "live_bitrix_rest",
+                "access_actor": access_actor,
                 "status": status,
                 "user_id": user_id,
                 "items": items,
@@ -143,10 +211,14 @@ class BitrixTaskSearchTool:
     name = "bitrix_task_search"
 
     def __init__(
-        self, client: BitrixToolClientPort | None = None, portal_search: PortalSearchPort | None = None
+        self,
+        client: BitrixToolClientPort | None = None,
+        portal_search: PortalSearchPort | None = None,
+        bitrix_oauth: BitrixOAuthService | None = None,
     ) -> None:
         self._client = client
         self._portal_search = portal_search
+        self._bitrix_oauth = bitrix_oauth
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -255,11 +327,17 @@ class BitrixTaskSearchTool:
 
         task_id = _safe_int(args.get("task_id") or args.get("id") or args.get("ID"))
         if task_id is not None:
-            if self._client is None:
-                return ToolResult(
-                    status=ToolStatus.NOT_CONFIGURED, tool=self.name, error="BitrixClient is not injected"
-                )
-            return await self._execute_task_detail(task_id, user_id=user_id)
+            read_client, access_actor, access_error = await _resolve_current_user_read_client(
+                self.name,
+                fallback_client=self._client,
+                bitrix_oauth=self._bitrix_oauth,
+                user_id=user_id,
+            )
+            if access_error is not None:
+                return access_error
+            return await self._execute_task_detail(
+                task_id, user_id=user_id, client=read_client, access_actor=access_actor
+            )
 
         scope = _scope_arg(args.get("scope"))
         if scope in {"my", "responsible", "created_by", "member"} and user_id is None:
@@ -291,11 +369,15 @@ class BitrixTaskSearchTool:
         errors: list[dict[str, str]] = []
 
         if project_id is None and project_query:
-            if self._client is None:
-                return ToolResult(
-                    status=ToolStatus.NOT_CONFIGURED, tool=self.name, error="BitrixClient is not injected"
-                )
-            project_matches, project_errors = await _search_projects(self._client, project_query, limit=1)
+            read_client, access_actor, access_error = await _resolve_current_user_read_client(
+                self.name,
+                fallback_client=self._client,
+                bitrix_oauth=self._bitrix_oauth,
+                user_id=user_id,
+            )
+            if access_error is not None:
+                return access_error
+            project_matches, project_errors = await _search_projects(read_client, project_query, limit=1)
             errors.extend(project_errors)
             if not project_matches:
                 return ToolResult(
@@ -304,6 +386,7 @@ class BitrixTaskSearchTool:
                     data={
                         "mode": "list",
                         "source": "live_bitrix_rest",
+                        "access_actor": access_actor,
                         "scope": scope,
                         "status": status,
                         "query": query,
@@ -344,8 +427,14 @@ class BitrixTaskSearchTool:
         if snapshot_result is not None:
             return snapshot_result
 
-        if self._client is None:
-            return ToolResult(status=ToolStatus.NOT_CONFIGURED, tool=self.name, error="BitrixClient is not injected")
+        read_client, access_actor, access_error = await _resolve_current_user_read_client(
+            self.name,
+            fallback_client=self._client,
+            bitrix_oauth=self._bitrix_oauth,
+            user_id=user_id,
+        )
+        if access_error is not None:
+            return access_error
 
         calls = _task_search_calls(
             scope=scope,
@@ -354,7 +443,7 @@ class BitrixTaskSearchTool:
             project_id=project_id,
             query="" if include_comments else query,
         )
-        sorted_tasks, task_errors = await _fetch_merged_tasks(self._client, calls)
+        sorted_tasks, task_errors = await _fetch_merged_tasks(read_client, calls)
         errors.extend(task_errors)
         if errors and not sorted_tasks:
             return ToolResult(
@@ -390,7 +479,7 @@ class BitrixTaskSearchTool:
 
         if include_comments:
             comment_errors = await _attach_task_comments(
-                self._client,
+                read_client,
                 pre_comment_filtered,
                 query=comment_query or query,
                 limit=comment_lookup_limit,
@@ -411,6 +500,7 @@ class BitrixTaskSearchTool:
             data={
                 "mode": "list",
                 "source": "live_bitrix_rest",
+                "access_actor": access_actor,
                 "scope": scope,
                 "scope_label": _scope_label(scope),
                 "status": status,
@@ -429,9 +519,16 @@ class BitrixTaskSearchTool:
             },
         )
 
-    async def _execute_task_detail(self, task_id: int, *, user_id: int | None) -> ToolResult:
+    async def _execute_task_detail(
+        self,
+        task_id: int,
+        *,
+        user_id: int | None,
+        client: BitrixToolClientPort,
+        access_actor: str,
+    ) -> ToolResult:
         try:
-            result = await self._client.result("tasks.task.get", {"taskId": task_id, "select": TASK_SELECT})
+            result = await client.result("tasks.task.get", {"taskId": task_id, "select": TASK_SELECT})
         except (BitrixApiError, BitrixConfigError) as exc:
             return ToolResult(
                 status=ToolStatus.ERROR,
@@ -446,6 +543,7 @@ class BitrixTaskSearchTool:
             data={
                 "mode": "detail",
                 "source": "live_bitrix_rest",
+                "access_actor": access_actor,
                 "task_id": str(task_id),
                 "item": _task_summary(task, user_id=user_id or 0) if task else None,
             },
@@ -632,9 +730,11 @@ class BitrixProjectSearchTool:
         self,
         client: BitrixToolClientPort | None = None,
         portal_search: PortalSearchPort | None = None,
+        bitrix_oauth: BitrixOAuthService | None = None,
     ) -> None:
         self._client = client
         self._portal_search = portal_search
+        self._bitrix_oauth = bitrix_oauth
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -701,19 +801,21 @@ class BitrixProjectSearchTool:
                     "errors": [],
                 },
             )
-        if self._client is None:
-            return ToolResult(
-                status=ToolStatus.NOT_CONFIGURED,
-                tool=self.name,
-                error="BitrixClient is not injected and project was not found in PortalSearchIndex",
-                data={"query": query},
-            )
-        matches, errors = await _search_projects(self._client, query, limit=limit)
+        read_client, access_actor, access_error = await _resolve_current_user_read_client(
+            self.name,
+            fallback_client=self._client,
+            bitrix_oauth=self._bitrix_oauth,
+            user_id=user_id,
+        )
+        if access_error is not None:
+            return access_error
+        matches, errors = await _search_projects(read_client, query, limit=limit)
         return ToolResult(
             status=ToolStatus.OK,
             tool=self.name,
             data={
                 "source": "live_bitrix_rest",
+                "access_actor": access_actor,
                 "query": query,
                 "items": [_project_summary(group) for group in matches],
                 "total": len(matches),

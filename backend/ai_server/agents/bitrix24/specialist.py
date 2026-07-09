@@ -141,9 +141,17 @@ class Bitrix24Specialist(BaseSpecialist):
         tools: list[AgentTool] = [
             PortalSearchTool(portal_search=portal_search_index, bitrix_files=bitrix_client),
             BitrixWarehouseSearchTool(client=bitrix_client, portal_search=portal_search_index),
-            BitrixMyTasksTool(client=bitrix_client),
-            BitrixTaskSearchTool(client=bitrix_client, portal_search=portal_search_index),
-            BitrixProjectSearchTool(client=bitrix_client, portal_search=portal_search_index),
+            BitrixMyTasksTool(client=bitrix_client, bitrix_oauth=bitrix_oauth),
+            BitrixTaskSearchTool(
+                client=bitrix_client,
+                portal_search=portal_search_index,
+                bitrix_oauth=bitrix_oauth,
+            ),
+            BitrixProjectSearchTool(
+                client=bitrix_client,
+                portal_search=portal_search_index,
+                bitrix_oauth=bitrix_oauth,
+            ),
             BitrixApiTool(
                 client=bitrix_client,
                 write_client=bitrix_client,
