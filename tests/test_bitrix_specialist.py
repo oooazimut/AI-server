@@ -1238,6 +1238,55 @@ def test_bitrix_llm_compose_formats_project_search_with_project_link(monkeypatch
     assert "(ID:" not in result.answer
 
 
+def test_bitrix_llm_compose_formats_portal_search_document_with_snippet(monkeypatch):
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client=client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="найди документ договор транзит", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="portal_search",
+                    data={
+                        "query": "договор транзит",
+                        "scope": "documents",
+                        "limit": 10,
+                        "results": [
+                            {
+                                "entity_type": "disk_file",
+                                "entity_id": "77",
+                                "title": "Договор Транзит.pdf",
+                                "body": (
+                                    "Карточка файла.\n\nТекст файла:\n"
+                                    "Это договор с компанией Транзит-Экспресс по поставке оборудования."
+                                ),
+                                "url": "/docs/path/Dogovor-Tranzit.pdf",
+                                "score": 42,
+                                "metadata": {},
+                            }
+                        ],
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "completed"
+    assert "Документы по запросу «договор транзит»:" in result.answer
+    assert (
+        "[URL=https://asutp-expert.bitrix24.ru/docs/path/Dogovor-Tranzit.pdf]Договор Транзит.pdf[/URL]" in result.answer
+    )
+    assert "Фрагмент:" in result.answer
+    assert "Транзит-Экспресс" in result.answer
+    assert "(ID:" not in result.answer
+
+
 def test_bitrix_llm_compose_formats_warehouse_products_with_links_and_more(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("BITRIX_REST_WEBHOOK_URL", "https://asutp-expert.bitrix24.ru/rest/1/token/")

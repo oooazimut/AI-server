@@ -258,6 +258,12 @@ def _direct_task_create_response(
                 answer=_format_project_search_answer(result.data, portal_base_url=portal_base_url),
                 model_usage=_local_model_usage(agent_id, "project_search_response"),
             )
+        if result.tool == "portal_search":
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer=_format_portal_search_answer(result.data, portal_base_url=portal_base_url),
+                model_usage=_local_model_usage(agent_id, "portal_search_response"),
+            )
         if result.tool == "task_create_draft":
             return BitrixLLMFinalResult(
                 status="needs_human",
@@ -485,6 +491,47 @@ def _format_project_search_answer(data: dict[str, Any], *, portal_base_url: str 
     return "\n".join(lines)
 
 
+def _format_portal_search_answer(data: dict[str, Any], *, portal_base_url: str = "") -> str:
+    query = _text(data.get("query"))
+    scope = _text(data.get("scope")) or "documents"
+    items = data.get("results") if isinstance(data.get("results"), list) else []
+    title = _portal_search_title(scope=scope, query=query)
+    if not items:
+        return title.replace(":", " не найдены.")
+
+    lines = [title]
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            continue
+        label = _portal_item_link(
+            _text(item.get("title")) or "документ",
+            _text(item.get("url")),
+            portal_base_url=portal_base_url,
+        )
+        lines.append(f"{index}. {label}")
+        snippet = _portal_snippet(_text(item.get("body")), query=query)
+        if snippet:
+            lines.append(f"   Фрагмент: {snippet}")
+
+    limit = _int_value(data.get("limit")) or len(items)
+    if len(items) >= limit:
+        lines.append(f"Показаны первые {len(items)} результатов. Если нужно, можно уточнить запрос.")
+    return "\n".join(lines)
+
+
+def _portal_search_title(*, scope: str, query: str) -> str:
+    scope_label = {
+        "documents": "Документы",
+        "files": "Файлы",
+        "projects": "Проекты",
+        "catalog": "Каталог",
+        "stores": "Склады",
+        "products": "Товары",
+        "stock": "Остатки",
+    }.get(scope, "Результаты поиска")
+    return f"{scope_label} по запросу «{query}»:"
+
+
 def _task_search_title(data: dict[str, Any]) -> str:
     project = data.get("project") if isinstance(data.get("project"), dict) else {}
     project_name = _text(project.get("name")) if isinstance(project, dict) else ""
@@ -549,6 +596,39 @@ def _project_link(title: str, project_id: str, *, portal_base_url: str = "") -> 
         return title
     url = f"{portal_base_url.rstrip('/')}/workgroups/group/{project_id}/"
     return f"[URL={url}]{title}[/URL]"
+
+
+def _portal_item_link(title: str, url: str, *, portal_base_url: str = "") -> str:
+    if not url:
+        return title
+    if url.startswith("http://") or url.startswith("https://"):
+        resolved = url
+    elif url.startswith("/") and portal_base_url:
+        resolved = portal_base_url.rstrip("/") + url
+    else:
+        return title
+    return f"[URL={resolved}]{title}[/URL]"
+
+
+def _portal_snippet(body: str, *, query: str, max_length: int = 180) -> str:
+    cleaned = re.sub(r"\s+", " ", body).strip()
+    if not cleaned:
+        return ""
+    if len(cleaned) <= max_length:
+        return cleaned
+    terms = [term for term in re.findall(r"[\w#№.-]+", query.lower().replace("ё", "е")) if len(term) > 1]
+    lowered = cleaned.lower().replace("ё", "е")
+    positions = [lowered.find(term) for term in terms if term and lowered.find(term) >= 0]
+    if positions:
+        position = min(positions)
+        start = max(0, position - max_length // 3)
+        end = min(len(cleaned), start + max_length)
+        start = max(0, end - max_length)
+        snippet = cleaned[start:end].strip()
+        prefix = "..." if start > 0 else ""
+        suffix = "..." if end < len(cleaned) else ""
+        return f"{prefix}{snippet}{suffix}"
+    return cleaned[: max_length - 3].rstrip() + "..."
 
 
 def _format_stock_amount(value: object) -> str:
