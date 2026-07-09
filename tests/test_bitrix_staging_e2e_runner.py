@@ -102,6 +102,15 @@ def test_tests_for_suite_quick_uses_small_read_only_subset() -> None:
     assert all(test.kind in {"read", "smoke"} for test in tests)
 
 
+def test_tests_for_suite_tasks_advanced_is_optional_read_only() -> None:
+    tests = runner_tests_for_suite("tasks_advanced", include_draft=False)
+
+    assert [test.test_id for test in tests] == ["BITRIX-TASK-ADVANCED-COMMENT-01"]
+    assert tests[0].kind == "read"
+    assert "задач" in tests[0].expect_all
+    assert "понаблюдать" in tests[0].expect_any
+
+
 def test_tests_for_suite_drafts_adds_cleanup_steps() -> None:
     tests = runner_tests_for_suite("drafts", include_draft=False)
 
