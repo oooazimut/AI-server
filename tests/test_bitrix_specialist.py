@@ -701,6 +701,58 @@ def test_bitrix_llm_exposes_and_accepts_calendar_confirmation_tools(monkeypatch)
     assert [call.name for call in result.decision.tool_calls] == ["calendar_event_confirm", "calendar_event_discard"]
 
 
+def test_bitrix_llm_exposes_and_accepts_project_confirmation_tools(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient(
+        json.dumps(
+            {
+                "status": "completed",
+                "answer": "",
+                "confidence": 0.7,
+                "tool_calls": [
+                    {"name": "project_create_confirm", "args": {}, "summary": "confirmed"},
+                    {"name": "project_create_discard", "args": {}, "summary": "discarded"},
+                ],
+            }
+        )
+    )
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "project_create_draft", "description": "", "parameters": {}},
+        {"name": "project_create_confirm", "description": "", "parameters": {}},
+        {"name": "project_create_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request="да, создай проект",
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "project_create",
+                        "method": "sonet_group.create",
+                        "params": {"fields": {"NAME": "Кулинич Валерий"}},
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert {"project_create_draft", "project_create_confirm", "project_create_discard"} <= ALLOWED_TOOL_NAMES
+    payload = json.loads(client.calls[0]["messages"][1]["content"])
+    prompt = client.calls[0]["messages"][0]["content"]
+    assert {"project_create_confirm", "project_create_discard"} <= {tool["name"] for tool in payload["tools"]}
+    assert payload["permission_context"]["pending_task_draft"]["_draft_type"] == "project_create"
+    assert "project_create_confirm" in prompt
+    assert [call.name for call in result.decision.tool_calls] == ["project_create_confirm", "project_create_discard"]
+
+
 def test_bitrix_llm_compose_formats_task_draft_without_profile_links(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')

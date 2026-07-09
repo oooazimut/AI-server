@@ -257,6 +257,17 @@ def test_bitrix_api_tool_denied_method():
     assert fake_bitrix.calls == []
 
 
+def test_bitrix_api_tool_denies_direct_project_creation():
+    fake_bitrix = FakeBitrixClient()
+    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=False)
+
+    result = anyio_run(tool.execute({"method": "sonet_group.create", "params": {"fields": {"NAME": "Проект"}}}))
+
+    assert result.status == ToolStatus.DENIED
+    assert result.error == "Use project_create_draft/project_create_confirm for Bitrix project creation."
+    assert fake_bitrix.calls == []
+
+
 def test_bitrix_api_tool_sonet_group_get_normalizes_hyphenated_project_name():
     class FakeProjectClient:
         def __init__(self) -> None:
