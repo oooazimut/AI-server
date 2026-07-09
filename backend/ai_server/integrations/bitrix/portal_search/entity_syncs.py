@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import html
+import re
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlsplit
@@ -15,6 +17,12 @@ from ai_server.integrations.bitrix.portal_search.text_utils import (
 from ai_server.integrations.bitrix.portal_search.types import PortalSearchResult
 from ai_server.settings import Settings
 from ai_server.utils import MOSCOW_TZ
+
+_BITRIX_PAIRED_TAG_RE = re.compile(
+    r"\[(USER|URL|B|I|U|S|QUOTE|CODE|COLOR|SIZE)[^\]]*\](.*?)\[/\1\]", re.IGNORECASE | re.DOTALL
+)
+_BITRIX_SINGLE_TAG_RE = re.compile(r"\[/?[A-Z][A-Z0-9_]*(?:=[^\]]*)?\]", re.IGNORECASE)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
 def _first(data: dict[str, Any], *keys: str) -> object | None:
@@ -34,6 +42,91 @@ def _attachment_ids(value: object) -> list[int]:
         if normalized.isdigit():
             ids.append(int(normalized))
     return ids
+
+
+async def _task_comment_texts(bitrix: BitrixClient, task_id: object, *, limit: int) -> list[str]:
+    if limit <= 0:
+        return []
+    try:
+        result = await bitrix.result("task.commentitem.getlist", {"TASKID": task_id})
+    except Exception:
+        return []
+    texts: list[str] = []
+    for comment in _extract_comments(result):
+        text = _comment_text(comment)
+        if not text or _is_system_comment_text(text):
+            continue
+        texts.append(text)
+        if len(texts) >= limit:
+            break
+    return texts
+
+
+def _extract_comments(result: Any) -> list[dict[str, Any]]:
+    if isinstance(result, list):
+        return [item for item in result if isinstance(item, dict)]
+    if isinstance(result, dict):
+        for key in ("comments", "COMMENTS", "items", "result"):
+            value = result.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                nested = _extract_comments(value)
+                if nested:
+                    return nested
+    return []
+
+
+def _comment_text(comment: dict[str, Any]) -> str:
+    return _clean_bitrix_text(
+        to_str(_first(comment, "POST_MESSAGE", "POST_MESSAGE_HTML", "POST_MESSAGE_TEXT", "text", "message")) or ""
+    )
+
+
+def _clean_bitrix_text(value: object) -> str:
+    text = html.unescape(str(value or ""))
+    previous = None
+    while previous != text:
+        previous = text
+        text = _BITRIX_PAIRED_TAG_RE.sub(r"\2", text)
+    text = _BITRIX_SINGLE_TAG_RE.sub("", text)
+    text = _HTML_TAG_RE.sub("", text)
+    return " ".join(text.split())
+
+
+def _is_system_comment_text(text: str) -> bool:
+    normalized = text.casefold().strip().rstrip(".")
+    if not normalized:
+        return True
+    if normalized.startswith("крайний срок изменен на:"):
+        return True
+    if normalized in {
+        "задача завершена",
+        "задача возвращена в работу",
+        "задача почти просрочена",
+    }:
+        return True
+    system_fragments = (
+        "вы добавлены наблюдателем",
+        "вы назначены исполнителем",
+        "задача почти просрочена",
+        "завершите задачу или передвиньте срок",
+    )
+    return any(fragment in normalized for fragment in system_fragments)
+
+
+def _person_label(value: object) -> str:
+    if not isinstance(value, dict):
+        return ""
+    name = to_str(_first(value, "name", "NAME"))
+    if name:
+        return name
+    parts = [
+        to_str(_first(value, "lastName", "LAST_NAME", "last_name")),
+        to_str(_first(value, "name", "NAME", "firstName", "FIRST_NAME")),
+        to_str(_first(value, "secondName", "SECOND_NAME", "second_name")),
+    ]
+    return " ".join(part for part in parts if part)
 
 
 async def sync_disk_file_item(
@@ -165,11 +258,16 @@ async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: 
             "DESCRIPTION",
             "STATUS",
             "RESPONSIBLE_ID",
+            "RESPONSIBLE",
             "CREATED_BY",
+            "CREATOR",
             "GROUP_ID",
             "DEADLINE",
+            "CREATED_DATE",
             "CHANGED_DATE",
             "CLOSED_DATE",
+            "ACCOMPLICES",
+            "AUDITORS",
             "UF_TASK_WEBDAV_FILES",
         ],
         order={"CHANGED_DATE": "DESC"},
@@ -182,28 +280,47 @@ async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: 
         if task_id is None:
             continue
         title = str(_first(task, "title", "TITLE") or "Без названия")
+        comments = (
+            await _task_comment_texts(bitrix, task_id, limit=settings.search_index_task_comment_limit)
+            if settings.search_index_include_task_comments
+            else []
+        )
+        responsible_label = _person_label(_first(task, "responsible", "RESPONSIBLE"))
+        creator_label = _person_label(_first(task, "creator", "CREATOR"))
+        responsible = responsible_label or to_str(_first(task, "responsibleId", "RESPONSIBLE_ID"))
+        creator = creator_label or to_str(_first(task, "createdBy", "CREATED_BY"))
+        body_parts = [
+            str(_first(task, "description", "DESCRIPTION") or ""),
+            f"Статус: {_first(task, 'status', 'STATUS')}",
+            f"Исполнитель: {responsible}" if responsible else "",
+            f"Постановщик: {creator}" if creator else "",
+            f"Проект: {_first(task, 'groupId', 'GROUP_ID')}",
+            f"Срок: {_first(task, 'deadline', 'DEADLINE')}",
+            f"Дата создания: {_first(task, 'createdDate', 'CREATED_DATE')}",
+            f"Дата закрытия: {_first(task, 'closedDate', 'CLOSED_DATE')}",
+            "Комментарии:\n" + "\n".join(f"- {comment}" for comment in comments) if comments else "",
+        ]
         index.upsert_item(
             entity_type="task",
             entity_id=task_id,
             title=title,
-            body="\n".join(
-                str(value)
-                for value in (
-                    _first(task, "description", "DESCRIPTION"),
-                    f"Статус: {_first(task, 'status', 'STATUS')}",
-                    f"Исполнитель: {_first(task, 'responsibleId', 'RESPONSIBLE_ID')}",
-                    f"Проект: {_first(task, 'groupId', 'GROUP_ID')}",
-                    f"Срок: {_first(task, 'deadline', 'DEADLINE')}",
-                )
-                if value
-            ),
+            body="\n".join(part for part in body_parts if str(part).strip()),
             url=_task_url(task_id, settings),
             metadata={
                 "status": _first(task, "status", "STATUS"),
                 "responsible_id": _first(task, "responsibleId", "RESPONSIBLE_ID"),
+                "responsible_label": responsible_label,
                 "created_by": _first(task, "createdBy", "CREATED_BY"),
+                "creator_label": creator_label,
                 "group_id": _first(task, "groupId", "GROUP_ID"),
                 "deadline": _first(task, "deadline", "DEADLINE"),
+                "created_date": _first(task, "createdDate", "CREATED_DATE"),
+                "changed_date": _first(task, "changedDate", "CHANGED_DATE"),
+                "closed_date": _first(task, "closedDate", "CLOSED_DATE"),
+                "accomplices": _first(task, "accomplices", "ACCOMPLICES"),
+                "auditors": _first(task, "auditors", "AUDITORS"),
+                "comments_indexed": bool(comments),
+                "comments_count": len(comments),
             },
             source_updated_at=to_str(_first(task, "changedDate", "CHANGED_DATE")),
         )
