@@ -101,6 +101,28 @@ def test_portal_search_tool_supports_store_scope():
     assert result.data["results"][0]["entity_type"] == "catalog_store"
 
 
+def test_portal_search_tool_denies_unrestricted_all_scope():
+    import asyncio
+
+    tool = PortalSearchTool(portal_search=_create_index())
+
+    result = asyncio.run(tool.execute({"query": "камера", "scope": "all", "limit": 5}, user_id=13))
+
+    assert result.status == "denied"
+    assert "focused non-task scope" in result.error
+
+
+def test_portal_search_tool_denies_task_scope():
+    import asyncio
+
+    tool = PortalSearchTool(portal_search=_create_index())
+
+    result = asyncio.run(tool.execute({"query": "камера", "scope": "tasks", "limit": 5}, user_id=13))
+
+    assert result.status == "denied"
+    assert "bitrix_task_search" in result.error
+
+
 def test_bitrix_search_endpoint(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     index = _create_index()

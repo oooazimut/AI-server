@@ -5,6 +5,8 @@ from typing import Any
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.tools.bitrix_search import PortalSearchPort, entity_types_for_scope, format_portal_search_results
 
+_DENIED_AGENT_SCOPES = {"", "all", "tasks"}
+
 
 class PortalSearchTool:
     name = "portal_search"
@@ -15,7 +17,10 @@ class PortalSearchTool:
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="portal_search",
-            description="Search the local Bitrix portal index (var/search_index.sqlite). Use for full-text search across tasks, projects, documents and disk files.",
+            description=(
+                "Search the local Bitrix portal index. Use only for focused document/file/project/catalog lookup. "
+                "Do not use for tasks or unrestricted all-scope search; use bitrix_task_search for tasks."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -57,6 +62,16 @@ class PortalSearchTool:
         limit = max(1, min(int(args.get("limit") or 10), 30))
         if not query:
             return ToolResult(status=ToolStatus.INVALID_TOOL_CALL, tool="portal_search", error="query is required")
+        if scope in _DENIED_AGENT_SCOPES:
+            return ToolResult(
+                status=ToolStatus.DENIED,
+                tool="portal_search",
+                error=(
+                    "portal_search requires a focused non-task scope. "
+                    "Use bitrix_task_search for tasks; use documents/files/projects/catalog/stores/products/stock for portal search."
+                ),
+                data={"query": query, "scope": scope, "limit": limit},
+            )
 
         entity_types = entity_types_for_scope(scope)
         if entity_types is None and scope not in {"", "all"}:
