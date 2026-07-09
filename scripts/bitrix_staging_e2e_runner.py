@@ -18,8 +18,8 @@ BACKEND_DIR = PROJECT_ROOT / "backend"
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(BACKEND_DIR))
 
-from ai_server.settings import get_settings
-from scripts.create_bitrix_dev_chat import env_file_paths, load_env_files
+from ai_server.settings import get_settings  # noqa: E402
+from scripts.create_bitrix_dev_chat import env_file_paths, load_env_files  # noqa: E402
 
 DEFAULT_EVENTS_URL = "http://127.0.0.1:8001/bitrix/events"
 DEFAULT_STATUS_URL = "http://127.0.0.1:8001/bitrix/webhook-events/status"
@@ -192,6 +192,16 @@ def send_event(
 
 
 def run_test(args: argparse.Namespace, *, run_id: str, test: TestCase) -> dict[str, Any]:
+    preflight_status = wait_queue_idle(args.status_url, timeout_seconds=args.preflight_idle_timeout)
+    if not preflight_status.get("ok"):
+        return {
+            "test_id": test.test_id,
+            "kind": test.kind,
+            "ok": False,
+            "stage": "preflight_queue_busy",
+            "worker_latest": compact_status(preflight_status.get("status") or {}),
+        }
+
     before_messages = get_messages(args.rest_webhook_url, args.dialog_id)
     before_ids = {item for item in (message_id(message) for message in before_messages) if item is not None}
     enqueue = send_event(
@@ -206,20 +216,25 @@ def run_test(args: argparse.Namespace, *, run_id: str, test: TestCase) -> dict[s
     )
     if not enqueue.get("ok"):
         return {"test_id": test.test_id, "ok": False, "stage": "enqueue", "enqueue": enqueue}
+    event_id = enqueue.get("event_id")
 
     deadline = time.time() + test.timeout_seconds
     last_status: dict[str, Any] = {}
     last_messages: list[dict[str, Any]] = []
     last_new_messages: list[dict[str, Any]] = []
+    event_was_processed = False
     while time.time() < deadline:
         time.sleep(args.poll_interval)
         last_status = request_json(args.status_url, timeout=10)
+        event_was_processed = event_was_processed or event_processed(last_status, event_id)
         messages = get_messages(args.rest_webhook_url, args.dialog_id)
         last_messages = messages
         new_messages = [
             message for message in messages if message_id(message) is not None and message_id(message) not in before_ids
         ]
         if not new_messages:
+            continue
+        if not event_was_processed:
             continue
         last_new_messages = new_messages
 
@@ -237,7 +252,8 @@ def run_test(args: argparse.Namespace, *, run_id: str, test: TestCase) -> dict[s
             "kind": test.kind,
             "ok": ok,
             "stage": "response",
-            "event_id": enqueue.get("event_id"),
+            "event_id": event_id,
+            "event_processed": event_was_processed,
             "new_message_ids": [message_id(message) for message in new_messages],
             "new_message_count": len(new_messages),
             "response_message_ids": [message_id(message) for message in response_messages],
@@ -254,12 +270,43 @@ def run_test(args: argparse.Namespace, *, run_id: str, test: TestCase) -> dict[s
         "kind": test.kind,
         "ok": False,
         "stage": "timeout",
-        "event_id": enqueue.get("event_id"),
+        "event_id": event_id,
+        "event_processed": event_was_processed,
         "last_message_count": len(last_messages),
         "last_new_message_ids": [message_id(message) for message in last_new_messages],
         "last_new_response_preview": "\n".join(message_text(message) for message in last_new_messages)[:1200],
         "worker_latest": compact_status(last_status),
     }
+
+
+def wait_queue_idle(status_url: str, *, timeout_seconds: float, poll_interval: float = 3.0) -> dict[str, Any]:
+    deadline = time.time() + timeout_seconds
+    last_status: dict[str, Any] = {}
+    while time.time() < deadline:
+        last_status = request_json(status_url, timeout=10)
+        if queue_is_idle(last_status):
+            return {"ok": True, "status": last_status}
+        time.sleep(poll_interval)
+    return {"ok": False, "status": last_status}
+
+
+def queue_is_idle(status: dict[str, Any]) -> bool:
+    queue = status.get("queue") if isinstance(status.get("queue"), dict) else {}
+    return int(queue.get("pending") or 0) == 0 and int(queue.get("processing") or 0) == 0
+
+
+def event_processed(status: dict[str, Any], event_id: object) -> bool:
+    if event_id in (None, ""):
+        return True
+    normalized = str(event_id)
+    latest = status.get("latest_events") if isinstance(status.get("latest_events"), list) else []
+    for item in latest:
+        if not isinstance(item, dict) or str(item.get("id") or "") != normalized:
+            continue
+        return str(item.get("status") or "").casefold() in {"done", "failed"}
+    worker = status.get("worker") if isinstance(status.get("worker"), dict) else {}
+    queue_idle = queue_is_idle(status)
+    return queue_idle and str(worker.get("last_event_id") or "") == normalized
 
 
 def matching_response_messages(messages: list[dict[str, Any]], test: TestCase) -> list[dict[str, Any]]:
@@ -329,6 +376,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--suite", choices=["all", *sorted(SAFE_TESTS)], default="all")
     parser.add_argument("--include-draft", action="store_true", help="Also run the stateful local draft test.")
     parser.add_argument("--poll-interval", type=float, default=3.0)
+    parser.add_argument("--preflight-idle-timeout", type=float, default=120.0)
     return parser
 
 
