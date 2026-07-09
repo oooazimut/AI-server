@@ -4,7 +4,9 @@ import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from ai_server.agents.bitrix24.tools.read_client import resolve_current_user_read_client
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
+from ai_server.integrations.bitrix.oauth import BitrixOAuthService
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.tools.bitrix_ports import BitrixToolClientPort
 from ai_server.tools.bitrix_search import PortalSearchPort
@@ -17,9 +19,11 @@ class BitrixWarehouseSearchTool:
         self,
         client: BitrixToolClientPort | None = None,
         portal_search: PortalSearchPort | None = None,
+        bitrix_oauth: BitrixOAuthService | None = None,
     ) -> None:
         self._client = client
         self._portal_search = portal_search
+        self._bitrix_oauth = bitrix_oauth
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -77,8 +81,17 @@ class BitrixWarehouseSearchTool:
         if snapshot_data is not None:
             return ToolResult(status=ToolStatus.OK, tool=self.name, data=snapshot_data)
 
+        read_client, access_actor, access_error = await resolve_current_user_read_client(
+            self.name,
+            fallback_client=self._client,
+            bitrix_oauth=self._bitrix_oauth,
+            user_id=user_id,
+        )
+        if access_error is not None:
+            return access_error
+
         try:
-            raw_stores = await self._client.result("catalog.store.list", {})
+            raw_stores = await read_client.result("catalog.store.list", {})
         except (BitrixApiError, BitrixConfigError) as exc:
             return ToolResult(
                 status=ToolStatus.NOT_CONFIGURED if isinstance(exc, BitrixConfigError) else ToolStatus.ERROR,
@@ -91,6 +104,8 @@ class BitrixWarehouseSearchTool:
         matches = _match_stores(stores, query=query, limit=limit)
         data: dict[str, Any] = {
             "query": query,
+            "source": "live_bitrix_rest",
+            "access_actor": access_actor,
             "matches": matches,
             "total_stores_seen": len(stores),
             "summary": _stores_summary(matches, query=query),
@@ -98,7 +113,12 @@ class BitrixWarehouseSearchTool:
 
         if include_products and matches:
             store_id = matches[0].get("id")
-            products_result = await self._store_products(store_id, limit=product_limit, offset=product_offset)
+            products_result = await self._store_products(
+                read_client,
+                store_id,
+                limit=product_limit,
+                offset=product_offset,
+            )
             data["products"] = products_result
 
         return ToolResult(status=ToolStatus.OK, tool=self.name, data=data)
@@ -200,8 +220,15 @@ class BitrixWarehouseSearchTool:
             "source": "postgres_portal_snapshot",
         }
 
-    async def _store_products(self, store_id: object, *, limit: int, offset: int = 0) -> dict[str, Any]:
-        if store_id in (None, "") or self._client is None:
+    async def _store_products(
+        self,
+        client: BitrixToolClientPort,
+        store_id: object,
+        *,
+        limit: int,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        if store_id in (None, ""):
             return {"status": "not_available", "items": [], "message": "store id is missing"}
 
         params = {
@@ -209,7 +236,7 @@ class BitrixWarehouseSearchTool:
             "select": ["storeId", "productId", "amount"],
         }
         try:
-            raw = await self._client.result("catalog.storeproduct.list", params)
+            raw = await client.result("catalog.storeproduct.list", params)
         except (BitrixApiError, BitrixConfigError) as exc:
             return {
                 "status": "error",
@@ -223,7 +250,7 @@ class BitrixWarehouseSearchTool:
             row for row in rows if _positive_amount(_first(row, "amount", "AMOUNT", "quantity", "QUANTITY")) is not None
         ]
         product_ids = [_first(row, "productId", "PRODUCT_ID", "product_id") for row in available_rows]
-        product_details = await self._product_details([pid for pid in product_ids if pid not in (None, "")])
+        product_details = await self._product_details(client, [pid for pid in product_ids if pid not in (None, "")])
 
         named_items = []
         missing_name_count = 0
@@ -259,11 +286,13 @@ class BitrixWarehouseSearchTool:
             "has_more": offset + len(items) < len(named_items),
         }
 
-    async def _product_details(self, product_ids: list[object]) -> dict[str, dict[str, Any]]:
-        if not product_ids or self._client is None:
+    async def _product_details(
+        self, client: BitrixToolClientPort, product_ids: list[object]
+    ) -> dict[str, dict[str, Any]]:
+        if not product_ids:
             return {}
         try:
-            raw = await self._client.result(
+            raw = await client.result(
                 "catalog.product.list",
                 {"filter": {"id": product_ids}, "select": ["id", "iblockId", "name"]},
             )
@@ -278,16 +307,14 @@ class BitrixWarehouseSearchTool:
                 details[str(product_id)] = detail
         missing_ids = [product_id for product_id in product_ids if str(product_id) not in details]
         for product_id in missing_ids[:10]:
-            detail = await self._product_detail(product_id)
+            detail = await self._product_detail(client, product_id)
             if detail.get("name"):
                 details[str(product_id)] = detail
         return details
 
-    async def _product_detail(self, product_id: object) -> dict[str, Any]:
-        if self._client is None:
-            return {}
+    async def _product_detail(self, client: BitrixToolClientPort, product_id: object) -> dict[str, Any]:
         try:
-            raw = await self._client.result("catalog.product.get", {"id": product_id})
+            raw = await client.result("catalog.product.get", {"id": product_id})
         except (BitrixApiError, BitrixConfigError):
             return {}
         if isinstance(raw, dict):

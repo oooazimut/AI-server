@@ -10,8 +10,9 @@ from ai_server.agents.bitrix24.tools.bitrix_api import (
     _match_sonet_groups,
     _normalize_project_name,
 )
+from ai_server.agents.bitrix24.tools.read_client import resolve_current_user_read_client
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
-from ai_server.integrations.bitrix.oauth import BitrixOAuthError, BitrixOAuthService, BitrixOAuthTokenMissing
+from ai_server.integrations.bitrix.oauth import BitrixOAuthService
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.tools.bitrix_ports import BitrixToolClientPort
 from ai_server.tools.bitrix_search import PortalSearchPort
@@ -46,58 +47,6 @@ TASK_SELECT = [
 ]
 DEFAULT_COMMENT_LOOKUP_TASK_LIMIT = 50
 MAX_COMMENT_LOOKUP_TASK_LIMIT = 200
-
-
-async def _resolve_current_user_read_client(
-    tool_name: str,
-    *,
-    fallback_client: BitrixToolClientPort | None,
-    bitrix_oauth: BitrixOAuthService | None,
-    user_id: int | None,
-) -> tuple[BitrixToolClientPort, str, ToolResult | None]:
-    if bitrix_oauth is None:
-        if fallback_client is None:
-            return (
-                _MissingBitrixClient(),
-                "none",
-                ToolResult(status=ToolStatus.NOT_CONFIGURED, tool=tool_name, error="BitrixClient is not injected"),
-            )
-        return fallback_client, "configured_client", None
-
-    if user_id is None:
-        return (
-            _MissingBitrixClient(),
-            "none",
-            ToolResult(
-                status=ToolStatus.DENIED,
-                tool=tool_name,
-                error="Bitrix read denied: current Bitrix user_id is missing.",
-            ),
-        )
-
-    try:
-        return await bitrix_oauth.client_for_user(user_id), "oauth_current_user", None
-    except BitrixOAuthTokenMissing as exc:
-        return (
-            _MissingBitrixClient(),
-            "none",
-            ToolResult(
-                status=ToolStatus.DENIED,
-                tool=tool_name,
-                error=f"Bitrix read denied: OAuth token for user {exc.user_id} is missing.",
-            ),
-        )
-    except (BitrixOAuthError, BitrixConfigError) as exc:
-        return (
-            _MissingBitrixClient(),
-            "none",
-            ToolResult(status=ToolStatus.ERROR, tool=tool_name, error=f"Bitrix OAuth read client failed: {exc}"),
-        )
-
-
-class _MissingBitrixClient:
-    async def result(self, method: str, params: dict[str, Any]) -> Any:
-        raise BitrixConfigError("BitrixClient is not injected")
 
 
 class BitrixMyTasksTool:
@@ -168,7 +117,7 @@ class BitrixMyTasksTool:
             {"role_source": "created_by", "filter": {**_status_filter(status), "CREATED_BY": user_id}},
         ]
 
-        read_client, access_actor, access_error = await _resolve_current_user_read_client(
+        read_client, access_actor, access_error = await resolve_current_user_read_client(
             self.name,
             fallback_client=self._client,
             bitrix_oauth=self._bitrix_oauth,
@@ -327,7 +276,7 @@ class BitrixTaskSearchTool:
 
         task_id = _safe_int(args.get("task_id") or args.get("id") or args.get("ID"))
         if task_id is not None:
-            read_client, access_actor, access_error = await _resolve_current_user_read_client(
+            read_client, access_actor, access_error = await resolve_current_user_read_client(
                 self.name,
                 fallback_client=self._client,
                 bitrix_oauth=self._bitrix_oauth,
@@ -369,7 +318,7 @@ class BitrixTaskSearchTool:
         errors: list[dict[str, str]] = []
 
         if project_id is None and project_query:
-            read_client, access_actor, access_error = await _resolve_current_user_read_client(
+            read_client, access_actor, access_error = await resolve_current_user_read_client(
                 self.name,
                 fallback_client=self._client,
                 bitrix_oauth=self._bitrix_oauth,
@@ -427,7 +376,7 @@ class BitrixTaskSearchTool:
         if snapshot_result is not None:
             return snapshot_result
 
-        read_client, access_actor, access_error = await _resolve_current_user_read_client(
+        read_client, access_actor, access_error = await resolve_current_user_read_client(
             self.name,
             fallback_client=self._client,
             bitrix_oauth=self._bitrix_oauth,
@@ -801,7 +750,7 @@ class BitrixProjectSearchTool:
                     "errors": [],
                 },
             )
-        read_client, access_actor, access_error = await _resolve_current_user_read_client(
+        read_client, access_actor, access_error = await resolve_current_user_read_client(
             self.name,
             fallback_client=self._client,
             bitrix_oauth=self._bitrix_oauth,

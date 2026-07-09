@@ -140,7 +140,11 @@ class Bitrix24Specialist(BaseSpecialist):
         _settings = settings or get_settings()
         tools: list[AgentTool] = [
             PortalSearchTool(portal_search=portal_search_index, bitrix_files=bitrix_client),
-            BitrixWarehouseSearchTool(client=bitrix_client, portal_search=portal_search_index),
+            BitrixWarehouseSearchTool(
+                client=bitrix_client,
+                portal_search=portal_search_index,
+                bitrix_oauth=bitrix_oauth,
+            ),
             BitrixMyTasksTool(client=bitrix_client, bitrix_oauth=bitrix_oauth),
             BitrixTaskSearchTool(
                 client=bitrix_client,
