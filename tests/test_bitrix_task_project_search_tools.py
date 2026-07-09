@@ -280,6 +280,71 @@ def test_task_search_uses_snapshot_for_comment_query():
     assert client.calls == []
 
 
+def test_task_search_snapshot_uses_oauth_actor_before_returning_index_data():
+    fallback_client = _FakeBitrixSearchClient()
+    oauth_client = _FakeBitrixSearchClient()
+    oauth = _FakeBitrixOAuth(oauth_client)
+    index = _FakePortalTaskIndex(
+        [
+            SimpleNamespace(
+                entity_id="65",
+                title="Bot stable check",
+                body="РљРѕРјРјРµРЅС‚Р°СЂРёРё:\n- bot stable after fix",
+                score=62,
+                url="https://example.test/tasks/65",
+                metadata={"status": "5", "responsible_id": "13", "created_by": "9"},
+            )
+        ]
+    )
+    tool = BitrixTaskSearchTool(client=fallback_client, portal_search=index, bitrix_oauth=oauth)
+
+    result = anyio.run(
+        lambda: tool.execute(
+            {"scope": "member", "status": "closed", "include_closed": True, "comment_query": "bot stable"},
+            user_id=13,
+        )
+    )
+
+    assert result.status == "ok"
+    assert result.data["source"] == "postgres_portal_snapshot"
+    assert result.data["access_actor"] == "oauth_current_user"
+    assert oauth.user_ids == [13]
+    assert fallback_client.calls == []
+    assert oauth_client.calls == []
+
+
+def test_task_search_snapshot_oauth_denies_without_user_id():
+    fallback_client = _FakeBitrixSearchClient()
+    oauth_client = _FakeBitrixSearchClient()
+    index = _FakePortalTaskIndex(
+        [
+            SimpleNamespace(
+                entity_id="65",
+                title="Bot stable check",
+                body="РљРѕРјРјРµРЅС‚Р°СЂРёРё:\n- bot stable after fix",
+                score=62,
+                url="https://example.test/tasks/65",
+                metadata={"status": "5", "responsible_id": "13", "created_by": "9"},
+            )
+        ]
+    )
+    tool = BitrixTaskSearchTool(
+        client=fallback_client,
+        portal_search=index,
+        bitrix_oauth=_FakeBitrixOAuth(oauth_client),
+    )
+
+    result = anyio.run(
+        lambda: tool.execute(
+            {"scope": "member", "status": "closed", "include_closed": True, "comment_query": "bot stable"}
+        )
+    )
+
+    assert result.status == "denied"
+    assert fallback_client.calls == []
+    assert oauth_client.calls == []
+
+
 def test_task_search_does_not_use_snapshot_for_all_scope():
     client = _FakeBitrixSearchClient()
     index = _FakePortalTaskIndex(
