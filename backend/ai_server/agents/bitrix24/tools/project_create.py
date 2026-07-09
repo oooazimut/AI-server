@@ -66,7 +66,7 @@ def build_project_create_draft_from_args(
         if not personal_for_self:
             errors.append("regular users may prepare only their own personal project")
         elif not _same_personal_project_name(name, actor_label):
-            errors.append("personal project name must match the current user's Bitrix name")
+            errors.append("personal project name must match the current user's Bitrix surname and name")
     if subject_id is None:
         errors.append("project_create_draft.subject_id is required")
     if owner_id is None:
@@ -87,7 +87,7 @@ def build_project_create_draft_from_args(
     fields["SPAM_PERMS"] = "K"
 
     if personal_for_self:
-        notes.append("Личный проект: имя должно совпадать с ФИО текущего пользователя Bitrix.")
+        notes.append("Личный проект: имя должно совпадать с фамилией и именем текущего пользователя Bitrix.")
     if not actor_is_admin:
         notes.append("Обычный пользователь не может создавать произвольные проекты.")
 
@@ -328,11 +328,19 @@ def _draft_preview(fields: dict[str, Any], *, personal_for_self: bool) -> dict[s
 def _same_personal_project_name(name: str, actor_name: str) -> bool:
     if not name or not actor_name:
         return False
-    return _normalize_person_name(name) == _normalize_person_name(actor_name)
+    candidate = _normalize_person_tokens(name)
+    actor = _normalize_person_tokens(actor_name)
+    if not candidate or not actor:
+        return False
+    if candidate == actor:
+        return True
+    if len(actor) >= 2 and candidate == actor[:2]:
+        return True
+    return len(actor) >= 2 and candidate == [actor[1], actor[0]]
 
 
-def _normalize_person_name(value: str) -> str:
-    return " ".join(compact_text(value).replace("ё", "е").casefold().split())
+def _normalize_person_tokens(value: str) -> list[str]:
+    return compact_text(value).replace("ё", "е").casefold().split()
 
 
 def _write_context_error(*, user_id: int | None, dialog_id: str | None, action: str) -> str:
