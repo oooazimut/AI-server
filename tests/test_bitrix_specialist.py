@@ -294,6 +294,33 @@ def test_bitrix_llm_decide_routes_project_search_to_deterministic_tool(monkeypat
     assert result.decision.tool_calls[0].args == {"query": "Ларгус 2", "limit": 10}
 
 
+def test_bitrix_llm_decide_routes_hyphenated_project_search_to_deterministic_tool(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient(
+        json.dumps(
+            {
+                "status": "completed",
+                "answer": "",
+                "confidence": 0.2,
+                "tool_calls": [{"name": "none", "args": {}}],
+            }
+        )
+    )
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t1", request="Битрикс найди проект Ларгус-2.", user={"id": "13"}),
+            retrieval_hits=[],
+            tool_definitions=_bitrix_read_tool_definitions(),
+        )
+    )
+
+    assert [call.name for call in result.decision.tool_calls] == ["bitrix_project_search"]
+    assert result.decision.tool_calls[0].args == {"query": "Ларгус-2", "limit": 10}
+
+
 def test_bitrix_specialist_passes_user_profile_and_permission_rag_to_llm():
     llm = FakeBitrixLLM()
     tools = FakeResolverTools(
