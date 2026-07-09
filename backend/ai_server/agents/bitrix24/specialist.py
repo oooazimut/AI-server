@@ -147,7 +147,11 @@ class Bitrix24Specialist(BaseSpecialist):
                 portal_search=portal_search_index,
                 bitrix_oauth=bitrix_oauth,
             ),
-            BitrixProjectSearchTool(client=bitrix_client, portal_search=portal_search_index),
+            BitrixProjectSearchTool(
+                client=bitrix_client,
+                portal_search=portal_search_index,
+                bitrix_oauth=bitrix_oauth,
+            ),
             BitrixApiTool(
                 client=bitrix_client,
                 write_client=bitrix_client,

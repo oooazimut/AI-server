@@ -498,6 +498,36 @@ def test_project_search_resolves_hyphenated_project_name():
     ]
 
 
+def test_project_search_uses_oauth_client_for_live_current_user_reads():
+    fallback_client = _FakeBitrixSearchClient()
+    oauth_client = _FakeBitrixSearchClient()
+    oauth = _FakeBitrixOAuth(oauth_client)
+    tool = BitrixProjectSearchTool(client=fallback_client, bitrix_oauth=oauth)
+
+    result = anyio.run(lambda: tool.execute({"query": "Ларгус-2"}, user_id=13))
+
+    assert result.status == "ok"
+    assert result.data["access_actor"] == "oauth_current_user"
+    assert oauth.user_ids == [13]
+    assert fallback_client.calls == []
+    assert oauth_client.calls == [
+        ("sonet_group.get", {"FILTER": {"%NAME": "Ларгус-2"}, "ORDER": {"NAME": "ASC"}}),
+        ("sonet_group.get", {"FILTER": {}, "ORDER": {"NAME": "ASC"}}),
+    ]
+
+
+def test_project_search_oauth_read_denies_live_lookup_without_user_id():
+    fallback_client = _FakeBitrixSearchClient()
+    oauth_client = _FakeBitrixSearchClient()
+    tool = BitrixProjectSearchTool(client=fallback_client, bitrix_oauth=_FakeBitrixOAuth(oauth_client))
+
+    result = anyio.run(lambda: tool.execute({"query": "Ларгус-2"}))
+
+    assert result.status == "denied"
+    assert fallback_client.calls == []
+    assert oauth_client.calls == []
+
+
 def test_project_search_uses_snapshot_before_live_bitrix():
     client = _FakeBitrixSearchClient()
     index = FakePortalSearchIndex()

@@ -730,9 +730,11 @@ class BitrixProjectSearchTool:
         self,
         client: BitrixToolClientPort | None = None,
         portal_search: PortalSearchPort | None = None,
+        bitrix_oauth: BitrixOAuthService | None = None,
     ) -> None:
         self._client = client
         self._portal_search = portal_search
+        self._bitrix_oauth = bitrix_oauth
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -799,19 +801,21 @@ class BitrixProjectSearchTool:
                     "errors": [],
                 },
             )
-        if self._client is None:
-            return ToolResult(
-                status=ToolStatus.NOT_CONFIGURED,
-                tool=self.name,
-                error="BitrixClient is not injected and project was not found in PortalSearchIndex",
-                data={"query": query},
-            )
-        matches, errors = await _search_projects(self._client, query, limit=limit)
+        read_client, access_actor, access_error = await _resolve_current_user_read_client(
+            self.name,
+            fallback_client=self._client,
+            bitrix_oauth=self._bitrix_oauth,
+            user_id=user_id,
+        )
+        if access_error is not None:
+            return access_error
+        matches, errors = await _search_projects(read_client, query, limit=limit)
         return ToolResult(
             status=ToolStatus.OK,
             tool=self.name,
             data={
                 "source": "live_bitrix_rest",
+                "access_actor": access_actor,
                 "query": query,
                 "items": [_project_summary(group) for group in matches],
                 "total": len(matches),
