@@ -71,6 +71,8 @@ class Settings:
     search_index_disk_max_depth: int
     search_index_include_disk: bool
     search_index_include_task_attachments: bool
+    search_index_include_task_comments: bool
+    search_index_task_comment_limit: int
     search_index_include_catalog: bool
     search_index_max_catalog_products: int
     search_content_enabled: bool
@@ -422,6 +424,8 @@ def get_settings() -> Settings:
         search_index_disk_max_depth=_env_int("SEARCH_INDEX_DISK_MAX_DEPTH", 6) or 6,
         search_index_include_disk=_env_bool("SEARCH_INDEX_INCLUDE_DISK", True),
         search_index_include_task_attachments=_env_bool("SEARCH_INDEX_INCLUDE_TASK_ATTACHMENTS", True),
+        search_index_include_task_comments=_env_bool("SEARCH_INDEX_INCLUDE_TASK_COMMENTS", True),
+        search_index_task_comment_limit=_env_int("SEARCH_INDEX_TASK_COMMENT_LIMIT", 20) or 20,
         search_index_include_catalog=_env_bool("SEARCH_INDEX_INCLUDE_CATALOG", True),
         search_index_max_catalog_products=_env_int("SEARCH_INDEX_MAX_CATALOG_PRODUCTS", 5000) or 5000,
         search_content_enabled=_env_bool("SEARCH_CONTENT_ENABLED", True),

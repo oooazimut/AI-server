@@ -152,10 +152,17 @@ def test_portal_metadata_sync_indexes_tasks_projects_and_disk(monkeypatch):
     assert stats.projects == 1
     assert stats.task_attachments == 1
     assert stats.disk_items == 3
-    assert index.get_item(entity_type="task", entity_id=202) is not None
+    task = index.get_item(entity_type="task", entity_id=202)
+    assert task is not None
+    assert "понаблюдать" in task.body.casefold()
+    assert "вы добавлены наблюдателем" not in task.body.casefold()
+    assert task.metadata["comments_indexed"] is True
+    assert task.metadata["comments_count"] == 1
+    assert task.metadata["responsible_label"] == "Марат"
     assert index.get_item(entity_type="project", entity_id=17) is not None
     assert index.get_item(entity_type="disk_file", entity_id=501) is not None
     assert index.search("план склад", entity_types={"disk_file"})
+    assert index.search("понаблюдать", entity_types={"task"})
 
 
 def test_portal_delta_sync_updates_folder_and_deletes_missing_children(monkeypatch):
@@ -270,13 +277,29 @@ class FakePortalBitrix:
                 "DESCRIPTION": "IP-камера, регистратор и склад",
                 "STATUS": 2,
                 "RESPONSIBLE_ID": 9,
+                "RESPONSIBLE": {"name": "Марат"},
                 "CREATED_BY": 1,
+                "CREATOR": {"name": "Валерий Кулинич"},
                 "GROUP_ID": 17,
                 "DEADLINE": "2026-06-10T09:00:00+03:00",
+                "CREATED_DATE": "2026-06-01T09:00:00+03:00",
                 "CHANGED_DATE": "2026-06-02T09:00:00+03:00",
+                "ACCOMPLICES": [11],
+                "AUDITORS": [13],
                 "UF_TASK_WEBDAV_FILES": ["n701"],
             }
         ]
+
+    async def result(self, method: str, payload: dict):
+        if method == "task.commentitem.getlist":
+            assert payload["TASKID"] == 202
+            return {
+                "result": [
+                    {"POST_MESSAGE": "[USER=13]Дмитрий[/USER], вы добавлены наблюдателем."},
+                    {"POST_MESSAGE": "[B]Внес изменения[/B], нужно понаблюдать хотя бы до завтра."},
+                ]
+            }
+        raise AssertionError(method)
 
     async def get_attached_object(self, attached_object_id: int):
         return {

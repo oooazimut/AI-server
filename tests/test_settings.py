@@ -135,3 +135,22 @@ def test_technical_footer_allowed_user_ids(monkeypatch):
     settings = get_settings()
 
     assert settings.resolved_tech_footer_allowed_user_ids == [1, 9]
+
+
+def test_search_index_task_comment_settings(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.delenv("SEARCH_INDEX_INCLUDE_TASK_COMMENTS", raising=False)
+    monkeypatch.delenv("SEARCH_INDEX_TASK_COMMENT_LIMIT", raising=False)
+
+    defaults = get_settings()
+
+    assert defaults.search_index_include_task_comments is True
+    assert defaults.search_index_task_comment_limit == 20
+
+    monkeypatch.setenv("SEARCH_INDEX_INCLUDE_TASK_COMMENTS", "false")
+    monkeypatch.setenv("SEARCH_INDEX_TASK_COMMENT_LIMIT", "5")
+
+    overridden = get_settings()
+
+    assert overridden.search_index_include_task_comments is False
+    assert overridden.search_index_task_comment_limit == 5
