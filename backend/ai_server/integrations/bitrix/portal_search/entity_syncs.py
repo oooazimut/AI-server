@@ -4,7 +4,7 @@ import html
 import re
 from datetime import datetime
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.portal_search.file_cache import delete_portal_file_cache_path, portal_file_cache_path
@@ -23,6 +23,7 @@ _BITRIX_PAIRED_TAG_RE = re.compile(
 )
 _BITRIX_SINGLE_TAG_RE = re.compile(r"\[/?[A-Z][A-Z0-9_]*(?:=[^\]]*)?\]", re.IGNORECASE)
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
+_BITRIX_BATCH_COMMENT_SIZE = 50
 
 
 def _first(data: dict[str, Any], *keys: str) -> object | None:
@@ -51,10 +52,47 @@ async def _task_comment_texts(bitrix: BitrixClient, task_id: object, *, limit: i
         result = await bitrix.result("task.commentitem.getlist", {"TASKID": task_id})
     except Exception:
         return []
+    return _comment_texts_from_result(result, limit=limit)
+
+
+async def _task_comments_by_id(
+    bitrix: BitrixClient,
+    task_ids: list[object],
+    *,
+    limit: int,
+) -> dict[str, list[str]]:
+    if limit <= 0:
+        return {}
+    unique_ids = list(dict.fromkeys(str(task_id) for task_id in task_ids if task_id is not None))
+    comments_by_id: dict[str, list[str]] = {}
+    for offset in range(0, len(unique_ids), _BITRIX_BATCH_COMMENT_SIZE):
+        chunk = unique_ids[offset : offset + _BITRIX_BATCH_COMMENT_SIZE]
+        cmd = {
+            f"task_{index}": "task.commentitem.getlist?" + urlencode({"TASKID": task_id})
+            for index, task_id in enumerate(chunk)
+        }
+        try:
+            batch_result = await bitrix.result("batch", {"halt": 0, "cmd": cmd})
+        except Exception:
+            for task_id in chunk:
+                comments_by_id[task_id] = await _task_comment_texts(bitrix, task_id, limit=limit)
+            continue
+
+        results = batch_result.get("result") if isinstance(batch_result, dict) else None
+        if not isinstance(results, dict):
+            for task_id in chunk:
+                comments_by_id[task_id] = []
+            continue
+        for index, task_id in enumerate(chunk):
+            comments_by_id[task_id] = _comment_texts_from_result(results.get(f"task_{index}"), limit=limit)
+    return comments_by_id
+
+
+def _comment_texts_from_result(result: Any, *, limit: int) -> list[str]:
     texts: list[str] = []
     for comment in _extract_comments(result):
         text = _comment_text(comment)
-        if not text or _is_system_comment_text(text):
+        if not text:
             continue
         texts.append(text)
         if len(texts) >= limit:
@@ -78,20 +116,21 @@ def _extract_comments(result: Any) -> list[dict[str, Any]]:
 
 
 def _comment_text(comment: dict[str, Any]) -> str:
-    return _clean_bitrix_text(
+    return _clean_bitrix_comment_text(
         to_str(_first(comment, "POST_MESSAGE", "POST_MESSAGE_HTML", "POST_MESSAGE_TEXT", "text", "message")) or ""
     )
 
 
-def _clean_bitrix_text(value: object) -> str:
-    text = html.unescape(str(value or ""))
+def _clean_bitrix_comment_text(value: object) -> str:
+    text = html.unescape(str(value or "")).replace("\r\n", "\n").replace("\r", "\n")
     previous = None
     while previous != text:
         previous = text
         text = _BITRIX_PAIRED_TAG_RE.sub(r"\2", text)
     text = _BITRIX_SINGLE_TAG_RE.sub("", text)
     text = _HTML_TAG_RE.sub("", text)
-    return " ".join(text.split())
+    lines = [" ".join(line.split()) for line in text.split("\n")]
+    return "\n".join(line for line in lines if line and not _is_system_comment_text(line))
 
 
 def _is_system_comment_text(text: str) -> bool:
@@ -109,8 +148,12 @@ def _is_system_comment_text(text: str) -> bool:
     system_fragments = (
         "вы добавлены наблюдателем",
         "вы назначены исполнителем",
+        "вы назначены соисполнителем",
+        "задача просрочена",
         "задача почти просрочена",
         "завершите задачу или передвиньте срок",
+        "необходимо указать крайний срок",
+        "необходимо принять задачу или отправить на доработку",
     )
     return any(fragment in normalized for fragment in system_fragments)
 
@@ -275,16 +318,21 @@ async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: 
     )
     indexed_attachments = 0
     seen_attachments: set[int] = set()
+    comments_by_task_id = (
+        await _task_comments_by_id(
+            bitrix,
+            [_first(task, "id", "ID") for task in tasks],
+            limit=settings.search_index_task_comment_limit,
+        )
+        if settings.search_index_include_task_comments
+        else {}
+    )
     for task in tasks:
         task_id = _first(task, "id", "ID")
         if task_id is None:
             continue
         title = str(_first(task, "title", "TITLE") or "Без названия")
-        comments = (
-            await _task_comment_texts(bitrix, task_id, limit=settings.search_index_task_comment_limit)
-            if settings.search_index_include_task_comments
-            else []
-        )
+        comments = comments_by_task_id.get(str(task_id), [])
         responsible_label = _person_label(_first(task, "responsible", "RESPONSIBLE"))
         creator_label = _person_label(_first(task, "creator", "CREATOR"))
         responsible = responsible_label or to_str(_first(task, "responsibleId", "RESPONSIBLE_ID"))

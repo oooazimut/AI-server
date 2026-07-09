@@ -163,6 +163,7 @@ def test_portal_metadata_sync_indexes_tasks_projects_and_disk(monkeypatch):
     assert index.get_item(entity_type="disk_file", entity_id=501) is not None
     assert index.search("план склад", entity_types={"disk_file"})
     assert index.search("понаблюдать", entity_types={"task"})
+    assert any(method == "batch" for method, _payload in bitrix.calls)
 
 
 def test_portal_delta_sync_updates_folder_and_deletes_missing_children(monkeypatch):
@@ -269,6 +270,9 @@ def test_search_webhook_indexer_upserts_and_deletes_file(monkeypatch):
 
 
 class FakePortalBitrix:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
     async def list_all_tasks(self, **kwargs):
         return [
             {
@@ -291,14 +295,23 @@ class FakePortalBitrix:
         ]
 
     async def result(self, method: str, payload: dict):
-        if method == "task.commentitem.getlist":
-            assert payload["TASKID"] == 202
+        self.calls.append((method, payload))
+        if method == "batch":
+            assert "task_0" in payload["cmd"]
+            assert "TASKID=202" in payload["cmd"]["task_0"]
             return {
-                "result": [
-                    {"POST_MESSAGE": "[USER=13]Дмитрий[/USER], вы добавлены наблюдателем."},
-                    {"POST_MESSAGE": "[B]Внес изменения[/B], нужно понаблюдать хотя бы до завтра."},
-                ]
+                "result": {
+                    "task_0": [
+                        {
+                            "POST_MESSAGE": "[USER=13]Дмитрий[/USER], вы добавлены наблюдателем.\nНеобходимо указать крайний срок, иначе задача не будет выполнена вовремя."
+                        },
+                        {"POST_MESSAGE": "[B]Внес изменения[/B], нужно понаблюдать хотя бы до завтра."},
+                    ]
+                },
+                "result_error": [],
             }
+        if method == "task.commentitem.getlist":
+            raise AssertionError("comment sync should use batch")
         raise AssertionError(method)
 
     async def get_attached_object(self, attached_object_id: int):
