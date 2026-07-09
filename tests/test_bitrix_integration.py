@@ -315,6 +315,41 @@ def test_bitrix_warehouse_search_tool_finds_store_and_products():
     assert any(method == "catalog.storeproduct.list" for method, _ in fake_bitrix.calls)
 
 
+def test_bitrix_warehouse_search_tool_uses_oauth_client_for_live_reads():
+    fallback_bitrix = FakeBitrixClient()
+    oauth_bitrix = FakeBitrixClient()
+    oauth = FakeBitrixOAuth(oauth_bitrix)
+    tool = BitrixWarehouseSearchTool(client=fallback_bitrix, bitrix_oauth=oauth)
+
+    result = anyio_run(
+        tool.execute(
+            {"query": "Borisov warehouse", "include_products": True, "limit": 5, "product_limit": 5},
+            user_id=13,
+        )
+    )
+
+    assert result.status == ToolStatus.OK
+    assert result.data["source"] == "live_bitrix_rest"
+    assert result.data["access_actor"] == "oauth_current_user"
+    assert oauth.user_ids == [13]
+    assert fallback_bitrix.calls == []
+    assert ("catalog.store.list", {}) in oauth_bitrix.calls
+    assert any(method == "catalog.storeproduct.list" for method, _ in oauth_bitrix.calls)
+    assert any(method == "catalog.product.list" for method, _ in oauth_bitrix.calls)
+
+
+def test_bitrix_warehouse_search_tool_oauth_read_denies_live_lookup_without_user_id():
+    fallback_bitrix = FakeBitrixClient()
+    oauth_bitrix = FakeBitrixClient()
+    tool = BitrixWarehouseSearchTool(client=fallback_bitrix, bitrix_oauth=FakeBitrixOAuth(oauth_bitrix))
+
+    result = anyio_run(tool.execute({"query": "Borisov warehouse", "include_products": True}))
+
+    assert result.status == ToolStatus.DENIED
+    assert fallback_bitrix.calls == []
+    assert oauth_bitrix.calls == []
+
+
 def test_bitrix_warehouse_search_tool_uses_stock_snapshot_before_live_bitrix():
     fake_bitrix = FakeBitrixClient()
     index = FakePortalSearchIndex()
