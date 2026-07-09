@@ -142,6 +142,7 @@ def test_bitrix_specialist_uses_portal_search_for_document_requests():
 
 def test_portal_metadata_sync_indexes_tasks_projects_and_disk(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
     monkeypatch.setenv("SEARCH_INDEX_MAX_TASK_ATTACHMENTS", "10")
     index = FakePortalSearchIndex()
     bitrix = FakePortalBitrix()
@@ -151,6 +152,9 @@ def test_portal_metadata_sync_indexes_tasks_projects_and_disk(monkeypatch):
     assert stats.tasks == 1
     assert stats.projects == 1
     assert stats.task_attachments == 1
+    assert stats.catalog_products == 2
+    assert stats.catalog_stores == 1
+    assert stats.catalog_stock_rows == 1
     assert stats.disk_items == 3
     task = index.get_item(entity_type="task", entity_id=202)
     assert task is not None
@@ -160,9 +164,17 @@ def test_portal_metadata_sync_indexes_tasks_projects_and_disk(monkeypatch):
     assert task.metadata["comments_count"] == 1
     assert task.metadata["responsible_label"] == "Марат"
     assert index.get_item(entity_type="project", entity_id=17) is not None
+    stock = index.get_item(entity_type="catalog_store_stock", entity_id="12:1001")
+    assert stock is not None
+    assert stock.metadata["store_title"] == "Borisov warehouse"
+    assert stock.metadata["product_name"] == "Junction box"
+    assert stock.metadata["amount"] == "3"
+    assert stock.url == "https://asutp-expert.bitrix24.ru/shop/documents-catalog/7/product/1001/"
+    assert index.get_item(entity_type="catalog_store_stock", entity_id="12:1002") is None
     assert index.get_item(entity_type="disk_file", entity_id=501) is not None
     assert index.search("план склад", entity_types={"disk_file"})
     assert index.search("понаблюдать", entity_types={"task"})
+    assert index.search("Borisov Junction", entity_types={"catalog_store_stock"})
     assert any(method == "batch" for method, _payload in bitrix.calls)
 
 
@@ -336,6 +348,39 @@ class FakePortalBitrix:
                 "DATE_UPDATE": "2026-06-02T08:00:00+03:00",
             }
         ][:limit]
+
+    async def list_catalogs(self):
+        return [{"iblockId": 7}]
+
+    async def list_catalog_products(self, iblock_id: int, *, limit: int | None = None):
+        products = [
+            {
+                "id": 1001,
+                "iblockId": iblock_id,
+                "name": "Junction box",
+                "previewText": "Electrical catalog item",
+                "detailText": "",
+            },
+            {
+                "id": 1002,
+                "iblockId": iblock_id,
+                "name": "Selector",
+                "previewText": "",
+                "detailText": "",
+            },
+        ]
+        return products[:limit] if limit else products
+
+    async def list_catalog_stores(self, *, limit: int | None = None):
+        stores = [{"id": 12, "title": "Borisov warehouse", "address": "Russian, 8", "description": ""}]
+        return stores[:limit] if limit else stores
+
+    async def list_catalog_store_products(self, store_id: object, *, limit: int | None = None):
+        rows = [
+            {"storeId": store_id, "productId": 1001, "amount": "3"},
+            {"storeId": store_id, "productId": 1002, "amount": "0"},
+        ]
+        return rows[:limit] if limit else rows
 
     async def list_disk_storages(self, *, limit: int | None = None):
         storages = [{"ID": 10, "ROOT_OBJECT_ID": 500, "NAME": "Общий диск"}]

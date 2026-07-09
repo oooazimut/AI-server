@@ -75,6 +75,7 @@ class Settings:
     search_index_task_comment_limit: int
     search_index_include_catalog: bool
     search_index_max_catalog_products: int
+    search_index_max_catalog_stock_rows: int
     search_content_enabled: bool
     search_content_keep_local_files: bool
     search_content_max_files: int
@@ -428,6 +429,7 @@ def get_settings() -> Settings:
         search_index_task_comment_limit=_env_int("SEARCH_INDEX_TASK_COMMENT_LIMIT", 20) or 20,
         search_index_include_catalog=_env_bool("SEARCH_INDEX_INCLUDE_CATALOG", True),
         search_index_max_catalog_products=_env_int("SEARCH_INDEX_MAX_CATALOG_PRODUCTS", 5000) or 5000,
+        search_index_max_catalog_stock_rows=_env_int("SEARCH_INDEX_MAX_CATALOG_STOCK_ROWS", 20000) or 20000,
         search_content_enabled=_env_bool("SEARCH_CONTENT_ENABLED", True),
         search_content_keep_local_files=_env_bool("SEARCH_CONTENT_KEEP_LOCAL_FILES", False),
         search_content_max_files=_env_int("SEARCH_CONTENT_MAX_FILES", 80) or 80,

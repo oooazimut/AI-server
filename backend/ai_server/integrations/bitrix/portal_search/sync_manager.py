@@ -65,9 +65,13 @@ async def sync_portal_index(
             catalog_stats = await _sync_catalog(bitrix, index, settings)
             stats.catalog_products = catalog_stats["products"]
             stats.catalog_stores = catalog_stats["stores"]
-            if stats.catalog_products < settings.search_index_max_catalog_products:
+            stats.catalog_stock_rows = catalog_stats["stock_rows"]
+            if (
+                stats.catalog_products < settings.search_index_max_catalog_products
+                and stats.catalog_stock_rows < settings.search_index_max_catalog_stock_rows
+            ):
                 stats.stale_deleted += index.delete_stale_items(
-                    entity_types={"catalog_product", "catalog_store"},
+                    entity_types={"catalog_product", "catalog_store", "catalog_store_stock"},
                     seen_before=sync_started_at,
                 )
             else:

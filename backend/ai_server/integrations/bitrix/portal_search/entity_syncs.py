@@ -229,6 +229,8 @@ async def sync_disk_file_item(
 async def _sync_catalog(bitrix: BitrixClient, index: PortalSearchIndex, settings: Settings) -> dict[str, int]:
     products_count = 0
     stores_count = 0
+    stock_rows_count = 0
+    products_by_id: dict[str, dict[str, Any]] = {}
 
     try:
         catalogs = await bitrix.list_catalogs()
@@ -249,7 +251,15 @@ async def _sync_catalog(bitrix: BitrixClient, index: PortalSearchIndex, settings
             product_id = _first(product, "id", "ID")
             if product_id is None:
                 continue
+            product_iblock_id = _first(product, "iblockId", "IBLOCK_ID", "iblock_id") or iblock_id
             name = str(_first(product, "name", "NAME") or f"Товар #{product_id}")
+            product_url = _catalog_product_url(product_iblock_id, product_id, settings)
+            products_by_id[str(product_id)] = {
+                "id": product_id,
+                "name": name,
+                "iblock_id": product_iblock_id,
+                "url": product_url,
+            }
             body_parts = [
                 str(_first(product, "previewText", "PREVIEW_TEXT") or ""),
                 str(_first(product, "detailText", "DETAIL_TEXT") or ""),
@@ -260,8 +270,8 @@ async def _sync_catalog(bitrix: BitrixClient, index: PortalSearchIndex, settings
                 entity_id=product_id,
                 title=name,
                 body="\n".join(p for p in body_parts if p.strip()),
-                url=_catalog_product_url(iblock_id, product_id, settings),
-                metadata={"iblock_id": iblock_id},
+                url=product_url,
+                metadata={"iblock_id": product_iblock_id},
             )
             products_count += 1
 
@@ -290,7 +300,60 @@ async def _sync_catalog(bitrix: BitrixClient, index: PortalSearchIndex, settings
         )
         stores_count += 1
 
-    return {"products": products_count, "stores": stores_count}
+        if stock_rows_count >= settings.search_index_max_catalog_stock_rows:
+            continue
+        remaining = settings.search_index_max_catalog_stock_rows - stock_rows_count
+        try:
+            stock_rows = await bitrix.list_catalog_store_products(store_id, limit=remaining)
+        except Exception:
+            continue
+        for row in stock_rows:
+            product_id = _first(row, "productId", "PRODUCT_ID", "product_id")
+            if product_id is None:
+                continue
+            amount = _first(row, "amount", "AMOUNT", "quantity", "QUANTITY")
+            if not _is_positive_number(amount):
+                continue
+            product = products_by_id.get(str(product_id))
+            if not product:
+                continue
+            product_name = str(product.get("name") or "").strip()
+            if not product_name:
+                continue
+            product_url = str(product.get("url") or "")
+            stock_body = "\n".join(
+                part
+                for part in (
+                    f"Store: {title}",
+                    f"Address: {address}" if address else "",
+                    f"Product: {product_name}",
+                    f"Amount: {amount}",
+                )
+                if part
+            )
+            index.upsert_item(
+                entity_type="catalog_store_stock",
+                entity_id=f"{store_id}:{product_id}",
+                title=f"{product_name} - {title}",
+                body=stock_body,
+                url=product_url,
+                metadata={
+                    "store_id": store_id,
+                    "store_title": title,
+                    "store_address": address,
+                    "product_id": product_id,
+                    "product_name": product_name,
+                    "iblock_id": product.get("iblock_id"),
+                    "amount": amount,
+                    "product_url": product_url,
+                    "positive_amount": True,
+                },
+            )
+            stock_rows_count += 1
+            if stock_rows_count >= settings.search_index_max_catalog_stock_rows:
+                break
+
+    return {"products": products_count, "stores": stores_count, "stock_rows": stock_rows_count}
 
 
 async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: Settings) -> dict[str, object]:
@@ -735,6 +798,15 @@ def _delta_folder_path(folder: PortalSearchResult) -> str:
     return to_str(folder.metadata.get("path")) or folder.title
 
 
+def _is_positive_number(value: object) -> bool:
+    if isinstance(value, bool) or value in (None, ""):
+        return False
+    try:
+        return float(str(value).replace(",", ".")) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 # ---------------------------------------------------------------------------
 # URL builders (private, used only in this module)
 # ---------------------------------------------------------------------------
@@ -780,8 +852,8 @@ def _project_url(project_id: object, settings: Settings) -> str:
 def _catalog_product_url(iblock_id: object, product_id: object, settings: Settings) -> str:
     domain = _portal_domain(settings)
     if not domain:
-        return f"/crm/catalog/{iblock_id}/product/{product_id}/"
-    return f"https://{domain}/crm/catalog/{iblock_id}/product/{product_id}/"
+        return f"/shop/documents-catalog/{iblock_id}/product/{product_id}/"
+    return f"https://{domain}/shop/documents-catalog/{iblock_id}/product/{product_id}/"
 
 
 def _disk_object_url(object_id: object, settings: Settings) -> str:
