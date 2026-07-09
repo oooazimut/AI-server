@@ -5,6 +5,11 @@ from ai_server.agents.bitrix24.tools.calendar import (
     CalendarEventDraftTool,
 )
 from ai_server.agents.bitrix24.tools.portal_search import PortalSearchTool
+from ai_server.agents.bitrix24.tools.project_create import (
+    ProjectCreateConfirmTool,
+    ProjectCreateDiscardTool,
+    ProjectCreateDraftTool,
+)
 from ai_server.agents.bitrix24.tools.proposals import (
     DeleteIncompleteProposalTool,
     SaveIncompleteProposalTool,
@@ -34,6 +39,9 @@ __all__ = [
     "CalendarEventConfirmTool",
     "CalendarEventDiscardTool",
     "PortalSearchTool",
+    "ProjectCreateDraftTool",
+    "ProjectCreateConfirmTool",
+    "ProjectCreateDiscardTool",
     "TaskCreateDraftTool",
     "TaskCreateConfirmTool",
     "TaskDraftDiscardTool",

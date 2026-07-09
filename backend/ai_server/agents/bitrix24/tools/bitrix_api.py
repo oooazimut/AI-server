@@ -9,6 +9,8 @@ from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.tools.bitrix_policy import apply_write_policy, decide_bitrix_method_policy
 from ai_server.tools.bitrix_ports import BitrixToolClientPort, BitrixWritePort
 
+PROJECT_WRITE_METHODS_WITH_DEDICATED_TOOLS = {"sonet_group.create"}
+
 
 class BitrixApiTool:
     name = "bitrix_api"
@@ -72,6 +74,13 @@ class BitrixApiTool:
     ) -> ToolResult:
         if self._client is None and self._write_client is None:
             return ToolResult(status=ToolStatus.NOT_CONFIGURED, tool="bitrix_api", error="BitrixClient is not injected")
+        if method.strip().casefold() in PROJECT_WRITE_METHODS_WITH_DEDICATED_TOOLS:
+            return ToolResult(
+                status=ToolStatus.DENIED,
+                tool="bitrix_api",
+                error="Use project_create_draft/project_create_confirm for Bitrix project creation.",
+                data={"method": method},
+            )
         decision = decide_bitrix_method_policy(method)
         if decision.decision == "deny":
             return ToolResult(

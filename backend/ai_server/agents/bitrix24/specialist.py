@@ -26,6 +26,9 @@ from ai_server.agents.bitrix24.tools import (
     CalendarEventDraftTool,
     DeleteIncompleteProposalTool,
     PortalSearchTool,
+    ProjectCreateConfirmTool,
+    ProjectCreateDiscardTool,
+    ProjectCreateDraftTool,
     SaveIncompleteProposalTool,
     SaveResponsibleResponseTool,
     TaskCloseConfirmTool,
@@ -69,6 +72,9 @@ _LLM_TOOL_NAMES = frozenset(
         "calendar_event_draft",
         "calendar_event_confirm",
         "calendar_event_discard",
+        "project_create_draft",
+        "project_create_confirm",
+        "project_create_discard",
         "save_incomplete_proposal",
         "delete_incomplete_proposal",
         "save_responsible_response",
@@ -175,6 +181,16 @@ class Bitrix24Specialist(BaseSpecialist):
                 draft_ttl_minutes=_settings.bitrix_task_draft_ttl_minutes,
             ),
             CalendarEventDiscardTool(store=bitrix_store),
+            ProjectCreateDraftTool(store=bitrix_store),
+            ProjectCreateConfirmTool(
+                store=bitrix_store,
+                write_client=bitrix_client,
+                bitrix_oauth=bitrix_oauth,
+                dry_run=_settings.agent_dry_run,
+                oauth_required_for_writes=_settings.bitrix_oauth_required_for_writes,
+                draft_ttl_minutes=_settings.bitrix_task_draft_ttl_minutes,
+            ),
+            ProjectCreateDiscardTool(store=bitrix_store),
             SaveIncompleteProposalTool(store=bitrix_store),
             DeleteIncompleteProposalTool(store=bitrix_store),
             SaveResponsibleResponseTool(store=bitrix_store),
@@ -225,6 +241,13 @@ class Bitrix24Specialist(BaseSpecialist):
             )
         elif tool_call.name == "calendar_event_draft":
             args = _calendar_event_args_with_actor_label(dict(tool_call.args or {}), task)
+            tool_call = SimpleNamespace(
+                name=tool_call.name,
+                args=args,
+                summary=getattr(tool_call, "summary", ""),
+            )
+        elif tool_call.name == "project_create_draft":
+            args = _project_create_args_with_actor_context(dict(tool_call.args or {}), task)
             tool_call = SimpleNamespace(
                 name=tool_call.name,
                 args=args,
@@ -370,6 +393,13 @@ def _calendar_event_args_with_actor_label(args: dict[str, Any], task: AgentTask)
     return args
 
 
+def _project_create_args_with_actor_context(args: dict[str, Any], task: AgentTask) -> dict[str, Any]:
+    profile = _current_user_profile(task)
+    actor_name = _current_user_label(task)
+    actor_is_admin = bool(profile.get("is_admin"))
+    return {**args, "_actor_name": actor_name, "_actor_is_admin": actor_is_admin}
+
+
 def _current_user_label(task: AgentTask) -> str:
     display_name = str(task.user.display_name or "").strip()
     if display_name:
@@ -384,6 +414,17 @@ def _current_user_label(task: AgentTask) -> str:
     if not isinstance(profile, dict):
         return ""
     return str(profile.get("label") or "").strip()
+
+
+def _current_user_profile(task: AgentTask) -> dict[str, Any]:
+    profile_result = task.context.get("bitrix_current_user_profile")
+    if not isinstance(profile_result, dict):
+        return {}
+    data = profile_result.get("data")
+    if not isinstance(data, dict):
+        return {}
+    profile = data.get("profile")
+    return profile if isinstance(profile, dict) else {}
 
 
 def _truthy(value: object) -> bool:
