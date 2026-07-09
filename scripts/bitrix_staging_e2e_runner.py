@@ -125,6 +125,10 @@ STATEFUL_TESTS: dict[str, list[TestCase]] = {
 }
 STATEFUL_TESTS["draft"] = STATEFUL_TESTS["drafts"]
 
+READ_ONLY_SUITE_ALIASES: dict[str, tuple[str, ...]] = {
+    "quick": ("smoke", "project"),
+}
+
 
 def request_json(
     url: str,
@@ -395,6 +399,9 @@ def tests_for_suite(suite: str, *, include_draft: bool) -> list[TestCase]:
     if suite == "all":
         for tests in SAFE_TESTS.values():
             selected.extend(tests)
+    elif suite in READ_ONLY_SUITE_ALIASES:
+        for aliased_suite in READ_ONLY_SUITE_ALIASES[suite]:
+            selected.extend(SAFE_TESTS[aliased_suite])
     elif suite in STATEFUL_TESTS:
         selected.extend(STATEFUL_TESTS[suite])
     else:
@@ -415,7 +422,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chat-id", type=int, default=int(os.getenv("BITRIX_E2E_CHAT_ID", "0") or 0))
     parser.add_argument("--user-id", type=int, default=int(os.getenv("BITRIX_E2E_USER_ID", "13") or 13))
     parser.add_argument("--bot-id", type=int, default=int(os.getenv("BITRIX_E2E_BOT_ID", "0") or 0))
-    parser.add_argument("--suite", choices=["all", *sorted(SAFE_TESTS), *sorted(STATEFUL_TESTS)], default="all")
+    parser.add_argument(
+        "--suite",
+        choices=["all", *sorted(READ_ONLY_SUITE_ALIASES), *sorted(SAFE_TESTS), *sorted(STATEFUL_TESTS)],
+        default="all",
+    )
     parser.add_argument(
         "--include-draft",
         action="store_true",
