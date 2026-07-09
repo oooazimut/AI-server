@@ -30,6 +30,11 @@ router = APIRouter()
 @router.get("/bitrix/status")
 async def bitrix_status(request: Request) -> dict[str, Any]:
     settings = request.app.state.settings
+    queue_stats = await request.app.state.webhook_event_queue.stats()
+    worker_status = _webhook_worker_status(
+        request.app.state.webhook_event_queue_status,
+        queue_stats.pop("worker_heartbeat", None),
+    )
     return {
         "configured": settings.bitrix_configured,
         "bot_id": settings.bitrix_bot_id,
@@ -43,10 +48,7 @@ async def bitrix_status(request: Request) -> dict[str, Any]:
         "task_supervisor": dict(request.app.state.task_supervisor_status),
         "reconciler": dict(request.app.state.reconciler_status),
         "webhook_events": dict(request.app.state.webhook_event_status),
-        "webhook_event_queue": {
-            **dict(request.app.state.webhook_event_queue_status),
-            **await request.app.state.webhook_event_queue.stats(),
-        },
+        "webhook_event_queue": {**worker_status, **queue_stats},
     }
 
 
@@ -136,9 +138,14 @@ def bitrix_oauth_start(request: Request) -> RedirectResponse:
 
 @router.get("/bitrix/webhook-events/status")
 async def bitrix_webhook_events_status(request: Request) -> dict[str, Any]:
+    queue_stats = await request.app.state.webhook_event_queue.stats()
+    worker_status = _webhook_worker_status(
+        request.app.state.webhook_event_queue_status,
+        queue_stats.pop("worker_heartbeat", None),
+    )
     return {
-        "worker": dict(request.app.state.webhook_event_queue_status),
-        "queue": await request.app.state.webhook_event_queue.stats(),
+        "worker": worker_status,
+        "queue": queue_stats,
         "latest_events": await request.app.state.webhook_event_queue.latest(limit=20),
     }
 
@@ -146,6 +153,17 @@ async def bitrix_webhook_events_status(request: Request) -> dict[str, Any]:
 @router.get("/agent/webhook-events/status")
 async def legacy_webhook_events_status(request: Request) -> dict[str, Any]:
     return await bitrix_webhook_events_status(request)
+
+
+def _webhook_worker_status(local_status: dict[str, Any], heartbeat: dict[str, Any] | None) -> dict[str, Any]:
+    status = dict(local_status)
+    if not heartbeat:
+        return status
+    if heartbeat.get("running"):
+        status.update({key: value for key, value in heartbeat.items() if value is not None})
+        return status
+    status["heartbeat"] = heartbeat
+    return status
 
 
 @router.post("/bitrix/events")

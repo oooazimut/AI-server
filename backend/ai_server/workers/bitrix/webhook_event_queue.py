@@ -75,6 +75,9 @@ async def run_webhook_event_worker(
         )
         for index in range(worker_count)
     ]
+    heartbeat_task = _create_worker_heartbeat_task(queue, status)
+    if heartbeat_task is not None:
+        tasks.append(heartbeat_task)
     try:
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
@@ -83,6 +86,24 @@ async def run_webhook_event_worker(
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
+
+
+def _create_worker_heartbeat_task(queue: WebhookConsumePort, status: dict[str, Any]) -> asyncio.Task | None:
+    heartbeat = getattr(queue, "heartbeat_worker", None)
+    if heartbeat is None:
+        return None
+
+    async def _run() -> None:
+        while True:
+            try:
+                await heartbeat(status)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("Failed to write webhook event worker heartbeat", exc_info=True)
+            await asyncio.sleep(5)
+
+    return asyncio.create_task(_run())
 
 
 async def _run_webhook_event_worker_loop(
