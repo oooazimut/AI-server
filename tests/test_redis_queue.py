@@ -37,6 +37,7 @@ def _make_pipe(mock_client: MagicMock) -> AsyncMock:
     pipe.ltrim = AsyncMock()
     pipe.zrem = AsyncMock()
     pipe.sadd = AsyncMock()
+    pipe.expire = AsyncMock()
     pipe.execute = AsyncMock(return_value=[1, 1, 1, 1])
     mock_client.pipeline = MagicMock(return_value=pipe)
     return pipe
@@ -210,6 +211,7 @@ def test_stats_returns_counts():
     client.zcard = AsyncMock(side_effect=[3, 1])
     client.scard = AsyncMock(return_value=2)
     client.lrange = AsyncMock(return_value=[])
+    client.hgetall = AsyncMock(return_value={})
 
     result = anyio_run(queue.stats())
 
@@ -218,6 +220,7 @@ def test_stats_returns_counts():
     assert result["processing"] == 1
     assert result["failed"] == 2
     assert result["latest"] is None
+    assert result["worker_heartbeat"]["running"] is False
 
 
 def test_stats_with_latest_event():
@@ -226,20 +229,69 @@ def test_stats_with_latest_event():
     client.scard = AsyncMock(return_value=0)
     client.lrange = AsyncMock(return_value=["7"])
     client.hgetall = AsyncMock(
-        return_value={
-            "id": "7",
-            "event_type": "ONIMBOTMESSAGEADD",
-            "status": "done",
-            "attempts": "1",
-            "received_at": "2026-06-23T10:00:00",
-            "processed_at": "2026-06-23T10:00:01",
-            "last_error": "",
-        }
+        side_effect=[
+            {
+                "id": "7",
+                "event_type": "ONIMBOTMESSAGEADD",
+                "status": "done",
+                "attempts": "1",
+                "received_at": "2026-06-23T10:00:00",
+                "processed_at": "2026-06-23T10:00:01",
+                "last_error": "",
+            },
+            {},
+        ]
     )
 
     result = anyio_run(queue.stats())
     assert result["latest"]["id"] == "7"
     assert result["latest"]["event_type"] == "ONIMBOTMESSAGEADD"
+
+
+def test_worker_heartbeat_roundtrip():
+    queue, client = _make_queue()
+    pipe = _make_pipe(client)
+
+    anyio_run(
+        queue.heartbeat_worker(
+            {
+                "running": True,
+                "worker_count": 1,
+                "active_workers": 0,
+                "processed": 3,
+                "errors": 0,
+            }
+        )
+    )
+
+    pipe.hset.assert_called_once()
+    pipe.expire.assert_called_once()
+    mapping = pipe.hset.call_args.kwargs["mapping"]
+    assert mapping["running"] == "true"
+    assert mapping["worker_count"] == "1"
+    assert mapping["processed"] == "3"
+
+
+def test_worker_heartbeat_status_fresh():
+    queue, client = _make_queue()
+    client.hgetall = AsyncMock(
+        return_value={
+            "running": "true",
+            "worker_count": "1",
+            "active_workers": "0",
+            "heartbeat_at": _iso_now(),
+            "heartbeat_epoch_ms": "999999999999999",
+            "processed": "3",
+            "errors": "0",
+        }
+    )
+
+    result = anyio_run(queue.worker_heartbeat())
+
+    assert result["running"] is True
+    assert result["source"] == "redis_heartbeat"
+    assert result["worker_count"] == 1
+    assert result["processed"] == 3
 
 
 # ---------------------------------------------------------------------------
