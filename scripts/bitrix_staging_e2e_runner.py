@@ -83,6 +83,22 @@ SAFE_TESTS: dict[str, list[TestCase]] = {
     ],
 }
 
+OPTIONAL_READ_TESTS: dict[str, list[TestCase]] = {
+    "tasks_advanced": [
+        TestCase(
+            test_id="BITRIX-TASK-ADVANCED-COMMENT-01",
+            text=(
+                "Битрикс найди закрытые задачи, где в комментариях есть слово понаблюдать. "
+                "Покажи не больше 5."
+            ),
+            timeout_seconds=300,
+            expect_all=("задач",),
+            expect_any=("понаблюдать", "не найден", "нет"),
+            reject_any=("вы добавлены наблюдателем", "вы назначены исполнителем"),
+        ),
+    ],
+}
+
 STATEFUL_TESTS: dict[str, list[TestCase]] = {
     "drafts": [
         TestCase(
@@ -402,6 +418,8 @@ def tests_for_suite(suite: str, *, include_draft: bool) -> list[TestCase]:
     elif suite in READ_ONLY_SUITE_ALIASES:
         for aliased_suite in READ_ONLY_SUITE_ALIASES[suite]:
             selected.extend(SAFE_TESTS[aliased_suite])
+    elif suite in OPTIONAL_READ_TESTS:
+        selected.extend(OPTIONAL_READ_TESTS[suite])
     elif suite in STATEFUL_TESTS:
         selected.extend(STATEFUL_TESTS[suite])
     else:
@@ -424,7 +442,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bot-id", type=int, default=int(os.getenv("BITRIX_E2E_BOT_ID", "0") or 0))
     parser.add_argument(
         "--suite",
-        choices=["all", *sorted(READ_ONLY_SUITE_ALIASES), *sorted(SAFE_TESTS), *sorted(STATEFUL_TESTS)],
+        choices=[
+            "all",
+            *sorted(READ_ONLY_SUITE_ALIASES),
+            *sorted(SAFE_TESTS),
+            *sorted(OPTIONAL_READ_TESTS),
+            *sorted(STATEFUL_TESTS),
+        ],
         default="all",
     )
     parser.add_argument(
