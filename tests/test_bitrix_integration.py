@@ -298,6 +298,33 @@ def test_bitrix_api_tool_sonet_group_get_normalizes_hyphenated_project_name():
     ]
 
 
+def test_bitrix_api_tool_read_uses_oauth_client_when_available():
+    fallback_bitrix = FakeBitrixClient()
+    oauth_bitrix = FakeBitrixClient()
+    oauth = FakeBitrixOAuth(oauth_bitrix)
+    tool = BitrixApiTool(client=fallback_bitrix, bitrix_oauth=oauth)
+
+    result = anyio_run(tool.execute({"method": "catalog.store.list", "params": {}}, user_id=13))
+
+    assert result.status == ToolStatus.OK
+    assert result.data["access_actor"] == "oauth_current_user"
+    assert oauth.user_ids == [13]
+    assert fallback_bitrix.calls == []
+    assert ("catalog.store.list", {}) in oauth_bitrix.calls
+
+
+def test_bitrix_api_tool_oauth_read_denies_without_user_id():
+    fallback_bitrix = FakeBitrixClient()
+    oauth_bitrix = FakeBitrixClient()
+    tool = BitrixApiTool(client=fallback_bitrix, bitrix_oauth=FakeBitrixOAuth(oauth_bitrix))
+
+    result = anyio_run(tool.execute({"method": "catalog.store.list", "params": {}}))
+
+    assert result.status == ToolStatus.DENIED
+    assert fallback_bitrix.calls == []
+    assert oauth_bitrix.calls == []
+
+
 def test_bitrix_warehouse_search_tool_finds_store_and_products():
     fake_bitrix = FakeBitrixClient()
     tool = BitrixWarehouseSearchTool(client=fake_bitrix)
