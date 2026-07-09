@@ -31,6 +31,7 @@ class TestCase:
     text: str
     timeout_seconds: int = 180
     expect_any: tuple[str, ...] = ()
+    expect_all: tuple[str, ...] = ()
     reject_any: tuple[str, ...] = ()
     kind: str = "read"
 
@@ -83,19 +84,46 @@ SAFE_TESTS: dict[str, list[TestCase]] = {
 }
 
 STATEFUL_TESTS: dict[str, list[TestCase]] = {
-    "draft": [
+    "drafts": [
         TestCase(
             test_id="BITRIX-TASK-DRAFT-01",
             text=(
                 "Битрикс создай задачу на меня: подготовить тестовый отчет. "
-                "Срок без срока. Не создавай сразу, только покажи черновик для подтверждения."
+                "Не создавай сразу, только покажи черновик для подтверждения."
             ),
             timeout_seconds=240,
-            expect_any=("черновик", "подтверд", "задач"),
+            expect_all=("черновик", "задач", "срок", "подтверд"),
+            reject_any=("Срок: Без срока", "/company/personal/user/"),
             kind="draft",
+        ),
+        TestCase(
+            test_id="BITRIX-TASK-DRAFT-DISCARD-01",
+            text="Битрикс отмени черновик задачи.",
+            timeout_seconds=180,
+            expect_all=("черновик", "задач", "удал"),
+            kind="draft_cleanup",
+        ),
+        TestCase(
+            test_id="BITRIX-CALENDAR-DRAFT-01",
+            text=(
+                "Битрикс напомни мне завтра позвонить Борисову. "
+                "Не добавляй сразу, только покажи черновик календаря для подтверждения."
+            ),
+            timeout_seconds=240,
+            expect_all=("черновик", "календар", "позвонить", "подтверд"),
+            reject_any=("/company/personal/user/",),
+            kind="draft",
+        ),
+        TestCase(
+            test_id="BITRIX-CALENDAR-DRAFT-DISCARD-01",
+            text="Битрикс отмени черновик события календаря.",
+            timeout_seconds=180,
+            expect_all=("черновик", "событ", "календар", "удал"),
+            kind="draft_cleanup",
         ),
     ],
 }
+STATEFUL_TESTS["draft"] = STATEFUL_TESTS["drafts"]
 
 
 def request_json(
@@ -243,10 +271,8 @@ def run_test(args: argparse.Namespace, *, run_id: str, test: TestCase) -> dict[s
             continue
 
         joined = "\n".join(message_text(message) for message in response_messages)
-        lower_joined = joined.casefold()
-        matched = not test.expect_any or any(item.casefold() in lower_joined for item in test.expect_any)
-        rejected = any(item.casefold() in lower_joined for item in test.reject_any)
-        ok = matched and not rejected
+        evaluation = evaluate_response_text(joined, test)
+        ok = evaluation["matched"] and not evaluation["rejected"]
         return {
             "test_id": test.test_id,
             "kind": test.kind,
@@ -258,9 +284,9 @@ def run_test(args: argparse.Namespace, *, run_id: str, test: TestCase) -> dict[s
             "new_message_count": len(new_messages),
             "response_message_ids": [message_id(message) for message in response_messages],
             "expect_any": list(test.expect_any),
+            "expect_all": list(test.expect_all),
             "reject_any": list(test.reject_any),
-            "matched": matched,
-            "rejected": rejected,
+            **evaluation,
             "response_preview": joined[:1200],
             "worker_latest": compact_status(last_status),
         }
@@ -310,10 +336,24 @@ def event_processed(status: dict[str, Any], event_id: object) -> bool:
 
 
 def matching_response_messages(messages: list[dict[str, Any]], test: TestCase) -> list[dict[str, Any]]:
-    if not test.expect_any:
+    expectations = (*test.expect_any, *test.expect_all)
+    if not expectations:
         return messages
-    needles = [item.casefold() for item in test.expect_any]
+    needles = [item.casefold() for item in expectations]
     return [message for message in messages if any(needle in message_text(message).casefold() for needle in needles)]
+
+
+def evaluate_response_text(text: str, test: TestCase) -> dict[str, bool]:
+    lower_text = text.casefold()
+    matched_any = not test.expect_any or any(item.casefold() in lower_text for item in test.expect_any)
+    matched_all = all(item.casefold() in lower_text for item in test.expect_all)
+    rejected = any(item.casefold() in lower_text for item in test.reject_any)
+    return {
+        "matched": matched_any and matched_all,
+        "matched_any": matched_any,
+        "matched_all": matched_all,
+        "rejected": rejected,
+    }
 
 
 def compact_status(status: dict[str, Any]) -> dict[str, Any]:
@@ -355,10 +395,12 @@ def tests_for_suite(suite: str, *, include_draft: bool) -> list[TestCase]:
     if suite == "all":
         for tests in SAFE_TESTS.values():
             selected.extend(tests)
+    elif suite in STATEFUL_TESTS:
+        selected.extend(STATEFUL_TESTS[suite])
     else:
         selected.extend(SAFE_TESTS.get(suite, []))
     if include_draft:
-        selected.extend(STATEFUL_TESTS["draft"])
+        selected.extend(STATEFUL_TESTS["drafts"])
     return selected
 
 
@@ -373,8 +415,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chat-id", type=int, default=int(os.getenv("BITRIX_E2E_CHAT_ID", "0") or 0))
     parser.add_argument("--user-id", type=int, default=int(os.getenv("BITRIX_E2E_USER_ID", "13") or 13))
     parser.add_argument("--bot-id", type=int, default=int(os.getenv("BITRIX_E2E_BOT_ID", "0") or 0))
-    parser.add_argument("--suite", choices=["all", *sorted(SAFE_TESTS)], default="all")
-    parser.add_argument("--include-draft", action="store_true", help="Also run the stateful local draft test.")
+    parser.add_argument("--suite", choices=["all", *sorted(SAFE_TESTS), *sorted(STATEFUL_TESTS)], default="all")
+    parser.add_argument(
+        "--include-draft",
+        action="store_true",
+        help="Also run the stateful local draft checks after the selected safe suite.",
+    )
     parser.add_argument(
         "--continue-on-failure",
         action="store_true",
