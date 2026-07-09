@@ -354,6 +354,18 @@ class BitrixTaskSearchTool:
         elif project_id is not None:
             project = {"id": str(project_id), "name": project_query or ""}
 
+        read_client: BitrixToolClientPort | None = None
+        access_actor = "snapshot_only"
+        if self._bitrix_oauth is not None:
+            read_client, access_actor, access_error = await resolve_current_user_read_client(
+                self.name,
+                fallback_client=self._client,
+                bitrix_oauth=self._bitrix_oauth,
+                user_id=user_id,
+            )
+            if access_error is not None:
+                return access_error
+
         snapshot_result = _snapshot_task_search(
             self._portal_search,
             query=comment_query or query,
@@ -372,18 +384,20 @@ class BitrixTaskSearchTool:
             project=project,
             include_comments=include_comments,
             comment_query=comment_query,
+            access_actor=access_actor,
         )
         if snapshot_result is not None:
             return snapshot_result
 
-        read_client, access_actor, access_error = await resolve_current_user_read_client(
-            self.name,
-            fallback_client=self._client,
-            bitrix_oauth=self._bitrix_oauth,
-            user_id=user_id,
-        )
-        if access_error is not None:
-            return access_error
+        if read_client is None:
+            read_client, access_actor, access_error = await resolve_current_user_read_client(
+                self.name,
+                fallback_client=self._client,
+                bitrix_oauth=self._bitrix_oauth,
+                user_id=user_id,
+            )
+            if access_error is not None:
+                return access_error
 
         calls = _task_search_calls(
             scope=scope,
@@ -518,6 +532,7 @@ def _snapshot_task_search(
     project: dict[str, Any] | None,
     include_comments: bool,
     comment_query: str,
+    access_actor: str,
 ) -> ToolResult | None:
     if portal_search is None or not query or not include_comments:
         return None
@@ -569,6 +584,7 @@ def _snapshot_task_search(
         data={
             "mode": "list",
             "source": "postgres_portal_snapshot",
+            "access_actor": access_actor,
             "scope": scope,
             "scope_label": _scope_label(scope),
             "status": status,
