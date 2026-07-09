@@ -474,6 +474,8 @@ def _snapshot_task_search(
 ) -> ToolResult | None:
     if portal_search is None or not query or not include_comments:
         return None
+    if not _snapshot_scope_is_user_bounded(scope, user_id=user_id):
+        return None
     try:
         stats = portal_search.stats()
     except Exception:
@@ -537,6 +539,10 @@ def _snapshot_task_search(
             "errors": [],
         },
     )
+
+
+def _snapshot_scope_is_user_bounded(scope: str, *, user_id: int | None) -> bool:
+    return user_id is not None and scope in {"my", "responsible", "created_by", "member"}
 
 
 def _snapshot_result_to_task(item: Any, *, query: str) -> dict[str, Any]:

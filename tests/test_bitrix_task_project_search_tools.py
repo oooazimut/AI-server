@@ -226,7 +226,7 @@ def test_task_search_uses_snapshot_for_comment_query():
     result = anyio.run(
         lambda: tool.execute(
             {
-                "scope": "all",
+                "scope": "member",
                 "status": "closed",
                 "include_closed": True,
                 "comment_query": "bot stable",
@@ -241,6 +241,45 @@ def test_task_search_uses_snapshot_for_comment_query():
     assert result.data["items"][0]["comment_snippets"] == ["bot stable after fix"]
     assert result.data["items"][0]["responsible_label"] == "Dmitry"
     assert client.calls == []
+
+
+def test_task_search_does_not_use_snapshot_for_all_scope():
+    client = _FakeBitrixSearchClient()
+    index = _FakePortalTaskIndex(
+        [
+            SimpleNamespace(
+                entity_id="65",
+                title="Hidden all-scope task",
+                body="Комментарии:\n- bot stable after fix",
+                score=62,
+                url="https://example.test/tasks/65",
+                metadata={
+                    "status": "5",
+                    "responsible_id": "99",
+                    "created_by": "98",
+                    "closed_date": "2025-01-15T09:12:40+03:00",
+                },
+            )
+        ]
+    )
+    tool = BitrixTaskSearchTool(client=client, portal_search=index)
+
+    result = anyio.run(
+        lambda: tool.execute(
+            {
+                "scope": "all",
+                "status": "closed",
+                "include_closed": True,
+                "comment_query": "bot stable",
+            },
+            user_id=13,
+        )
+    )
+
+    assert result.status == "ok"
+    assert result.data["source"] == "live_bitrix_rest"
+    assert result.data["items"] == []
+    assert any(method == "tasks.task.list" for method, _payload in client.calls)
 
 
 def test_task_snapshot_search_respects_role_scope():
