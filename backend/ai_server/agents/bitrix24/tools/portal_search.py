@@ -22,7 +22,17 @@ class PortalSearchTool:
                     "query": {"type": "string"},
                     "scope": {
                         "type": "string",
-                        "enum": ["all", "documents", "files", "tasks", "projects", "catalog", "stores", "products"],
+                        "enum": [
+                            "all",
+                            "documents",
+                            "files",
+                            "tasks",
+                            "projects",
+                            "catalog",
+                            "stores",
+                            "products",
+                            "stock",
+                        ],
                     },
                     "limit": {"type": "integer", "minimum": 1, "maximum": 30},
                 },

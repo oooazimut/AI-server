@@ -27,6 +27,7 @@ class PortalSyncStats:
     task_attachments: int = 0
     catalog_products: int = 0
     catalog_stores: int = 0
+    catalog_stock_rows: int = 0
     stale_deleted: int = 0
     prune_skipped: list[str] | None = None
     content: PortalContentSyncStats | None = None
@@ -34,7 +35,15 @@ class PortalSyncStats:
 
     @property
     def total(self) -> int:
-        return self.tasks + self.projects + self.disk_items + self.task_attachments + self.catalog_products
+        return (
+            self.tasks
+            + self.projects
+            + self.disk_items
+            + self.task_attachments
+            + self.catalog_products
+            + self.catalog_stores
+            + self.catalog_stock_rows
+        )
 
 
 @dataclass
