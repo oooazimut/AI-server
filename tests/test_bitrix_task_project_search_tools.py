@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import anyio
 
 from ai_server.agents.bitrix24.tools.tasks import BitrixProjectSearchTool, BitrixTaskSearchTool
@@ -83,6 +85,20 @@ class _FakeBitrixSearchClient:
                 {"ID": "53", "NAME": "Ларгус 3"},
             ]
         return []
+
+
+class _FakePortalTaskIndex:
+    def __init__(self, items: list[SimpleNamespace]) -> None:
+        self.items = items
+
+    def stats(self):
+        return SimpleNamespace(exists=True, by_type={"task": len(self.items)})
+
+    def search(self, query: str, *, entity_types: set[str] | None = None, limit: int = 10):
+        assert entity_types == {"task"}
+        needle = query.casefold()
+        matches = [item for item in self.items if needle in f"{item.title} {item.body}".casefold()]
+        return matches[:limit]
 
 
 def test_task_search_responsible_scope_uses_current_user_and_active_statuses():
@@ -171,6 +187,99 @@ def test_task_search_can_match_query_in_comments_without_title_filter():
     task_call = next(payload for method, payload in client.calls if method == "tasks.task.list")
     assert "%TITLE" not in task_call["filter"]
     assert ("task.commentitem.getlist", {"TASKID": "101"}) in client.calls
+
+
+def test_task_search_uses_snapshot_for_comment_query():
+    client = _FakeBitrixSearchClient()
+    index = _FakePortalTaskIndex(
+        [
+            SimpleNamespace(
+                entity_id="65",
+                title="Bot stable check",
+                body=(
+                    "Status: 5\n"
+                    "Deadline: 2025-01-15T12:00:00+03:00\n"
+                    "Комментарии:\n"
+                    "- Discussed in the morning.\n"
+                    "- bot stable after fix"
+                ),
+                score=62,
+                url="https://example.test/tasks/65",
+                metadata={
+                    "status": "5",
+                    "responsible_id": "13",
+                    "created_by": "9",
+                    "group_id": "45",
+                    "deadline": "2025-01-15T12:00:00+03:00",
+                    "created_date": "2025-01-13T09:00:00+03:00",
+                    "closed_date": "2025-01-15T09:12:40+03:00",
+                    "responsible_label": "Dmitry",
+                    "creator_label": "Valery",
+                    "comments_count": 2,
+                },
+            )
+        ]
+    )
+    tool = BitrixTaskSearchTool(client=client, portal_search=index)
+
+    result = anyio.run(
+        lambda: tool.execute(
+            {
+                "scope": "all",
+                "status": "closed",
+                "include_closed": True,
+                "comment_query": "bot stable",
+            },
+            user_id=13,
+        )
+    )
+
+    assert result.status == "ok"
+    assert result.data["source"] == "postgres_portal_snapshot"
+    assert [item["id"] for item in result.data["items"]] == ["65"]
+    assert result.data["items"][0]["comment_snippets"] == ["bot stable after fix"]
+    assert result.data["items"][0]["responsible_label"] == "Dmitry"
+    assert client.calls == []
+
+
+def test_task_snapshot_search_respects_role_scope():
+    client = _FakeBitrixSearchClient()
+    index = _FakePortalTaskIndex(
+        [
+            SimpleNamespace(
+                entity_id="65",
+                title="Observer task",
+                body="Комментарии:\n- bot stable after fix",
+                score=62,
+                url="https://example.test/tasks/65",
+                metadata={
+                    "status": "5",
+                    "responsible_id": "35",
+                    "created_by": "9",
+                    "auditors": [13],
+                    "closed_date": "2025-01-15T09:12:40+03:00",
+                },
+            )
+        ]
+    )
+    tool = BitrixTaskSearchTool(client=client, portal_search=index)
+
+    responsible = anyio.run(
+        lambda: tool.execute(
+            {"scope": "responsible", "status": "closed", "include_closed": True, "comment_query": "bot stable"},
+            user_id=13,
+        )
+    )
+    member = anyio.run(
+        lambda: tool.execute(
+            {"scope": "member", "status": "closed", "include_closed": True, "comment_query": "bot stable"},
+            user_id=13,
+        )
+    )
+
+    assert responsible.status == "ok"
+    assert responsible.data["items"] == []
+    assert [item["id"] for item in member.data["items"]] == ["65"]
 
 
 def test_task_search_comment_query_requires_comment_match():

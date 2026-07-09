@@ -136,7 +136,7 @@ class Bitrix24Specialist(BaseSpecialist):
             PortalSearchTool(portal_search=portal_search_index),
             BitrixWarehouseSearchTool(client=bitrix_client),
             BitrixMyTasksTool(client=bitrix_client),
-            BitrixTaskSearchTool(client=bitrix_client),
+            BitrixTaskSearchTool(client=bitrix_client, portal_search=portal_search_index),
             BitrixProjectSearchTool(client=bitrix_client),
             BitrixApiTool(
                 client=bitrix_client,

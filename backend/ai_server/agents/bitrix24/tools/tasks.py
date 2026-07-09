@@ -12,6 +12,7 @@ from ai_server.agents.bitrix24.tools.bitrix_api import (
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.tools.bitrix_ports import BitrixToolClientPort
+from ai_server.tools.bitrix_search import PortalSearchPort
 
 DEFAULT_MY_TASKS_LIMIT = 10
 DEFAULT_TASK_SEARCH_LIMIT = 10
@@ -140,8 +141,11 @@ class BitrixMyTasksTool:
 class BitrixTaskSearchTool:
     name = "bitrix_task_search"
 
-    def __init__(self, client: BitrixToolClientPort | None = None) -> None:
+    def __init__(
+        self, client: BitrixToolClientPort | None = None, portal_search: PortalSearchPort | None = None
+    ) -> None:
         self._client = client
+        self._portal_search = portal_search
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -241,11 +245,19 @@ class BitrixTaskSearchTool:
         dialog_key: str | None = None,
         dialog_id: str | None = None,
     ) -> ToolResult:
-        if self._client is None:
-            return ToolResult(status=ToolStatus.NOT_CONFIGURED, tool=self.name, error="BitrixClient is not injected")
+        if self._client is None and self._portal_search is None:
+            return ToolResult(
+                status=ToolStatus.NOT_CONFIGURED,
+                tool=self.name,
+                error="BitrixClient or portal search index is required.",
+            )
 
         task_id = _safe_int(args.get("task_id") or args.get("id") or args.get("ID"))
         if task_id is not None:
+            if self._client is None:
+                return ToolResult(
+                    status=ToolStatus.NOT_CONFIGURED, tool=self.name, error="BitrixClient is not injected"
+                )
             return await self._execute_task_detail(task_id, user_id=user_id)
 
         scope = _scope_arg(args.get("scope"))
@@ -278,6 +290,10 @@ class BitrixTaskSearchTool:
         errors: list[dict[str, str]] = []
 
         if project_id is None and project_query:
+            if self._client is None:
+                return ToolResult(
+                    status=ToolStatus.NOT_CONFIGURED, tool=self.name, error="BitrixClient is not injected"
+                )
             project_matches, project_errors = await _search_projects(self._client, project_query, limit=1)
             errors.extend(project_errors)
             if not project_matches:
@@ -304,6 +320,31 @@ class BitrixTaskSearchTool:
             project_id = _safe_int(project.get("id"))
         elif project_id is not None:
             project = {"id": str(project_id), "name": project_query or ""}
+
+        snapshot_result = _snapshot_task_search(
+            self._portal_search,
+            query=comment_query or query,
+            scope=scope,
+            status=status,
+            user_id=user_id,
+            project_id=project_id,
+            created_from=_first_arg_text(args, "created_from", "created_start"),
+            created_to=_first_arg_text(args, "created_to", "created_end"),
+            deadline_from=_first_arg_text(args, "deadline_from", "deadline_start"),
+            deadline_to=_first_arg_text(args, "deadline_to", "deadline_end"),
+            closed_from=_first_arg_text(args, "closed_from", "closed_start"),
+            closed_to=_first_arg_text(args, "closed_to", "closed_end"),
+            limit=limit,
+            offset=offset,
+            project=project,
+            include_comments=include_comments,
+            comment_query=comment_query,
+        )
+        if snapshot_result is not None:
+            return snapshot_result
+
+        if self._client is None:
+            return ToolResult(status=ToolStatus.NOT_CONFIGURED, tool=self.name, error="BitrixClient is not injected")
 
         calls = _task_search_calls(
             scope=scope,
@@ -408,6 +449,173 @@ class BitrixTaskSearchTool:
                 "item": _task_summary(task, user_id=user_id or 0) if task else None,
             },
         )
+
+
+def _snapshot_task_search(
+    portal_search: PortalSearchPort | None,
+    *,
+    query: str,
+    scope: str,
+    status: str,
+    user_id: int | None,
+    project_id: int | None,
+    created_from: str,
+    created_to: str,
+    deadline_from: str,
+    deadline_to: str,
+    closed_from: str,
+    closed_to: str,
+    limit: int,
+    offset: int,
+    project: dict[str, Any] | None,
+    include_comments: bool,
+    comment_query: str,
+) -> ToolResult | None:
+    if portal_search is None or not query or not include_comments:
+        return None
+    try:
+        stats = portal_search.stats()
+    except Exception:
+        return None
+    if not bool(getattr(stats, "exists", False)):
+        return None
+    by_type = getattr(stats, "by_type", {}) or {}
+    if int(by_type.get("task") or 0) <= 0:
+        return None
+
+    search_limit = min(500, max(100, offset + limit * 10))
+    try:
+        candidates = portal_search.search(query, entity_types={"task"}, limit=search_limit)
+    except Exception:
+        return None
+
+    tasks = [_snapshot_result_to_task(item, query=query) for item in candidates]
+    filtered = [
+        task
+        for task in tasks
+        if _matches_snapshot_scope(task, scope=scope, user_id=user_id)
+        and (project_id is None or _safe_int(_first_text(task, "groupId", "GROUP_ID")) == project_id)
+        and _matches_task_status(task, status)
+        and _matches_date_range(
+            task, keys=("createdDate", "CREATED_DATE"), from_value=created_from, to_value=created_to
+        )
+        and _matches_deadline_range(task, from_value=deadline_from, to_value=deadline_to)
+        and _matches_date_range(task, keys=("closedDate", "CLOSED_DATE"), from_value=closed_from, to_value=closed_to)
+        and (status != "overdue" or _is_overdue(task))
+        and _matches_text_query(task, query, include_comments=True)
+        and _matches_comment_query(task, comment_query)
+    ]
+    filtered.sort(
+        key=lambda task: (
+            -int(task.get("_snapshot_score") or 0),
+            _deadline_sort_key(task),
+            _safe_int(_task_id(task)) or 0,
+        )
+    )
+    page = filtered[offset : offset + limit]
+    return ToolResult(
+        status=ToolStatus.OK,
+        tool=BitrixTaskSearchTool.name,
+        data={
+            "mode": "list",
+            "source": "postgres_portal_snapshot",
+            "scope": scope,
+            "scope_label": _scope_label(scope),
+            "status": status,
+            "query": query if query != comment_query else "",
+            "comment_query": comment_query or query,
+            "include_comments": True,
+            "comment_lookup_task_limit": 0,
+            "project": project,
+            "project_query": project.get("name", "") if project else "",
+            "items": [_task_summary(task, user_id=user_id or 0) for task in page],
+            "total": len(filtered),
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + limit < len(filtered),
+            "errors": [],
+        },
+    )
+
+
+def _snapshot_result_to_task(item: Any, *, query: str) -> dict[str, Any]:
+    metadata = dict(getattr(item, "metadata", {}) or {})
+    body = str(getattr(item, "body", "") or "")
+    comments = _snapshot_comment_texts(body)
+    matched_comments = [
+        {"POST_MESSAGE": comment} for comment in comments if query.casefold().strip() in comment.casefold()
+    ]
+    snippet = _snapshot_comment_snippet(comments, query=query)
+    responsible_label = str(metadata.get("responsible_label") or "")
+    creator_label = str(metadata.get("creator_label") or "")
+    return {
+        "id": str(getattr(item, "entity_id", "") or ""),
+        "title": str(getattr(item, "title", "") or "задача"),
+        "description": body,
+        "status": str(metadata.get("status") or ""),
+        "responsibleId": str(metadata.get("responsible_id") or ""),
+        "createdBy": str(metadata.get("created_by") or ""),
+        "groupId": str(metadata.get("group_id") or ""),
+        "deadline": str(metadata.get("deadline") or ""),
+        "createdDate": str(metadata.get("created_date") or ""),
+        "closedDate": str(metadata.get("closed_date") or ""),
+        "accomplices": metadata.get("accomplices") or [],
+        "auditors": metadata.get("auditors") or [],
+        "responsible": {"name": responsible_label} if responsible_label else {},
+        "creator": {"name": creator_label} if creator_label else {},
+        "_comments": [{"POST_MESSAGE": comment} for comment in comments],
+        "_matched_comments": matched_comments,
+        "_comment_snippets": [snippet] if snippet else [],
+        "_snapshot_score": int(getattr(item, "score", 0) or 0),
+        "_snapshot_url": str(getattr(item, "url", "") or ""),
+    }
+
+
+def _snapshot_comment_texts(body: str) -> list[str]:
+    marker = "Комментарии:"
+    if marker not in body:
+        return []
+    tail = body.split(marker, 1)[1]
+    comments = []
+    for line in tail.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            comments.append(stripped[2:].strip())
+    return [comment for comment in comments if comment]
+
+
+def _snapshot_comment_snippet(comments: list[str], *, query: str) -> str:
+    needle = query.casefold().strip()
+    if not needle:
+        return comments[0][:180] if comments else ""
+    for comment in comments:
+        lower = comment.casefold()
+        pos = lower.find(needle)
+        if pos < 0:
+            continue
+        start = max(0, pos - 60)
+        end = min(len(comment), pos + len(query) + 100)
+        prefix = "..." if start else ""
+        suffix = "..." if end < len(comment) else ""
+        return f"{prefix}{comment[start:end]}{suffix}"
+    return ""
+
+
+def _matches_snapshot_scope(task: dict[str, Any], *, scope: str, user_id: int | None) -> bool:
+    if scope == "all":
+        return True
+    if user_id is None:
+        return False
+    if scope == "responsible":
+        return _safe_int(_first_text(task, "responsibleId", "RESPONSIBLE_ID")) == user_id
+    if scope == "created_by":
+        return _safe_int(_first_text(task, "createdBy", "CREATED_BY")) == user_id
+    return user_id in {
+        _safe_int(_first_text(task, "responsibleId", "RESPONSIBLE_ID")),
+        _safe_int(_first_text(task, "createdBy", "CREATED_BY")),
+        *_int_list(task.get("accomplices") or task.get("ACCOMPLICES")),
+        *_int_list(task.get("auditors") or task.get("AUDITORS")),
+    }
 
 
 class BitrixProjectSearchTool:
