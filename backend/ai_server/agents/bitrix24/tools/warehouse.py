@@ -7,13 +7,19 @@ from typing import Any
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.tools.bitrix_ports import BitrixToolClientPort
+from ai_server.tools.bitrix_search import PortalSearchPort
 
 
 class BitrixWarehouseSearchTool:
     name = "bitrix_warehouse_search"
 
-    def __init__(self, client: BitrixToolClientPort | None = None) -> None:
+    def __init__(
+        self,
+        client: BitrixToolClientPort | None = None,
+        portal_search: PortalSearchPort | None = None,
+    ) -> None:
         self._client = client
+        self._portal_search = portal_search
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -61,6 +67,16 @@ class BitrixWarehouseSearchTool:
         product_offset = max(0, int(args.get("product_offset") or args.get("offset") or 0))
         include_products = bool(args.get("include_products"))
 
+        snapshot_data = self._snapshot_search(
+            query=query,
+            include_products=include_products,
+            limit=limit,
+            product_limit=product_limit,
+            product_offset=product_offset,
+        )
+        if snapshot_data is not None:
+            return ToolResult(status=ToolStatus.OK, tool=self.name, data=snapshot_data)
+
         try:
             raw_stores = await self._client.result("catalog.store.list", {})
         except (BitrixApiError, BitrixConfigError) as exc:
@@ -86,6 +102,103 @@ class BitrixWarehouseSearchTool:
             data["products"] = products_result
 
         return ToolResult(status=ToolStatus.OK, tool=self.name, data=data)
+
+    def _snapshot_search(
+        self,
+        *,
+        query: str,
+        include_products: bool,
+        limit: int,
+        product_limit: int,
+        product_offset: int,
+    ) -> dict[str, Any] | None:
+        if self._portal_search is None:
+            return None
+        try:
+            if not self._portal_search.stats().exists:
+                return None
+            store_results = self._portal_search.search(query, entity_types={"catalog_store"}, limit=limit)
+            stock_seed_results = self._portal_search.search(
+                query,
+                entity_types={"catalog_store_stock"},
+                limit=max(limit, product_limit + product_offset),
+            )
+        except Exception:
+            return None
+
+        matches = [_snapshot_store_match(item) for item in store_results]
+        if not matches and stock_seed_results:
+            matches = [_snapshot_store_match_from_stock(item) for item in stock_seed_results[:limit]]
+        matches = _dedupe_store_matches(matches)[:limit]
+        if not matches:
+            return None
+
+        data: dict[str, Any] = {
+            "query": query,
+            "matches": matches,
+            "total_stores_seen": len(matches),
+            "source": "postgres_portal_snapshot",
+            "summary": _stores_summary(matches, query=query),
+        }
+        if include_products:
+            data["products"] = self._snapshot_store_products(
+                matches[0],
+                limit=product_limit,
+                offset=product_offset,
+            )
+        return data
+
+    def _snapshot_store_products(self, store: dict[str, Any], *, limit: int, offset: int) -> dict[str, Any]:
+        if self._portal_search is None:
+            return {"status": "not_available", "items": [], "message": "portal search index is missing"}
+        store_id = store.get("id")
+        store_title = str(store.get("title") or "")
+        query = store_title or str(store_id or "")
+        try:
+            rows = self._portal_search.search(
+                query,
+                entity_types={"catalog_store_stock"},
+                limit=max(1000, offset + limit),
+            )
+        except Exception as exc:
+            return {"status": "error", "error": str(exc), "items": []}
+
+        stock_items = []
+        for row in rows:
+            metadata = row.metadata or {}
+            if store_id not in (None, "") and str(metadata.get("store_id")) != str(store_id):
+                continue
+            product_name = str(metadata.get("product_name") or row.title).strip()
+            if not product_name:
+                continue
+            stock_items.append(
+                {
+                    "product_id": metadata.get("product_id"),
+                    "product_name": product_name,
+                    "iblock_id": metadata.get("iblock_id"),
+                    "product_url": metadata.get("product_url") or row.url,
+                    "amount": metadata.get("amount"),
+                    "raw": metadata,
+                    "source": "postgres_portal_snapshot",
+                }
+            )
+
+        total = len(stock_items)
+        items = stock_items[offset : offset + limit]
+        return {
+            "status": "ok",
+            "store_id": store_id,
+            "items": items,
+            "limit": limit,
+            "offset": offset,
+            "total_rows_seen": total,
+            "available_items_seen": total,
+            "available_items_with_names": total,
+            "filtered_non_positive_count": 0,
+            "filtered_missing_name_count": 0,
+            "has_more": offset + len(items) < total,
+            "source": "postgres_portal_snapshot",
+        }
 
     async def _store_products(self, store_id: object, *, limit: int, offset: int = 0) -> dict[str, Any]:
         if store_id in (None, "") or self._client is None:
@@ -212,6 +325,50 @@ def _compact_store(store: dict[str, Any]) -> dict[str, Any]:
         "is_default": _first(store, "isDefault", "IS_DEFAULT"),
         "raw": store,
     }
+
+
+def _snapshot_store_match(item: Any) -> dict[str, Any]:
+    metadata = getattr(item, "metadata", {}) or {}
+    return {
+        "id": getattr(item, "entity_id", ""),
+        "title": getattr(item, "title", ""),
+        "address": _first_text(getattr(item, "body", "")),
+        "active": metadata.get("active"),
+        "is_default": metadata.get("is_default"),
+        "source": "postgres_portal_snapshot",
+    }
+
+
+def _snapshot_store_match_from_stock(item: Any) -> dict[str, Any]:
+    metadata = getattr(item, "metadata", {}) or {}
+    return {
+        "id": metadata.get("store_id"),
+        "title": metadata.get("store_title"),
+        "address": metadata.get("store_address"),
+        "active": None,
+        "is_default": None,
+        "source": "postgres_portal_snapshot",
+    }
+
+
+def _dedupe_store_matches(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result = []
+    seen: set[str] = set()
+    for match in matches:
+        key = str(match.get("id") or match.get("title") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(match)
+    return result
+
+
+def _first_text(value: object) -> str:
+    for line in str(value or "").splitlines():
+        text = line.strip()
+        if text:
+            return text
+    return ""
 
 
 def _compact_product(product: dict[str, Any]) -> dict[str, Any]:
