@@ -212,13 +212,24 @@ class ProjectCreateConfirmTool:
         dialog_id: str | None = None,
     ) -> ToolResult:
         if not dialog_key:
-            return ToolResult(status=ToolStatus.INVALID_TOOL_CALL, tool=self.name, error="project_create_confirm requires dialog_key")
+            return ToolResult(
+                status=ToolStatus.INVALID_TOOL_CALL, tool=self.name, error="project_create_confirm requires dialog_key"
+            )
         draft = await self._store.get_task_draft(dialog_key, ttl_minutes=self._draft_ttl_minutes)
         if not draft or draft.get("_draft_type") != PROJECT_CREATE_DRAFT_TYPE:
-            return ToolResult(status=ToolStatus.NOT_FOUND, tool=self.name, error="no pending project creation draft found for this dialog")
+            return ToolResult(
+                status=ToolStatus.NOT_FOUND,
+                tool=self.name,
+                error="no pending project creation draft found for this dialog",
+            )
         params = draft.get("params") if isinstance(draft.get("params"), dict) else {}
         if not params.get("fields"):
-            return ToolResult(status=ToolStatus.CONTRACT_VIOLATION, tool=self.name, error="project creation draft has no fields", data={"draft": draft})
+            return ToolResult(
+                status=ToolStatus.CONTRACT_VIOLATION,
+                tool=self.name,
+                error="project creation draft has no fields",
+                data={"draft": draft},
+            )
         sanitized = apply_write_policy("sonet_group.create", params)
         if self._dry_run:
             return ToolResult(status=ToolStatus.DRY_RUN, tool=self.name, data={"params": sanitized, "draft": draft})
@@ -226,14 +237,23 @@ class ProjectCreateConfirmTool:
         if self._oauth_required_for_writes:
             context_error = _write_context_error(user_id=user_id, dialog_id=dialog_id, action="project creation")
             if context_error:
-                return ToolResult(status=ToolStatus.DENIED, tool=self.name, error=context_error, data={"params": sanitized})
+                return ToolResult(
+                    status=ToolStatus.DENIED, tool=self.name, error=context_error, data={"params": sanitized}
+                )
             if self._bitrix_oauth is None:
-                return ToolResult(status=ToolStatus.NOT_CONFIGURED, tool=self.name, error="Bitrix OAuth is required for project creation.", data={"params": sanitized})
+                return ToolResult(
+                    status=ToolStatus.NOT_CONFIGURED,
+                    tool=self.name,
+                    error="Bitrix OAuth is required for project creation.",
+                    data={"params": sanitized},
+                )
             try:
                 oauth_client = await self._bitrix_oauth.client_for_user(user_id)
                 result = await oauth_client.call("sonet_group.create", sanitized)
             except BitrixOAuthTokenMissing as exc:
-                return ToolResult(status=ToolStatus.NOT_CONFIGURED, tool=self.name, error=str(exc), data={"params": sanitized})
+                return ToolResult(
+                    status=ToolStatus.NOT_CONFIGURED, tool=self.name, error=str(exc), data={"params": sanitized}
+                )
             except (BitrixApiError, BitrixConfigError) as exc:
                 return ToolResult(
                     status=ToolStatus.NOT_CONFIGURED if isinstance(exc, BitrixConfigError) else ToolStatus.ERROR,
@@ -242,18 +262,32 @@ class ProjectCreateConfirmTool:
                     data={"params": sanitized},
                 )
             except Exception as exc:
-                return ToolResult(status=ToolStatus.ERROR, tool=self.name, error=f"{type(exc).__name__}: {exc}", data={"params": sanitized})
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool=self.name,
+                    error=f"{type(exc).__name__}: {exc}",
+                    data={"params": sanitized},
+                )
             await self._store.delete_task_draft(dialog_key)
-            return ToolResult(status=ToolStatus.OK, tool=self.name, data={"result": result, "params": sanitized, "draft": draft})
+            return ToolResult(
+                status=ToolStatus.OK, tool=self.name, data={"result": result, "params": sanitized, "draft": draft}
+            )
 
         if self._write_client is None:
             return ToolResult(status=ToolStatus.NOT_CONFIGURED, tool=self.name, error="write_client is not configured")
         try:
             result = await self._write_client.call("sonet_group.create", sanitized)
         except Exception as exc:
-            return ToolResult(status=ToolStatus.ERROR, tool=self.name, error=f"{type(exc).__name__}: {exc}", data={"params": sanitized})
+            return ToolResult(
+                status=ToolStatus.ERROR,
+                tool=self.name,
+                error=f"{type(exc).__name__}: {exc}",
+                data={"params": sanitized},
+            )
         await self._store.delete_task_draft(dialog_key)
-        return ToolResult(status=ToolStatus.OK, tool=self.name, data={"result": result, "params": sanitized, "draft": draft})
+        return ToolResult(
+            status=ToolStatus.OK, tool=self.name, data={"result": result, "params": sanitized, "draft": draft}
+        )
 
 
 class ProjectCreateDiscardTool:
