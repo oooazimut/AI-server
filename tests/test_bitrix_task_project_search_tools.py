@@ -432,6 +432,13 @@ def test_project_search_uses_snapshot_before_live_bitrix():
         body="Автомобильный проект\nПроект: Ларгус 2\nВладелец: 1",
         metadata={"owner_id": 1},
     )
+    index.upsert_item(
+        entity_type="project",
+        entity_id=53,
+        title="ларгус 3",
+        body="Другой автомобильный проект\nПроект: ларгус 3\nВладелец: 1",
+        metadata={"owner_id": 1},
+    )
     tool = BitrixProjectSearchTool(client=client, portal_search=index)
 
     result = anyio.run(lambda: tool.execute({"query": "Ларгус-2"}, user_id=13))
