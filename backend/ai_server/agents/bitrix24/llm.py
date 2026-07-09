@@ -800,7 +800,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Для чтения/поиска проекта по названию используй bitrix_project_search. "
         "Для создания проекта используй только project_create_draft, не прямой bitrix_api sonet_group.create. "
         "Вызывай project_create_draft только после bitrix_project_search, если подходящий проект не найден. "
-        "Обычный пользователь может подготовить только свой личный проект: personal_for_self=true, а name должен совпадать с ФИО из permission_context.bitrix_current_user_profile.data.profile.label. "
+        "Обычный пользователь может подготовить только свой личный проект: personal_for_self=true, name бери как 'Фамилия Имя' из permission_context.bitrix_current_user_profile.data.profile.label, без отчества. "
         "Произвольное создание проектов доступно только Bitrix-администратору. Личные проекты по умолчанию открытые и видимые. "
         "Для поиска складов, остатков и запросов вида 'найди склад Борисов' используй bitrix_warehouse_search, "
         "а не свободный bitrix_api. Если пользователь просит что есть на складе/остатки, передай include_products=true "

@@ -90,6 +90,26 @@ def test_project_draft_denies_personal_name_mismatch():
     assert "d:9" not in store._drafts
 
 
+def test_project_draft_allows_personal_project_without_patronymic():
+    store = FakeTaskDraftStore()
+    tool = ProjectCreateDraftTool(store=store)
+
+    result = _exec(
+        tool,
+        {
+            "name": "Коверга Дмитрий",
+            "personal_for_self": True,
+            "_actor_name": "Коверга Дмитрий Владимирович",
+        },
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+
+    assert result.status == ToolStatus.OK
+    assert store._drafts["d:13"]["params"]["fields"]["NAME"] == "Коверга Дмитрий"
+
+
 def test_project_draft_allows_admin_arbitrary_project():
     store = FakeTaskDraftStore()
     tool = ProjectCreateDraftTool(store=store)
