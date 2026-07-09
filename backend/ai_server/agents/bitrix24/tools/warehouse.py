@@ -71,16 +71,6 @@ class BitrixWarehouseSearchTool:
         product_offset = max(0, int(args.get("product_offset") or args.get("offset") or 0))
         include_products = bool(args.get("include_products"))
 
-        snapshot_data = self._snapshot_search(
-            query=query,
-            include_products=include_products,
-            limit=limit,
-            product_limit=product_limit,
-            product_offset=product_offset,
-        )
-        if snapshot_data is not None:
-            return ToolResult(status=ToolStatus.OK, tool=self.name, data=snapshot_data)
-
         read_client, access_actor, access_error = await resolve_current_user_read_client(
             self.name,
             fallback_client=self._client,
@@ -89,6 +79,17 @@ class BitrixWarehouseSearchTool:
         )
         if access_error is not None:
             return access_error
+
+        snapshot_data = self._snapshot_search(
+            query=query,
+            include_products=include_products,
+            limit=limit,
+            product_limit=product_limit,
+            product_offset=product_offset,
+            access_actor=access_actor,
+        )
+        if snapshot_data is not None:
+            return ToolResult(status=ToolStatus.OK, tool=self.name, data=snapshot_data)
 
         try:
             raw_stores = await read_client.result("catalog.store.list", {})
@@ -131,6 +132,7 @@ class BitrixWarehouseSearchTool:
         limit: int,
         product_limit: int,
         product_offset: int,
+        access_actor: str,
     ) -> dict[str, Any] | None:
         if self._portal_search is None:
             return None
@@ -158,6 +160,7 @@ class BitrixWarehouseSearchTool:
             "matches": matches,
             "total_stores_seen": len(matches),
             "source": "postgres_portal_snapshot",
+            "access_actor": access_actor,
             "summary": _stores_summary(matches, query=query),
         }
         if include_products:

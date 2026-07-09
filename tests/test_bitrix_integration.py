@@ -393,6 +393,54 @@ def test_bitrix_warehouse_search_tool_uses_stock_snapshot_before_live_bitrix():
     assert fake_bitrix.calls == []
 
 
+def test_bitrix_warehouse_snapshot_uses_oauth_actor_before_returning_index_data():
+    fallback_bitrix = FakeBitrixClient()
+    oauth_bitrix = FakeBitrixClient()
+    oauth = FakeBitrixOAuth(oauth_bitrix)
+    index = FakePortalSearchIndex()
+    index.upsert_item(
+        entity_type="catalog_store",
+        entity_id=10,
+        title="Borisov warehouse",
+        body="Borisov address",
+        metadata={},
+    )
+    tool = BitrixWarehouseSearchTool(client=fallback_bitrix, portal_search=index, bitrix_oauth=oauth)
+
+    result = anyio_run(tool.execute({"query": "Borisov warehouse", "limit": 5}, user_id=13))
+
+    assert result.status == ToolStatus.OK
+    assert result.data["source"] == "postgres_portal_snapshot"
+    assert result.data["access_actor"] == "oauth_current_user"
+    assert oauth.user_ids == [13]
+    assert fallback_bitrix.calls == []
+    assert oauth_bitrix.calls == []
+
+
+def test_bitrix_warehouse_snapshot_oauth_denies_without_user_id():
+    fallback_bitrix = FakeBitrixClient()
+    oauth_bitrix = FakeBitrixClient()
+    index = FakePortalSearchIndex()
+    index.upsert_item(
+        entity_type="catalog_store",
+        entity_id=10,
+        title="Borisov warehouse",
+        body="Borisov address",
+        metadata={},
+    )
+    tool = BitrixWarehouseSearchTool(
+        client=fallback_bitrix,
+        portal_search=index,
+        bitrix_oauth=FakeBitrixOAuth(oauth_bitrix),
+    )
+
+    result = anyio_run(tool.execute({"query": "Borisov warehouse", "limit": 5}))
+
+    assert result.status == ToolStatus.DENIED
+    assert fallback_bitrix.calls == []
+    assert oauth_bitrix.calls == []
+
+
 def test_bitrix_warehouse_search_tool_filters_non_available_products_before_limit():
     class FakeWarehouseClient(FakeBitrixClient):
         async def result(self, method, payload=None, *, base_url=None):
