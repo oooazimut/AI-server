@@ -125,6 +125,14 @@ class BitrixLLMService:
         dialog_history: list[dict[str, str]] | None = None,
         available_skills: list | None = None,
     ) -> BitrixLLMDecisionResult:
+        local_decision = _common_read_decision(task.request, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "common_read_route"),
+                raw={"source": "common_read_route"},
+            )
+
         instructions = load_instructions(manifest)
         completion = await self.client.complete(
             agent_id=manifest.id,
@@ -1018,22 +1026,35 @@ _WRITE_MARKERS = (
 def _normalize_common_read_decision(decision: BitrixLLMDecision, request: str) -> BitrixLLMDecision:
     if any(call.name in _WRITE_TOOL_NAMES for call in decision.tool_calls):
         return decision
+    local_decision = _common_read_decision(request, None)
+    if local_decision is not None:
+        return local_decision
+    return decision
+
+
+def _common_read_decision(request: str, tool_definitions: list[dict[str, Any]] | None) -> BitrixLLMDecision | None:
+    available_tools = {str(tool.get("name") or "") for tool in tool_definitions or []}
+    require_declared_tool = tool_definitions is not None
     clean_request = _strip_command_prefix(request)
     lowered = clean_request.casefold()
     if not any(marker in lowered for marker in _READ_MARKERS):
-        return decision
+        return None
     if any(marker in lowered for marker in _WRITE_MARKERS):
-        return decision
+        return None
 
     task_args = _common_task_read_args(clean_request)
     if task_args is not None:
-        return _replace_decision_tool(decision, "bitrix_task_search", task_args)
+        if require_declared_tool and "bitrix_task_search" not in available_tools:
+            return None
+        return _local_decision_tool("bitrix_task_search", task_args)
 
     project_query = _common_project_query(clean_request)
     if project_query:
-        return _replace_decision_tool(decision, "bitrix_project_search", {"query": project_query, "limit": 10})
+        if require_declared_tool and "bitrix_project_search" not in available_tools:
+            return None
+        return _local_decision_tool("bitrix_project_search", {"query": project_query, "limit": 10})
 
-    return decision
+    return None
 
 
 def _replace_decision_tool(decision: BitrixLLMDecision, name: str, args: dict[str, Any]) -> BitrixLLMDecision:
@@ -1041,6 +1062,15 @@ def _replace_decision_tool(decision: BitrixLLMDecision, name: str, args: dict[st
         status="completed",
         answer=decision.answer,
         confidence=max(decision.confidence, 0.8),
+        tool_calls=[BitrixLLMToolCall(name=name, args=args, summary="deterministic common Bitrix read routing")],
+    )
+
+
+def _local_decision_tool(name: str, args: dict[str, Any]) -> BitrixLLMDecision:
+    return BitrixLLMDecision(
+        status="completed",
+        answer="",
+        confidence=0.9,
         tool_calls=[BitrixLLMToolCall(name=name, args=args, summary="deterministic common Bitrix read routing")],
     )
 
