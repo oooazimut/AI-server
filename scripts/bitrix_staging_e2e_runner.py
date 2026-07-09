@@ -92,7 +92,7 @@ STATEFUL_TESTS: dict[str, list[TestCase]] = {
                 "Не создавай сразу, только покажи черновик для подтверждения."
             ),
             timeout_seconds=240,
-            expect_all=("черновик", "задач", "срок", "подтверд"),
+            expect_all=("черновик", "задач", "срок", "если всё верно"),
             reject_any=("Срок: Без срока", "/company/personal/user/"),
             kind="draft",
         ),
@@ -110,7 +110,7 @@ STATEFUL_TESTS: dict[str, list[TestCase]] = {
                 "Не добавляй сразу, только покажи черновик календаря для подтверждения."
             ),
             timeout_seconds=240,
-            expect_all=("черновик", "календар", "позвонить", "подтверд"),
+            expect_all=("черновик", "календар", "позвонить", "если всё верно"),
             reject_any=("/company/personal/user/",),
             kind="draft",
         ),
@@ -466,10 +466,13 @@ def main() -> int:
     tests = tests_for_suite(args.suite, include_draft=args.include_draft)
     results = []
     stopped_after_failure = False
-    for test in tests:
+    for index, test in enumerate(tests):
         result = run_test(args, run_id=run_id, test=test)
         results.append(result)
         if not result.get("ok") and not args.continue_on_failure:
+            for cleanup_test in cleanup_tests_after_failure(tests, index):
+                cleanup_result = run_test(args, run_id=run_id, test=cleanup_test)
+                results.append(cleanup_result)
             stopped_after_failure = True
             break
     payload = {
@@ -490,6 +493,17 @@ def main() -> int:
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0 if payload["ok"] else 2
+
+
+def cleanup_tests_after_failure(tests: list[TestCase], failed_index: int) -> list[TestCase]:
+    if tests[failed_index].kind != "draft":
+        return []
+    cleanup_tests: list[TestCase] = []
+    for test in tests[failed_index + 1 :]:
+        if test.kind != "draft_cleanup":
+            break
+        cleanup_tests.append(test)
+    return cleanup_tests
 
 
 if __name__ == "__main__":
