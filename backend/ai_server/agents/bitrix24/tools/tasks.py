@@ -878,6 +878,7 @@ def _search_projects_snapshot(
                 break
     except Exception:
         return None
+    results = _filter_project_snapshot_results(results, query=query, limit=limit)
     if not results:
         return None
     return [_project_summary_from_index(item) for item in results]
@@ -889,6 +890,28 @@ def _project_search_variants(query: str) -> list[str]:
     if normalized and normalized not in {item.casefold() for item in variants}:
         variants.append(normalized)
     return variants
+
+
+def _filter_project_snapshot_results(items: list[Any], *, query: str, limit: int) -> list[Any]:
+    normalized_query = _normalize_project_name(query)
+    query_terms = set(normalized_query.split())
+    scored: list[tuple[int, str, Any]] = []
+    for item in items:
+        name = str(getattr(item, "title", "") or "")
+        normalized_name = _normalize_project_name(name)
+        if not normalized_name:
+            continue
+        score = 0
+        if normalized_name == normalized_query:
+            score = 100
+        elif normalized_query and normalized_query in normalized_name:
+            score = 80
+        elif query_terms and query_terms.issubset(set(normalized_name.split())):
+            score = 70
+        if score:
+            scored.append((score, normalized_name, item))
+    scored.sort(key=lambda row: (-row[0], row[1]))
+    return [item for _score, _name, item in scored[:limit]]
 
 
 def _extract_tasks(result: Any) -> list[dict[str, Any]]:
