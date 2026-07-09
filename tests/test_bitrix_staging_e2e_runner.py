@@ -4,6 +4,7 @@ from scripts.bitrix_staging_e2e_runner import (
     TestCase as RunnerTestCase,
 )
 from scripts.bitrix_staging_e2e_runner import (
+    cleanup_tests_after_failure,
     evaluate_response_text,
     event_processed,
     matching_response_messages,
@@ -105,3 +106,25 @@ def test_tests_for_suite_drafts_adds_cleanup_steps() -> None:
     ]
     assert tests[0].reject_any
     assert tests[1].kind == "draft_cleanup"
+
+
+def test_cleanup_tests_after_failure_returns_next_cleanup_block_only() -> None:
+    tests = [
+        RunnerTestCase(test_id="task-draft", text="", kind="draft"),
+        RunnerTestCase(test_id="task-cleanup", text="", kind="draft_cleanup"),
+        RunnerTestCase(test_id="calendar-draft", text="", kind="draft"),
+        RunnerTestCase(test_id="calendar-cleanup", text="", kind="draft_cleanup"),
+    ]
+
+    cleanup = cleanup_tests_after_failure(tests, 0)
+
+    assert [test.test_id for test in cleanup] == ["task-cleanup"]
+
+
+def test_cleanup_tests_after_failure_ignores_read_failures() -> None:
+    tests = [
+        RunnerTestCase(test_id="read", text="", kind="read"),
+        RunnerTestCase(test_id="cleanup", text="", kind="draft_cleanup"),
+    ]
+
+    assert cleanup_tests_after_failure(tests, 0) == []
