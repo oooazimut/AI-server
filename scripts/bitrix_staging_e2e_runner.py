@@ -375,6 +375,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bot-id", type=int, default=int(os.getenv("BITRIX_E2E_BOT_ID", "0") or 0))
     parser.add_argument("--suite", choices=["all", *sorted(SAFE_TESTS)], default="all")
     parser.add_argument("--include-draft", action="store_true", help="Also run the stateful local draft test.")
+    parser.add_argument(
+        "--continue-on-failure",
+        action="store_true",
+        help="Run remaining tests after a failure. By default the suite stops to avoid delayed-response mixups.",
+    )
     parser.add_argument("--poll-interval", type=float, default=3.0)
     parser.add_argument("--preflight-idle-timeout", type=float, default=120.0)
     return parser
@@ -413,11 +418,20 @@ def main() -> int:
 
     run_id = "AI-TEST-" + datetime.now().strftime("%Y%m%d-%H%M%S")
     tests = tests_for_suite(args.suite, include_draft=args.include_draft)
-    results = [run_test(args, run_id=run_id, test=test) for test in tests]
+    results = []
+    stopped_after_failure = False
+    for test in tests:
+        result = run_test(args, run_id=run_id, test=test)
+        results.append(result)
+        if not result.get("ok") and not args.continue_on_failure:
+            stopped_after_failure = True
+            break
     payload = {
         "ok": all(item.get("ok") for item in results),
         "suite": args.suite,
         "include_draft": args.include_draft,
+        "continue_on_failure": args.continue_on_failure,
+        "stopped_after_failure": stopped_after_failure,
         "run_id": run_id,
         "events_url": args.events_url,
         "status_url": args.status_url,
