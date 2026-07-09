@@ -90,12 +90,39 @@ class BitrixApiTool:
             )
         if decision.decision == "confirm":
             return await self._execute_write(method, params, summary, user_id=user_id, dialog_id=dialog_id)
-        if self._client is None:
+        read_client = self._client
+        access_actor = "configured_client"
+        if self._bitrix_oauth is not None:
+            if user_id is None:
+                return ToolResult(
+                    status=ToolStatus.DENIED,
+                    tool="bitrix_api",
+                    error="Bitrix read operation denied: current Bitrix user_id is missing.",
+                    data={"method": method, "params": params},
+                )
+            try:
+                read_client = await self._bitrix_oauth.client_for_user(user_id)
+                access_actor = "oauth_current_user"
+            except BitrixOAuthTokenMissing as exc:
+                return ToolResult(
+                    status=ToolStatus.DENIED,
+                    tool="bitrix_api",
+                    error=str(exc),
+                    data={"method": method, "params": params},
+                )
+            except (BitrixApiError, BitrixConfigError) as exc:
+                return ToolResult(
+                    status=ToolStatus.NOT_CONFIGURED if isinstance(exc, BitrixConfigError) else ToolStatus.ERROR,
+                    tool="bitrix_api",
+                    error=str(exc),
+                    data={"method": method, "params": params},
+                )
+        if read_client is None:
             return ToolResult(status=ToolStatus.NOT_CONFIGURED, tool="bitrix_api", error="BitrixClient is not injected")
         try:
-            result = await self._client.result(method, params)
+            result = await read_client.result(method, params)
             if method.casefold() == "sonet_group.get":
-                result = await _sonet_group_get_with_normalized_fallback(self._client, params, result)
+                result = await _sonet_group_get_with_normalized_fallback(read_client, params, result)
         except (BitrixApiError, BitrixConfigError) as exc:
             return ToolResult(
                 status=ToolStatus.NOT_CONFIGURED if isinstance(exc, BitrixConfigError) else ToolStatus.ERROR,
@@ -104,7 +131,9 @@ class BitrixApiTool:
                 data={"method": method, "params": params},
             )
         return ToolResult(
-            status=ToolStatus.OK, tool="bitrix_api", data={"method": method, "params": params, "result": result}
+            status=ToolStatus.OK,
+            tool="bitrix_api",
+            data={"method": method, "params": params, "result": result, "access_actor": access_actor},
         )
 
     async def _execute_write(
