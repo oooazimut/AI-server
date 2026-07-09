@@ -555,6 +555,54 @@ def test_project_search_uses_snapshot_before_live_bitrix():
     assert client.calls == []
 
 
+def test_project_search_snapshot_uses_oauth_actor_before_returning_index_data():
+    fallback_client = _FakeBitrixSearchClient()
+    oauth_client = _FakeBitrixSearchClient()
+    oauth = _FakeBitrixOAuth(oauth_client)
+    index = FakePortalSearchIndex()
+    index.upsert_item(
+        entity_type="project",
+        entity_id=45,
+        title="Р›Р°СЂРіСѓСЃ 2",
+        body="РђРІС‚РѕРјРѕР±РёР»СЊРЅС‹Р№ РїСЂРѕРµРєС‚\nРџСЂРѕРµРєС‚: Р›Р°СЂРіСѓСЃ 2",
+        metadata={"owner_id": 1},
+    )
+    tool = BitrixProjectSearchTool(client=fallback_client, portal_search=index, bitrix_oauth=oauth)
+
+    result = anyio.run(lambda: tool.execute({"query": "Р›Р°СЂРіСѓСЃ-2"}, user_id=13))
+
+    assert result.status == "ok"
+    assert result.data["source"] == "postgres_portal_snapshot"
+    assert result.data["access_actor"] == "oauth_current_user"
+    assert oauth.user_ids == [13]
+    assert fallback_client.calls == []
+    assert oauth_client.calls == []
+
+
+def test_project_search_snapshot_oauth_denies_without_user_id():
+    fallback_client = _FakeBitrixSearchClient()
+    oauth_client = _FakeBitrixSearchClient()
+    index = FakePortalSearchIndex()
+    index.upsert_item(
+        entity_type="project",
+        entity_id=45,
+        title="Р›Р°СЂРіСѓСЃ 2",
+        body="РђРІС‚РѕРјРѕР±РёР»СЊРЅС‹Р№ РїСЂРѕРµРєС‚\nРџСЂРѕРµРєС‚: Р›Р°СЂРіСѓСЃ 2",
+        metadata={"owner_id": 1},
+    )
+    tool = BitrixProjectSearchTool(
+        client=fallback_client,
+        portal_search=index,
+        bitrix_oauth=_FakeBitrixOAuth(oauth_client),
+    )
+
+    result = anyio.run(lambda: tool.execute({"query": "Р›Р°СЂРіСѓСЃ-2"}))
+
+    assert result.status == "denied"
+    assert fallback_client.calls == []
+    assert oauth_client.calls == []
+
+
 def _matches_task_filter(task: dict, task_filter: dict) -> bool:
     statuses = task_filter.get("STATUS")
     if isinstance(statuses, list) and int(task["status"]) not in statuses:

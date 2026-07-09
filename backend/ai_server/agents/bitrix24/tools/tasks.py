@@ -736,6 +736,18 @@ class BitrixProjectSearchTool:
             minimum=1,
             maximum=MAX_PROJECT_SEARCH_LIMIT,
         )
+        read_client: BitrixToolClientPort | None = None
+        access_actor = "snapshot_only"
+        if self._bitrix_oauth is not None:
+            read_client, access_actor, access_error = await resolve_current_user_read_client(
+                self.name,
+                fallback_client=self._client,
+                bitrix_oauth=self._bitrix_oauth,
+                user_id=user_id,
+            )
+            if access_error is not None:
+                return access_error
+
         snapshot_matches = _search_projects_snapshot(self._portal_search, query, limit=limit)
         if snapshot_matches is not None:
             return ToolResult(
@@ -743,6 +755,7 @@ class BitrixProjectSearchTool:
                 tool=self.name,
                 data={
                     "source": "postgres_portal_snapshot",
+                    "access_actor": access_actor,
                     "query": query,
                     "items": snapshot_matches,
                     "total": len(snapshot_matches),
@@ -750,14 +763,15 @@ class BitrixProjectSearchTool:
                     "errors": [],
                 },
             )
-        read_client, access_actor, access_error = await resolve_current_user_read_client(
-            self.name,
-            fallback_client=self._client,
-            bitrix_oauth=self._bitrix_oauth,
-            user_id=user_id,
-        )
-        if access_error is not None:
-            return access_error
+        if read_client is None:
+            read_client, access_actor, access_error = await resolve_current_user_read_client(
+                self.name,
+                fallback_client=self._client,
+                bitrix_oauth=self._bitrix_oauth,
+                user_id=user_id,
+            )
+            if access_error is not None:
+                return access_error
         matches, errors = await _search_projects(read_client, query, limit=limit)
         return ToolResult(
             status=ToolStatus.OK,
