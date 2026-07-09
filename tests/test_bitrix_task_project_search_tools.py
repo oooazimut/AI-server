@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import anyio
 
 from ai_server.agents.bitrix24.tools.tasks import BitrixProjectSearchTool, BitrixTaskSearchTool
+from tests.fakes import FakePortalSearchIndex
 
 
 class _FakeBitrixSearchClient:
@@ -419,6 +420,26 @@ def test_project_search_resolves_hyphenated_project_name():
         ("sonet_group.get", {"FILTER": {"%NAME": "Ларгус-2"}, "ORDER": {"NAME": "ASC"}}),
         ("sonet_group.get", {"FILTER": {}, "ORDER": {"NAME": "ASC"}}),
     ]
+
+
+def test_project_search_uses_snapshot_before_live_bitrix():
+    client = _FakeBitrixSearchClient()
+    index = FakePortalSearchIndex()
+    index.upsert_item(
+        entity_type="project",
+        entity_id=45,
+        title="Ларгус 2",
+        body="Автомобильный проект\nПроект: Ларгус 2\nВладелец: 1",
+        metadata={"owner_id": 1},
+    )
+    tool = BitrixProjectSearchTool(client=client, portal_search=index)
+
+    result = anyio.run(lambda: tool.execute({"query": "Ларгус-2"}, user_id=13))
+
+    assert result.status == "ok"
+    assert result.data["source"] == "postgres_portal_snapshot"
+    assert result.data["items"] == [{"id": "45", "name": "Ларгус 2", "description": "Автомобильный проект"}]
+    assert client.calls == []
 
 
 def _matches_task_filter(task: dict, task_filter: dict) -> bool:
