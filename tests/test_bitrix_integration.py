@@ -14,7 +14,7 @@ from ai_server.settings import get_settings
 from ai_server.tools.bitrix_policy import apply_write_policy
 from ai_server.transcription import TranscriptionResult
 from scripts.create_bitrix_dev_chat import chat_reference, sanitize_result
-from tests.fakes import FakeBitrixLLM
+from tests.fakes import FakeBitrixLLM, FakePortalSearchIndex
 
 
 def _bitrix_v2_message_payload() -> dict:
@@ -302,6 +302,49 @@ def test_bitrix_warehouse_search_tool_finds_store_and_products():
     assert result.data["products"]["items"][0]["product_url"] == "/shop/documents-catalog/7/product/1001/"
     assert ("catalog.store.list", {}) in fake_bitrix.calls
     assert any(method == "catalog.storeproduct.list" for method, _ in fake_bitrix.calls)
+
+
+def test_bitrix_warehouse_search_tool_uses_stock_snapshot_before_live_bitrix():
+    fake_bitrix = FakeBitrixClient()
+    index = FakePortalSearchIndex()
+    index.upsert_item(
+        entity_type="catalog_store",
+        entity_id=10,
+        title="Borisov warehouse",
+        body="Borisov address",
+        metadata={},
+    )
+    index.upsert_item(
+        entity_type="catalog_store_stock",
+        entity_id="10:1001",
+        title="Cable - Borisov warehouse",
+        body="Store: Borisov warehouse\nProduct: Cable\nAmount: 3",
+        url="https://example.test/shop/documents-catalog/7/product/1001/",
+        metadata={
+            "store_id": 10,
+            "store_title": "Borisov warehouse",
+            "store_address": "Borisov address",
+            "product_id": 1001,
+            "product_name": "Cable",
+            "iblock_id": 7,
+            "amount": "3",
+            "product_url": "https://example.test/shop/documents-catalog/7/product/1001/",
+            "positive_amount": True,
+        },
+    )
+    tool = BitrixWarehouseSearchTool(client=fake_bitrix, portal_search=index)
+
+    result = anyio_run(
+        tool.execute({"query": "Borisov warehouse", "include_products": True, "limit": 5, "product_limit": 5})
+    )
+
+    assert result.status == ToolStatus.OK
+    assert result.data["source"] == "postgres_portal_snapshot"
+    assert result.data["products"]["source"] == "postgres_portal_snapshot"
+    assert result.data["products"]["items"][0]["product_id"] == 1001
+    assert result.data["products"]["items"][0]["product_name"] == "Cable"
+    assert result.data["products"]["items"][0]["amount"] == "3"
+    assert fake_bitrix.calls == []
 
 
 def test_bitrix_warehouse_search_tool_filters_non_available_products_before_limit():
