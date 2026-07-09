@@ -8,6 +8,7 @@ from typing import Any
 from ai_server.agents.bitrix24.tools.bitrix_api import (
     _extract_sonet_groups,
     _match_sonet_groups,
+    _normalize_project_name,
 )
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
@@ -621,8 +622,13 @@ def _matches_snapshot_scope(task: dict[str, Any], *, scope: str, user_id: int | 
 class BitrixProjectSearchTool:
     name = "bitrix_project_search"
 
-    def __init__(self, client: BitrixToolClientPort | None = None) -> None:
+    def __init__(
+        self,
+        client: BitrixToolClientPort | None = None,
+        portal_search: PortalSearchPort | None = None,
+    ) -> None:
         self._client = client
+        self._portal_search = portal_search
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -655,8 +661,12 @@ class BitrixProjectSearchTool:
         dialog_key: str | None = None,
         dialog_id: str | None = None,
     ) -> ToolResult:
-        if self._client is None:
-            return ToolResult(status=ToolStatus.NOT_CONFIGURED, tool=self.name, error="BitrixClient is not injected")
+        if self._client is None and self._portal_search is None:
+            return ToolResult(
+                status=ToolStatus.NOT_CONFIGURED,
+                tool=self.name,
+                error="BitrixClient or PortalSearchIndex is required",
+            )
         query = _first_arg_text(args, "query", "project", "name")
         if not query:
             return ToolResult(
@@ -671,6 +681,27 @@ class BitrixProjectSearchTool:
             minimum=1,
             maximum=MAX_PROJECT_SEARCH_LIMIT,
         )
+        snapshot_matches = _search_projects_snapshot(self._portal_search, query, limit=limit)
+        if snapshot_matches is not None:
+            return ToolResult(
+                status=ToolStatus.OK,
+                tool=self.name,
+                data={
+                    "source": "postgres_portal_snapshot",
+                    "query": query,
+                    "items": snapshot_matches,
+                    "total": len(snapshot_matches),
+                    "limit": limit,
+                    "errors": [],
+                },
+            )
+        if self._client is None:
+            return ToolResult(
+                status=ToolStatus.NOT_CONFIGURED,
+                tool=self.name,
+                error="BitrixClient is not injected and project was not found in PortalSearchIndex",
+                data={"query": query},
+            )
         matches, errors = await _search_projects(self._client, query, limit=limit)
         return ToolResult(
             status=ToolStatus.OK,
@@ -821,6 +852,45 @@ async def _search_projects(
     return _match_sonet_groups(_extract_sonet_groups(fallback_result), query=query, limit=limit), errors
 
 
+def _search_projects_snapshot(
+    portal_search: PortalSearchPort | None,
+    query: str,
+    *,
+    limit: int,
+) -> list[dict[str, Any]] | None:
+    if portal_search is None:
+        return None
+    try:
+        if not portal_search.stats().exists:
+            return None
+        results = []
+        seen: set[tuple[str, str]] = set()
+        for variant in _project_search_variants(query):
+            for item in portal_search.search(variant, entity_types={"project"}, limit=limit):
+                key = (str(getattr(item, "entity_type", "")), str(getattr(item, "entity_id", "")))
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append(item)
+                if len(results) >= limit:
+                    break
+            if len(results) >= limit:
+                break
+    except Exception:
+        return None
+    if not results:
+        return None
+    return [_project_summary_from_index(item) for item in results]
+
+
+def _project_search_variants(query: str) -> list[str]:
+    variants = [query]
+    normalized = _normalize_project_name(query)
+    if normalized and normalized not in {item.casefold() for item in variants}:
+        variants.append(normalized)
+    return variants
+
+
 def _extract_tasks(result: Any) -> list[dict[str, Any]]:
     if isinstance(result, list):
         return [item for item in result if isinstance(item, dict)]
@@ -888,6 +958,22 @@ def _project_summary(group: dict[str, Any]) -> dict[str, Any]:
         "name": name,
         "description": _first_text(group, "DESCRIPTION", "description"),
     }
+
+
+def _project_summary_from_index(item: Any) -> dict[str, Any]:
+    return {
+        "id": str(getattr(item, "entity_id", "") or ""),
+        "name": str(getattr(item, "title", "") or ""),
+        "description": _project_description_from_index(getattr(item, "body", "") or ""),
+    }
+
+
+def _project_description_from_index(body: object) -> str:
+    lines = [line.strip() for line in str(body or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    first = lines[0]
+    return "" if first.startswith("Проект:") or first.startswith("Владелец:") else first
 
 
 def _person_label(value: object) -> str:
