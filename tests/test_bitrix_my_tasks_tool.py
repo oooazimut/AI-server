@@ -64,6 +64,16 @@ class _FakeTaskClient:
         }
 
 
+class _FakeBitrixOAuth:
+    def __init__(self, client: _FakeTaskClient) -> None:
+        self.client = client
+        self.user_ids: list[int] = []
+
+    async def client_for_user(self, user_id: int):
+        self.user_ids.append(user_id)
+        return self.client
+
+
 def test_my_tasks_merges_created_and_member_tasks_sorted_by_deadline():
     client = _FakeTaskClient()
     tool = BitrixMyTasksTool(client=client)
@@ -83,3 +93,18 @@ def test_my_tasks_merges_created_and_member_tasks_sorted_by_deadline():
     assert result.data["items"][2]["roles"] == ["соисполнитель"]
     assert client.calls[0][1]["filter"] == {"STATUS": [1, 2, 3, 4], "MEMBER": 9}
     assert client.calls[1][1]["filter"] == {"STATUS": [1, 2, 3, 4], "CREATED_BY": 9}
+
+
+def test_my_tasks_uses_oauth_client_for_current_user_reads():
+    fallback_client = _FakeTaskClient()
+    oauth_client = _FakeTaskClient()
+    oauth = _FakeBitrixOAuth(oauth_client)
+    tool = BitrixMyTasksTool(client=fallback_client, bitrix_oauth=oauth)
+
+    result = anyio.run(lambda: tool.execute({"status": "open", "limit": 10}, user_id=9))
+
+    assert result.status == "ok"
+    assert result.data["access_actor"] == "oauth_current_user"
+    assert oauth.user_ids == [9]
+    assert fallback_client.calls == []
+    assert oauth_client.calls[0][1]["filter"] == {"STATUS": [1, 2, 3, 4], "MEMBER": 9}

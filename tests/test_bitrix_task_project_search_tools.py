@@ -102,6 +102,16 @@ class _FakePortalTaskIndex:
         return matches[:limit]
 
 
+class _FakeBitrixOAuth:
+    def __init__(self, client: _FakeBitrixSearchClient) -> None:
+        self.client = client
+        self.user_ids: list[int] = []
+
+    async def client_for_user(self, user_id: int):
+        self.user_ids.append(user_id)
+        return self.client
+
+
 def test_task_search_responsible_scope_uses_current_user_and_active_statuses():
     client = _FakeBitrixSearchClient()
     tool = BitrixTaskSearchTool(client=client)
@@ -112,6 +122,33 @@ def test_task_search_responsible_scope_uses_current_user_and_active_statuses():
     assert [item["title"] for item in result.data["items"]] == ["Ответственная задача"]
     assert result.data["total"] == 1
     assert client.calls[0][1]["filter"] == {"STATUS": [1, 2, 3, 4], "RESPONSIBLE_ID": 13}
+
+
+def test_task_search_uses_oauth_client_for_live_current_user_reads():
+    fallback_client = _FakeBitrixSearchClient()
+    oauth_client = _FakeBitrixSearchClient()
+    oauth = _FakeBitrixOAuth(oauth_client)
+    tool = BitrixTaskSearchTool(client=fallback_client, bitrix_oauth=oauth)
+
+    result = anyio.run(lambda: tool.execute({"scope": "responsible"}, user_id=13))
+
+    assert result.status == "ok"
+    assert result.data["access_actor"] == "oauth_current_user"
+    assert oauth.user_ids == [13]
+    assert fallback_client.calls == []
+    assert oauth_client.calls[0][1]["filter"] == {"STATUS": [1, 2, 3, 4], "RESPONSIBLE_ID": 13}
+
+
+def test_task_search_oauth_read_denies_live_lookup_without_user_id():
+    fallback_client = _FakeBitrixSearchClient()
+    oauth_client = _FakeBitrixSearchClient()
+    tool = BitrixTaskSearchTool(client=fallback_client, bitrix_oauth=_FakeBitrixOAuth(oauth_client))
+
+    result = anyio.run(lambda: tool.execute({"scope": "all", "query": "РћР±СѓС‡РµРЅРёРµ"}))
+
+    assert result.status == "denied"
+    assert fallback_client.calls == []
+    assert oauth_client.calls == []
 
 
 def test_task_search_status_all_requires_explicit_include_closed_flag():
