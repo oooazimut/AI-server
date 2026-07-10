@@ -125,28 +125,12 @@ class BitrixLLMService:
         dialog_history: list[dict[str, str]] | None = None,
         available_skills: list | None = None,
     ) -> BitrixLLMDecisionResult:
-        local_decision = _common_task_draft_discard_decision(task.request, tool_definitions)
+        local_decision = _common_draft_discard_decision(task.request, task.context, tool_definitions)
         if local_decision is not None:
             return BitrixLLMDecisionResult(
                 decision=local_decision,
-                model_usage=_local_model_usage(manifest.id, "task_draft_discard_route"),
-                raw={"source": "task_draft_discard_route"},
-            )
-
-        local_decision = _common_calendar_event_discard_decision(task.request, tool_definitions)
-        if local_decision is not None:
-            return BitrixLLMDecisionResult(
-                decision=local_decision,
-                model_usage=_local_model_usage(manifest.id, "calendar_event_discard_route"),
-                raw={"source": "calendar_event_discard_route"},
-            )
-
-        local_decision = _common_project_create_discard_decision(task.request, tool_definitions)
-        if local_decision is not None:
-            return BitrixLLMDecisionResult(
-                decision=local_decision,
-                model_usage=_local_model_usage(manifest.id, "project_create_discard_route"),
-                raw={"source": "project_create_discard_route"},
+                model_usage=_local_model_usage(manifest.id, "draft_discard_route"),
+                raw={"source": "draft_discard_route"},
             )
 
         local_decision = _common_draft_confirm_decision(task.request, task.context, tool_definitions)
@@ -1151,6 +1135,46 @@ _CALENDAR_REMINDER_TITLE_CUTOFF_RE = re.compile(
     r"\s+(?:не\s+добавляй|только\s+покажи|покажи\s+черновик|создай\s+черновик|для\s+подтверждения)\b.*",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+def _common_draft_discard_decision(
+    request: str,
+    context: dict[str, Any],
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    lowered = _strip_command_prefix(request).casefold()
+    if not _is_draft_discard_request(lowered):
+        return None
+
+    draft = context.get("pending_task_draft") if isinstance(context, dict) else None
+    if isinstance(draft, dict) and draft:
+        draft_type = _text(draft.get("_draft_type")) or "task_create"
+        tool_name = {
+            "task_create": "task_draft_discard",
+            "task_close": "task_close_discard",
+            "calendar_event": "calendar_event_discard",
+            "project_create": "project_create_discard",
+        }.get(draft_type)
+        if tool_name and _draft_discard_tool_available(tool_definitions, tool_name):
+            return _discard_decision_tool(tool_name, f"deterministic Bitrix {draft_type} draft discard routing")
+        return None
+
+    fallback_tool = _draft_discard_tool_from_text(lowered)
+    if fallback_tool and _draft_discard_tool_available(tool_definitions, fallback_tool):
+        return _discard_decision_tool(fallback_tool, f"deterministic Bitrix {fallback_tool} routing")
+    return None
+
+
+def _draft_discard_tool_from_text(lowered_request: str) -> str:
+    if "календар" in lowered_request or "событ" in lowered_request:
+        return "calendar_event_discard"
+    if "проект" in lowered_request:
+        return "project_create_discard"
+    if "закрыт" in lowered_request and "задач" in lowered_request:
+        return "task_close_discard"
+    if "задач" in lowered_request:
+        return "task_draft_discard"
+    return ""
 
 
 def _common_task_draft_discard_decision(
