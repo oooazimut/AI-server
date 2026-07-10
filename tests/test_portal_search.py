@@ -349,6 +349,47 @@ def test_portal_metadata_sync_indexes_tasks_projects_and_disk(monkeypatch):
     assert any(method == "batch" for method, _payload in bitrix.calls)
 
 
+def test_portal_metadata_sync_deduplicates_disk_roots(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    monkeypatch.setenv("SEARCH_INDEX_MAX_TASK_ATTACHMENTS", "10")
+    monkeypatch.setenv("SEARCH_INDEX_MAX_DISK_ITEMS", "10")
+
+    class DuplicateRootBitrix(FakePortalBitrix):
+        def __init__(self):
+            super().__init__()
+            self.folder_calls: dict[int, int] = {}
+
+        async def list_disk_storages(self, *, limit: int | None = None):
+            storages = [
+                {"ID": 10, "ROOT_OBJECT_ID": 500, "NAME": "РћР±С‰РёР№ РґРёСЃРє"},
+                {"ID": 11, "ROOT_OBJECT_ID": 500, "NAME": "Р”СѓР±Р»СЊ РѕР±С‰РµРіРѕ РґРёСЃРєР°"},
+            ]
+            return storages[:limit] if limit else storages
+
+        async def list_disk_folder_children_all(
+            self,
+            *,
+            folder_id: int,
+            filter_: dict | None = None,
+            limit: int | None = None,
+        ):
+            self.folder_calls[folder_id] = self.folder_calls.get(folder_id, 0) + 1
+            return await super().list_disk_folder_children_all(folder_id=folder_id, filter_=filter_, limit=limit)
+
+    index = FakePortalSearchIndex()
+    bitrix = DuplicateRootBitrix()
+
+    stats = anyio_run(sync_portal_index(bitrix, index, settings=get_settings()))
+
+    assert stats.disk_items == 4
+    assert bitrix.folder_calls[500] == 1
+    assert index.get_item(entity_type="disk_storage", entity_id=10) is not None
+    assert index.get_item(entity_type="disk_storage", entity_id=11) is not None
+    assert index.get_item(entity_type="disk_file", entity_id=501) is not None
+    assert index.get_item(entity_type="disk_folder", entity_id=502) is not None
+
+
 def test_portal_delta_sync_updates_folder_and_deletes_missing_children(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     index = FakePortalSearchIndex()

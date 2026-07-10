@@ -508,6 +508,8 @@ async def _sync_projects(bitrix: BitrixClient, index: PortalSearchIndex, setting
 async def _sync_disk(bitrix: BitrixClient, index: PortalSearchIndex, settings: Settings) -> dict[str, object]:
     storages = await bitrix.list_disk_storages(limit=settings.search_index_max_storages)
     indexed_items = 0
+    visited_folder_ids: set[int] = set()
+    seen_disk_object_ids: set[int] = set()
     for storage in storages:
         storage_id = _first(storage, "ID", "id")
         root_id = _first(storage, "ROOT_OBJECT_ID", "rootObjectId")
@@ -530,17 +532,23 @@ async def _sync_disk(bitrix: BitrixClient, index: PortalSearchIndex, settings: S
         )
         indexed_items += 1
 
-        if root_id is None or indexed_items >= settings.search_index_max_disk_items:
+        root_folder_id = safe_int(root_id)
+        if root_folder_id is None or indexed_items >= settings.search_index_max_disk_items:
             continue
+        if root_folder_id in visited_folder_ids:
+            continue
+        visited_folder_ids.add(root_folder_id)
         indexed_items += await _sync_disk_folder(
             bitrix,
             index,
-            folder_id=int(root_id),
+            folder_id=root_folder_id,
             storage_name=name,
             path=name,
             depth=0,
             remaining=settings.search_index_max_disk_items - indexed_items,
             settings=settings,
+            visited_folder_ids=visited_folder_ids,
+            seen_disk_object_ids=seen_disk_object_ids,
         )
         if indexed_items >= settings.search_index_max_disk_items:
             break
@@ -563,6 +571,8 @@ async def _sync_disk_folder(
     depth: int,
     remaining: int,
     settings: Settings,
+    visited_folder_ids: set[int],
+    seen_disk_object_ids: set[int],
 ) -> int:
     if remaining <= 0 or depth > settings.search_index_disk_max_depth:
         return 0
@@ -573,6 +583,11 @@ async def _sync_disk_folder(
         item_id = _first(child, "ID", "id")
         if item_id is None:
             continue
+        disk_object_id = safe_int(item_id)
+        if disk_object_id is not None and disk_object_id in seen_disk_object_ids:
+            continue
+        if disk_object_id is not None:
+            seen_disk_object_ids.add(disk_object_id)
         name = str(_first(child, "NAME", "name") or f"Объект #{item_id}")
         item_type = str(_first(child, "TYPE", "type") or "").lower()
         child_path = f"{path}/{name}"
@@ -607,15 +622,21 @@ async def _sync_disk_folder(
         )
         count += 1
         if entity_type == "disk_folder" and depth < settings.search_index_disk_max_depth:
+            child_folder_id = safe_int(item_id)
+            if child_folder_id is None or child_folder_id in visited_folder_ids:
+                continue
+            visited_folder_ids.add(child_folder_id)
             count += await _sync_disk_folder(
                 bitrix,
                 index,
-                folder_id=int(item_id),
+                folder_id=child_folder_id,
                 storage_name=storage_name,
                 path=child_path,
                 depth=depth + 1,
                 remaining=remaining - count,
                 settings=settings,
+                visited_folder_ids=visited_folder_ids,
+                seen_disk_object_ids=seen_disk_object_ids,
             )
         if count >= remaining:
             break
