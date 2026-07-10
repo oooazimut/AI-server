@@ -71,7 +71,10 @@ class PortalSearchIndexerWorker:
         self._owns_lock = False
         self.status: dict[str, Any] = {
             "running": False,
-            "enabled": settings.search_background_indexer_enabled,
+            "enabled": self._periodic_enabled(),
+            "metadata_enabled": self._metadata_enabled(),
+            "content_enabled": self._content_enabled(),
+            "delta_enabled": self._delta_enabled(),
             "last_error": None,
             "last_error_at": None,
             "consecutive_errors": 0,
@@ -127,7 +130,10 @@ class PortalSearchIndexerWorker:
     def public_status(self) -> dict[str, Any]:
         return {
             **self.status,
-            "enabled": self._settings.search_background_indexer_enabled,
+            "enabled": self._periodic_enabled(),
+            "metadata_enabled": self._metadata_enabled(),
+            "content_enabled": self._content_enabled(),
+            "delta_enabled": self._delta_enabled(),
             "lock_path": str(self._settings.search_background_lock_path),
             "state_path": str(self._settings.search_background_state_path),
         }
@@ -171,25 +177,36 @@ class PortalSearchIndexerWorker:
         self.status["running"] = True
         initial_delay = timedelta(seconds=self._settings.search_background_initial_delay_seconds)
         now = _now()
-        next_metadata_at = self._next_run_at(
-            "last_metadata_sync_at",
-            self._settings.search_background_metadata_interval_seconds,
-            initial_delay=initial_delay,
-            now=now,
+        next_metadata_at = (
+            self._next_run_at(
+                "last_metadata_sync_at",
+                self._settings.search_background_metadata_interval_seconds,
+                initial_delay=initial_delay,
+                now=now,
+            )
+            if self._metadata_enabled()
+            else None
         )
-        next_content_at = self._next_run_at(
-            "last_content_sync_at",
-            self._settings.search_background_content_interval_seconds,
-            initial_delay=initial_delay,
-            now=now,
+        next_content_at = (
+            self._next_run_at(
+                "last_content_sync_at",
+                self._settings.search_background_content_interval_seconds,
+                initial_delay=initial_delay,
+                now=now,
+            )
+            if self._content_enabled()
+            else None
         )
-        next_delta_at = now + initial_delay
+        next_delta_at = now + initial_delay if self._delta_enabled() else None
         self._set_next_times(next_metadata_at, next_content_at, next_delta_at)
 
         try:
             while self.status["running"]:
-                self.status["enabled"] = self._settings.search_background_indexer_enabled
-                if not self._settings.search_background_indexer_enabled:
+                self.status["enabled"] = self._periodic_enabled()
+                self.status["metadata_enabled"] = self._metadata_enabled()
+                self.status["content_enabled"] = self._content_enabled()
+                self.status["delta_enabled"] = self._delta_enabled()
+                if not self._periodic_enabled():
                     await asyncio.sleep(30)
                     continue
 
@@ -202,7 +219,7 @@ class PortalSearchIndexerWorker:
 
                 self._heartbeat_lock()
                 now = _now()
-                if now >= next_metadata_at:
+                if self._metadata_enabled() and next_metadata_at and now >= next_metadata_at:
                     await self.run_metadata_once()
                     self._heartbeat_lock()
                     next_metadata_at = _now() + timedelta(
@@ -211,7 +228,7 @@ class PortalSearchIndexerWorker:
                     self.status["next_metadata_sync_at"] = _format_time(next_metadata_at)
 
                 now = _now()
-                if self._settings.search_content_enabled and now >= next_content_at:
+                if self._content_enabled() and next_content_at and now >= next_content_at:
                     await self.run_content_once()
                     self._heartbeat_lock()
                     next_content_at = _now() + timedelta(
@@ -220,18 +237,18 @@ class PortalSearchIndexerWorker:
                     self.status["next_content_sync_at"] = _format_time(next_content_at)
 
                 now = _now()
-                if self._settings.search_delta_indexer_enabled and now >= next_delta_at:
+                if self._delta_enabled() and next_delta_at and now >= next_delta_at:
                     await self.run_delta_once()
                     self._heartbeat_lock()
                     next_delta_at = _now() + timedelta(seconds=self._settings.search_delta_interval_seconds)
                     self.status["next_delta_sync_at"] = _format_time(next_delta_at)
 
-                sleep_candidates = [
-                    max((next_metadata_at - _now()).total_seconds(), 1),
-                    max((next_content_at - _now()).total_seconds(), 1),
-                    30,
-                ]
-                if self._settings.search_delta_indexer_enabled:
+                sleep_candidates = [30]
+                if self._metadata_enabled() and next_metadata_at:
+                    sleep_candidates.append(max((next_metadata_at - _now()).total_seconds(), 1))
+                if self._content_enabled() and next_content_at:
+                    sleep_candidates.append(max((next_content_at - _now()).total_seconds(), 1))
+                if self._delta_enabled() and next_delta_at:
                     sleep_candidates.append(max((next_delta_at - _now()).total_seconds(), 1))
                 await asyncio.sleep(min(sleep_candidates))
         except asyncio.CancelledError:
@@ -380,13 +397,25 @@ class PortalSearchIndexerWorker:
 
     def _set_next_times(
         self,
-        metadata_at: datetime,
-        content_at: datetime,
-        delta_at: datetime,
+        metadata_at: datetime | None,
+        content_at: datetime | None,
+        delta_at: datetime | None,
     ) -> None:
-        self.status["next_metadata_sync_at"] = _format_time(metadata_at)
-        self.status["next_content_sync_at"] = _format_time(content_at)
-        self.status["next_delta_sync_at"] = _format_time(delta_at)
+        self.status["next_metadata_sync_at"] = _format_time(metadata_at) if metadata_at else None
+        self.status["next_content_sync_at"] = _format_time(content_at) if content_at else None
+        self.status["next_delta_sync_at"] = _format_time(delta_at) if delta_at else None
+
+    def _periodic_enabled(self) -> bool:
+        return self._settings.search_background_periodic_enabled
+
+    def _metadata_enabled(self) -> bool:
+        return self._settings.search_background_periodic_metadata_enabled
+
+    def _content_enabled(self) -> bool:
+        return self._settings.search_content_enabled and self._settings.search_background_periodic_content_enabled
+
+    def _delta_enabled(self) -> bool:
+        return self._settings.search_delta_indexer_enabled and self._settings.search_background_periodic_delta_enabled
 
     def _next_run_at(
         self,

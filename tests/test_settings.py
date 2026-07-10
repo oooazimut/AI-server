@@ -154,3 +154,48 @@ def test_search_index_task_comment_settings(monkeypatch):
 
     assert overridden.search_index_include_task_comments is False
     assert overridden.search_index_task_comment_limit == 5
+
+
+def test_search_index_disk_depth_defaults_to_full_portal_probe_depth(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.delenv("SEARCH_INDEX_DISK_MAX_DEPTH", raising=False)
+
+    defaults = get_settings()
+
+    assert defaults.search_index_disk_max_depth == 30
+
+    monkeypatch.setenv("SEARCH_INDEX_DISK_MAX_DEPTH", "8")
+
+    overridden = get_settings()
+
+    assert overridden.search_index_disk_max_depth == 8
+
+
+def test_search_background_legacy_flag_enables_all_periodic_modes(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("SEARCH_BACKGROUND_INDEXER_ENABLED", "true")
+    monkeypatch.delenv("SEARCH_BACKGROUND_METADATA_ENABLED", raising=False)
+    monkeypatch.delenv("SEARCH_BACKGROUND_CONTENT_ENABLED", raising=False)
+    monkeypatch.delenv("SEARCH_BACKGROUND_DELTA_ENABLED", raising=False)
+
+    settings = get_settings()
+
+    assert settings.search_background_periodic_enabled is True
+    assert settings.search_background_periodic_metadata_enabled is True
+    assert settings.search_background_periodic_content_enabled is True
+    assert settings.search_background_periodic_delta_enabled is True
+
+
+def test_search_background_modes_can_be_enabled_independently(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("SEARCH_BACKGROUND_INDEXER_ENABLED", "false")
+    monkeypatch.setenv("SEARCH_BACKGROUND_METADATA_ENABLED", "false")
+    monkeypatch.setenv("SEARCH_BACKGROUND_CONTENT_ENABLED", "true")
+    monkeypatch.setenv("SEARCH_BACKGROUND_DELTA_ENABLED", "true")
+
+    settings = get_settings()
+
+    assert settings.search_background_periodic_enabled is True
+    assert settings.search_background_periodic_metadata_enabled is False
+    assert settings.search_background_periodic_content_enabled is True
+    assert settings.search_background_periodic_delta_enabled is True

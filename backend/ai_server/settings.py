@@ -83,6 +83,9 @@ class Settings:
     search_content_max_chars: int
     search_content_allowed_extensions: str
     search_background_indexer_enabled: bool
+    search_background_metadata_enabled: bool
+    search_background_content_enabled: bool
+    search_background_delta_enabled: bool
     search_background_initial_delay_seconds: int
     search_background_metadata_interval_seconds: int
     search_background_content_interval_seconds: int
@@ -173,6 +176,28 @@ class Settings:
     @property
     def bitrix_bot_uses_oauth(self) -> bool:
         return self.bitrix_bot_auth_mode.strip().lower() == "oauth"
+
+    @property
+    def search_background_periodic_enabled(self) -> bool:
+        return any(
+            (
+                self.search_background_periodic_metadata_enabled,
+                self.search_content_enabled and self.search_background_periodic_content_enabled,
+                self.search_delta_indexer_enabled and self.search_background_periodic_delta_enabled,
+            )
+        )
+
+    @property
+    def search_background_periodic_metadata_enabled(self) -> bool:
+        return self.search_background_indexer_enabled or self.search_background_metadata_enabled
+
+    @property
+    def search_background_periodic_content_enabled(self) -> bool:
+        return self.search_background_indexer_enabled or self.search_background_content_enabled
+
+    @property
+    def search_background_periodic_delta_enabled(self) -> bool:
+        return self.search_background_indexer_enabled or self.search_background_delta_enabled
 
     @property
     def bitrix_oauth_configured(self) -> bool:
@@ -422,7 +447,7 @@ def get_settings() -> Settings:
         search_index_max_storages=_env_int("SEARCH_INDEX_MAX_STORAGES", 500) or 500,
         search_index_max_disk_items=_env_int("SEARCH_INDEX_MAX_DISK_ITEMS", 50000) or 50000,
         search_index_max_task_attachments=_env_int("SEARCH_INDEX_MAX_TASK_ATTACHMENTS", 5000) or 5000,
-        search_index_disk_max_depth=_env_int("SEARCH_INDEX_DISK_MAX_DEPTH", 6) or 6,
+        search_index_disk_max_depth=_env_int("SEARCH_INDEX_DISK_MAX_DEPTH", 30) or 30,
         search_index_include_disk=_env_bool("SEARCH_INDEX_INCLUDE_DISK", True),
         search_index_include_task_attachments=_env_bool("SEARCH_INDEX_INCLUDE_TASK_ATTACHMENTS", True),
         search_index_include_task_comments=_env_bool("SEARCH_INDEX_INCLUDE_TASK_COMMENTS", True),
@@ -439,6 +464,9 @@ def get_settings() -> Settings:
             "SEARCH_CONTENT_ALLOWED_EXTENSIONS", ".txt,.csv,.doc,.docx,.xlsx,.xls,.pdf"
         ),
         search_background_indexer_enabled=_env_bool("SEARCH_BACKGROUND_INDEXER_ENABLED", False),
+        search_background_metadata_enabled=_env_bool("SEARCH_BACKGROUND_METADATA_ENABLED", False),
+        search_background_content_enabled=_env_bool("SEARCH_BACKGROUND_CONTENT_ENABLED", False),
+        search_background_delta_enabled=_env_bool("SEARCH_BACKGROUND_DELTA_ENABLED", False),
         search_background_initial_delay_seconds=_env_int("SEARCH_BACKGROUND_INITIAL_DELAY_SECONDS", 60) or 60,
         search_background_metadata_interval_seconds=_env_int("SEARCH_BACKGROUND_METADATA_INTERVAL_SECONDS", 6 * 60 * 60)
         or (6 * 60 * 60),
