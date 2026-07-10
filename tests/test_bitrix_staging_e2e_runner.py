@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from scripts.bitrix_staging_e2e_runner import (
     TestCase as RunnerTestCase,
@@ -11,10 +12,12 @@ from scripts.bitrix_staging_e2e_runner import (
     default_lock_path,
     evaluate_response_text,
     event_processed,
+    expected_pending_draft,
     make_run_id,
     matching_response_messages,
     queue_is_idle,
     release_dialog_lock,
+    verify_draft_state,
 )
 from scripts.bitrix_staging_e2e_runner import (
     tests_for_suite as runner_tests_for_suite,
@@ -78,6 +81,31 @@ def test_queue_is_idle_requires_no_pending_or_processing_events() -> None:
     assert queue_is_idle({"queue": {"pending": 0, "processing": 0, "failed": 3}})
     assert not queue_is_idle({"queue": {"pending": 1, "processing": 0}})
     assert not queue_is_idle({"queue": {"pending": 0, "processing": 1}})
+
+
+def test_expected_pending_draft_only_for_stateful_steps() -> None:
+    assert expected_pending_draft(RunnerTestCase(test_id="draft", text="", kind="draft")) is True
+    assert expected_pending_draft(RunnerTestCase(test_id="cleanup", text="", kind="draft_cleanup")) is False
+    assert expected_pending_draft(RunnerTestCase(test_id="read", text="", kind="read")) is None
+
+
+def test_verify_draft_state_can_be_disabled() -> None:
+    args = SimpleNamespace(verify_draft_store=False, database_url="", dialog_key="")
+    test = RunnerTestCase(test_id="draft", text="", kind="draft")
+
+    assert verify_draft_state(args, test) == {"checked": False, "ok": True}
+
+
+def test_verify_draft_state_fails_without_database_url_for_draft() -> None:
+    args = SimpleNamespace(verify_draft_store=True, database_url="", dialog_key="chat:1:user:2")
+    test = RunnerTestCase(test_id="draft", text="", kind="draft")
+
+    result = verify_draft_state(args, test)
+
+    assert result["checked"]
+    assert not result["ok"]
+    assert result["error"] == "missing_database_url"
+    assert result["expected_present"] is True
 
 
 def test_make_run_id_is_unique_and_keeps_readable_prefix() -> None:

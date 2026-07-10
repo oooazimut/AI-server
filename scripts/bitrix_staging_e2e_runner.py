@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -20,6 +21,8 @@ BACKEND_DIR = PROJECT_ROOT / "backend"
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(BACKEND_DIR))
 
+from ai_server.integrations.bitrix.chat_parser import make_dialog_key  # noqa: E402
+from ai_server.integrations.postgres.bitrix_agent import PostgresBitrixAgentStore  # noqa: E402
 from ai_server.settings import get_settings  # noqa: E402
 from scripts.create_bitrix_dev_chat import env_file_paths, load_env_files  # noqa: E402
 
@@ -311,7 +314,8 @@ def run_test(args: argparse.Namespace, *, run_id: str, test: TestCase) -> dict[s
 
         joined = "\n".join(message_text(message) for message in response_messages)
         evaluation = evaluate_response_text(joined, test)
-        ok = evaluation["matched"] and not evaluation["rejected"]
+        draft_state = verify_draft_state(args, test)
+        ok = evaluation["matched"] and not evaluation["rejected"] and draft_state.get("ok", True)
         return {
             "test_id": test.test_id,
             "kind": test.kind,
@@ -326,6 +330,7 @@ def run_test(args: argparse.Namespace, *, run_id: str, test: TestCase) -> dict[s
             "expect_all": list(test.expect_all),
             "reject_any": list(test.reject_any),
             **evaluation,
+            "draft_state": draft_state,
             "response_preview": joined[:1200],
             "worker_latest": compact_status(last_status),
         }
@@ -393,6 +398,51 @@ def evaluate_response_text(text: str, test: TestCase) -> dict[str, bool]:
         "matched_all": matched_all,
         "rejected": rejected,
     }
+
+
+def expected_pending_draft(test: TestCase) -> bool | None:
+    if test.kind == "draft":
+        return True
+    if test.kind == "draft_cleanup":
+        return False
+    return None
+
+
+def verify_draft_state(args: argparse.Namespace, test: TestCase) -> dict[str, Any]:
+    expected = expected_pending_draft(test)
+    if expected is None or not getattr(args, "verify_draft_store", True):
+        return {"checked": False, "ok": True}
+    database_url = str(getattr(args, "database_url", "") or "")
+    dialog_key = str(getattr(args, "dialog_key", "") or "")
+    if not database_url:
+        return {"checked": True, "ok": False, "error": "missing_database_url", "expected_present": expected}
+    if not dialog_key:
+        return {"checked": True, "ok": False, "error": "missing_dialog_key", "expected_present": expected}
+    try:
+        draft = asyncio.run(load_pending_task_draft(database_url, dialog_key))
+    except Exception as exc:
+        return {
+            "checked": True,
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "expected_present": expected,
+            "dialog_key": dialog_key,
+        }
+    present = bool(draft)
+    return {
+        "checked": True,
+        "ok": present is expected,
+        "expected_present": expected,
+        "present": present,
+        "dialog_key": dialog_key,
+        "draft_type": draft.get("_draft_type") if isinstance(draft, dict) else None,
+        "has_fields": isinstance(draft, dict) and isinstance(draft.get("fields"), dict),
+    }
+
+
+async def load_pending_task_draft(database_url: str, dialog_key: str) -> dict[str, Any] | None:
+    store = PostgresBitrixAgentStore(database_url)
+    return await store.get_task_draft(dialog_key)
 
 
 def compact_status(status: dict[str, Any]) -> dict[str, Any]:
@@ -547,6 +597,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--poll-interval", type=float, default=3.0)
     parser.add_argument("--preflight-idle-timeout", type=float, default=120.0)
     parser.add_argument(
+        "--verify-draft-store",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="For stateful draft suites, verify pending draft presence in PostgreSQL.",
+    )
+    parser.add_argument(
         "--lock-path",
         default=os.getenv("BITRIX_E2E_LOCK_PATH", ""),
         help="Dialog-level lock path. Defaults to a temp file derived from dialog-id.",
@@ -575,6 +631,8 @@ def main() -> int:
     args.secret = args.secret or settings.webhook_secret
     args.bot_id = args.bot_id or settings.bitrix_bot_id
     args.chat_id = args.chat_id or chat_id_from_dialog(args.dialog_id)
+    args.database_url = settings.database_url
+    args.dialog_key = make_dialog_key(chat_id=args.chat_id, dialog_id=args.dialog_id, user_id=args.user_id)
 
     missing = [
         name
@@ -632,6 +690,7 @@ def main() -> int:
         "lock_path": None if args.disable_lock else args.lock_path,
         "rest_webhook_configured": bool(args.rest_webhook_url),
         "dialog_id": args.dialog_id,
+        "dialog_key": args.dialog_key,
         "user_id": args.user_id,
         "bot_id": args.bot_id,
         "loaded_env_keys": sorted({key for key in loaded_env_keys if key.startswith(("BITRIX_", "WEBHOOK_"))}),
