@@ -573,7 +573,7 @@ def test_bitrix_llm_decision_payload_includes_permission_context(monkeypatch):
     assert any("Bitrix itself decides final permissions" in rule for rule in permission["rules"])
 
 
-def test_bitrix_llm_exposes_and_accepts_task_draft_confirmation_tools(monkeypatch):
+def test_bitrix_llm_routes_task_draft_confirmation_without_llm(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient(
         json.dumps(
@@ -615,17 +615,12 @@ def test_bitrix_llm_exposes_and_accepts_task_draft_confirmation_tools(monkeypatc
     )
 
     assert {"task_create_confirm", "task_draft_discard"} <= ALLOWED_TOOL_NAMES
-    payload = json.loads(client.calls[0]["messages"][1]["content"])
-    prompt = client.calls[0]["messages"][0]["content"]
-    assert {"task_create_confirm", "task_draft_discard"} <= {tool["name"] for tool in payload["tools"]}
-    assert payload["permission_context"]["current_dialog_id"] == "chat4321"
-    assert payload["permission_context"]["pending_task_draft"]["fields"]["TITLE"] == "test"
-    assert "task_create_confirm" in prompt
-    assert "task_draft_discard" in prompt
-    assert [call.name for call in result.decision.tool_calls] == ["task_create_confirm", "task_draft_discard"]
+    assert client.calls == []
+    assert result.raw == {"source": "draft_confirm_route"}
+    assert [call.name for call in result.decision.tool_calls] == ["task_create_confirm"]
 
 
-def test_bitrix_llm_exposes_and_accepts_task_close_confirmation_tools(monkeypatch):
+def test_bitrix_llm_routes_task_close_confirmation_without_llm(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient(
         json.dumps(
@@ -669,16 +664,12 @@ def test_bitrix_llm_exposes_and_accepts_task_close_confirmation_tools(monkeypatc
     )
 
     assert {"task_close_draft", "task_close_confirm", "task_close_discard"} <= ALLOWED_TOOL_NAMES
-    payload = json.loads(client.calls[0]["messages"][1]["content"])
-    prompt = client.calls[0]["messages"][0]["content"]
-    assert {"task_close_confirm", "task_close_discard"} <= {tool["name"] for tool in payload["tools"]}
-    assert payload["permission_context"]["pending_task_draft"]["_draft_type"] == "task_close"
-    assert "task_close_confirm" in prompt
-    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" in prompt
-    assert [call.name for call in result.decision.tool_calls] == ["task_close_confirm", "task_close_discard"]
+    assert client.calls == []
+    assert result.raw == {"source": "draft_confirm_route"}
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_confirm"]
 
 
-def test_bitrix_llm_exposes_and_accepts_calendar_confirmation_tools(monkeypatch):
+def test_bitrix_llm_routes_calendar_confirmation_without_llm(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient(
         json.dumps(
@@ -722,13 +713,9 @@ def test_bitrix_llm_exposes_and_accepts_calendar_confirmation_tools(monkeypatch)
     )
 
     assert {"calendar_event_draft", "calendar_event_confirm", "calendar_event_discard"} <= ALLOWED_TOOL_NAMES
-    payload = json.loads(client.calls[0]["messages"][1]["content"])
-    prompt = client.calls[0]["messages"][0]["content"]
-    assert {"calendar_event_confirm", "calendar_event_discard"} <= {tool["name"] for tool in payload["tools"]}
-    assert payload["permission_context"]["pending_task_draft"]["_draft_type"] == "calendar_event"
-    assert "calendar_event_confirm" in prompt
-    assert "calendar.event.add" in prompt
-    assert [call.name for call in result.decision.tool_calls] == ["calendar_event_confirm", "calendar_event_discard"]
+    assert client.calls == []
+    assert result.raw == {"source": "draft_confirm_route"}
+    assert [call.name for call in result.decision.tool_calls] == ["calendar_event_confirm"]
 
 
 def test_bitrix_llm_decide_routes_simple_reminder_to_calendar_draft(monkeypatch):
@@ -812,12 +799,144 @@ def test_bitrix_llm_decide_routes_task_draft_discard_without_llm(monkeypatch):
     )
 
     assert client.calls == []
-    assert result.raw == {"source": "task_draft_discard_route"}
+    assert result.raw == {"source": "draft_discard_route"}
     assert [call.name for call in result.decision.tool_calls] == ["task_draft_discard"]
     assert result.decision.tool_calls[0].args == {}
 
 
-def test_bitrix_llm_exposes_and_accepts_project_confirmation_tools(monkeypatch):
+def test_bitrix_llm_decide_routes_task_close_draft_discard_without_llm(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient(
+        json.dumps(
+            {
+                "status": "completed",
+                "answer": "Нет активного черновика закрытия задачи для отмены.",
+                "confidence": 0.2,
+                "tool_calls": [{"name": "none", "args": {}}],
+            }
+        )
+    )
+    service = BitrixLLMService(client, settings=get_settings())
+    tool_definitions = [
+        {"name": "task_draft_discard", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
+        {"name": "none", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request="Битрикс отмени черновик закрытия задачи.",
+                user={"id": "13"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "task_close",
+                        "task_id": 139,
+                        "task_title": "Обучение сотрудников",
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "draft_discard_route"}
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_discard"]
+    assert result.decision.tool_calls[0].args == {}
+
+
+def test_bitrix_llm_decide_routes_calendar_draft_discard_without_llm(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient(
+        json.dumps(
+            {
+                "status": "completed",
+                "answer": "Нет активного черновика события календаря для отмены.",
+                "confidence": 0.2,
+                "tool_calls": [{"name": "none", "args": {}}],
+            }
+        )
+    )
+    service = BitrixLLMService(client, settings=get_settings())
+    tool_definitions = [
+        {"name": "task_draft_discard", "description": "", "parameters": {}},
+        {"name": "calendar_event_discard", "description": "", "parameters": {}},
+        {"name": "project_create_discard", "description": "", "parameters": {}},
+        {"name": "none", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request="Битрикс отмени черновик события календаря.",
+                user={"id": "13"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {"_draft_type": "calendar_event", "title": "Позвонить Борисову"},
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "draft_discard_route"}
+    assert [call.name for call in result.decision.tool_calls] == ["calendar_event_discard"]
+    assert result.decision.tool_calls[0].args == {}
+
+
+def test_bitrix_llm_decide_routes_project_draft_discard_without_llm(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient(
+        json.dumps(
+            {
+                "status": "completed",
+                "answer": "Нет активного черновика проекта для отмены.",
+                "confidence": 0.2,
+                "tool_calls": [{"name": "none", "args": {}}],
+            }
+        )
+    )
+    service = BitrixLLMService(client, settings=get_settings())
+    tool_definitions = [
+        {"name": "task_draft_discard", "description": "", "parameters": {}},
+        {"name": "calendar_event_discard", "description": "", "parameters": {}},
+        {"name": "project_create_discard", "description": "", "parameters": {}},
+        {"name": "none", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request="Битрикс отмени черновик проекта.",
+                user={"id": "13"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {"_draft_type": "project_create", "params": {"fields": {"NAME": "Иванов"}}},
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "draft_discard_route"}
+    assert [call.name for call in result.decision.tool_calls] == ["project_create_discard"]
+    assert result.decision.tool_calls[0].args == {}
+
+
+def test_bitrix_llm_routes_project_confirmation_without_llm(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient(
         json.dumps(
@@ -861,12 +980,98 @@ def test_bitrix_llm_exposes_and_accepts_project_confirmation_tools(monkeypatch):
     )
 
     assert {"project_create_draft", "project_create_confirm", "project_create_discard"} <= ALLOWED_TOOL_NAMES
-    payload = json.loads(client.calls[0]["messages"][1]["content"])
-    prompt = client.calls[0]["messages"][0]["content"]
-    assert {"project_create_confirm", "project_create_discard"} <= {tool["name"] for tool in payload["tools"]}
-    assert payload["permission_context"]["pending_task_draft"]["_draft_type"] == "project_create"
-    assert "project_create_confirm" in prompt
-    assert [call.name for call in result.decision.tool_calls] == ["project_create_confirm", "project_create_discard"]
+    assert client.calls == []
+    assert result.raw == {"source": "draft_confirm_route"}
+    assert [call.name for call in result.decision.tool_calls] == ["project_create_confirm"]
+
+
+def test_bitrix_llm_compose_formats_project_create_draft(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="создай проект", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="project_create_draft",
+                    data={
+                        "params": {"params": {"fields": {"NAME": "Кулинич Валерий"}}},
+                        "preview": {
+                            "name": "Кулинич Валерий",
+                            "type": "личный проект",
+                            "visibility": "открытый",
+                            "description": "Личный проект Кулинич Валерий",
+                        },
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert "Черновик проекта:" in result.answer
+    assert "Название: Кулинич Валерий" in result.answer
+    assert "Тип: личный проект" in result.answer
+    assert "Открытость: открытый" in result.answer
+    assert "Если всё верно" in result.answer
+
+
+def test_bitrix_llm_compose_formats_project_create_confirm_with_project_link(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    settings = get_settings()
+    service = BitrixLLMService(client, settings=settings)
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="да, создай проект", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="project_create_confirm",
+                    data={
+                        "result": {"result": 777},
+                        "params": {"fields": {"NAME": "Кулинич Валерий"}},
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "completed"
+    assert "Проект создан:" in result.answer
+    assert "Кулинич Валерий" in result.answer
+    assert "/workgroups/group/777/" in result.answer
+    assert "/company/personal/user/" not in result.answer
+
+
+def test_bitrix_llm_compose_formats_project_create_discard_without_llm(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="отмени черновик проекта", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[ToolResult(status="ok", tool="project_create_discard", data={"discarded": True})],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "completed"
+    assert result.answer == "Черновик проекта удалён."
 
 
 def test_bitrix_llm_compose_formats_task_draft_without_profile_links(monkeypatch):
