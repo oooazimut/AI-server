@@ -125,6 +125,14 @@ class BitrixLLMService:
         dialog_history: list[dict[str, str]] | None = None,
         available_skills: list | None = None,
     ) -> BitrixLLMDecisionResult:
+        local_decision = _common_task_draft_discard_decision(task.request, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "task_draft_discard_route"),
+                raw={"source": "task_draft_discard_route"},
+            )
+
         local_decision = _common_calendar_event_draft_decision(task.request, tool_definitions)
         if local_decision is not None:
             return BitrixLLMDecisionResult(
@@ -1047,6 +1055,36 @@ _CALENDAR_REMINDER_TITLE_CUTOFF_RE = re.compile(
     r"\s+(?:не\s+добавляй|только\s+покажи|покажи\s+черновик|создай\s+черновик|для\s+подтверждения)\b.*",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+def _common_task_draft_discard_decision(
+    request: str,
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    available_tools = {str(tool.get("name") or "") for tool in tool_definitions or []}
+    if tool_definitions is not None and "task_draft_discard" not in available_tools:
+        return None
+
+    clean_request = _strip_command_prefix(request)
+    lowered = clean_request.casefold()
+    if "черновик" not in lowered or "задач" not in lowered:
+        return None
+    if not any(marker in lowered for marker in ("отмени", "отменить", "удали", "удалить", "не создавай")):
+        return None
+    if any(marker in lowered for marker in ("календар", "событ", "проект")):
+        return None
+    return BitrixLLMDecision(
+        status="completed",
+        answer="",
+        confidence=0.92,
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="task_draft_discard",
+                args={},
+                summary="deterministic Bitrix task draft discard routing",
+            )
+        ],
+    )
 
 
 def _common_calendar_event_draft_decision(
