@@ -4,10 +4,12 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -427,6 +429,70 @@ def chat_id_from_dialog(dialog_id: str) -> int:
     return 0
 
 
+def make_run_id() -> str:
+    return f"AI-TEST-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+
+
+def default_lock_path(dialog_id: str) -> str:
+    safe_dialog = "".join(char if char.isalnum() else "-" for char in dialog_id).strip("-") or "default"
+    return str(Path(tempfile.gettempdir()) / f"ai-server-bitrix-e2e-{safe_dialog}.lock")
+
+
+def acquire_dialog_lock(
+    lock_path: str,
+    *,
+    timeout_seconds: float,
+    stale_seconds: float,
+    poll_interval: float = 1.0,
+) -> dict[str, Any]:
+    deadline = time.time() + timeout_seconds
+    path = Path(lock_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if stale_seconds > 0:
+                try:
+                    if time.time() - path.stat().st_mtime > stale_seconds:
+                        path.unlink()
+                        continue
+                except OSError:
+                    pass
+            if time.time() >= deadline:
+                return {"ok": False, "error": "dialog_lock_timeout", "lock_path": str(path)}
+            time.sleep(poll_interval)
+            continue
+        except OSError as exc:
+            return {"ok": False, "error": type(exc).__name__, "details": str(exc), "lock_path": str(path)}
+
+        payload = {
+            "pid": os.getpid(),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        os.write(fd, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        return {"ok": True, "fd": fd, "lock_path": str(path)}
+
+
+def release_dialog_lock(lock: dict[str, Any] | None) -> None:
+    if not lock or not lock.get("ok"):
+        return
+    fd = lock.get("fd")
+    if isinstance(fd, int):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    lock_path = lock.get("lock_path")
+    if isinstance(lock_path, str):
+        try:
+            Path(lock_path).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
 def tests_for_suite(suite: str, *, include_draft: bool) -> list[TestCase]:
     selected: list[TestCase] = []
     if suite == "all":
@@ -480,6 +546,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--poll-interval", type=float, default=3.0)
     parser.add_argument("--preflight-idle-timeout", type=float, default=120.0)
+    parser.add_argument(
+        "--lock-path",
+        default=os.getenv("BITRIX_E2E_LOCK_PATH", ""),
+        help="Dialog-level lock path. Defaults to a temp file derived from dialog-id.",
+    )
+    parser.add_argument("--lock-timeout", type=float, default=float(os.getenv("BITRIX_E2E_LOCK_TIMEOUT", "600") or 600))
+    parser.add_argument(
+        "--stale-lock-seconds",
+        type=float,
+        default=float(os.getenv("BITRIX_E2E_STALE_LOCK_SECONDS", "1800") or 1800),
+    )
+    parser.add_argument("--disable-lock", action="store_true")
     return parser
 
 
@@ -514,19 +592,34 @@ def main() -> int:
         print(json.dumps({"ok": False, "error": "missing_config", "missing": missing}, ensure_ascii=False, indent=2))
         return 1
 
-    run_id = "AI-TEST-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    args.lock_path = args.lock_path or default_lock_path(args.dialog_id)
+    lock: dict[str, Any] | None = None
+    if not args.disable_lock:
+        lock = acquire_dialog_lock(
+            args.lock_path,
+            timeout_seconds=args.lock_timeout,
+            stale_seconds=args.stale_lock_seconds,
+        )
+        if not lock.get("ok"):
+            print(json.dumps(lock, ensure_ascii=False, indent=2))
+            return 3
+
+    run_id = make_run_id()
     tests = tests_for_suite(args.suite, include_draft=args.include_draft)
     results = []
     stopped_after_failure = False
-    for index, test in enumerate(tests):
-        result = run_test(args, run_id=run_id, test=test)
-        results.append(result)
-        if not result.get("ok") and not args.continue_on_failure:
-            for cleanup_test in cleanup_tests_after_failure(tests, index):
-                cleanup_result = run_test(args, run_id=run_id, test=cleanup_test)
-                results.append(cleanup_result)
-            stopped_after_failure = True
-            break
+    try:
+        for index, test in enumerate(tests):
+            result = run_test(args, run_id=run_id, test=test)
+            results.append(result)
+            if not result.get("ok") and not args.continue_on_failure:
+                for cleanup_test in cleanup_tests_after_failure(tests, index):
+                    cleanup_result = run_test(args, run_id=run_id, test=cleanup_test)
+                    results.append(cleanup_result)
+                stopped_after_failure = True
+                break
+    finally:
+        release_dialog_lock(lock)
     payload = {
         "ok": all(item.get("ok") for item in results),
         "suite": args.suite,
@@ -536,6 +629,7 @@ def main() -> int:
         "run_id": run_id,
         "events_url": args.events_url,
         "status_url": args.status_url,
+        "lock_path": None if args.disable_lock else args.lock_path,
         "rest_webhook_configured": bool(args.rest_webhook_url),
         "dialog_id": args.dialog_id,
         "user_id": args.user_id,

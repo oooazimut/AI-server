@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from scripts.bitrix_staging_e2e_runner import (
     TestCase as RunnerTestCase,
 )
 from scripts.bitrix_staging_e2e_runner import (
+    acquire_dialog_lock,
     cleanup_tests_after_failure,
+    default_lock_path,
     evaluate_response_text,
     event_processed,
+    make_run_id,
     matching_response_messages,
     queue_is_idle,
+    release_dialog_lock,
 )
 from scripts.bitrix_staging_e2e_runner import (
     tests_for_suite as runner_tests_for_suite,
@@ -72,6 +78,41 @@ def test_queue_is_idle_requires_no_pending_or_processing_events() -> None:
     assert queue_is_idle({"queue": {"pending": 0, "processing": 0, "failed": 3}})
     assert not queue_is_idle({"queue": {"pending": 1, "processing": 0}})
     assert not queue_is_idle({"queue": {"pending": 0, "processing": 1}})
+
+
+def test_make_run_id_is_unique_and_keeps_readable_prefix() -> None:
+    first = make_run_id()
+    second = make_run_id()
+
+    assert first.startswith("AI-TEST-")
+    assert second.startswith("AI-TEST-")
+    assert first != second
+
+
+def test_default_lock_path_is_scoped_to_dialog() -> None:
+    assert default_lock_path("chat4321").endswith("ai-server-bitrix-e2e-chat4321.lock")
+
+
+def test_acquire_dialog_lock_blocks_parallel_runner() -> None:
+    lock_dir = Path(__file__).resolve().parents[1] / ".tmp_e2e_lock_tests"
+    lock_dir.mkdir(exist_ok=True)
+    lock_path = str(lock_dir / "dialog.lock")
+    first = acquire_dialog_lock(lock_path, timeout_seconds=0.1, stale_seconds=60, poll_interval=0.01)
+    second = acquire_dialog_lock(lock_path, timeout_seconds=0.1, stale_seconds=60, poll_interval=0.01)
+
+    try:
+        assert first["ok"]
+        assert not second["ok"]
+        assert second["error"] == "dialog_lock_timeout"
+    finally:
+        release_dialog_lock(first)
+
+    third = acquire_dialog_lock(lock_path, timeout_seconds=0.1, stale_seconds=60, poll_interval=0.01)
+    try:
+        assert third["ok"]
+    finally:
+        release_dialog_lock(third)
+        lock_dir.rmdir()
 
 
 def test_event_processed_uses_current_event_status() -> None:
