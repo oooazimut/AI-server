@@ -48,6 +48,7 @@ def build_task_create_draft_from_args(args: dict[str, Any], *, user_id: int | No
     responsible_label = compact_text(str(args.get("responsible_name") or args.get("responsible_label") or ""))
     responsible_note = ""
     group_id = optional_int(args.get("group_id"))
+    project_label = compact_text(str(args.get("project_name") or args.get("group_name") or ""))
 
     if responsible_id is None and _truthy(args.get("responsible_self")):
         responsible_id = user_id
@@ -93,7 +94,9 @@ def build_task_create_draft_from_args(args: dict[str, Any], *, user_id: int | No
     return BitrixTaskCreateDraft(
         params={"fields": fields} if fields else {},
         summary=_summary(title=title, responsible_id=responsible_id, deadline=deadline, group_id=group_id),
-        preview=_draft_preview(fields, responsible_label=responsible_label) if fields else {},
+        preview=_draft_preview(fields, responsible_label=responsible_label, project_label=project_label)
+        if fields
+        else {},
         contract_errors=unique(contract_errors),
         notes=notes,
     )
@@ -122,6 +125,8 @@ class TaskCreateDraftTool:
                     "responsible_self": {"type": "boolean"},
                     "responsible_name": {"type": "string"},
                     "group_id": {"type": "integer"},
+                    "project_name": {"type": "string"},
+                    "group_name": {"type": "string"},
                     "deadline_iso": {"type": "string"},
                     "no_deadline": {"type": "boolean"},
                 },
@@ -361,18 +366,23 @@ def _default_description(title: str) -> str:
     return f"Краткое содержание: {title}"
 
 
-def _draft_preview(fields: dict[str, Any], *, responsible_label: str = "") -> dict[str, str]:
+def _draft_preview(fields: dict[str, Any], *, responsible_label: str = "", project_label: str = "") -> dict[str, str]:
     title = compact_text(str(fields.get("TITLE") or "задача"))
     description = compact_text(str(fields.get("DESCRIPTION") or ""))
     deadline = str(fields.get("DEADLINE") or "")
     no_deadline = _truthy(fields.get("NO_DEADLINE"))
     deadline_label = "без срока" if no_deadline else _format_deadline_for_preview(deadline)
-    return {
+    preview = {
         "title": title,
         "description": description,
         "responsible": responsible_label or "указанный сотрудник",
         "deadline": deadline_label,
     }
+    if project_label:
+        preview["project"] = project_label
+    elif fields.get("GROUP_ID") is not None:
+        preview["project"] = "выбранный проект"
+    return preview
 
 
 def _format_deadline_for_preview(deadline: str) -> str:

@@ -87,10 +87,7 @@ OPTIONAL_READ_TESTS: dict[str, list[TestCase]] = {
     "tasks_advanced": [
         TestCase(
             test_id="BITRIX-TASK-ADVANCED-COMMENT-01",
-            text=(
-                "Битрикс найди закрытые задачи, где в комментариях есть слово понаблюдать. "
-                "Покажи не больше 5."
-            ),
+            text=("Битрикс найди закрытые задачи, где в комментариях есть слово понаблюдать. Покажи не больше 5."),
             timeout_seconds=300,
             expect_all=("задач",),
             expect_any=("понаблюдать", "не найден", "нет"),
@@ -135,6 +132,26 @@ STATEFUL_TESTS: dict[str, list[TestCase]] = {
             text="Битрикс отмени черновик события календаря.",
             timeout_seconds=180,
             expect_all=("черновик", "событ", "календар", "удал"),
+            kind="draft_cleanup",
+        ),
+    ],
+    "drafts_project": [
+        TestCase(
+            test_id="BITRIX-TASK-PROJECT-DRAFT-01",
+            text=(
+                "Битрикс создай задачу в проекте Ларгус-2 на меня: проверить документы. "
+                "Не создавай сразу, только покажи черновик для подтверждения."
+            ),
+            timeout_seconds=300,
+            expect_all=("черновик", "задач", "проект", "Ларгус", "срок", "если всё верно"),
+            reject_any=("Срок: Без срока", "/company/personal/user/"),
+            kind="draft",
+        ),
+        TestCase(
+            test_id="BITRIX-TASK-PROJECT-DRAFT-DISCARD-01",
+            text="Битрикс отмени черновик задачи.",
+            timeout_seconds=180,
+            expect_all=("черновик", "задач", "удал"),
             kind="draft_cleanup",
         ),
     ],

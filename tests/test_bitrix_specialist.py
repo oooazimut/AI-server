@@ -806,6 +806,7 @@ def test_bitrix_llm_compose_formats_task_draft_without_profile_links(monkeypatch
                         "preview": {
                             "title": "тест подтверждения",
                             "responsible": "Дмитрий",
+                            "project": "Ларгус 2",
                             "deadline": "13.07.2026 19:00 МСК",
                             "description": "Краткое содержание: тест подтверждения",
                         },
@@ -822,6 +823,7 @@ def test_bitrix_llm_compose_formats_task_draft_without_profile_links(monkeypatch
     assert "Черновик задачи" in result.answer
     assert "по умолчанию: 3 рабочих дня" not in result.answer
     assert "13.07.2026 19:00 МСК" in result.answer
+    assert "Проект: Ларгус 2" in result.answer
     assert "Описание: тест подтверждения" in result.answer
     assert "Описание: Краткое содержание:" not in result.answer
     assert "[URL" not in result.answer

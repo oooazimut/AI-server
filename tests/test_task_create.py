@@ -119,6 +119,18 @@ def test_draft_default_deadline_when_missing():
     assert any("Срок по умолчанию" in note for note in draft.notes)
 
 
+def test_draft_project_label_stays_in_preview_only():
+    draft = build_task_create_draft_from_args(
+        {"title": "Задача", "responsible_id": 9, "group_id": 45, "project_name": "Ларгус 2"},
+        user_id=9,
+    )
+
+    assert draft.is_ready
+    assert draft.params["fields"]["GROUP_ID"] == 45
+    assert "_PROJECT_LABEL" not in draft.params["fields"]
+    assert draft.preview["project"] == "Ларгус 2"
+
+
 # ---------------------------------------------------------------------------
 # build_task_create_draft_from_args — contract errors
 # ---------------------------------------------------------------------------

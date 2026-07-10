@@ -124,6 +124,18 @@ def test_tests_for_suite_drafts_adds_cleanup_steps() -> None:
     assert tests[1].kind == "draft_cleanup"
 
 
+def test_tests_for_suite_project_draft_requires_project_in_preview_and_cleanup() -> None:
+    tests = runner_tests_for_suite("drafts_project", include_draft=False)
+
+    assert [test.test_id for test in tests] == [
+        "BITRIX-TASK-PROJECT-DRAFT-01",
+        "BITRIX-TASK-PROJECT-DRAFT-DISCARD-01",
+    ]
+    assert "проект" in tests[0].expect_all
+    assert "Ларгус" in tests[0].expect_all
+    assert tests[1].kind == "draft_cleanup"
+
+
 def test_cleanup_tests_after_failure_returns_next_cleanup_block_only() -> None:
     tests = [
         RunnerTestCase(test_id="task-draft", text="", kind="draft"),

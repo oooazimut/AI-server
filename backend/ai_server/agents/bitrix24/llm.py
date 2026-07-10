@@ -670,18 +670,27 @@ def _format_task_create_draft_answer(data: dict[str, Any]) -> str:
     fields = params.get("fields") if isinstance(params.get("fields"), dict) else {}
     title = _text(preview.get("title")) or _text(fields.get("TITLE")) or "задача"
     responsible = _text(preview.get("responsible")) or "указанный сотрудник"
+    project = _text(preview.get("project"))
     deadline = _text(preview.get("deadline")) or _deadline_label_from_fields(fields)
     description = _clean_task_description(
         _text(preview.get("description")) or _text(fields.get("DESCRIPTION")) or f"Краткое содержание: {title}"
     )
-    return (
-        "Черновик задачи:\n"
-        f"Название: {title}\n"
-        f"Ответственный: {responsible}\n"
-        f"Срок: {deadline}\n"
-        f"Описание: {description}\n\n"
-        "Если всё верно, напишите: да, создай."
+    lines = [
+        "Черновик задачи:",
+        f"Название: {title}",
+        f"Ответственный: {responsible}",
+    ]
+    if project:
+        lines.append(f"Проект: {project}")
+    lines.extend(
+        [
+            f"Срок: {deadline}",
+            f"Описание: {description}",
+            "",
+            "Если всё верно, напишите: да, создай.",
+        ]
     )
+    return "\n".join(lines)
 
 
 def _format_task_create_confirm_answer(data: dict[str, Any], *, portal_base_url: str = "") -> str:
@@ -901,7 +910,8 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Если знаешь имя ответственного после поиска, тоже передай его в responsible_name "
         "только для человекочитаемого черновика. "
         "Если ответственный указан по имени — сначала вызови bitrix_api(user.search), получи ID, затем task_create_draft. "
-        "Если проект указан по названию — сначала вызови bitrix_project_search, получи ID, затем task_create_draft. "
+        "Если проект указан по названию — сначала вызови bitrix_project_search, получи ID, затем task_create_draft; "
+        "в task_create_draft передай group_id и project_name для человекочитаемого черновика. "
         "Если пользователь сказал относительный срок, вычисли deadline_iso сам по current_datetime. "
         "Если срок не указан, не спрашивай уточнение: backend поставит срок по умолчанию три рабочих дня, 19:00 МСК. "
         "Передавай no_deadline=true только если пользователь явно сказал, что задача должна быть без срока. "
@@ -950,7 +960,7 @@ def _compose_system_prompt(portal_base_url: str = "") -> str:
     return (
         "Ты тот же LLM-субагент Bitrix24. Сформируй итоговый ответ человеку по результатам tools. "
         "Не выдумывай данные, которых нет в tool_results. "
-        "Для результата task_create_draft черновик должен быть обычным текстом без ссылок: название, ответственный, срок, описание, запрос подтверждения. "
+        "Для результата task_create_draft черновик должен быть обычным текстом без ссылок: название, ответственный, проект если указан, срок, описание, запрос подтверждения. "
         "Для результата task_create_confirm дай ссылку только на созданную задачу; ссылки на профиль сотрудника запрещены. "
         "Для результата task_close_draft покажи обычный текст без ссылок: задача, действие, результат, непроверенные пункты, запрос подтверждения. "
         "Для результата task_close_confirm дай ссылку только на задачу; ссылки на профиль сотрудника запрещены. "
