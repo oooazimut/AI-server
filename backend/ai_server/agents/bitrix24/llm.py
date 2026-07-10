@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
@@ -23,7 +23,7 @@ from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
 from ai_server.retrieval import RetrievalHit
 from ai_server.settings import Settings
-from ai_server.utils import confidence, optional_int
+from ai_server.utils import MOSCOW_TZ, confidence, optional_int
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +125,14 @@ class BitrixLLMService:
         dialog_history: list[dict[str, str]] | None = None,
         available_skills: list | None = None,
     ) -> BitrixLLMDecisionResult:
+        local_decision = _common_calendar_event_draft_decision(task.request, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "calendar_reminder_route"),
+                raw={"source": "calendar_reminder_route"},
+            )
+
         local_decision = _common_read_decision(task.request, tool_definitions)
         if local_decision is not None:
             return BitrixLLMDecisionResult(
@@ -1035,6 +1043,87 @@ _WRITE_MARKERS = (
     "удалить",
     "напомни",
 )
+_CALENDAR_REMINDER_TITLE_CUTOFF_RE = re.compile(
+    r"\s+(?:не\s+добавляй|только\s+покажи|покажи\s+черновик|создай\s+черновик|для\s+подтверждения)\b.*",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _common_calendar_event_draft_decision(
+    request: str,
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    available_tools = {str(tool.get("name") or "") for tool in tool_definitions or []}
+    if tool_definitions is not None and "calendar_event_draft" not in available_tools:
+        return None
+
+    args = _simple_calendar_reminder_args(_strip_command_prefix(request))
+    if args is None:
+        return None
+    return BitrixLLMDecision(
+        status="completed",
+        answer="",
+        confidence=0.92,
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="calendar_event_draft",
+                args=args,
+                summary="deterministic Bitrix calendar reminder draft routing",
+            )
+        ],
+    )
+
+
+def _simple_calendar_reminder_args(request: str) -> dict[str, Any] | None:
+    lowered = request.casefold()
+    if "напомни" not in lowered:
+        return None
+    if any(marker in lowered for marker in ("задач", "проект")):
+        return None
+
+    match = re.search(
+        r"\bнапомни(?:\s+мне)?\s+(?P<date>сегодня|завтра|послезавтра)\s+(?P<title>.+)",
+        request,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if match is None:
+        return None
+
+    target_date = _relative_calendar_date(match.group("date"))
+    title = _calendar_reminder_title(match.group("title"))
+    if not target_date or not title:
+        return None
+    return {
+        "title": title,
+        "date_iso": target_date.isoformat(),
+        "description": title,
+    }
+
+
+def _relative_calendar_date(value: str) -> date | None:
+    today = _moscow_today()
+    match value.casefold():
+        case "сегодня":
+            return today
+        case "завтра":
+            return today + timedelta(days=1)
+        case "послезавтра":
+            return today + timedelta(days=2)
+    return None
+
+
+def _moscow_today() -> date:
+    return datetime.now(MOSCOW_TZ).date()
+
+
+def _calendar_reminder_title(value: str) -> str:
+    title = _CALENDAR_REMINDER_TITLE_CUTOFF_RE.sub("", value)
+    title = re.split(r"[.!?]\s+", title, maxsplit=1)[0]
+    title = re.sub(r"^(?:что|чтобы|о\s+том,?\s+что)\s+", "", title.strip(), flags=re.IGNORECASE)
+    title = title.strip(" .,:;-")
+    if not title:
+        return ""
+    return title[:1].upper() + title[1:]
 
 
 def _normalize_common_read_decision(decision: BitrixLLMDecision, request: str) -> BitrixLLMDecision:
