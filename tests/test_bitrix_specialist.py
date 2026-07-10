@@ -573,7 +573,7 @@ def test_bitrix_llm_decision_payload_includes_permission_context(monkeypatch):
     assert any("Bitrix itself decides final permissions" in rule for rule in permission["rules"])
 
 
-def test_bitrix_llm_exposes_and_accepts_task_draft_confirmation_tools(monkeypatch):
+def test_bitrix_llm_routes_task_draft_confirmation_without_llm(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient(
         json.dumps(
@@ -615,17 +615,12 @@ def test_bitrix_llm_exposes_and_accepts_task_draft_confirmation_tools(monkeypatc
     )
 
     assert {"task_create_confirm", "task_draft_discard"} <= ALLOWED_TOOL_NAMES
-    payload = json.loads(client.calls[0]["messages"][1]["content"])
-    prompt = client.calls[0]["messages"][0]["content"]
-    assert {"task_create_confirm", "task_draft_discard"} <= {tool["name"] for tool in payload["tools"]}
-    assert payload["permission_context"]["current_dialog_id"] == "chat4321"
-    assert payload["permission_context"]["pending_task_draft"]["fields"]["TITLE"] == "test"
-    assert "task_create_confirm" in prompt
-    assert "task_draft_discard" in prompt
-    assert [call.name for call in result.decision.tool_calls] == ["task_create_confirm", "task_draft_discard"]
+    assert client.calls == []
+    assert result.raw == {"source": "draft_confirm_route"}
+    assert [call.name for call in result.decision.tool_calls] == ["task_create_confirm"]
 
 
-def test_bitrix_llm_exposes_and_accepts_task_close_confirmation_tools(monkeypatch):
+def test_bitrix_llm_routes_task_close_confirmation_without_llm(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient(
         json.dumps(
@@ -669,16 +664,12 @@ def test_bitrix_llm_exposes_and_accepts_task_close_confirmation_tools(monkeypatc
     )
 
     assert {"task_close_draft", "task_close_confirm", "task_close_discard"} <= ALLOWED_TOOL_NAMES
-    payload = json.loads(client.calls[0]["messages"][1]["content"])
-    prompt = client.calls[0]["messages"][0]["content"]
-    assert {"task_close_confirm", "task_close_discard"} <= {tool["name"] for tool in payload["tools"]}
-    assert payload["permission_context"]["pending_task_draft"]["_draft_type"] == "task_close"
-    assert "task_close_confirm" in prompt
-    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" in prompt
-    assert [call.name for call in result.decision.tool_calls] == ["task_close_confirm", "task_close_discard"]
+    assert client.calls == []
+    assert result.raw == {"source": "draft_confirm_route"}
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_confirm"]
 
 
-def test_bitrix_llm_exposes_and_accepts_calendar_confirmation_tools(monkeypatch):
+def test_bitrix_llm_routes_calendar_confirmation_without_llm(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient(
         json.dumps(
@@ -722,13 +713,9 @@ def test_bitrix_llm_exposes_and_accepts_calendar_confirmation_tools(monkeypatch)
     )
 
     assert {"calendar_event_draft", "calendar_event_confirm", "calendar_event_discard"} <= ALLOWED_TOOL_NAMES
-    payload = json.loads(client.calls[0]["messages"][1]["content"])
-    prompt = client.calls[0]["messages"][0]["content"]
-    assert {"calendar_event_confirm", "calendar_event_discard"} <= {tool["name"] for tool in payload["tools"]}
-    assert payload["permission_context"]["pending_task_draft"]["_draft_type"] == "calendar_event"
-    assert "calendar_event_confirm" in prompt
-    assert "calendar.event.add" in prompt
-    assert [call.name for call in result.decision.tool_calls] == ["calendar_event_confirm", "calendar_event_discard"]
+    assert client.calls == []
+    assert result.raw == {"source": "draft_confirm_route"}
+    assert [call.name for call in result.decision.tool_calls] == ["calendar_event_confirm"]
 
 
 def test_bitrix_llm_decide_routes_simple_reminder_to_calendar_draft(monkeypatch):
@@ -903,7 +890,7 @@ def test_bitrix_llm_decide_routes_project_draft_discard_without_llm(monkeypatch)
     assert result.decision.tool_calls[0].args == {}
 
 
-def test_bitrix_llm_exposes_and_accepts_project_confirmation_tools(monkeypatch):
+def test_bitrix_llm_routes_project_confirmation_without_llm(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient(
         json.dumps(
@@ -947,12 +934,9 @@ def test_bitrix_llm_exposes_and_accepts_project_confirmation_tools(monkeypatch):
     )
 
     assert {"project_create_draft", "project_create_confirm", "project_create_discard"} <= ALLOWED_TOOL_NAMES
-    payload = json.loads(client.calls[0]["messages"][1]["content"])
-    prompt = client.calls[0]["messages"][0]["content"]
-    assert {"project_create_confirm", "project_create_discard"} <= {tool["name"] for tool in payload["tools"]}
-    assert payload["permission_context"]["pending_task_draft"]["_draft_type"] == "project_create"
-    assert "project_create_confirm" in prompt
-    assert [call.name for call in result.decision.tool_calls] == ["project_create_confirm", "project_create_discard"]
+    assert client.calls == []
+    assert result.raw == {"source": "draft_confirm_route"}
+    assert [call.name for call in result.decision.tool_calls] == ["project_create_confirm"]
 
 
 def test_bitrix_llm_compose_formats_project_create_draft(monkeypatch):

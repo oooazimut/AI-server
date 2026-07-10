@@ -149,6 +149,14 @@ class BitrixLLMService:
                 raw={"source": "project_create_discard_route"},
             )
 
+        local_decision = _common_draft_confirm_decision(task.request, task.context, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "draft_confirm_route"),
+                raw={"source": "draft_confirm_route"},
+            )
+
         local_decision = _common_calendar_event_draft_decision(task.request, tool_definitions)
         if local_decision is not None:
             return BitrixLLMDecisionResult(
@@ -1221,6 +1229,61 @@ def _is_draft_discard_request(lowered_request: str) -> bool:
 
 
 def _discard_decision_tool(name: str, summary: str) -> BitrixLLMDecision:
+    return BitrixLLMDecision(
+        status="completed",
+        answer="",
+        confidence=0.92,
+        tool_calls=[
+            BitrixLLMToolCall(
+                name=name,
+                args={},
+                summary=summary,
+            )
+        ],
+    )
+
+
+def _common_draft_confirm_decision(
+    request: str,
+    context: dict[str, Any],
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    if not _is_draft_confirm_request(_strip_command_prefix(request).casefold()):
+        return None
+    draft = context.get("pending_task_draft") if isinstance(context, dict) else None
+    if not isinstance(draft, dict) or not draft:
+        return None
+
+    draft_type = _text(draft.get("_draft_type")) or "task_create"
+    tool_name = {
+        "task_create": "task_create_confirm",
+        "task_close": "task_close_confirm",
+        "calendar_event": "calendar_event_confirm",
+        "project_create": "project_create_confirm",
+    }.get(draft_type)
+    if not tool_name:
+        return None
+    if not _draft_discard_tool_available(tool_definitions, tool_name):
+        return None
+    return _confirm_decision_tool(tool_name, f"deterministic Bitrix {draft_type} draft confirm routing")
+
+
+def _is_draft_confirm_request(lowered_request: str) -> bool:
+    if any(marker in lowered_request for marker in ("не создавай", "отмени", "отменить", "удали", "удалить")):
+        return False
+    return bool(
+        re.search(r"\bда\b", lowered_request)
+        or "подтверждаю" in lowered_request
+        or "всё верно" in lowered_request
+        or "все верно" in lowered_request
+        or "создавай" in lowered_request
+        or "закрывай" in lowered_request
+        or "добавь в календар" in lowered_request
+        or "создай проект" in lowered_request
+    )
+
+
+def _confirm_decision_tool(name: str, summary: str) -> BitrixLLMDecision:
     return BitrixLLMDecision(
         status="completed",
         answer="",
