@@ -438,7 +438,12 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                 ORDER BY indexed_at DESC
                 LIMIT %s
                 """,
-                (CONTENT_INDEX_VERSION, CONTENT_INDEX_VERSION, list(CONTENT_TERMINAL_STATUSES), limit),
+                (
+                    CONTENT_INDEX_VERSION,
+                    CONTENT_INDEX_VERSION,
+                    sorted({*CONTENT_TERMINAL_STATUSES, "unsupported"}),
+                    limit,
+                ),
             ).fetchall()
         return [_row_to_search_result(row) for row in rows]
 
