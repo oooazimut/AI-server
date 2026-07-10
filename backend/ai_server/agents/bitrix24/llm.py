@@ -133,6 +133,22 @@ class BitrixLLMService:
                 raw={"source": "task_draft_discard_route"},
             )
 
+        local_decision = _common_calendar_event_discard_decision(task.request, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "calendar_event_discard_route"),
+                raw={"source": "calendar_event_discard_route"},
+            )
+
+        local_decision = _common_project_create_discard_decision(task.request, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "project_create_discard_route"),
+                raw={"source": "project_create_discard_route"},
+            )
+
         local_decision = _common_calendar_event_draft_decision(task.request, tool_definitions)
         if local_decision is not None:
             return BitrixLLMDecisionResult(
@@ -287,6 +303,24 @@ def _direct_task_create_response(
                 status="completed",
                 answer=_format_portal_search_answer(result.data, portal_base_url=portal_base_url),
                 model_usage=_local_model_usage(agent_id, "portal_search_response"),
+            )
+        if result.tool == "project_create_draft":
+            return BitrixLLMFinalResult(
+                status="needs_human",
+                answer=_format_project_create_draft_answer(result.data),
+                model_usage=_local_model_usage(agent_id, "project_create_draft_response"),
+            )
+        if result.tool == "project_create_confirm":
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer=_format_project_create_confirm_answer(result.data, portal_base_url=portal_base_url),
+                model_usage=_local_model_usage(agent_id, "project_create_confirm_response"),
+            )
+        if result.tool == "project_create_discard":
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer="Черновик проекта удалён.",
+                model_usage=_local_model_usage(agent_id, "project_create_discard_response"),
             )
         if result.tool == "task_create_draft":
             return BitrixLLMFinalResult(
@@ -541,6 +575,41 @@ def _format_portal_search_answer(data: dict[str, Any], *, portal_base_url: str =
     if len(items) >= limit:
         lines.append(f"Показаны первые {len(items)} результатов. Если нужно, можно уточнить запрос.")
     return "\n".join(lines)
+
+
+def _format_project_create_draft_answer(data: dict[str, Any]) -> str:
+    preview = data.get("preview") if isinstance(data.get("preview"), dict) else {}
+    params = data.get("params") if isinstance(data.get("params"), dict) else {}
+    method_params = params.get("params") if isinstance(params.get("params"), dict) else {}
+    fields = method_params.get("fields") if isinstance(method_params.get("fields"), dict) else {}
+    name = _text(preview.get("name")) or _text(fields.get("NAME")) or "проект"
+    project_type = _text(preview.get("type")) or "проект"
+    visibility = _text(preview.get("visibility"))
+    description = _text(preview.get("description")) or _text(fields.get("DESCRIPTION"))
+
+    lines = [
+        "Черновик проекта:",
+        f"Название: {name}",
+        f"Тип: {project_type}",
+    ]
+    if visibility:
+        lines.append(f"Открытость: {visibility}")
+    if description:
+        lines.append(f"Описание: {description}")
+    lines.extend(["", "Если всё верно, напишите: да, создай проект."])
+    return "\n".join(lines)
+
+
+def _format_project_create_confirm_answer(data: dict[str, Any], *, portal_base_url: str = "") -> str:
+    draft = data.get("draft") if isinstance(data.get("draft"), dict) else {}
+    params = data.get("params") if isinstance(data.get("params"), dict) else {}
+    fields = params.get("fields") if isinstance(params.get("fields"), dict) else {}
+    draft_params = draft.get("params") if isinstance(draft.get("params"), dict) else {}
+    draft_fields = draft_params.get("fields") if isinstance(draft_params.get("fields"), dict) else {}
+    name = _text(fields.get("NAME")) or _text(draft_fields.get("NAME")) or "проект"
+    project_id = _created_project_id(data.get("result"))
+    label = _project_link(name, project_id, portal_base_url=portal_base_url)
+    return f"Проект создан: {label}."
 
 
 def _portal_search_title(*, scope: str, query: str) -> str:
@@ -841,6 +910,25 @@ def _created_task_id(value: object) -> str:
     return ""
 
 
+def _created_project_id(value: object) -> str:
+    direct = _text(value)
+    if direct and not isinstance(value, dict):
+        return direct
+    if not isinstance(value, dict):
+        return ""
+    candidates: list[object] = [value.get("id"), value.get("ID"), value.get("group_id"), value.get("GROUP_ID")]
+    nested = value.get("result")
+    if isinstance(nested, dict):
+        candidates.extend([nested.get("id"), nested.get("ID"), nested.get("group_id"), nested.get("GROUP_ID")])
+    else:
+        candidates.append(nested)
+    for candidate in candidates:
+        text = _text(candidate)
+        if text:
+            return text
+    return ""
+
+
 def _deadline_label_from_fields(fields: dict[str, Any]) -> str:
     if fields.get("NO_DEADLINE"):
         return "без срока"
@@ -1082,6 +1170,66 @@ def _common_task_draft_discard_decision(
                 name="task_draft_discard",
                 args={},
                 summary="deterministic Bitrix task draft discard routing",
+            )
+        ],
+    )
+
+
+def _common_calendar_event_discard_decision(
+    request: str,
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    if not _draft_discard_tool_available(tool_definitions, "calendar_event_discard"):
+        return None
+    lowered = _strip_command_prefix(request).casefold()
+    if not _is_draft_discard_request(lowered):
+        return None
+    if "календар" not in lowered and "событ" not in lowered:
+        return None
+    return _discard_decision_tool(
+        "calendar_event_discard",
+        "deterministic Bitrix calendar event draft discard routing",
+    )
+
+
+def _common_project_create_discard_decision(
+    request: str,
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    if not _draft_discard_tool_available(tool_definitions, "project_create_discard"):
+        return None
+    lowered = _strip_command_prefix(request).casefold()
+    if not _is_draft_discard_request(lowered):
+        return None
+    if "проект" not in lowered:
+        return None
+    return _discard_decision_tool(
+        "project_create_discard",
+        "deterministic Bitrix project draft discard routing",
+    )
+
+
+def _draft_discard_tool_available(tool_definitions: list[dict[str, Any]] | None, tool_name: str) -> bool:
+    available_tools = {str(tool.get("name") or "") for tool in tool_definitions or []}
+    return tool_definitions is None or tool_name in available_tools
+
+
+def _is_draft_discard_request(lowered_request: str) -> bool:
+    if "черновик" not in lowered_request:
+        return False
+    return any(marker in lowered_request for marker in ("отмени", "отменить", "удали", "удалить", "не создавай"))
+
+
+def _discard_decision_tool(name: str, summary: str) -> BitrixLLMDecision:
+    return BitrixLLMDecision(
+        status="completed",
+        answer="",
+        confidence=0.92,
+        tool_calls=[
+            BitrixLLMToolCall(
+                name=name,
+                args={},
+                summary=summary,
             )
         ],
     )
