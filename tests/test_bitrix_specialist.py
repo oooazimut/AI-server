@@ -778,6 +778,45 @@ def test_bitrix_llm_decide_routes_simple_reminder_to_calendar_draft(monkeypatch)
     }
 
 
+def test_bitrix_llm_decide_routes_task_draft_discard_without_llm(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient(
+        json.dumps(
+            {
+                "status": "completed",
+                "answer": "Нет активного черновика задачи для отмены.",
+                "confidence": 0.2,
+                "tool_calls": [{"name": "none", "args": {}}],
+            }
+        )
+    )
+    service = BitrixLLMService(client, settings=get_settings())
+    tool_definitions = [
+        {"name": "task_draft_discard", "description": "", "parameters": {}},
+        {"name": "calendar_event_discard", "description": "", "parameters": {}},
+        {"name": "none", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request="Битрикс отмени черновик задачи.",
+                user={"id": "13"},
+                context={"dialog_id": "chat4321", "pending_task_draft": {"fields": {"TITLE": "тест"}}},
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_draft_discard_route"}
+    assert [call.name for call in result.decision.tool_calls] == ["task_draft_discard"]
+    assert result.decision.tool_calls[0].args == {}
+
+
 def test_bitrix_llm_exposes_and_accepts_project_confirmation_tools(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient(
