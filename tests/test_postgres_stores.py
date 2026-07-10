@@ -505,7 +505,12 @@ def test_bitrix_store_content_candidates_filters_completed_items(monkeypatch):
     assert "content_index_status" in sql
     assert "content_index_version" in sql
     assert "ANY" in sql
-    assert params == (CONTENT_INDEX_VERSION, CONTENT_INDEX_VERSION, list(CONTENT_TERMINAL_STATUSES), 80)
+    assert params == (
+        CONTENT_INDEX_VERSION,
+        CONTENT_INDEX_VERSION,
+        sorted({*CONTENT_TERMINAL_STATUSES, "unsupported"}),
+        80,
+    )
 
 
 # ---------------------------------------------------------------------------
