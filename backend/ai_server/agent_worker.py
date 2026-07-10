@@ -391,7 +391,7 @@ async def main() -> None:
         )
         agent_tasks.append(asyncio.create_task(_publish_roster()))
         agent_tasks.append(asyncio.create_task(run_staff_sync(vehicle_usage_store, settings.redis_url)))
-    if settings.search_background_indexer_enabled:
+    if settings.search_background_periodic_enabled:
         agent_tasks.append(asyncio.create_task(portal_search_indexer.run_periodic()))
     if settings.supervisor_enabled:
         _supervisor_status: dict = {
