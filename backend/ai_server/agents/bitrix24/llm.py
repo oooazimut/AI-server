@@ -1249,7 +1249,7 @@ def _draft_discard_tool_available(tool_definitions: list[dict[str, Any]] | None,
 def _is_draft_discard_request(lowered_request: str) -> bool:
     if "черновик" not in lowered_request:
         return False
-    return any(marker in lowered_request for marker in ("отмени", "отменить", "удали", "удалить", "не создавай"))
+    return any(marker in lowered_request for marker in ("отмени", "отменить", "удали", "удалить"))
 
 
 def _discard_decision_tool(name: str, summary: str) -> BitrixLLMDecision:
