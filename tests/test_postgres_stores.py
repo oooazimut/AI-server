@@ -501,6 +501,7 @@ def test_bitrix_store_content_candidates_filters_completed_items(monkeypatch):
 
     assert result[0].entity_id == "501"
     sql, params = conn.calls[0]
+    assert "COALESCE" in sql
     assert "content_index_status" in sql
     assert "content_index_version" in sql
     assert "ANY" in sql
