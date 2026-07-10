@@ -425,10 +425,20 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                 SELECT entity_type, entity_id, title, body, url, metadata_json
                 FROM {_TABLE}
                 WHERE entity_type IN ('disk_file', 'task_attachment')
+                  AND NOT (
+                    (
+                      metadata_json::jsonb ->> 'content_index_status' = 'indexed'
+                      AND metadata_json::jsonb ->> 'content_index_version' = %s
+                    )
+                    OR (
+                      metadata_json::jsonb ->> 'content_index_version' = %s
+                      AND metadata_json::jsonb ->> 'content_index_status' = ANY(%s)
+                    )
+                  )
                 ORDER BY indexed_at DESC
                 LIMIT %s
                 """,
-                (limit,),
+                (CONTENT_INDEX_VERSION, CONTENT_INDEX_VERSION, list(CONTENT_TERMINAL_STATUSES), limit),
             ).fetchall()
         return [_row_to_search_result(row) for row in rows]
 
