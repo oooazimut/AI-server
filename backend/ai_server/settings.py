@@ -447,7 +447,7 @@ def get_settings() -> Settings:
         search_index_max_storages=_env_int("SEARCH_INDEX_MAX_STORAGES", 500) or 500,
         search_index_max_disk_items=_env_int("SEARCH_INDEX_MAX_DISK_ITEMS", 50000) or 50000,
         search_index_max_task_attachments=_env_int("SEARCH_INDEX_MAX_TASK_ATTACHMENTS", 5000) or 5000,
-        search_index_disk_max_depth=_env_int("SEARCH_INDEX_DISK_MAX_DEPTH", 6) or 6,
+        search_index_disk_max_depth=_env_int("SEARCH_INDEX_DISK_MAX_DEPTH", 30) or 30,
         search_index_include_disk=_env_bool("SEARCH_INDEX_INCLUDE_DISK", True),
         search_index_include_task_attachments=_env_bool("SEARCH_INDEX_INCLUDE_TASK_ATTACHMENTS", True),
         search_index_include_task_comments=_env_bool("SEARCH_INDEX_INCLUDE_TASK_COMMENTS", True),
