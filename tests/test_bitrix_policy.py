@@ -129,6 +129,10 @@ def test_unknown_method_denied():
     assert decide_bitrix_method_policy("someapi.customthing").decision == "deny"
 
 
+def test_unsupported_bitrix_search_method_denied():
+    assert decide_bitrix_method_policy("search.search").decision == "deny"
+
+
 def test_method_with_no_dot_denied():
     assert decide_bitrix_method_policy("getcustomdata").decision == "deny"
 

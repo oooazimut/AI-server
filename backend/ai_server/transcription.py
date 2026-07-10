@@ -99,6 +99,8 @@ class YandexSpeechKitTranscriber:
         self.language = language or _settings.yandex_speechkit_lang
         self.max_bytes = max_bytes or _settings.yandex_speechkit_max_bytes
         self.ffmpeg_path = ffmpeg_path or _settings.ffmpeg_path
+        self.chunk_seconds = max(1, _settings.yandex_speechkit_chunk_seconds)
+        self.max_chunks = max(1, _settings.yandex_speechkit_max_chunks)
 
     @property
     def configured(self) -> bool:
@@ -112,12 +114,28 @@ class YandexSpeechKitTranscriber:
         if not source.exists():
             raise TranscriptionError(f"Attachment does not exist: {source}")
 
-        prepared_path, content_type = await self._prepare_audio(source)
-        if prepared_path.stat().st_size > self.max_bytes:
-            raise TranscriptionError(f"Attachment exceeds SpeechKit sync limit of {self.max_bytes} bytes")
+        chunks = await self._prepare_audio_chunks(source)
+        if len(chunks) > self.max_chunks:
+            max_seconds = self.chunk_seconds * self.max_chunks
+            raise TranscriptionError(
+                f"Attachment is too long for SpeechKit chunked sync recognition; maximum is about {max_seconds} seconds"
+            )
 
-        text, payload = await self._recognize_file(prepared_path, content_type)
-        return TranscriptionResult(text=text, model="yandex_speechkit", attachment=attachment, raw=payload)
+        texts: list[str] = []
+        payloads: list[dict[str, Any]] = []
+        for chunk_path in chunks:
+            if chunk_path.stat().st_size > self.max_bytes:
+                raise TranscriptionError(f"SpeechKit audio chunk exceeds sync limit of {self.max_bytes} bytes")
+            text, payload = await self._recognize_file(chunk_path, "audio/ogg")
+            texts.append(text)
+            payloads.append(payload)
+
+        return TranscriptionResult(
+            text=" ".join(part for part in texts if part).strip(),
+            model="yandex_speechkit",
+            attachment=attachment,
+            raw={"chunks": payloads},
+        )
 
     async def _recognize_file(self, path: Path, content_type: str) -> tuple[str, dict[str, Any]]:
         settings = self._settings
@@ -148,23 +166,23 @@ class YandexSpeechKitTranscriber:
             raise TranscriptionError(f"Yandex SpeechKit returned empty text: {payload}")
         return text, payload
 
-    async def _prepare_audio(self, source: Path) -> tuple[Path, str]:
+    async def _prepare_audio_chunks(self, source: Path) -> list[Path]:
         suffix = source.suffix.lower()
-        if suffix in {".ogg", ".opus"}:
-            return source, "audio/ogg"
-
         settings = self._settings
         if not settings.yandex_speechkit_convert_to_ogg:
+            if suffix in {".ogg", ".opus"}:
+                return [source]
             raise TranscriptionError(f"Yandex SpeechKit does not accept {suffix or 'this'} audio directly")
 
-        target = source.with_suffix(".ogg")
-        if target.exists() and target.stat().st_mtime >= source.stat().st_mtime:
-            return target, "audio/ogg"
         if not shutil.which(self.ffmpeg_path):
             raise TranscriptionError(
                 "ffmpeg is required to convert Bitrix voice messages to OggOpus for Yandex SpeechKit. "
                 "Set FFMPEG_PATH or install ffmpeg."
             )
+
+        chunk_pattern = source.with_suffix(".speechkit-chunk-%03d.ogg")
+        for old_chunk in source.parent.glob(f"{source.stem}.speechkit-chunk-*.ogg"):
+            old_chunk.unlink(missing_ok=True)
 
         process = await asyncio.create_subprocess_exec(
             self.ffmpeg_path,
@@ -172,18 +190,30 @@ class YandexSpeechKitTranscriber:
             "-i",
             str(source),
             "-vn",
+            "-ac",
+            "1",
             "-acodec",
             "libopus",
             "-b:a",
             "32k",
-            str(target),
+            "-f",
+            "segment",
+            "-segment_time",
+            str(self.chunk_seconds),
+            "-reset_timestamps",
+            "1",
+            str(chunk_pattern),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         _, stderr = await process.communicate()
         if process.returncode != 0:
             raise TranscriptionError(f"ffmpeg conversion failed: {stderr.decode(errors='ignore')}")
-        return target, "audio/ogg"
+
+        chunks = sorted(source.parent.glob(f"{source.stem}.speechkit-chunk-*.ogg"))
+        if not chunks:
+            raise TranscriptionError("ffmpeg conversion did not produce audio chunks")
+        return chunks
 
 
 class UnconfiguredTranscriber:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import html
+import re
 from datetime import datetime
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.portal_search.file_cache import delete_portal_file_cache_path, portal_file_cache_path
@@ -15,6 +17,13 @@ from ai_server.integrations.bitrix.portal_search.text_utils import (
 from ai_server.integrations.bitrix.portal_search.types import PortalSearchResult
 from ai_server.settings import Settings
 from ai_server.utils import MOSCOW_TZ
+
+_BITRIX_PAIRED_TAG_RE = re.compile(
+    r"\[(USER|URL|B|I|U|S|QUOTE|CODE|COLOR|SIZE)[^\]]*\](.*?)\[/\1\]", re.IGNORECASE | re.DOTALL
+)
+_BITRIX_SINGLE_TAG_RE = re.compile(r"\[/?[A-Z][A-Z0-9_]*(?:=[^\]]*)?\]", re.IGNORECASE)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_BITRIX_BATCH_COMMENT_SIZE = 50
 
 
 def _first(data: dict[str, Any], *keys: str) -> object | None:
@@ -34,6 +43,133 @@ def _attachment_ids(value: object) -> list[int]:
         if normalized.isdigit():
             ids.append(int(normalized))
     return ids
+
+
+async def _task_comment_texts(bitrix: BitrixClient, task_id: object, *, limit: int) -> list[str]:
+    if limit <= 0:
+        return []
+    try:
+        result = await bitrix.result("task.commentitem.getlist", {"TASKID": task_id})
+    except Exception:
+        return []
+    return _comment_texts_from_result(result, limit=limit)
+
+
+async def _task_comments_by_id(
+    bitrix: BitrixClient,
+    task_ids: list[object],
+    *,
+    limit: int,
+) -> dict[str, list[str]]:
+    if limit <= 0:
+        return {}
+    unique_ids = list(dict.fromkeys(str(task_id) for task_id in task_ids if task_id is not None))
+    comments_by_id: dict[str, list[str]] = {}
+    for offset in range(0, len(unique_ids), _BITRIX_BATCH_COMMENT_SIZE):
+        chunk = unique_ids[offset : offset + _BITRIX_BATCH_COMMENT_SIZE]
+        cmd = {
+            f"task_{index}": "task.commentitem.getlist?" + urlencode({"TASKID": task_id})
+            for index, task_id in enumerate(chunk)
+        }
+        try:
+            batch_result = await bitrix.result("batch", {"halt": 0, "cmd": cmd})
+        except Exception:
+            for task_id in chunk:
+                comments_by_id[task_id] = await _task_comment_texts(bitrix, task_id, limit=limit)
+            continue
+
+        results = batch_result.get("result") if isinstance(batch_result, dict) else None
+        if not isinstance(results, dict):
+            for task_id in chunk:
+                comments_by_id[task_id] = []
+            continue
+        for index, task_id in enumerate(chunk):
+            comments_by_id[task_id] = _comment_texts_from_result(results.get(f"task_{index}"), limit=limit)
+    return comments_by_id
+
+
+def _comment_texts_from_result(result: Any, *, limit: int) -> list[str]:
+    texts: list[str] = []
+    for comment in _extract_comments(result):
+        text = _comment_text(comment)
+        if not text:
+            continue
+        texts.append(text)
+        if len(texts) >= limit:
+            break
+    return texts
+
+
+def _extract_comments(result: Any) -> list[dict[str, Any]]:
+    if isinstance(result, list):
+        return [item for item in result if isinstance(item, dict)]
+    if isinstance(result, dict):
+        for key in ("comments", "COMMENTS", "items", "result"):
+            value = result.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                nested = _extract_comments(value)
+                if nested:
+                    return nested
+    return []
+
+
+def _comment_text(comment: dict[str, Any]) -> str:
+    return _clean_bitrix_comment_text(
+        to_str(_first(comment, "POST_MESSAGE", "POST_MESSAGE_HTML", "POST_MESSAGE_TEXT", "text", "message")) or ""
+    )
+
+
+def _clean_bitrix_comment_text(value: object) -> str:
+    text = html.unescape(str(value or "")).replace("\r\n", "\n").replace("\r", "\n")
+    previous = None
+    while previous != text:
+        previous = text
+        text = _BITRIX_PAIRED_TAG_RE.sub(r"\2", text)
+    text = _BITRIX_SINGLE_TAG_RE.sub("", text)
+    text = _HTML_TAG_RE.sub("", text)
+    lines = [" ".join(line.split()) for line in text.split("\n")]
+    return "\n".join(line for line in lines if line and not _is_system_comment_text(line))
+
+
+def _is_system_comment_text(text: str) -> bool:
+    normalized = text.casefold().strip().rstrip(".")
+    if not normalized:
+        return True
+    if normalized.startswith("крайний срок изменен на:"):
+        return True
+    if normalized in {
+        "задача завершена",
+        "задача возвращена в работу",
+        "задача почти просрочена",
+    }:
+        return True
+    system_fragments = (
+        "вы добавлены наблюдателем",
+        "вы назначены исполнителем",
+        "вы назначены соисполнителем",
+        "задача просрочена",
+        "задача почти просрочена",
+        "завершите задачу или передвиньте срок",
+        "необходимо указать крайний срок",
+        "необходимо принять задачу или отправить на доработку",
+    )
+    return any(fragment in normalized for fragment in system_fragments)
+
+
+def _person_label(value: object) -> str:
+    if not isinstance(value, dict):
+        return ""
+    name = to_str(_first(value, "name", "NAME"))
+    if name:
+        return name
+    parts = [
+        to_str(_first(value, "lastName", "LAST_NAME", "last_name")),
+        to_str(_first(value, "name", "NAME", "firstName", "FIRST_NAME")),
+        to_str(_first(value, "secondName", "SECOND_NAME", "second_name")),
+    ]
+    return " ".join(part for part in parts if part)
 
 
 async def sync_disk_file_item(
@@ -93,6 +229,8 @@ async def sync_disk_file_item(
 async def _sync_catalog(bitrix: BitrixClient, index: PortalSearchIndex, settings: Settings) -> dict[str, int]:
     products_count = 0
     stores_count = 0
+    stock_rows_count = 0
+    products_by_id: dict[str, dict[str, Any]] = {}
 
     try:
         catalogs = await bitrix.list_catalogs()
@@ -113,7 +251,15 @@ async def _sync_catalog(bitrix: BitrixClient, index: PortalSearchIndex, settings
             product_id = _first(product, "id", "ID")
             if product_id is None:
                 continue
+            product_iblock_id = _first(product, "iblockId", "IBLOCK_ID", "iblock_id") or iblock_id
             name = str(_first(product, "name", "NAME") or f"Товар #{product_id}")
+            product_url = _catalog_product_url(product_iblock_id, product_id, settings)
+            products_by_id[str(product_id)] = {
+                "id": product_id,
+                "name": name,
+                "iblock_id": product_iblock_id,
+                "url": product_url,
+            }
             body_parts = [
                 str(_first(product, "previewText", "PREVIEW_TEXT") or ""),
                 str(_first(product, "detailText", "DETAIL_TEXT") or ""),
@@ -124,8 +270,8 @@ async def _sync_catalog(bitrix: BitrixClient, index: PortalSearchIndex, settings
                 entity_id=product_id,
                 title=name,
                 body="\n".join(p for p in body_parts if p.strip()),
-                url=_catalog_product_url(iblock_id, product_id, settings),
-                metadata={"iblock_id": iblock_id},
+                url=product_url,
+                metadata={"iblock_id": product_iblock_id},
             )
             products_count += 1
 
@@ -154,7 +300,60 @@ async def _sync_catalog(bitrix: BitrixClient, index: PortalSearchIndex, settings
         )
         stores_count += 1
 
-    return {"products": products_count, "stores": stores_count}
+        if stock_rows_count >= settings.search_index_max_catalog_stock_rows:
+            continue
+        remaining = settings.search_index_max_catalog_stock_rows - stock_rows_count
+        try:
+            stock_rows = await bitrix.list_catalog_store_products(store_id, limit=remaining)
+        except Exception:
+            continue
+        for row in stock_rows:
+            product_id = _first(row, "productId", "PRODUCT_ID", "product_id")
+            if product_id is None:
+                continue
+            amount = _first(row, "amount", "AMOUNT", "quantity", "QUANTITY")
+            if not _is_positive_number(amount):
+                continue
+            product = products_by_id.get(str(product_id))
+            if not product:
+                continue
+            product_name = str(product.get("name") or "").strip()
+            if not product_name:
+                continue
+            product_url = str(product.get("url") or "")
+            stock_body = "\n".join(
+                part
+                for part in (
+                    f"Store: {title}",
+                    f"Address: {address}" if address else "",
+                    f"Product: {product_name}",
+                    f"Amount: {amount}",
+                )
+                if part
+            )
+            index.upsert_item(
+                entity_type="catalog_store_stock",
+                entity_id=f"{store_id}:{product_id}",
+                title=f"{product_name} - {title}",
+                body=stock_body,
+                url=product_url,
+                metadata={
+                    "store_id": store_id,
+                    "store_title": title,
+                    "store_address": address,
+                    "product_id": product_id,
+                    "product_name": product_name,
+                    "iblock_id": product.get("iblock_id"),
+                    "amount": amount,
+                    "product_url": product_url,
+                    "positive_amount": True,
+                },
+            )
+            stock_rows_count += 1
+            if stock_rows_count >= settings.search_index_max_catalog_stock_rows:
+                break
+
+    return {"products": products_count, "stores": stores_count, "stock_rows": stock_rows_count}
 
 
 async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: Settings) -> dict[str, object]:
@@ -165,11 +364,16 @@ async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: 
             "DESCRIPTION",
             "STATUS",
             "RESPONSIBLE_ID",
+            "RESPONSIBLE",
             "CREATED_BY",
+            "CREATOR",
             "GROUP_ID",
             "DEADLINE",
+            "CREATED_DATE",
             "CHANGED_DATE",
             "CLOSED_DATE",
+            "ACCOMPLICES",
+            "AUDITORS",
             "UF_TASK_WEBDAV_FILES",
         ],
         order={"CHANGED_DATE": "DESC"},
@@ -177,33 +381,57 @@ async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: 
     )
     indexed_attachments = 0
     seen_attachments: set[int] = set()
+    comments_by_task_id = (
+        await _task_comments_by_id(
+            bitrix,
+            [_first(task, "id", "ID") for task in tasks],
+            limit=settings.search_index_task_comment_limit,
+        )
+        if settings.search_index_include_task_comments
+        else {}
+    )
     for task in tasks:
         task_id = _first(task, "id", "ID")
         if task_id is None:
             continue
         title = str(_first(task, "title", "TITLE") or "Без названия")
+        comments = comments_by_task_id.get(str(task_id), [])
+        responsible_label = _person_label(_first(task, "responsible", "RESPONSIBLE"))
+        creator_label = _person_label(_first(task, "creator", "CREATOR"))
+        responsible = responsible_label or to_str(_first(task, "responsibleId", "RESPONSIBLE_ID"))
+        creator = creator_label or to_str(_first(task, "createdBy", "CREATED_BY"))
+        body_parts = [
+            str(_first(task, "description", "DESCRIPTION") or ""),
+            f"Статус: {_first(task, 'status', 'STATUS')}",
+            f"Исполнитель: {responsible}" if responsible else "",
+            f"Постановщик: {creator}" if creator else "",
+            f"Проект: {_first(task, 'groupId', 'GROUP_ID')}",
+            f"Срок: {_first(task, 'deadline', 'DEADLINE')}",
+            f"Дата создания: {_first(task, 'createdDate', 'CREATED_DATE')}",
+            f"Дата закрытия: {_first(task, 'closedDate', 'CLOSED_DATE')}",
+            "Комментарии:\n" + "\n".join(f"- {comment}" for comment in comments) if comments else "",
+        ]
         index.upsert_item(
             entity_type="task",
             entity_id=task_id,
             title=title,
-            body="\n".join(
-                str(value)
-                for value in (
-                    _first(task, "description", "DESCRIPTION"),
-                    f"Статус: {_first(task, 'status', 'STATUS')}",
-                    f"Исполнитель: {_first(task, 'responsibleId', 'RESPONSIBLE_ID')}",
-                    f"Проект: {_first(task, 'groupId', 'GROUP_ID')}",
-                    f"Срок: {_first(task, 'deadline', 'DEADLINE')}",
-                )
-                if value
-            ),
+            body="\n".join(part for part in body_parts if str(part).strip()),
             url=_task_url(task_id, settings),
             metadata={
                 "status": _first(task, "status", "STATUS"),
                 "responsible_id": _first(task, "responsibleId", "RESPONSIBLE_ID"),
+                "responsible_label": responsible_label,
                 "created_by": _first(task, "createdBy", "CREATED_BY"),
+                "creator_label": creator_label,
                 "group_id": _first(task, "groupId", "GROUP_ID"),
                 "deadline": _first(task, "deadline", "DEADLINE"),
+                "created_date": _first(task, "createdDate", "CREATED_DATE"),
+                "changed_date": _first(task, "changedDate", "CHANGED_DATE"),
+                "closed_date": _first(task, "closedDate", "CLOSED_DATE"),
+                "accomplices": _first(task, "accomplices", "ACCOMPLICES"),
+                "auditors": _first(task, "auditors", "AUDITORS"),
+                "comments_indexed": bool(comments),
+                "comments_count": len(comments),
             },
             source_updated_at=to_str(_first(task, "changedDate", "CHANGED_DATE")),
         )
@@ -570,6 +798,15 @@ def _delta_folder_path(folder: PortalSearchResult) -> str:
     return to_str(folder.metadata.get("path")) or folder.title
 
 
+def _is_positive_number(value: object) -> bool:
+    if isinstance(value, bool) or value in (None, ""):
+        return False
+    try:
+        return float(str(value).replace(",", ".")) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 # ---------------------------------------------------------------------------
 # URL builders (private, used only in this module)
 # ---------------------------------------------------------------------------
@@ -615,8 +852,8 @@ def _project_url(project_id: object, settings: Settings) -> str:
 def _catalog_product_url(iblock_id: object, product_id: object, settings: Settings) -> str:
     domain = _portal_domain(settings)
     if not domain:
-        return f"/crm/catalog/{iblock_id}/product/{product_id}/"
-    return f"https://{domain}/crm/catalog/{iblock_id}/product/{product_id}/"
+        return f"/shop/documents-catalog/{iblock_id}/product/{product_id}/"
+    return f"https://{domain}/shop/documents-catalog/{iblock_id}/product/{product_id}/"
 
 
 def _disk_object_url(object_id: object, settings: Settings) -> str:

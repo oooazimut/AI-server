@@ -133,7 +133,7 @@ WRITE_METHODS_DIRECT = {
     "im.notify.system.add",  # системное уведомление — всегда разрешено без подтверждения
 }
 DENIED_PREFIXES = ("user.", "department.", "humanresources.", "imbot.", "im.", "rest.")
-DENIED_METHODS = {"user.add", "user.update", "user.delete", "user.dismiss", "imbot.bot.unregister"}
+DENIED_METHODS = {"user.add", "user.update", "user.delete", "user.dismiss", "imbot.bot.unregister", "search.search"}
 
 
 def decide_bitrix_method_policy(method: str) -> PolicyDecision:

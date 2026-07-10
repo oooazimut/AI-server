@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist
-from ai_server.agents.bitrix24.tools import BitrixApiTool
+from ai_server.agents.bitrix24.tools import BitrixApiTool, BitrixWarehouseSearchTool
 from ai_server.attachments import StoredAttachment
 from ai_server.integrations.bitrix.chat_parser import build_agent_task_from_bitrix_chat
 from ai_server.integrations.bitrix.client import BitrixClient
@@ -14,7 +14,7 @@ from ai_server.settings import get_settings
 from ai_server.tools.bitrix_policy import apply_write_policy
 from ai_server.transcription import TranscriptionResult
 from scripts.create_bitrix_dev_chat import chat_reference, sanitize_result
-from tests.fakes import FakeBitrixLLM
+from tests.fakes import FakeBitrixLLM, FakePortalSearchIndex
 
 
 def _bitrix_v2_message_payload() -> dict:
@@ -146,10 +146,10 @@ def test_build_agent_task_from_bitrix_chat_transcribes_voice(tmp_path):
     assert task.context["transcriptions"][0]["text"] == "Создай задачу по камере"
 
 
-def test_bitrix_api_tool_write_executes_directly():
-    """BitrixApiTool should execute write methods directly via write_client.call()."""
+def test_bitrix_api_tool_write_executes_directly_when_oauth_not_required():
+    """Legacy mode may execute write methods via write_client.call()."""
     fake_bitrix = FakeBitrixClient()
-    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix)
+    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=False)
 
     result = anyio_run(
         tool.execute(
@@ -160,6 +160,63 @@ def test_bitrix_api_tool_write_executes_directly():
 
     assert result.status == ToolStatus.OK
     assert any(method == "tasks.task.add" for method, _ in fake_bitrix.calls)
+
+
+def test_bitrix_api_tool_write_uses_oauth_when_required():
+    fallback_bitrix = FakeBitrixClient()
+    oauth_bitrix = FakeBitrixClient()
+    oauth = FakeBitrixOAuth(oauth_bitrix)
+    tool = BitrixApiTool(
+        client=fallback_bitrix,
+        write_client=fallback_bitrix,
+        bitrix_oauth=oauth,
+        oauth_required_for_writes=True,
+    )
+
+    result = anyio_run(
+        tool.execute(
+            {"method": "tasks.task.add", "params": {"fields": {"TITLE": "Тест"}}, "summary": "создать задачу"},
+            user_id=9,
+            dialog_id="chat99",
+        )
+    )
+
+    assert result.status == ToolStatus.OK
+    assert oauth.user_ids == [9]
+    assert any(method == "tasks.task.add" for method, _ in oauth_bitrix.calls)
+    assert fallback_bitrix.calls == []
+
+
+def test_bitrix_api_tool_required_oauth_blocks_missing_dialog_id():
+    fake_bitrix = FakeBitrixClient()
+    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=True)
+
+    result = anyio_run(
+        tool.execute(
+            {"method": "tasks.task.add", "params": {"fields": {"TITLE": "Тест"}}, "summary": "создать задачу"},
+            user_id=9,
+            dialog_id=None,
+        )
+    )
+
+    assert result.status == ToolStatus.DENIED
+    assert fake_bitrix.calls == []
+
+
+def test_bitrix_api_tool_required_oauth_does_not_fallback_to_write_client():
+    fake_bitrix = FakeBitrixClient()
+    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=True)
+
+    result = anyio_run(
+        tool.execute(
+            {"method": "tasks.task.add", "params": {"fields": {"TITLE": "Тест"}}, "summary": "создать задачу"},
+            user_id=9,
+            dialog_id="chat99",
+        )
+    )
+
+    assert result.status == ToolStatus.NOT_CONFIGURED
+    assert fake_bitrix.calls == []
 
 
 def test_bitrix_api_tool_dry_run_blocks_write():
@@ -174,7 +231,7 @@ def test_bitrix_api_tool_dry_run_blocks_write():
 
 def test_bitrix_api_tool_write_no_write_client_returns_not_configured():
     fake_bitrix = FakeBitrixClient()
-    tool = BitrixApiTool(client=fake_bitrix, write_client=None)
+    tool = BitrixApiTool(client=fake_bitrix, write_client=None, oauth_required_for_writes=False)
 
     result = anyio_run(tool.execute({"method": "tasks.task.add", "params": {"fields": {"TITLE": "Тест"}}}, user_id=9))
 
@@ -183,7 +240,7 @@ def test_bitrix_api_tool_write_no_write_client_returns_not_configured():
 
 def test_bitrix_api_tool_write_empty_params_returns_invalid():
     fake_bitrix = FakeBitrixClient()
-    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix)
+    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=False)
 
     result = anyio_run(tool.execute({"method": "tasks.task.add", "params": {}}))
 
@@ -198,6 +255,257 @@ def test_bitrix_api_tool_denied_method():
 
     assert result.status == ToolStatus.DENIED
     assert fake_bitrix.calls == []
+
+
+def test_bitrix_api_tool_denies_direct_project_creation():
+    fake_bitrix = FakeBitrixClient()
+    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=False)
+
+    result = anyio_run(tool.execute({"method": "sonet_group.create", "params": {"fields": {"NAME": "Проект"}}}))
+
+    assert result.status == ToolStatus.DENIED
+    assert result.error == "Use project_create_draft/project_create_confirm for Bitrix project creation."
+    assert fake_bitrix.calls == []
+
+
+def test_bitrix_api_tool_sonet_group_get_normalizes_hyphenated_project_name():
+    class FakeProjectClient:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def result(self, method, payload=None, *, base_url=None):
+            self.calls.append((method, payload or {}))
+            if method == "sonet_group.get" and (payload or {}).get("FILTER", {}).get("%NAME"):
+                return []
+            if method == "sonet_group.get":
+                return [
+                    {"ID": "39", "NAME": "Логан"},
+                    {"ID": "45", "NAME": "Ларгус 2"},
+                    {"ID": "53", "NAME": "ларгус 3"},
+                ]
+            return []
+
+    fake_bitrix = FakeProjectClient()
+    tool = BitrixApiTool(client=fake_bitrix)
+
+    result = anyio_run(tool.execute({"method": "sonet_group.get", "params": {"FILTER": {"%NAME": "Ларгус-2"}}}))
+
+    assert result.status == ToolStatus.OK
+    assert result.data["result"] == [{"ID": "45", "NAME": "Ларгус 2"}]
+    assert fake_bitrix.calls == [
+        ("sonet_group.get", {"FILTER": {"%NAME": "Ларгус-2"}}),
+        ("sonet_group.get", {"FILTER": {}, "ORDER": {"NAME": "ASC"}}),
+    ]
+
+
+def test_bitrix_api_tool_read_uses_oauth_client_when_available():
+    fallback_bitrix = FakeBitrixClient()
+    oauth_bitrix = FakeBitrixClient()
+    oauth = FakeBitrixOAuth(oauth_bitrix)
+    tool = BitrixApiTool(client=fallback_bitrix, bitrix_oauth=oauth)
+
+    result = anyio_run(tool.execute({"method": "catalog.store.list", "params": {}}, user_id=13))
+
+    assert result.status == ToolStatus.OK
+    assert result.data["access_actor"] == "oauth_current_user"
+    assert oauth.user_ids == [13]
+    assert fallback_bitrix.calls == []
+    assert ("catalog.store.list", {}) in oauth_bitrix.calls
+
+
+def test_bitrix_api_tool_oauth_read_denies_without_user_id():
+    fallback_bitrix = FakeBitrixClient()
+    oauth_bitrix = FakeBitrixClient()
+    tool = BitrixApiTool(client=fallback_bitrix, bitrix_oauth=FakeBitrixOAuth(oauth_bitrix))
+
+    result = anyio_run(tool.execute({"method": "catalog.store.list", "params": {}}))
+
+    assert result.status == ToolStatus.DENIED
+    assert fallback_bitrix.calls == []
+    assert oauth_bitrix.calls == []
+
+
+def test_bitrix_warehouse_search_tool_finds_store_and_products():
+    fake_bitrix = FakeBitrixClient()
+    tool = BitrixWarehouseSearchTool(client=fake_bitrix)
+
+    result = anyio_run(
+        tool.execute({"query": "Borisov warehouse", "include_products": True, "limit": 5, "product_limit": 5})
+    )
+
+    assert result.status == ToolStatus.OK
+    assert result.data["matches"][0]["id"] == 10
+    assert result.data["products"]["items"][0]["product_id"] == 1001
+    assert result.data["products"]["items"][0]["product_name"] == "Cable"
+    assert result.data["products"]["items"][0]["product_url"] == "/shop/documents-catalog/7/product/1001/"
+    assert ("catalog.store.list", {}) in fake_bitrix.calls
+    assert any(method == "catalog.storeproduct.list" for method, _ in fake_bitrix.calls)
+
+
+def test_bitrix_warehouse_search_tool_uses_oauth_client_for_live_reads():
+    fallback_bitrix = FakeBitrixClient()
+    oauth_bitrix = FakeBitrixClient()
+    oauth = FakeBitrixOAuth(oauth_bitrix)
+    tool = BitrixWarehouseSearchTool(client=fallback_bitrix, bitrix_oauth=oauth)
+
+    result = anyio_run(
+        tool.execute(
+            {"query": "Borisov warehouse", "include_products": True, "limit": 5, "product_limit": 5},
+            user_id=13,
+        )
+    )
+
+    assert result.status == ToolStatus.OK
+    assert result.data["source"] == "live_bitrix_rest"
+    assert result.data["access_actor"] == "oauth_current_user"
+    assert oauth.user_ids == [13]
+    assert fallback_bitrix.calls == []
+    assert ("catalog.store.list", {}) in oauth_bitrix.calls
+    assert any(method == "catalog.storeproduct.list" for method, _ in oauth_bitrix.calls)
+    assert any(method == "catalog.product.list" for method, _ in oauth_bitrix.calls)
+
+
+def test_bitrix_warehouse_search_tool_oauth_read_denies_live_lookup_without_user_id():
+    fallback_bitrix = FakeBitrixClient()
+    oauth_bitrix = FakeBitrixClient()
+    tool = BitrixWarehouseSearchTool(client=fallback_bitrix, bitrix_oauth=FakeBitrixOAuth(oauth_bitrix))
+
+    result = anyio_run(tool.execute({"query": "Borisov warehouse", "include_products": True}))
+
+    assert result.status == ToolStatus.DENIED
+    assert fallback_bitrix.calls == []
+    assert oauth_bitrix.calls == []
+
+
+def test_bitrix_warehouse_search_tool_uses_stock_snapshot_before_live_bitrix():
+    fake_bitrix = FakeBitrixClient()
+    index = FakePortalSearchIndex()
+    index.upsert_item(
+        entity_type="catalog_store",
+        entity_id=10,
+        title="Borisov warehouse",
+        body="Borisov address",
+        metadata={},
+    )
+    index.upsert_item(
+        entity_type="catalog_store_stock",
+        entity_id="10:1001",
+        title="Cable - Borisov warehouse",
+        body="Store: Borisov warehouse\nProduct: Cable\nAmount: 3",
+        url="https://example.test/shop/documents-catalog/7/product/1001/",
+        metadata={
+            "store_id": 10,
+            "store_title": "Borisov warehouse",
+            "store_address": "Borisov address",
+            "product_id": 1001,
+            "product_name": "Cable",
+            "iblock_id": 7,
+            "amount": "3",
+            "product_url": "https://example.test/shop/documents-catalog/7/product/1001/",
+            "positive_amount": True,
+        },
+    )
+    tool = BitrixWarehouseSearchTool(client=fake_bitrix, portal_search=index)
+
+    result = anyio_run(
+        tool.execute({"query": "Borisov warehouse", "include_products": True, "limit": 5, "product_limit": 5})
+    )
+
+    assert result.status == ToolStatus.OK
+    assert result.data["source"] == "postgres_portal_snapshot"
+    assert result.data["products"]["source"] == "postgres_portal_snapshot"
+    assert result.data["products"]["items"][0]["product_id"] == 1001
+    assert result.data["products"]["items"][0]["product_name"] == "Cable"
+    assert result.data["products"]["items"][0]["amount"] == "3"
+    assert fake_bitrix.calls == []
+
+
+def test_bitrix_warehouse_snapshot_uses_oauth_actor_before_returning_index_data():
+    fallback_bitrix = FakeBitrixClient()
+    oauth_bitrix = FakeBitrixClient()
+    oauth = FakeBitrixOAuth(oauth_bitrix)
+    index = FakePortalSearchIndex()
+    index.upsert_item(
+        entity_type="catalog_store",
+        entity_id=10,
+        title="Borisov warehouse",
+        body="Borisov address",
+        metadata={},
+    )
+    tool = BitrixWarehouseSearchTool(client=fallback_bitrix, portal_search=index, bitrix_oauth=oauth)
+
+    result = anyio_run(tool.execute({"query": "Borisov warehouse", "limit": 5}, user_id=13))
+
+    assert result.status == ToolStatus.OK
+    assert result.data["source"] == "postgres_portal_snapshot"
+    assert result.data["access_actor"] == "oauth_current_user"
+    assert oauth.user_ids == [13]
+    assert fallback_bitrix.calls == []
+    assert oauth_bitrix.calls == []
+
+
+def test_bitrix_warehouse_snapshot_oauth_denies_without_user_id():
+    fallback_bitrix = FakeBitrixClient()
+    oauth_bitrix = FakeBitrixClient()
+    index = FakePortalSearchIndex()
+    index.upsert_item(
+        entity_type="catalog_store",
+        entity_id=10,
+        title="Borisov warehouse",
+        body="Borisov address",
+        metadata={},
+    )
+    tool = BitrixWarehouseSearchTool(
+        client=fallback_bitrix,
+        portal_search=index,
+        bitrix_oauth=FakeBitrixOAuth(oauth_bitrix),
+    )
+
+    result = anyio_run(tool.execute({"query": "Borisov warehouse", "limit": 5}))
+
+    assert result.status == ToolStatus.DENIED
+    assert fallback_bitrix.calls == []
+    assert oauth_bitrix.calls == []
+
+
+def test_bitrix_warehouse_search_tool_filters_non_available_products_before_limit():
+    class FakeWarehouseClient(FakeBitrixClient):
+        async def result(self, method, payload=None, *, base_url=None):
+            self.calls.append((method, payload or {}))
+            if method == "catalog.store.list":
+                return {"stores": [{"id": 10, "title": "Borisov warehouse", "address": "Borisov"}]}
+            if method == "catalog.storeproduct.list":
+                return {
+                    "storeProducts": [
+                        {"storeId": 10, "productId": 1001, "amount": "0"},
+                        {"storeId": 10, "productId": 1002},
+                        {"storeId": 10, "productId": 1003, "amount": "2"},
+                        {"storeId": 10, "productId": 1004, "amount": "5"},
+                        {"storeId": 10, "productId": 1005, "amount": ""},
+                    ]
+                }
+            if method == "catalog.product.list":
+                return {
+                    "products": [
+                        {"id": 1003, "iblockId": 7, "name": "Cable"},
+                        {"id": 1004, "iblockId": 7, "name": "Switch"},
+                    ]
+                }
+            return {}
+
+    fake_bitrix = FakeWarehouseClient()
+    tool = BitrixWarehouseSearchTool(client=fake_bitrix)
+
+    result = anyio_run(
+        tool.execute({"query": "Borisov warehouse", "include_products": True, "limit": 5, "product_limit": 1})
+    )
+
+    assert result.status == ToolStatus.OK
+    products = result.data["products"]
+    assert [item["product_id"] for item in products["items"]] == [1003]
+    assert products["filtered_non_positive_count"] == 3
+    assert products["available_items_seen"] == 2
+    assert products["has_more"] is True
 
 
 def test_bitrix24_specialist_skips_quality_control_when_disabled(monkeypatch, tmp_path):
@@ -360,6 +668,21 @@ class FakeBitrixClient:
         self.calls.append((method, payload or {}))
         return {"result": {"id": 123}}
 
+    async def result(self, method, payload=None, *, base_url=None):
+        self.calls.append((method, payload or {}))
+        if method == "catalog.store.list":
+            return {
+                "stores": [
+                    {"id": 10, "title": "Borisov warehouse", "address": "Borisov"},
+                    {"id": 11, "title": "Minsk warehouse", "address": "Minsk"},
+                ]
+            }
+        if method == "catalog.storeproduct.list":
+            return {"storeProducts": [{"storeId": 10, "productId": 1001, "amount": "7"}]}
+        if method == "catalog.product.list":
+            return {"products": [{"id": 1001, "iblockId": 7, "name": "Cable"}]}
+        return {"id": 123}
+
     async def send_bot_message(self, dialog_id, message, *, bot_id=None, keyboard=None):
         self.messages.append((dialog_id, message, bot_id, keyboard))
         return 1
@@ -421,6 +744,16 @@ class FakeBitrixClient:
             )
         )
         return 1
+
+
+class FakeBitrixOAuth:
+    def __init__(self, client) -> None:
+        self.client = client
+        self.user_ids = []
+
+    async def client_for_user(self, user_id: int):
+        self.user_ids.append(user_id)
+        return self.client
 
 
 class RecordingCreateChatClient(BitrixClient):

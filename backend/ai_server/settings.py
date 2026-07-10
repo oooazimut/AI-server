@@ -22,6 +22,7 @@ class Settings:
     bitrix_oauth_client_secret: str
     bitrix_oauth_enabled: bool
     bitrix_oauth_required_for_writes: bool
+    bitrix_task_draft_ttl_minutes: int
     bitrix_oauth_app_path: str
     bitrix_oauth_callback_path: str
     bitrix_oauth_token_endpoint: str
@@ -70,8 +71,11 @@ class Settings:
     search_index_disk_max_depth: int
     search_index_include_disk: bool
     search_index_include_task_attachments: bool
+    search_index_include_task_comments: bool
+    search_index_task_comment_limit: int
     search_index_include_catalog: bool
     search_index_max_catalog_products: int
+    search_index_max_catalog_stock_rows: int
     search_content_enabled: bool
     search_content_keep_local_files: bool
     search_content_max_files: int
@@ -139,6 +143,8 @@ class Settings:
     yandex_speechkit_lang: str
     yandex_speechkit_max_bytes: int
     yandex_speechkit_convert_to_ogg: bool
+    yandex_speechkit_chunk_seconds: int
+    yandex_speechkit_max_chunks: int
     ffmpeg_path: str
     agent_private_disk_path_markers: str
     agent_private_disk_restricted_user_ids: str
@@ -369,6 +375,7 @@ def get_settings() -> Settings:
         bitrix_oauth_client_secret=_env("BITRIX_OAUTH_CLIENT_SECRET"),
         bitrix_oauth_enabled=_env_bool("BITRIX_OAUTH_ENABLED", True),
         bitrix_oauth_required_for_writes=_env_bool("BITRIX_OAUTH_REQUIRED_FOR_WRITES", True),
+        bitrix_task_draft_ttl_minutes=_env_int("BITRIX_TASK_DRAFT_TTL_MINUTES", 24 * 60) or (24 * 60),
         bitrix_oauth_app_path=_env("BITRIX_OAUTH_APP_PATH", "/bitrix/app"),
         bitrix_oauth_callback_path=_env("BITRIX_OAUTH_CALLBACK_PATH", "/bitrix/oauth/callback"),
         bitrix_oauth_token_endpoint=_env("BITRIX_OAUTH_TOKEN_ENDPOINT", "https://oauth.bitrix.info/oauth/token/"),
@@ -418,8 +425,11 @@ def get_settings() -> Settings:
         search_index_disk_max_depth=_env_int("SEARCH_INDEX_DISK_MAX_DEPTH", 6) or 6,
         search_index_include_disk=_env_bool("SEARCH_INDEX_INCLUDE_DISK", True),
         search_index_include_task_attachments=_env_bool("SEARCH_INDEX_INCLUDE_TASK_ATTACHMENTS", True),
+        search_index_include_task_comments=_env_bool("SEARCH_INDEX_INCLUDE_TASK_COMMENTS", True),
+        search_index_task_comment_limit=_env_int("SEARCH_INDEX_TASK_COMMENT_LIMIT", 20) or 20,
         search_index_include_catalog=_env_bool("SEARCH_INDEX_INCLUDE_CATALOG", True),
         search_index_max_catalog_products=_env_int("SEARCH_INDEX_MAX_CATALOG_PRODUCTS", 5000) or 5000,
+        search_index_max_catalog_stock_rows=_env_int("SEARCH_INDEX_MAX_CATALOG_STOCK_ROWS", 20000) or 20000,
         search_content_enabled=_env_bool("SEARCH_CONTENT_ENABLED", True),
         search_content_keep_local_files=_env_bool("SEARCH_CONTENT_KEEP_LOCAL_FILES", False),
         search_content_max_files=_env_int("SEARCH_CONTENT_MAX_FILES", 80) or 80,
@@ -492,6 +502,8 @@ def get_settings() -> Settings:
         yandex_speechkit_lang=_env("YANDEX_SPEECHKIT_LANG", "ru-RU"),
         yandex_speechkit_max_bytes=_env_int("YANDEX_SPEECHKIT_MAX_BYTES", 1024 * 1024) or (1024 * 1024),
         yandex_speechkit_convert_to_ogg=_env_bool("YANDEX_SPEECHKIT_CONVERT_TO_OGG", True),
+        yandex_speechkit_chunk_seconds=_env_int("YANDEX_SPEECHKIT_CHUNK_SECONDS", 25) or 25,
+        yandex_speechkit_max_chunks=_env_int("YANDEX_SPEECHKIT_MAX_CHUNKS", 12) or 12,
         ffmpeg_path=_env("FFMPEG_PATH", "ffmpeg"),
         agent_private_disk_path_markers=_env("AGENT_PRIVATE_DISK_PATH_MARKERS", "Приватный доступ"),
         agent_private_disk_restricted_user_ids=_env("AGENT_PRIVATE_DISK_RESTRICTED_USER_IDS"),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import Any
 
 from ai_server.agents.base import BaseSpecialist
@@ -16,10 +17,23 @@ from ai_server.agents.bitrix24.quality_control import (
 )
 from ai_server.agents.bitrix24.tools import (
     BitrixApiTool,
+    BitrixMyTasksTool,
+    BitrixProjectSearchTool,
+    BitrixTaskSearchTool,
+    BitrixWarehouseSearchTool,
+    CalendarEventConfirmTool,
+    CalendarEventDiscardTool,
+    CalendarEventDraftTool,
     DeleteIncompleteProposalTool,
     PortalSearchTool,
+    ProjectCreateConfirmTool,
+    ProjectCreateDiscardTool,
+    ProjectCreateDraftTool,
     SaveIncompleteProposalTool,
     SaveResponsibleResponseTool,
+    TaskCloseConfirmTool,
+    TaskCloseDiscardTool,
+    TaskCloseDraftTool,
     TaskCreateConfirmTool,
     TaskCreateDraftTool,
     TaskDraftDiscardTool,
@@ -44,10 +58,23 @@ logger = logging.getLogger(__name__)
 _LLM_TOOL_NAMES = frozenset(
     {
         "portal_search",
+        "bitrix_warehouse_search",
+        "bitrix_my_tasks",
+        "bitrix_task_search",
+        "bitrix_project_search",
         "bitrix_api",
         "task_create_draft",
         "task_create_confirm",
         "task_draft_discard",
+        "task_close_draft",
+        "task_close_confirm",
+        "task_close_discard",
+        "calendar_event_draft",
+        "calendar_event_confirm",
+        "calendar_event_discard",
+        "project_create_draft",
+        "project_create_confirm",
+        "project_create_discard",
         "save_incomplete_proposal",
         "delete_incomplete_proposal",
         "save_responsible_response",
@@ -112,16 +139,74 @@ class Bitrix24Specialist(BaseSpecialist):
     ) -> Bitrix24Specialist:
         _settings = settings or get_settings()
         tools: list[AgentTool] = [
-            PortalSearchTool(portal_search=portal_search_index),
+            PortalSearchTool(
+                portal_search=portal_search_index,
+                bitrix_files=bitrix_client,
+                bitrix_oauth=bitrix_oauth,
+            ),
+            BitrixWarehouseSearchTool(
+                client=bitrix_client,
+                portal_search=portal_search_index,
+                bitrix_oauth=bitrix_oauth,
+            ),
+            BitrixMyTasksTool(client=bitrix_client, bitrix_oauth=bitrix_oauth),
+            BitrixTaskSearchTool(
+                client=bitrix_client,
+                portal_search=portal_search_index,
+                bitrix_oauth=bitrix_oauth,
+            ),
+            BitrixProjectSearchTool(
+                client=bitrix_client,
+                portal_search=portal_search_index,
+                bitrix_oauth=bitrix_oauth,
+            ),
             BitrixApiTool(
                 client=bitrix_client,
                 write_client=bitrix_client,
                 bitrix_oauth=bitrix_oauth,
                 dry_run=_settings.agent_dry_run,
+                oauth_required_for_writes=_settings.bitrix_oauth_required_for_writes,
             ),
             TaskCreateDraftTool(store=bitrix_store),
-            TaskCreateConfirmTool(store=bitrix_store, write_client=bitrix_client, dry_run=_settings.agent_dry_run),
+            TaskCreateConfirmTool(
+                store=bitrix_store,
+                write_client=bitrix_client,
+                bitrix_oauth=bitrix_oauth,
+                dry_run=_settings.agent_dry_run,
+                oauth_required_for_writes=_settings.bitrix_oauth_required_for_writes,
+                draft_ttl_minutes=_settings.bitrix_task_draft_ttl_minutes,
+            ),
             TaskDraftDiscardTool(store=bitrix_store),
+            TaskCloseDraftTool(store=bitrix_store),
+            TaskCloseConfirmTool(
+                store=bitrix_store,
+                write_client=bitrix_client,
+                bitrix_oauth=bitrix_oauth,
+                dry_run=_settings.agent_dry_run,
+                oauth_required_for_writes=_settings.bitrix_oauth_required_for_writes,
+                draft_ttl_minutes=_settings.bitrix_task_draft_ttl_minutes,
+            ),
+            TaskCloseDiscardTool(store=bitrix_store),
+            CalendarEventDraftTool(store=bitrix_store),
+            CalendarEventConfirmTool(
+                store=bitrix_store,
+                write_client=bitrix_client,
+                bitrix_oauth=bitrix_oauth,
+                dry_run=_settings.agent_dry_run,
+                oauth_required_for_writes=_settings.bitrix_oauth_required_for_writes,
+                draft_ttl_minutes=_settings.bitrix_task_draft_ttl_minutes,
+            ),
+            CalendarEventDiscardTool(store=bitrix_store),
+            ProjectCreateDraftTool(store=bitrix_store),
+            ProjectCreateConfirmTool(
+                store=bitrix_store,
+                write_client=bitrix_client,
+                bitrix_oauth=bitrix_oauth,
+                dry_run=_settings.agent_dry_run,
+                oauth_required_for_writes=_settings.bitrix_oauth_required_for_writes,
+                draft_ttl_minutes=_settings.bitrix_task_draft_ttl_minutes,
+            ),
+            ProjectCreateDiscardTool(store=bitrix_store),
             SaveIncompleteProposalTool(store=bitrix_store),
             DeleteIncompleteProposalTool(store=bitrix_store),
             SaveResponsibleResponseTool(store=bitrix_store),
@@ -158,6 +243,34 @@ class Bitrix24Specialist(BaseSpecialist):
             )
         return await super().handle(task)
 
+    async def _execute_tool_call(
+        self,
+        tool_call: Any,
+        task: AgentTask,
+    ) -> tuple[ToolResult | None, Any | None, list[Any]]:
+        if tool_call.name == "task_create_draft":
+            args = _task_create_args_with_actor_label(dict(tool_call.args or {}), task)
+            tool_call = SimpleNamespace(
+                name=tool_call.name,
+                args=args,
+                summary=getattr(tool_call, "summary", ""),
+            )
+        elif tool_call.name == "calendar_event_draft":
+            args = _calendar_event_args_with_actor_label(dict(tool_call.args or {}), task)
+            tool_call = SimpleNamespace(
+                name=tool_call.name,
+                args=args,
+                summary=getattr(tool_call, "summary", ""),
+            )
+        elif tool_call.name == "project_create_draft":
+            args = _project_create_args_with_actor_context(dict(tool_call.args or {}), task)
+            tool_call = SimpleNamespace(
+                name=tool_call.name,
+                args=args,
+                summary=getattr(tool_call, "summary", ""),
+            )
+        return await super()._execute_tool_call(tool_call, task)
+
     def tool_definitions(self) -> list[dict]:
         return [t.definition().model_dump() for t in self._tool_registry.values() if t.name in _LLM_TOOL_NAMES]
 
@@ -168,7 +281,10 @@ class Bitrix24Specialist(BaseSpecialist):
         draft_context: dict[str, Any] = {}
         dialog_key = str(task.context.get("dialog_key") or "")
         if dialog_key and self._draft_store is not None:
-            pending = await self._draft_store.get_task_draft(dialog_key)
+            pending = await self._draft_store.get_task_draft(
+                dialog_key,
+                ttl_minutes=self._settings_for_qc.bitrix_task_draft_ttl_minutes if self._settings_for_qc else None,
+            )
             if pending:
                 draft_context = {"pending_task_draft": pending}
         merged_task = task.model_copy(
@@ -266,3 +382,72 @@ def _tool_context_status(value: object) -> str:
     if isinstance(value, dict):
         return str(value.get("status") or "")
     return ""
+
+
+def _task_create_args_with_actor_label(args: dict[str, Any], task: AgentTask) -> dict[str, Any]:
+    if str(args.get("responsible_name") or args.get("responsible_label") or "").strip():
+        return args
+    user_id = optional_int(task.user.id)
+    responsible_id = optional_int(args.get("responsible_id"))
+    responsible_self = _truthy(args.get("responsible_self"))
+    if not responsible_self and (user_id is None or responsible_id != user_id):
+        return args
+    label = _current_user_label(task)
+    if label:
+        return {**args, "responsible_name": label}
+    return args
+
+
+def _calendar_event_args_with_actor_label(args: dict[str, Any], task: AgentTask) -> dict[str, Any]:
+    if str(args.get("owner_name") or args.get("owner_label") or "").strip():
+        return args
+    if args.get("attendee_ids") or args.get("attendees"):
+        return args
+    label = _current_user_label(task)
+    if label:
+        return {**args, "owner_name": label}
+    return args
+
+
+def _project_create_args_with_actor_context(args: dict[str, Any], task: AgentTask) -> dict[str, Any]:
+    profile = _current_user_profile(task)
+    actor_name = _current_user_label(task)
+    actor_is_admin = bool(profile.get("is_admin"))
+    return {**args, "_actor_name": actor_name, "_actor_is_admin": actor_is_admin}
+
+
+def _current_user_label(task: AgentTask) -> str:
+    display_name = str(task.user.display_name or "").strip()
+    if display_name:
+        return display_name
+    profile_result = task.context.get("bitrix_current_user_profile")
+    if not isinstance(profile_result, dict):
+        return ""
+    data = profile_result.get("data")
+    if not isinstance(data, dict):
+        return ""
+    profile = data.get("profile")
+    if not isinstance(profile, dict):
+        return ""
+    return str(profile.get("label") or "").strip()
+
+
+def _current_user_profile(task: AgentTask) -> dict[str, Any]:
+    profile_result = task.context.get("bitrix_current_user_profile")
+    if not isinstance(profile_result, dict):
+        return {}
+    data = profile_result.get("data")
+    if not isinstance(data, dict):
+        return {}
+    profile = data.get("profile")
+    return profile if isinstance(profile, dict) else {}
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().casefold() in {"1", "true", "yes", "y", "да", "on"}
+    return bool(value)

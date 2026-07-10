@@ -21,6 +21,14 @@ def format_portal_sync_stats(stats: PortalSyncStats) -> str:
         f"Вложения задач: {stats.task_attachments}",
         f"Всего: {stats.total}",
     ]
+    if stats.catalog_products or stats.catalog_stores or stats.catalog_stock_rows:
+        lines.extend(
+            [
+                f"Catalog products: {stats.catalog_products}",
+                f"Catalog stores: {stats.catalog_stores}",
+                f"Catalog stock rows: {stats.catalog_stock_rows}",
+            ]
+        )
     if stats.stale_deleted:
         lines.append(f"Удалено из индекса как исчезнувшее: {stats.stale_deleted}")
     if stats.prune_skipped:
@@ -114,6 +122,10 @@ def entity_types_for_scope(scope: str) -> set[str] | None:
         "files": {"disk_file", "disk_folder", "disk_storage", "task_attachment"},
         "tasks": {"task", "task_attachment"},
         "projects": {"project"},
+        "catalog": {"catalog_product", "catalog_store", "catalog_store_stock"},
+        "stores": {"catalog_store", "catalog_store_stock"},
+        "products": {"catalog_product", "catalog_store_stock"},
+        "stock": {"catalog_store_stock"},
     }.get(normalized)
 
 
@@ -125,6 +137,9 @@ def _entity_type_label(entity_type: str) -> str:
         "disk_storage": "Хранилище",
         "disk_folder": "Папка",
         "disk_file": "Файл",
+        "catalog_store": "Склад",
+        "catalog_product": "Товар",
+        "catalog_store_stock": "Stock",
     }.get(entity_type, entity_type)
 
 

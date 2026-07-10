@@ -44,6 +44,35 @@ def _create_index() -> FakePortalSearchIndex:
     return index
 
 
+class _FakeBitrixFiles:
+    def __init__(self, *, allowed_files: set[int] | None = None, allowed_attachments: set[int] | None = None) -> None:
+        self.allowed_files = allowed_files if allowed_files is not None else {101}
+        self.allowed_attachments = allowed_attachments if allowed_attachments is not None else set()
+        self.calls: list[tuple[str, int]] = []
+
+    async def get_disk_file_download_url(self, file_id: int) -> str:
+        self.calls.append(("get_disk_file_download_url", file_id))
+        if file_id not in self.allowed_files:
+            raise RuntimeError("access denied")
+        return f"https://example.test/download/{file_id}"
+
+    async def get_attached_object(self, attached_object_id: int):
+        self.calls.append(("get_attached_object", attached_object_id))
+        if attached_object_id not in self.allowed_attachments:
+            raise RuntimeError("access denied")
+        return {"ID": attached_object_id, "DOWNLOAD_URL": f"https://example.test/attached/{attached_object_id}"}
+
+
+class _FakeBitrixOAuth:
+    def __init__(self, client: _FakeBitrixFiles) -> None:
+        self.client = client
+        self.user_ids: list[int] = []
+
+    async def client_for_user(self, user_id: int):
+        self.user_ids.append(user_id)
+        return self.client
+
+
 def test_portal_search_index_searches_old_schema():
     index = _create_index()
 
@@ -62,13 +91,89 @@ def test_portal_search_tool_returns_results():
     import asyncio
 
     index = _create_index()
-    tool = PortalSearchTool(portal_search=index)
+    tool = PortalSearchTool(portal_search=index, bitrix_files=_FakeBitrixFiles())
 
     result = asyncio.run(tool.execute({"query": "транзит договор", "scope": "documents", "limit": 5}))
 
     assert result.status == "ok"
     assert result.data["results"][0]["entity_type"] == "disk_file"
     assert "Нашёл по порталу" in result.data["summary"]
+
+
+def test_portal_search_tool_requires_live_access_check_for_documents():
+    import asyncio
+
+    tool = PortalSearchTool(portal_search=_create_index())
+
+    result = asyncio.run(tool.execute({"query": "транзит договор", "scope": "documents", "limit": 5}))
+
+    assert result.status == "denied"
+    assert "live access check" in result.error
+
+
+def test_portal_search_tool_filters_inaccessible_documents():
+    import asyncio
+
+    index = _create_index()
+    index.upsert_item(
+        entity_type="disk_file",
+        entity_id="303",
+        title="Скрытый договор.docx",
+        body="Текст договора с компанией Транзит-Экспресс.",
+        url="https://example.test/docs/303",
+        metadata={"disk_object_id": 303},
+    )
+    tool = PortalSearchTool(portal_search=index, bitrix_files=_FakeBitrixFiles(allowed_files={101}))
+
+    result = asyncio.run(tool.execute({"query": "транзит договор", "scope": "documents", "limit": 5}))
+
+    assert result.status == "ok"
+    assert [item["entity_id"] for item in result.data["results"]] == ["101"]
+    assert result.data["access_checked"] is True
+    assert result.data["access_filtered_count"] == 1
+
+
+def test_portal_search_tool_uses_oauth_client_for_document_access_check():
+    import asyncio
+
+    index = _create_index()
+    fallback_files = _FakeBitrixFiles()
+    oauth_files = _FakeBitrixFiles()
+    oauth = _FakeBitrixOAuth(oauth_files)
+    tool = PortalSearchTool(portal_search=index, bitrix_files=fallback_files, bitrix_oauth=oauth)
+
+    result = asyncio.run(
+        tool.execute({"query": "С‚СЂР°РЅР·РёС‚ РґРѕРіРѕРІРѕСЂ", "scope": "documents", "limit": 5}, user_id=13)
+    )
+
+    assert result.status == "ok"
+    if not result.data["results"]:
+        result = asyncio.run(tool.execute({"query": "docx", "scope": "documents", "limit": 5}, user_id=13))
+    assert result.data["access_checked"] is True
+    assert result.data["access_actor"] == "oauth_current_user"
+    assert oauth.user_ids
+    assert set(oauth.user_ids) == {13}
+    assert fallback_files.calls == []
+    assert oauth_files.calls == [("get_disk_file_download_url", 101)]
+
+
+def test_portal_search_tool_oauth_document_access_denies_without_user_id():
+    import asyncio
+
+    index = _create_index()
+    fallback_files = _FakeBitrixFiles()
+    oauth_files = _FakeBitrixFiles()
+    tool = PortalSearchTool(
+        portal_search=index,
+        bitrix_files=fallback_files,
+        bitrix_oauth=_FakeBitrixOAuth(oauth_files),
+    )
+
+    result = asyncio.run(tool.execute({"query": "С‚СЂР°РЅР·РёС‚ РґРѕРіРѕРІРѕСЂ", "scope": "documents"}))
+
+    assert result.status == "denied"
+    assert fallback_files.calls == []
+    assert oauth_files.calls == []
 
 
 def test_portal_search_tool_reports_missing_index():
@@ -80,6 +185,91 @@ def test_portal_search_tool_reports_missing_index():
 
     assert result.status == "not_configured"
     assert "missing" in result.data["message"].lower()
+
+
+def test_portal_search_tool_supports_store_scope():
+    import asyncio
+
+    index = _create_index()
+    index.upsert_item(
+        entity_type="catalog_store",
+        entity_id="12",
+        title="Borisov warehouse",
+        body="Main stock location",
+        metadata={},
+    )
+    tool = PortalSearchTool(portal_search=index)
+
+    result = asyncio.run(tool.execute({"query": "Borisov", "scope": "stores", "limit": 5}))
+
+    assert result.status == "ok"
+    assert result.data["results"][0]["entity_type"] == "catalog_store"
+
+
+def test_portal_search_tool_uses_oauth_actor_for_store_scope():
+    import asyncio
+
+    index = _create_index()
+    index.upsert_item(
+        entity_type="catalog_store",
+        entity_id="12",
+        title="Borisov warehouse",
+        body="Main stock location",
+        metadata={},
+    )
+    oauth_files = _FakeBitrixFiles()
+    oauth = _FakeBitrixOAuth(oauth_files)
+    tool = PortalSearchTool(portal_search=index, bitrix_oauth=oauth)
+
+    result = asyncio.run(tool.execute({"query": "Borisov", "scope": "stores", "limit": 5}, user_id=13))
+
+    assert result.status == "ok"
+    assert result.data["access_actor"] == "oauth_current_user"
+    assert result.data["results"][0]["entity_type"] == "catalog_store"
+    assert oauth.user_ids == [13]
+    assert oauth_files.calls == []
+
+
+def test_portal_search_tool_oauth_store_scope_denies_without_user_id():
+    import asyncio
+
+    index = _create_index()
+    index.upsert_item(
+        entity_type="catalog_store",
+        entity_id="12",
+        title="Borisov warehouse",
+        body="Main stock location",
+        metadata={},
+    )
+    oauth_files = _FakeBitrixFiles()
+    tool = PortalSearchTool(portal_search=index, bitrix_oauth=_FakeBitrixOAuth(oauth_files))
+
+    result = asyncio.run(tool.execute({"query": "Borisov", "scope": "stores", "limit": 5}))
+
+    assert result.status == "denied"
+    assert oauth_files.calls == []
+
+
+def test_portal_search_tool_denies_unrestricted_all_scope():
+    import asyncio
+
+    tool = PortalSearchTool(portal_search=_create_index())
+
+    result = asyncio.run(tool.execute({"query": "камера", "scope": "all", "limit": 5}, user_id=13))
+
+    assert result.status == "denied"
+    assert "focused non-task scope" in result.error
+
+
+def test_portal_search_tool_denies_task_scope():
+    import asyncio
+
+    tool = PortalSearchTool(portal_search=_create_index())
+
+    result = asyncio.run(tool.execute({"query": "камера", "scope": "tasks", "limit": 5}, user_id=13))
+
+    assert result.status == "denied"
+    assert "bitrix_task_search" in result.error
 
 
 def test_bitrix_search_endpoint(monkeypatch):
@@ -103,7 +293,7 @@ def test_bitrix_specialist_uses_portal_search_for_document_requests():
     specialist = Bitrix24Specialist(
         manifest,
         retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
-        agent_tools=[PortalSearchTool(portal_search=index)],
+        agent_tools=[PortalSearchTool(portal_search=index, bitrix_files=_FakeBitrixFiles())],
         llm=FakeBitrixLLM(
             tool_calls=[
                 BitrixLLMToolCall(
@@ -123,6 +313,7 @@ def test_bitrix_specialist_uses_portal_search_for_document_requests():
 
 def test_portal_metadata_sync_indexes_tasks_projects_and_disk(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
     monkeypatch.setenv("SEARCH_INDEX_MAX_TASK_ATTACHMENTS", "10")
     index = FakePortalSearchIndex()
     bitrix = FakePortalBitrix()
@@ -132,11 +323,30 @@ def test_portal_metadata_sync_indexes_tasks_projects_and_disk(monkeypatch):
     assert stats.tasks == 1
     assert stats.projects == 1
     assert stats.task_attachments == 1
+    assert stats.catalog_products == 2
+    assert stats.catalog_stores == 1
+    assert stats.catalog_stock_rows == 1
     assert stats.disk_items == 3
-    assert index.get_item(entity_type="task", entity_id=202) is not None
+    task = index.get_item(entity_type="task", entity_id=202)
+    assert task is not None
+    assert "понаблюдать" in task.body.casefold()
+    assert "вы добавлены наблюдателем" not in task.body.casefold()
+    assert task.metadata["comments_indexed"] is True
+    assert task.metadata["comments_count"] == 1
+    assert task.metadata["responsible_label"] == "Марат"
     assert index.get_item(entity_type="project", entity_id=17) is not None
+    stock = index.get_item(entity_type="catalog_store_stock", entity_id="12:1001")
+    assert stock is not None
+    assert stock.metadata["store_title"] == "Borisov warehouse"
+    assert stock.metadata["product_name"] == "Junction box"
+    assert stock.metadata["amount"] == "3"
+    assert stock.url == "https://asutp-expert.bitrix24.ru/shop/documents-catalog/7/product/1001/"
+    assert index.get_item(entity_type="catalog_store_stock", entity_id="12:1002") is None
     assert index.get_item(entity_type="disk_file", entity_id=501) is not None
     assert index.search("план склад", entity_types={"disk_file"})
+    assert index.search("понаблюдать", entity_types={"task"})
+    assert index.search("Borisov Junction", entity_types={"catalog_store_stock"})
+    assert any(method == "batch" for method, _payload in bitrix.calls)
 
 
 def test_portal_delta_sync_updates_folder_and_deletes_missing_children(monkeypatch):
@@ -243,6 +453,9 @@ def test_search_webhook_indexer_upserts_and_deletes_file(monkeypatch):
 
 
 class FakePortalBitrix:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
     async def list_all_tasks(self, **kwargs):
         return [
             {
@@ -251,13 +464,38 @@ class FakePortalBitrix:
                 "DESCRIPTION": "IP-камера, регистратор и склад",
                 "STATUS": 2,
                 "RESPONSIBLE_ID": 9,
+                "RESPONSIBLE": {"name": "Марат"},
                 "CREATED_BY": 1,
+                "CREATOR": {"name": "Валерий Кулинич"},
                 "GROUP_ID": 17,
                 "DEADLINE": "2026-06-10T09:00:00+03:00",
+                "CREATED_DATE": "2026-06-01T09:00:00+03:00",
                 "CHANGED_DATE": "2026-06-02T09:00:00+03:00",
+                "ACCOMPLICES": [11],
+                "AUDITORS": [13],
                 "UF_TASK_WEBDAV_FILES": ["n701"],
             }
         ]
+
+    async def result(self, method: str, payload: dict):
+        self.calls.append((method, payload))
+        if method == "batch":
+            assert "task_0" in payload["cmd"]
+            assert "TASKID=202" in payload["cmd"]["task_0"]
+            return {
+                "result": {
+                    "task_0": [
+                        {
+                            "POST_MESSAGE": "[USER=13]Дмитрий[/USER], вы добавлены наблюдателем.\nНеобходимо указать крайний срок, иначе задача не будет выполнена вовремя."
+                        },
+                        {"POST_MESSAGE": "[B]Внес изменения[/B], нужно понаблюдать хотя бы до завтра."},
+                    ]
+                },
+                "result_error": [],
+            }
+        if method == "task.commentitem.getlist":
+            raise AssertionError("comment sync should use batch")
+        raise AssertionError(method)
 
     async def get_attached_object(self, attached_object_id: int):
         return {
@@ -281,6 +519,39 @@ class FakePortalBitrix:
                 "DATE_UPDATE": "2026-06-02T08:00:00+03:00",
             }
         ][:limit]
+
+    async def list_catalogs(self):
+        return [{"iblockId": 7}]
+
+    async def list_catalog_products(self, iblock_id: int, *, limit: int | None = None):
+        products = [
+            {
+                "id": 1001,
+                "iblockId": iblock_id,
+                "name": "Junction box",
+                "previewText": "Electrical catalog item",
+                "detailText": "",
+            },
+            {
+                "id": 1002,
+                "iblockId": iblock_id,
+                "name": "Selector",
+                "previewText": "",
+                "detailText": "",
+            },
+        ]
+        return products[:limit] if limit else products
+
+    async def list_catalog_stores(self, *, limit: int | None = None):
+        stores = [{"id": 12, "title": "Borisov warehouse", "address": "Russian, 8", "description": ""}]
+        return stores[:limit] if limit else stores
+
+    async def list_catalog_store_products(self, store_id: object, *, limit: int | None = None):
+        rows = [
+            {"storeId": store_id, "productId": 1001, "amount": "3"},
+            {"storeId": store_id, "productId": 1002, "amount": "0"},
+        ]
+        return rows[:limit] if limit else rows
 
     async def list_disk_storages(self, *, limit: int | None = None):
         storages = [{"ID": 10, "ROOT_OBJECT_ID": 500, "NAME": "Общий диск"}]

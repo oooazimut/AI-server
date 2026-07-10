@@ -148,6 +148,10 @@ class OrchestratorLLMService:
         tool_results: list[ToolResult],
         **kwargs: Any,
     ) -> OrchestratorFinalResult:
+        direct_result = _direct_specialist_answer(tool_results)
+        if direct_result is not None:
+            return direct_result
+
         completion = await self.client.complete(
             agent_id=manifest.id,
             messages=[
@@ -187,6 +191,29 @@ def orchestrator_llm_failure_result(message: str) -> OrchestratorFinalResult:
             notes=[message],
         ),
     )
+
+
+def _direct_specialist_answer(tool_results: list[ToolResult]) -> OrchestratorFinalResult | None:
+    for result in reversed(tool_results):
+        if result.tool != "call_specialist" or str(result.status) != "ok":
+            continue
+        data = result.data if isinstance(result.data, dict) else {}
+        answer = str(data.get("answer") or "").strip()
+        if not answer:
+            continue
+        status = result_status(data.get("status"))
+        return OrchestratorFinalResult(
+            answer=answer,
+            status=status,
+            model_usage=ModelUsageRecord(
+                agent_id="internal_orchestrator",
+                provider="local",
+                model="specialist_answer_passthrough",
+                status="skipped",
+                notes=["single_specialist_answer_passthrough"],
+            ),
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------

@@ -63,12 +63,15 @@ async def run_diagnost_event_worker(
             if source == "orchestrator" and result.status == "completed":
                 user_id = str(task.user.id) if task.user and task.user.id is not None else ""
                 dialog_key = str(task.context.get("dialog_key") or "")
-                if user_id and dialog_key:
+                feedback_dialog_id = str(
+                    task.context.get("recipient_id") or task.context.get("dialog_id") or dialog_key
+                )
+                if user_id and feedback_dialog_id:
                     try:
                         await store.create_pending_feedback(
                             task.task_id,
                             user_id,
-                            dialog_key,
+                            feedback_dialog_id,
                             channel=task.user.channel if task.user else None,
                         )
                     except Exception:

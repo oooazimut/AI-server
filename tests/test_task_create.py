@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from ai_server.agents.bitrix24.tools.task_create import (
     BitrixTaskCreateDraft,
     build_task_create_draft_from_args,
@@ -41,6 +43,7 @@ def test_draft_complete_with_no_deadline():
     assert draft.params["fields"]["TITLE"] == "Проверить камеру"
     assert draft.params["fields"]["RESPONSIBLE_ID"] == 9
     assert draft.params["fields"]["NO_DEADLINE"] is True
+    assert "DEADLINE" not in draft.params["fields"]
 
 
 def test_draft_strips_title_punctuation():
@@ -93,6 +96,41 @@ def test_draft_description_included():
     assert draft.params["fields"]["DESCRIPTION"] == "Подробное описание"
 
 
+def test_draft_default_description_from_title():
+    draft = build_task_create_draft_from_args(
+        {"title": "Проверить связь", "responsible_id": 9, "no_deadline": True},
+        user_id=9,
+    )
+    assert draft.params["fields"]["DESCRIPTION"] == "Краткое содержание: Проверить связь"
+
+
+def test_draft_default_deadline_when_missing():
+    draft = build_task_create_draft_from_args(
+        {"title": "Задача", "responsible_id": 9},
+        user_id=9,
+    )
+    fields = draft.params["fields"]
+    deadline = datetime.fromisoformat(fields["DEADLINE"])
+    assert draft.is_ready
+    assert "NO_DEADLINE" not in fields
+    assert deadline.hour == 19
+    assert deadline.minute == 0
+    assert deadline.weekday() < 5
+    assert any("Срок по умолчанию" in note for note in draft.notes)
+
+
+def test_draft_project_label_stays_in_preview_only():
+    draft = build_task_create_draft_from_args(
+        {"title": "Задача", "responsible_id": 9, "group_id": 45, "project_name": "Ларгус 2"},
+        user_id=9,
+    )
+
+    assert draft.is_ready
+    assert draft.params["fields"]["GROUP_ID"] == 45
+    assert "_PROJECT_LABEL" not in draft.params["fields"]
+    assert draft.preview["project"] == "Ларгус 2"
+
+
 # ---------------------------------------------------------------------------
 # build_task_create_draft_from_args — contract errors
 # ---------------------------------------------------------------------------
@@ -122,15 +160,6 @@ def test_draft_responsible_self_without_user_id():
         user_id=None,
     )
     assert not draft.is_ready
-
-
-def test_draft_missing_deadline():
-    draft = build_task_create_draft_from_args(
-        {"title": "Задача", "responsible_id": 9},
-        user_id=9,
-    )
-    assert not draft.is_ready
-    assert any("deadline" in e for e in draft.contract_errors)
 
 
 def test_draft_invalid_deadline_format():

@@ -4,11 +4,11 @@ from typing import Any, Protocol
 
 
 class TaskDraftStorePort(Protocol):
-    """Port for persisting a pending task-creation draft keyed by dialog_key."""
+    """Port for persisting a pending Bitrix write draft keyed by dialog_key."""
 
     async def save_task_draft(self, dialog_key: str, params: dict[str, Any]) -> None: ...
 
-    async def get_task_draft(self, dialog_key: str) -> dict[str, Any] | None: ...
+    async def get_task_draft(self, dialog_key: str, *, ttl_minutes: int | None = None) -> dict[str, Any] | None: ...
 
     async def delete_task_draft(self, dialog_key: str) -> None: ...
 

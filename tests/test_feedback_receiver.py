@@ -37,19 +37,37 @@ def _store(pending: dict | None = None) -> AsyncMock:
 
 
 def test_detect_rating_thumbs_up():
-    assert _detect_rating("👍")[0] == 5
+    assert _detect_rating("👍")[0] == 10
 
 
 def test_detect_rating_thumbs_down():
     assert _detect_rating("👎")[0] == 1
 
 
-def test_detect_rating_digit_5():
-    assert _detect_rating("5")[0] == 5
+def test_detect_rating_digit_10():
+    assert _detect_rating("10")[0] == 10
+
+
+def test_detect_rating_digit_6():
+    assert _detect_rating("6")[0] == 6
+
+
+def test_detect_rating_fraction_10():
+    assert _detect_rating("10/10")[0] == 10
 
 
 def test_detect_rating_digit_1():
     assert _detect_rating("1")[0] == 1
+
+
+def test_detect_rating_with_explanation():
+    rating, raw_text = _detect_rating("7 — ответ неполный")
+    assert rating == 7
+    assert raw_text == "7 — ответ неполный"
+
+
+def test_detect_rating_fraction_with_explanation():
+    assert _detect_rating("8/10, помогло")[0] == 8
 
 
 def test_detect_rating_unknown_text():
@@ -97,7 +115,7 @@ def test_handle_returns_true_and_saves_feedback():
     task = _task(text="👍", user_id="99")
     result = _run(adapter.handle(task))
     assert result is True
-    store.save_feedback.assert_awaited_once_with("ev-42", "99", rating=5, raw_text="👍", dialog_key="dk-1")
+    store.save_feedback.assert_awaited_once_with("ev-42", "99", rating=10, raw_text="👍", dialog_key="dk-1")
     store.mark_pending_received.assert_awaited_once_with(7)
 
 

@@ -17,12 +17,14 @@ _PENDING_KEY = f"{_PREFIX}:pending"  # sorted set, score = next_attempt_at epoch
 _PROCESSING_KEY = f"{_PREFIX}:processing"  # sorted set, score = started_at epoch ms
 _FAILED_KEY = f"{_PREFIX}:failed"  # set of failed event_ids
 _RECENT_KEY = f"{_PREFIX}:recent"  # list of recent event_ids (newest first)
+_WORKER_HEARTBEAT_KEY = f"{_PREFIX}:worker:heartbeat"
 _DEDUPE_TTL = 48 * 3600  # dedupe key expiry in seconds
 _RECENT_MAX = 200  # keep last N entries in recent list
 _STALE_SECONDS = 120
 _MAX_ATTEMPTS = 5
 _RETRY_BASE = 30
 _RETRY_MAX = 600
+_WORKER_HEARTBEAT_TTL_SECONDS = 30
 
 
 def _data_key(event_id: int) -> str:
@@ -231,6 +233,51 @@ class RedisEventQueue:
             "done": None,
             "failed": failed,
             "latest": latest,
+            "worker_heartbeat": await self.worker_heartbeat(),
+        }
+
+    async def heartbeat_worker(self, status: dict[str, Any]) -> None:
+        now_ms = _epoch_ms()
+        payload = {
+            "running": "true" if status.get("running") else "false",
+            "worker_count": str(status.get("worker_count") or 0),
+            "active_workers": str(status.get("active_workers") or 0),
+            "last_check_at": str(status.get("last_check_at") or ""),
+            "last_event_id": str(status.get("last_event_id") or ""),
+            "last_event": str(status.get("last_event") or ""),
+            "last_error": str(status.get("last_error") or ""),
+            "processed": str(status.get("processed") or 0),
+            "errors": str(status.get("errors") or 0),
+            "heartbeat_at": _iso_now(),
+            "heartbeat_epoch_ms": str(now_ms),
+        }
+        pipe = self._client.pipeline(transaction=True)
+        pipe.hset(_WORKER_HEARTBEAT_KEY, mapping=payload)
+        pipe.expire(_WORKER_HEARTBEAT_KEY, _WORKER_HEARTBEAT_TTL_SECONDS)
+        await pipe.execute()
+
+    async def worker_heartbeat(self) -> dict[str, Any]:
+        raw = await self._client.hgetall(_WORKER_HEARTBEAT_KEY)
+        if not raw:
+            return {"running": False, "heartbeat_at": None, "heartbeat_age_seconds": None}
+        try:
+            heartbeat_age_seconds = max(0.0, (_epoch_ms() - float(raw.get("heartbeat_epoch_ms") or 0)) / 1000)
+        except (TypeError, ValueError):
+            heartbeat_age_seconds = None
+        fresh = heartbeat_age_seconds is not None and heartbeat_age_seconds <= _WORKER_HEARTBEAT_TTL_SECONDS
+        return {
+            "running": raw.get("running") == "true" and fresh,
+            "heartbeat_at": raw.get("heartbeat_at") or None,
+            "heartbeat_age_seconds": heartbeat_age_seconds,
+            "worker_count": _safe_int(raw.get("worker_count")),
+            "active_workers": _safe_int(raw.get("active_workers")),
+            "last_check_at": raw.get("last_check_at") or None,
+            "last_event_id": _safe_int(raw.get("last_event_id")),
+            "last_event": raw.get("last_event") or None,
+            "last_error": raw.get("last_error") or None,
+            "processed": _safe_int(raw.get("processed")),
+            "errors": _safe_int(raw.get("errors")),
+            "source": "redis_heartbeat",
         }
 
     async def latest(self, *, limit: int = 20) -> list[dict[str, Any]]:
@@ -277,3 +324,12 @@ def _decode_json(value: str) -> dict[str, Any]:
     except (json.JSONDecodeError, TypeError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _safe_int(value: object) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None

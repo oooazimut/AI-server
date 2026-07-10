@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from typing import Any
 
 from ai_server.agents.bitrix24.ports import TaskDraftStorePort
+from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
+from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.tools.bitrix_policy import apply_write_policy
 from ai_server.tools.bitrix_ports import BitrixWritePort
-from ai_server.utils import compact_text, optional_int, unique
+from ai_server.utils import MOSCOW_TZ, compact_text, optional_int, unique
+
+DEFAULT_TASK_DEADLINE_WORKING_DAYS = 3
+DEFAULT_TASK_DEADLINE_HOUR = 19
 
 
 @dataclass(frozen=True)
@@ -16,6 +21,7 @@ class BitrixTaskCreateDraft:
     method: str = "tasks.task.add"
     params: dict[str, Any] = field(default_factory=dict)
     summary: str = ""
+    preview: dict[str, str] = field(default_factory=dict)
     contract_errors: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -28,6 +34,7 @@ class BitrixTaskCreateDraft:
             "method": self.method,
             "params": self.params,
             "summary": self.summary,
+            "preview": self.preview,
             "contract_errors": self.contract_errors,
             "notes": self.notes,
         }
@@ -38,15 +45,19 @@ def build_task_create_draft_from_args(args: dict[str, Any], *, user_id: int | No
     title = compact_text(str(args.get("title") or "")).strip(" .,:;-")
     description = compact_text(str(args.get("description") or ""))
     responsible_id = optional_int(args.get("responsible_id"))
+    responsible_label = compact_text(str(args.get("responsible_name") or args.get("responsible_label") or ""))
     responsible_note = ""
     group_id = optional_int(args.get("group_id"))
+    project_label = compact_text(str(args.get("project_name") or args.get("group_name") or ""))
 
     if responsible_id is None and _truthy(args.get("responsible_self")):
         responsible_id = user_id
         if responsible_id is not None:
-            responsible_note = "Ответственным выбран текущий пользователь."
+            responsible_note = "Ответственным выбран пользователь Bitrix из текущего диалога."
         else:
             responsible_note = "LLM выбрала текущего пользователя, но канал не передал Bitrix user id."
+    if not responsible_label and responsible_id is not None:
+        responsible_label = "указанный сотрудник"
 
     deadline, deadline_note, no_deadline, deadline_error = _deadline_from_args(args)
 
@@ -56,8 +67,7 @@ def build_task_create_draft_from_args(args: dict[str, Any], *, user_id: int | No
 
     if title:
         fields["TITLE"] = title
-        if description:
-            fields["DESCRIPTION"] = description
+        fields["DESCRIPTION"] = description or _default_description(title)
     else:
         contract_errors.append("task_create_draft.title is required")
 
@@ -84,6 +94,9 @@ def build_task_create_draft_from_args(args: dict[str, Any], *, user_id: int | No
     return BitrixTaskCreateDraft(
         params={"fields": fields} if fields else {},
         summary=_summary(title=title, responsible_id=responsible_id, deadline=deadline, group_id=group_id),
+        preview=_draft_preview(fields, responsible_label=responsible_label, project_label=project_label)
+        if fields
+        else {},
         contract_errors=unique(contract_errors),
         notes=notes,
     )
@@ -110,14 +123,16 @@ class TaskCreateDraftTool:
                     "description": {"type": "string"},
                     "responsible_id": {"type": "integer"},
                     "responsible_self": {"type": "boolean"},
+                    "responsible_name": {"type": "string"},
                     "group_id": {"type": "integer"},
+                    "project_name": {"type": "string"},
+                    "group_name": {"type": "string"},
                     "deadline_iso": {"type": "string"},
                     "no_deadline": {"type": "boolean"},
                 },
                 "required": ["title"],
                 "allOf": [
                     {"anyOf": [{"required": ["responsible_id"]}, {"required": ["responsible_self"]}]},
-                    {"anyOf": [{"required": ["deadline_iso"]}, {"required": ["no_deadline"]}]},
                 ],
             },
         )
@@ -143,7 +158,12 @@ class TaskCreateDraftTool:
         return ToolResult(
             status=ToolStatus.OK,
             tool=self.name,
-            data={"summary": draft.summary, "params": draft.params, "notes": draft.notes},
+            data={
+                "summary": draft.summary,
+                "params": draft.params,
+                "preview": draft.preview,
+                "notes": draft.notes,
+            },
         )
 
 
@@ -155,18 +175,25 @@ class TaskCreateConfirmTool:
         store: TaskDraftStorePort,
         write_client: BitrixWritePort | None = None,
         *,
+        bitrix_oauth: BitrixOAuthService | None = None,
         dry_run: bool = False,
+        oauth_required_for_writes: bool = True,
+        draft_ttl_minutes: int | None = None,
     ) -> None:
         self._store = store
         self._write_client = write_client
+        self._bitrix_oauth = bitrix_oauth
         self._dry_run = dry_run
+        self._oauth_required_for_writes = oauth_required_for_writes
+        self._draft_ttl_minutes = draft_ttl_minutes
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="task_create_confirm",
             description=(
                 "Confirm and execute the pending task creation draft. "
-                "Call this after the user explicitly confirms they want to create the task."
+                "Call this after the user explicitly confirms they want to create the task. "
+                "When OAuth is required, creation executes only as the current Bitrix user."
             ),
             parameters={"type": "object", "properties": {}, "required": []},
         )
@@ -185,12 +212,19 @@ class TaskCreateConfirmTool:
                 tool=self.name,
                 error="task_create_confirm requires dialog_key",
             )
-        draft_params = await self._store.get_task_draft(dialog_key)
+        draft_params = await self._store.get_task_draft(dialog_key, ttl_minutes=self._draft_ttl_minutes)
         if not draft_params:
             return ToolResult(
                 status=ToolStatus.NOT_FOUND,
                 tool=self.name,
                 error="no pending task draft found for this dialog",
+            )
+        if draft_params.get("_draft_type") not in (None, "task_create"):
+            return ToolResult(
+                status=ToolStatus.NOT_FOUND,
+                tool=self.name,
+                error="no pending task creation draft found for this dialog",
+                data={"draft_type": draft_params.get("_draft_type")},
             )
         if self._dry_run:
             return ToolResult(
@@ -198,13 +232,61 @@ class TaskCreateConfirmTool:
                 tool=self.name,
                 data={"params": draft_params},
             )
+        sanitized = apply_write_policy("tasks.task.add", draft_params)
+
+        if self._oauth_required_for_writes:
+            context_error = _write_context_error(user_id=user_id, dialog_id=dialog_id)
+            if context_error:
+                return ToolResult(
+                    status=ToolStatus.DENIED,
+                    tool=self.name,
+                    error=context_error,
+                    data={"params": sanitized},
+                )
+            if self._bitrix_oauth is None:
+                return ToolResult(
+                    status=ToolStatus.NOT_CONFIGURED,
+                    tool=self.name,
+                    error="Bitrix OAuth is required for task creation.",
+                    data={"params": sanitized},
+                )
+            try:
+                oauth_client = await self._bitrix_oauth.client_for_user(user_id)
+                result = await oauth_client.call("tasks.task.add", sanitized)
+            except BitrixOAuthTokenMissing as exc:
+                return ToolResult(
+                    status=ToolStatus.NOT_CONFIGURED,
+                    tool=self.name,
+                    error=str(exc),
+                    data={"params": sanitized},
+                )
+            except (BitrixApiError, BitrixConfigError) as exc:
+                return ToolResult(
+                    status=ToolStatus.NOT_CONFIGURED if isinstance(exc, BitrixConfigError) else ToolStatus.ERROR,
+                    tool=self.name,
+                    error=str(exc),
+                    data={"params": sanitized},
+                )
+            except Exception as exc:
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool=self.name,
+                    error=f"{type(exc).__name__}: {exc}",
+                    data={"params": sanitized},
+                )
+            await self._store.delete_task_draft(dialog_key)
+            return ToolResult(
+                status=ToolStatus.OK,
+                tool=self.name,
+                data={"result": result, "params": sanitized},
+            )
+
         if self._write_client is None:
             return ToolResult(
                 status=ToolStatus.NOT_CONFIGURED,
                 tool=self.name,
                 error="write_client is not configured",
             )
-        sanitized = apply_write_policy("tasks.task.add", draft_params)
         try:
             result = await self._write_client.call("tasks.task.add", sanitized)
         except Exception as exc:
@@ -256,12 +338,61 @@ def _deadline_from_args(args: dict[str, Any]) -> tuple[str | None, str, bool, st
         return None, "LLM explicitly selected no_deadline.", True, ""
     raw_deadline = str(args.get("deadline") or args.get("deadline_iso") or "").strip()
     if not raw_deadline:
-        return None, "", False, "task_create_draft requires deadline_iso or no_deadline=true"
+        return (
+            _default_deadline_iso(),
+            "Срок по умолчанию: три рабочих дня от даты создания, 19:00 МСК.",
+            False,
+            "",
+        )
     try:
         datetime.fromisoformat(raw_deadline.replace("Z", "+00:00"))
     except ValueError:
         return None, "", False, "task_create_draft.deadline_iso must be ISO 8601"
     return raw_deadline, "LLM provided deadline_iso.", False, ""
+
+
+def _default_deadline_iso(*, now: datetime | None = None) -> str:
+    current = (now or datetime.now(MOSCOW_TZ)).astimezone(MOSCOW_TZ)
+    day = current.date()
+    remaining = DEFAULT_TASK_DEADLINE_WORKING_DAYS
+    while remaining > 0:
+        day += timedelta(days=1)
+        if day.weekday() < 5:
+            remaining -= 1
+    return datetime.combine(day, time(DEFAULT_TASK_DEADLINE_HOUR, 0), tzinfo=MOSCOW_TZ).isoformat()
+
+
+def _default_description(title: str) -> str:
+    return f"Краткое содержание: {title}"
+
+
+def _draft_preview(fields: dict[str, Any], *, responsible_label: str = "", project_label: str = "") -> dict[str, str]:
+    title = compact_text(str(fields.get("TITLE") or "задача"))
+    description = compact_text(str(fields.get("DESCRIPTION") or ""))
+    deadline = str(fields.get("DEADLINE") or "")
+    no_deadline = _truthy(fields.get("NO_DEADLINE"))
+    deadline_label = "без срока" if no_deadline else _format_deadline_for_preview(deadline)
+    preview = {
+        "title": title,
+        "description": description,
+        "responsible": responsible_label or "указанный сотрудник",
+        "deadline": deadline_label,
+    }
+    if project_label:
+        preview["project"] = project_label
+    elif fields.get("GROUP_ID") is not None:
+        preview["project"] = "выбранный проект"
+    return preview
+
+
+def _format_deadline_for_preview(deadline: str) -> str:
+    if not deadline:
+        return "не указан"
+    try:
+        parsed = datetime.fromisoformat(deadline.replace("Z", "+00:00")).astimezone(MOSCOW_TZ)
+    except ValueError:
+        return deadline
+    return parsed.strftime("%d.%m.%Y %H:%M МСК")
 
 
 def _summary(*, title: str, responsible_id: int | None, deadline: str | None, group_id: int | None) -> str:
@@ -282,8 +413,16 @@ def _truthy(value: object) -> bool:
     if isinstance(value, (int, float)):
         return value != 0
     if isinstance(value, str):
-        return value.strip().casefold() in {"1", "true", "yes", "y", "да", "on"}
+        return value.strip().casefold() in {"1", "true", "yes", "y", "да", "on", "без срока", "бессрочно"}
     return bool(value)
+
+
+def _write_context_error(*, user_id: int | None, dialog_id: str | None) -> str:
+    if user_id is None:
+        return "Bitrix task creation denied: current Bitrix user_id is missing."
+    if not str(dialog_id or "").strip():
+        return "Bitrix task creation denied: current Bitrix dialog_id is missing."
+    return ""
 
 
 __all__ = [
