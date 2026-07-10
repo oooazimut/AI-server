@@ -804,6 +804,51 @@ def test_bitrix_llm_decide_routes_task_draft_discard_without_llm(monkeypatch):
     assert result.decision.tool_calls[0].args == {}
 
 
+def test_bitrix_llm_does_not_treat_preview_request_as_task_draft_discard(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient(
+        json.dumps(
+            {
+                "status": "completed",
+                "answer": "",
+                "confidence": 0.7,
+                "tool_calls": [
+                    {
+                        "name": "task_create_draft",
+                        "args": {"title": "подготовить тестовый отчет", "responsible_self": True},
+                    }
+                ],
+            }
+        )
+    )
+    service = BitrixLLMService(client, settings=get_settings())
+    tool_definitions = [
+        {"name": "task_create_draft", "description": "", "parameters": {}},
+        {"name": "task_draft_discard", "description": "", "parameters": {}},
+        {"name": "none", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request=(
+                    "Битрикс создай задачу на меня: подготовить тестовый отчет. "
+                    "Не создавай сразу, только покажи черновик для подтверждения."
+                ),
+                user={"id": "13"},
+                context={"dialog_id": "chat4321"},
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert len(client.calls) == 1
+    assert [call.name for call in result.decision.tool_calls] == ["task_create_draft"]
+
+
 def test_bitrix_llm_decide_routes_task_close_draft_discard_without_llm(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient(
