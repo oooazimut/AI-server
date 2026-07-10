@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from unittest.mock import AsyncMock, patch
 
+from ai_server.integrations.bitrix.portal_search.types import CONTENT_INDEX_VERSION, CONTENT_TERMINAL_STATUSES
 from ai_server.integrations.postgres.bitrix_agent import PostgresBitrixAgentStore
 from ai_server.integrations.postgres.orchestrator_agent import PostgresOrchestratorStore
 from ai_server.integrations.postgres.pto_agent import PostgresPtoAgentStore
@@ -479,6 +480,31 @@ def test_bitrix_store_update_responsible_response(monkeypatch):
 
     store.update_responsible_response(3, "Согласен с дедлайном")
     assert any("responsible_response" in sql for sql, _ in conn.calls)
+
+
+def test_bitrix_store_content_candidates_filters_completed_items(monkeypatch):
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    rows = [
+        {
+            "entity_type": "disk_file",
+            "entity_id": "501",
+            "title": "pending.txt",
+            "body": "",
+            "url": "",
+            "metadata_json": "{}",
+        }
+    ]
+    factory, conn = _sync_conn_factory(rows=rows)
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    result = store.content_candidates(limit=80)
+
+    assert result[0].entity_id == "501"
+    sql, params = conn.calls[0]
+    assert "content_index_status" in sql
+    assert "content_index_version" in sql
+    assert "ANY" in sql
+    assert params == (CONTENT_INDEX_VERSION, CONTENT_INDEX_VERSION, list(CONTENT_TERMINAL_STATUSES), 80)
 
 
 # ---------------------------------------------------------------------------
