@@ -1,6 +1,8 @@
 import asyncio
 import json
+from datetime import date
 
+import ai_server.agents.bitrix24.llm as bitrix_llm
 from ai_server.agents.bitrix24 import Bitrix24Specialist, BitrixLLMDecision, BitrixLLMService, BitrixLLMToolCall
 from ai_server.agents.bitrix24.llm import ALLOWED_TOOL_NAMES
 from ai_server.agents.bitrix24.tools.task_create import TaskCreateDraftTool
@@ -727,6 +729,53 @@ def test_bitrix_llm_exposes_and_accepts_calendar_confirmation_tools(monkeypatch)
     assert "calendar_event_confirm" in prompt
     assert "calendar.event.add" in prompt
     assert [call.name for call in result.decision.tool_calls] == ["calendar_event_confirm", "calendar_event_discard"]
+
+
+def test_bitrix_llm_decide_routes_simple_reminder_to_calendar_draft(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setattr(bitrix_llm, "_moscow_today", lambda: date(2026, 7, 10))
+    client = RecordingLLMClient(
+        json.dumps(
+            {
+                "status": "completed",
+                "answer": "Черновик события календаря: ...",
+                "confidence": 0.2,
+                "tool_calls": [{"name": "none", "args": {}}],
+            }
+        )
+    )
+    service = BitrixLLMService(client, settings=get_settings())
+    tool_definitions = [
+        {"name": "calendar_event_draft", "description": "", "parameters": {}},
+        {"name": "calendar_event_confirm", "description": "", "parameters": {}},
+        {"name": "calendar_event_discard", "description": "", "parameters": {}},
+        {"name": "none", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request=(
+                    "Битрикс напомни мне завтра позвонить Борисову. "
+                    "Не добавляй сразу, только покажи черновик календаря для подтверждения."
+                ),
+                user={"id": "13"},
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "calendar_reminder_route"}
+    assert [call.name for call in result.decision.tool_calls] == ["calendar_event_draft"]
+    assert result.decision.tool_calls[0].args == {
+        "title": "Позвонить Борисову",
+        "date_iso": "2026-07-11",
+        "description": "Позвонить Борисову",
+    }
 
 
 def test_bitrix_llm_exposes_and_accepts_project_confirmation_tools(monkeypatch):
