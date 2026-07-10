@@ -1028,9 +1028,51 @@ def test_bitrix_llm_compose_formats_calendar_event_draft(monkeypatch):
     assert result.status == "needs_human"
     assert "Черновик события календаря" in result.answer
     assert "09.07.2026 12:00 МСК" in result.answer
+    assert "Описание: Позвонить Борисову" in result.answer
     assert "по настройкам календаря Bitrix" not in result.answer
     assert "Участники: только текущий пользователь" not in result.answer
     assert "[URL" not in result.answer
+
+
+def test_bitrix_llm_compose_hides_generic_calendar_event_description(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="напомни завтра позвонить Борисову", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="calendar_event_draft",
+                    data={
+                        "draft": {
+                            "_draft_type": "calendar_event",
+                            "title": "Позвонить Борисову",
+                            "description": "Напоминание",
+                            "start_iso": "2026-07-09T12:00:00+03:00",
+                            "end_iso": "2026-07-09T12:30:00+03:00",
+                        },
+                        "preview": {
+                            "title": "Позвонить Борисову",
+                            "description": "Напоминание",
+                            "start": "09.07.2026 12:00 МСК",
+                            "end": "09.07.2026 12:30 МСК",
+                            "participants": "Коверга Дмитрий Владимирович",
+                        },
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert "Участники: Коверга Дмитрий Владимирович" in result.answer
+    assert "Описание: Напоминание" not in result.answer
 
 
 def test_bitrix_llm_compose_formats_calendar_event_confirm_without_fake_link(monkeypatch):

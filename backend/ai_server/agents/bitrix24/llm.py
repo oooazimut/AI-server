@@ -764,7 +764,7 @@ def _format_calendar_event_draft_answer(data: dict[str, Any]) -> str:
         lines.append(f"Участники: {participants}")
     if reminder and not _is_default_calendar_reminder_label(reminder):
         lines.append(f"Напоминание: {reminder}")
-    if description:
+    if description and not _is_generic_calendar_description(description):
         lines.append(f"Описание: {description}")
     lines.append("")
     lines.append("Если всё верно, напишите: да, добавь в календарь.")
@@ -801,6 +801,10 @@ def _is_default_calendar_participant_label(value: str) -> bool:
 
 def _is_default_calendar_reminder_label(value: str) -> bool:
     return _text(value).casefold() == "по настройкам календаря bitrix"
+
+
+def _is_generic_calendar_description(value: str) -> bool:
+    return _text(value).casefold() in {"напоминание", "событие", "calendar event", "reminder"}
 
 
 def _created_task_id(value: object) -> str:
