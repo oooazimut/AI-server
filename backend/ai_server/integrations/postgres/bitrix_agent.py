@@ -425,7 +425,7 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                 SELECT entity_type, entity_id, title, body, url, metadata_json
                 FROM {_TABLE}
                 WHERE entity_type IN ('disk_file', 'task_attachment')
-                  AND NOT (
+                  AND NOT COALESCE((
                     (
                       metadata_json::jsonb ->> 'content_index_status' = 'indexed'
                       AND metadata_json::jsonb ->> 'content_index_version' = %s
@@ -434,7 +434,7 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                       metadata_json::jsonb ->> 'content_index_version' = %s
                       AND metadata_json::jsonb ->> 'content_index_status' = ANY(%s)
                     )
-                  )
+                  ), FALSE)
                 ORDER BY indexed_at DESC
                 LIMIT %s
                 """,
