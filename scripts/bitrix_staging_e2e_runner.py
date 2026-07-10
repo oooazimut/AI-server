@@ -545,7 +545,14 @@ def release_dialog_lock(lock: dict[str, Any] | None) -> None:
 
 def tests_for_suite(suite: str, *, include_draft: bool) -> list[TestCase]:
     selected: list[TestCase] = []
-    if suite == "all":
+    if suite == "release":
+        for tests in SAFE_TESTS.values():
+            selected.extend(tests)
+        for tests in OPTIONAL_READ_TESTS.values():
+            selected.extend(tests)
+        selected.extend(STATEFUL_TESTS["drafts"])
+        selected.extend(STATEFUL_TESTS["drafts_project"])
+    elif suite == "all":
         for tests in SAFE_TESTS.values():
             selected.extend(tests)
     elif suite in READ_ONLY_SUITE_ALIASES:
@@ -557,7 +564,7 @@ def tests_for_suite(suite: str, *, include_draft: bool) -> list[TestCase]:
         selected.extend(STATEFUL_TESTS[suite])
     else:
         selected.extend(SAFE_TESTS.get(suite, []))
-    if include_draft:
+    if include_draft and suite != "release":
         selected.extend(STATEFUL_TESTS["drafts"])
     return selected
 
@@ -577,6 +584,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--suite",
         choices=[
             "all",
+            "release",
             *sorted(READ_ONLY_SUITE_ALIASES),
             *sorted(SAFE_TESTS),
             *sorted(OPTIONAL_READ_TESTS),

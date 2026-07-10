@@ -180,6 +180,20 @@ def test_tests_for_suite_tasks_advanced_is_optional_read_only() -> None:
     assert "понаблюдать" in tests[0].expect_any
 
 
+def test_tests_for_suite_release_combines_safe_advanced_and_drafts_once() -> None:
+    tests = runner_tests_for_suite("release", include_draft=True)
+    test_ids = [test.test_id for test in tests]
+
+    assert "BITRIX-SMOKE-01" in test_ids
+    assert "BITRIX-WAREHOUSE-BORISOV-01" in test_ids
+    assert "BITRIX-TASK-ADVANCED-COMMENT-01" in test_ids
+    assert "BITRIX-TASK-DRAFT-01" in test_ids
+    assert "BITRIX-CALENDAR-DRAFT-01" in test_ids
+    assert "BITRIX-TASK-PROJECT-DRAFT-01" in test_ids
+    assert test_ids.count("BITRIX-TASK-DRAFT-01") == 1
+    assert all(test.kind in {"read", "smoke", "draft", "draft_cleanup"} for test in tests)
+
+
 def test_tests_for_suite_drafts_adds_cleanup_steps() -> None:
     tests = runner_tests_for_suite("drafts", include_draft=False)
 
