@@ -199,3 +199,14 @@ def test_search_background_modes_can_be_enabled_independently(monkeypatch):
     assert settings.search_background_periodic_metadata_enabled is False
     assert settings.search_background_periodic_content_enabled is True
     assert settings.search_background_periodic_delta_enabled is True
+
+
+def test_search_background_metadata_schedule_settings(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("SEARCH_BACKGROUND_METADATA_TIME", "00:30")
+    monkeypatch.setenv("SEARCH_BACKGROUND_METADATA_WEEKDAY", "sun")
+
+    settings = get_settings()
+
+    assert settings.search_background_metadata_time == "00:30"
+    assert settings.search_background_metadata_weekday == "sun"
