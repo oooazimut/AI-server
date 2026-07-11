@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from ai_server.agents.bitrix24.tools.read_client import oauth_authorization_data, oauth_missing_error
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
@@ -110,11 +111,17 @@ class BitrixApiTool:
                 read_client = await self._bitrix_oauth.client_for_user(user_id)
                 access_actor = "oauth_current_user"
             except BitrixOAuthTokenMissing as exc:
+                data = {"method": method, "params": params}
+                data.update(oauth_authorization_data(self._bitrix_oauth, user_id=exc.user_id))
                 return ToolResult(
                     status=ToolStatus.DENIED,
                     tool="bitrix_api",
-                    error=str(exc),
-                    data={"method": method, "params": params},
+                    error=oauth_missing_error(
+                        "Bitrix read operation denied",
+                        user_id=exc.user_id,
+                        authorization=data.get("authorization"),
+                    ),
+                    data=data,
                 )
             except (BitrixApiError, BitrixConfigError) as exc:
                 return ToolResult(
@@ -196,11 +203,17 @@ class BitrixApiTool:
                 )
             except BitrixOAuthTokenMissing as exc:
                 if self._oauth_required_for_writes:
+                    data = {"method": method, "params": params}
+                    data.update(oauth_authorization_data(self._bitrix_oauth, user_id=exc.user_id))
                     return ToolResult(
                         status=ToolStatus.NOT_CONFIGURED,
                         tool="bitrix_api",
-                        error=str(exc),
-                        data={"method": method, "params": params},
+                        error=oauth_missing_error(
+                            "Bitrix write operation denied",
+                            user_id=exc.user_id,
+                            authorization=data.get("authorization"),
+                        ),
+                        data=data,
                     )
             except (BitrixApiError, BitrixConfigError) as exc:
                 return ToolResult(

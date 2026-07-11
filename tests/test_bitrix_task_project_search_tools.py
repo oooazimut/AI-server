@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import anyio
 
 from ai_server.agents.bitrix24.tools.tasks import BitrixProjectSearchTool, BitrixTaskSearchTool
+from ai_server.integrations.bitrix.oauth import BitrixOAuthTokenMissing
 from tests.fakes import FakePortalSearchIndex
 
 
@@ -112,6 +113,21 @@ class _FakeBitrixOAuth:
         return self.client
 
 
+class _FakeMissingBitrixOAuth:
+    async def client_for_user(self, user_id: int):
+        raise BitrixOAuthTokenMissing(user_id)
+
+    def authorization_hint(self, user_id: int | None = None):
+        return {
+            "user_id": user_id,
+            "app_url": "https://kitvideovpn.ru/bitrix/app",
+            "marketplace_app_url": "https://asutp-expert.bitrix24.ru/marketplace/view/local.prod/",
+            "marketplace_app_path": "/marketplace/view/local.prod/",
+            "oauth_start_url": "https://asutp-expert.bitrix24.ru/oauth/authorize/?client_id=local.prod",
+            "message": "Open the Bitrix app to authorize.",
+        }
+
+
 def test_task_search_responsible_scope_uses_current_user_and_active_statuses():
     client = _FakeBitrixSearchClient()
     tool = BitrixTaskSearchTool(client=client)
@@ -149,6 +165,20 @@ def test_task_search_oauth_read_denies_live_lookup_without_user_id():
     assert result.status == "denied"
     assert fallback_client.calls == []
     assert oauth_client.calls == []
+
+
+def test_project_search_oauth_missing_returns_authorization_link():
+    fallback_client = _FakeBitrixSearchClient()
+    tool = BitrixProjectSearchTool(client=fallback_client, bitrix_oauth=_FakeMissingBitrixOAuth())
+
+    result = anyio.run(lambda: tool.execute({"query": "Ларгус"}, user_id=1))
+
+    assert result.status == "denied"
+    assert "https://asutp-expert.bitrix24.ru/oauth/authorize/" in result.error
+    assert result.data["authorization"]["marketplace_app_url"] == (
+        "https://asutp-expert.bitrix24.ru/marketplace/view/local.prod/"
+    )
+    assert fallback_client.calls == []
 
 
 def test_task_search_status_all_requires_explicit_include_closed_flag():
