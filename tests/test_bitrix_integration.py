@@ -299,6 +299,25 @@ def test_bitrix_api_tool_denies_direct_task_creation():
     assert fake_bitrix.calls == []
 
 
+def test_bitrix_api_tool_denies_direct_task_closing_methods():
+    close_methods = [
+        ("tasks.task.result.add", {"taskId": 139, "fields": {"TEXT": "Готово"}}),
+        ("tasks.task.complete", {"taskId": 139}),
+        ("tasks.task.approve", {"taskId": 139}),
+    ]
+
+    for method, params in close_methods:
+        fake_bitrix = FakeBitrixClient()
+        tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=False)
+
+        result = anyio_run(tool.execute({"method": method, "params": params}))
+
+        assert result.status == ToolStatus.DENIED
+        assert "task_close_draft/task_close_confirm" in result.error
+        assert result.data == {"method": method}
+        assert fake_bitrix.calls == []
+
+
 def test_bitrix_api_tool_denies_direct_calendar_event_creation():
     fake_bitrix = FakeBitrixClient()
     tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=False)

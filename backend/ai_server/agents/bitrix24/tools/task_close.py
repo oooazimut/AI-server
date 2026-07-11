@@ -43,21 +43,74 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
         str(args.get("completion_summary") or args.get("result_text") or args.get("summary") or "")
     )
     unresolved_items = _string_list(args.get("unresolved_items") or args.get("missing_parts"))
+    task_points = _string_list(args.get("task_points") or args.get("task_items") or args.get("checklist_items"))
+    equipment_consumables = compact_text(
+        str(args.get("equipment_consumables") or args.get("equipment") or args.get("consumables") or "")
+    )
+    overall_status = _overall_status(args.get("overall_status") or args.get("completion_status"))
+    overall_status_label = _overall_status_label(overall_status)
+    not_done_items = _string_list(
+        args.get("not_done_items") or args.get("unfinished_items") or args.get("incomplete_items")
+    )
+    unconfirmed_items = _unique_strings(
+        [
+            *_string_list(args.get("unconfirmed_items") or args.get("unknown_items") or args.get("unverified_items")),
+            *unresolved_items,
+        ]
+    )
+    missing_fields = _string_list(args.get("missing_fields") or args.get("questions") or args.get("needed_details"))
+    problem_types = _problem_types(
+        overall_status=overall_status,
+        not_done_items=not_done_items,
+        unconfirmed_items=unconfirmed_items,
+    )
+    ai_close_incomplete = bool(problem_types)
+    ai_close_marker = INCOMPLETE_CLOSE_MARKER if ai_close_incomplete else ""
 
     contract_errors: list[str] = []
     if task_id is None:
         contract_errors.append("task_close_draft.task_id is required")
-    if not completion_summary and not unresolved_items:
-        contract_errors.append("task_close_draft.completion_summary or unresolved_items is required")
+    if not any(
+        [
+            completion_summary,
+            task_points,
+            equipment_consumables,
+            overall_status,
+            not_done_items,
+            unconfirmed_items,
+            missing_fields,
+        ]
+    ):
+        contract_errors.append(
+            "task_close_draft.completion_summary, task_points, overall_status, "
+            "not_done_items or unconfirmed_items is required"
+        )
 
-    result_text = _result_text(completion_summary, unresolved_items)
+    result_text = _result_text(
+        completion_summary=completion_summary,
+        task_points=task_points,
+        equipment_consumables=equipment_consumables,
+        overall_status_label=overall_status_label,
+        not_done_items=not_done_items,
+        unconfirmed_items=unconfirmed_items,
+    )
     payload = {
         "_draft_type": TASK_CLOSE_DRAFT_TYPE,
         "task_id": task_id,
         "task_title": task_title,
         "action": action,
         "completion_summary": completion_summary,
-        "unresolved_items": unresolved_items,
+        "task_points": task_points,
+        "equipment_consumables": equipment_consumables,
+        "overall_status": overall_status,
+        "overall_status_label": overall_status_label,
+        "not_done_items": not_done_items,
+        "unconfirmed_items": unconfirmed_items,
+        "unresolved_items": _unique_strings([*not_done_items, *unconfirmed_items]),
+        "missing_fields": missing_fields,
+        "problem_types": problem_types,
+        "ai_close_incomplete": ai_close_incomplete,
+        "ai_close_marker": ai_close_marker,
         "result_text": result_text,
     }
     preview = {
@@ -65,7 +118,17 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
         "action": action,
         "action_label": _action_label(action),
         "completion_summary": completion_summary,
-        "unresolved_items": unresolved_items,
+        "task_points": task_points,
+        "equipment_consumables": equipment_consumables,
+        "overall_status": overall_status,
+        "overall_status_label": overall_status_label,
+        "not_done_items": not_done_items,
+        "unconfirmed_items": unconfirmed_items,
+        "unresolved_items": payload["unresolved_items"],
+        "missing_fields": missing_fields,
+        "problem_types": problem_types,
+        "ai_close_incomplete": ai_close_incomplete,
+        "ai_close_marker": ai_close_marker,
         "result_text": result_text,
     }
     return BitrixTaskCloseDraft(payload=payload, preview=preview, contract_errors=contract_errors)
@@ -100,6 +163,35 @@ class TaskCloseDraftTool:
                         "description": (
                             "Items that could not be verified but the user explicitly agreed to close with a marker."
                         ),
+                    },
+                    "task_points": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Short task/checklist points and what is known about their completion.",
+                    },
+                    "equipment_consumables": {
+                        "type": "string",
+                        "description": "Equipment or consumables used, in the user's own words.",
+                    },
+                    "overall_status": {
+                        "type": "string",
+                        "enum": ["completed", "partial", "not_done", "unconfirmed"],
+                        "description": "Overall completion status for the draft.",
+                    },
+                    "not_done_items": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Task points that are known to be unfinished or not done.",
+                    },
+                    "unconfirmed_items": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Task points whose result is unknown or not confirmed.",
+                    },
+                    "missing_fields": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Draft fields that still need a short answer from the user.",
                     },
                     "action": {
                         "type": "string",
@@ -300,19 +392,46 @@ async def _execute_task_close(
         "result_add": result_add,
         "close_method": close_method,
         "close_result": close_result,
+        "not_done_items": _string_list(draft.get("not_done_items")),
+        "unconfirmed_items": _string_list(draft.get("unconfirmed_items")),
         "unresolved_items": _string_list(draft.get("unresolved_items")),
+        "problem_types": _string_list(draft.get("problem_types")),
+        "ai_close_incomplete": bool(draft.get("ai_close_incomplete")),
+        "ai_close_marker": str(draft.get("ai_close_marker") or ""),
     }
 
 
-def _result_text(completion_summary: str, unresolved_items: list[str]) -> str:
+def _result_text(
+    *,
+    completion_summary: str,
+    task_points: list[str],
+    equipment_consumables: str,
+    overall_status_label: str,
+    not_done_items: list[str],
+    unconfirmed_items: list[str],
+) -> str:
     lines: list[str] = []
     if completion_summary:
         lines.append(completion_summary)
-    if unresolved_items:
+    if task_points:
+        lines.append("")
+        lines.append("Пункты задачи:")
+        lines.extend(f"- {item}" for item in task_points)
+    if equipment_consumables:
+        lines.append("")
+        lines.append(f"Оборудование, расходники: {equipment_consumables}")
+    if overall_status_label:
+        lines.append("")
+        lines.append(f"Общий итог: {overall_status_label}")
+    if not_done_items or unconfirmed_items:
         lines.append("")
         lines.append(f"Метка: {INCOMPLETE_CLOSE_MARKER}")
-        lines.append("Задача закрыта с непроверенными пунктами:")
-        lines.extend(f"- {item}" for item in unresolved_items)
+    if not_done_items:
+        lines.append("Невыполненные пункты:")
+        lines.extend(f"- {item}" for item in not_done_items)
+    if unconfirmed_items:
+        lines.append("Неподтверждённые пункты:")
+        lines.extend(f"- {item}" for item in unconfirmed_items)
     return "\n".join(lines).strip()
 
 
@@ -331,6 +450,52 @@ def _string_list(value: object) -> list[str]:
 def _close_action(value: object) -> str:
     text = str(value or "complete").strip().casefold()
     return "approve" if text in {"approve", "accept", "принять", "утвердить"} else "complete"
+
+
+def _overall_status(value: object) -> str:
+    text = str(value or "").strip().casefold()
+    if not text:
+        return ""
+    if text in {"completed", "complete", "done", "выполнено", "готово", "полностью", "выполнена полностью"}:
+        return "completed"
+    if text in {"partial", "partially_done", "partly_done", "частично", "выполнена частично"}:
+        return "partial"
+    if text in {"not_done", "not_completed", "not done", "не выполнено", "не сделано", "не выполнена"}:
+        return "not_done"
+    if text in {"unconfirmed", "unknown", "unclear", "не подтверждено", "неизвестно", "непонятно"}:
+        return "unconfirmed"
+    return text
+
+
+def _overall_status_label(status: str) -> str:
+    return {
+        "completed": "выполнена полностью",
+        "partial": "выполнена частично",
+        "not_done": "не выполнена",
+        "unconfirmed": "результат не подтверждён",
+    }.get(status, status)
+
+
+def _problem_types(*, overall_status: str, not_done_items: list[str], unconfirmed_items: list[str]) -> list[str]:
+    values: list[str] = []
+    if not_done_items or overall_status in {"partial", "not_done"}:
+        values.append("not_done")
+    if unconfirmed_items or overall_status == "unconfirmed":
+        values.append("unconfirmed")
+    return values
+
+
+def _unique_strings(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = compact_text(str(value or "")).strip(" -•")
+        key = normalized.casefold()
+        if not normalized or key in seen:
+            continue
+        seen.add(key)
+        result.append(normalized)
+    return result
 
 
 def _action_label(action: str) -> str:

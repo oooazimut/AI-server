@@ -14,6 +14,9 @@ WRITE_METHODS_WITH_DEDICATED_DRAFT_TOOLS = {
     "calendar.event.add": "Use calendar_event_draft/calendar_event_confirm for Bitrix calendar event creation.",
     "sonet_group.create": "Use project_create_draft/project_create_confirm for Bitrix project creation.",
     "tasks.task.add": "Use task_create_draft/task_create_confirm for Bitrix task creation.",
+    "tasks.task.result.add": "Use task_close_draft/task_close_confirm for Bitrix task closing results.",
+    "tasks.task.complete": "Use task_close_draft/task_close_confirm for Bitrix task closing.",
+    "tasks.task.approve": "Use task_close_draft/task_close_confirm for Bitrix task approval/closing.",
 }
 
 
@@ -42,7 +45,7 @@ class BitrixApiTool:
                 "Bitrix24 REST API access. Read methods (ending in .get/.list/.search) execute immediately. "
                 "Write methods execute after explicit user confirmation in the conversation. "
                 "When OAuth is required, writes execute only as the current Bitrix user. "
-                "Dedicated draft workflows must be used for task, project and calendar event creation. "
+                "Dedicated draft workflows must be used for task/project/calendar creation and task closing. "
                 "Dangerous methods (user management, bots) are denied."
             ),
             parameters={

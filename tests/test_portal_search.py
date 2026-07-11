@@ -331,8 +331,17 @@ def test_portal_metadata_sync_indexes_tasks_projects_and_disk(monkeypatch):
     assert task is not None
     assert "понаблюдать" in task.body.casefold()
     assert "вы добавлены наблюдателем" not in task.body.casefold()
+    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" in task.body
     assert task.metadata["comments_indexed"] is True
     assert task.metadata["comments_count"] == 1
+    assert task.metadata["task_results_indexed"] is True
+    assert task.metadata["task_results_count"] == 1
+    assert task.metadata["ai_close_incomplete"] is True
+    assert task.metadata["ai_close_marker"] == "AI_SERVER_TASK_CLOSE_INCOMPLETE"
+    assert task.metadata["ai_close_problem_types"] == ["not_done", "unconfirmed"]
+    assert task.metadata["ai_close_has_not_done"] is True
+    assert task.metadata["ai_close_has_unconfirmed"] is True
+    assert task.metadata["ai_close_marker_source"] == "task_result"
     assert task.metadata["responsible_label"] == "Марат"
     assert index.get_item(entity_type="project", entity_id=17) is not None
     stock = index.get_item(entity_type="catalog_store_stock", entity_id="12:1001")
@@ -345,6 +354,7 @@ def test_portal_metadata_sync_indexes_tasks_projects_and_disk(monkeypatch):
     assert index.get_item(entity_type="disk_file", entity_id=501) is not None
     assert index.search("план склад", entity_types={"disk_file"})
     assert index.search("понаблюдать", entity_types={"task"})
+    assert index.search("AI_SERVER_TASK_CLOSE_INCOMPLETE", entity_types={"task"})
     assert index.search("Borisov Junction", entity_types={"catalog_store_stock"})
     assert any(method == "batch" for method, _payload in bitrix.calls)
 
@@ -521,6 +531,24 @@ class FakePortalBitrix:
     async def result(self, method: str, payload: dict):
         self.calls.append((method, payload))
         if method == "batch":
+            if "task_result_0" in payload["cmd"]:
+                assert "taskId=202" in payload["cmd"]["task_result_0"]
+                return {
+                    "result": {
+                        "task_result_0": [
+                            {
+                                "text": (
+                                    "Метка: AI_SERVER_TASK_CLOSE_INCOMPLETE\n"
+                                    "Невыполненные пункты:\n"
+                                    "- не проверен архив\n"
+                                    "Неподтверждённые пункты:\n"
+                                    "- нет фото результата"
+                                )
+                            }
+                        ]
+                    },
+                    "result_error": [],
+                }
             assert "task_0" in payload["cmd"]
             assert "TASKID=202" in payload["cmd"]["task_0"]
             return {
@@ -536,6 +564,8 @@ class FakePortalBitrix:
             }
         if method == "task.commentitem.getlist":
             raise AssertionError("comment sync should use batch")
+        if method == "tasks.task.result.list":
+            raise AssertionError("task result sync should use batch")
         raise AssertionError(method)
 
     async def get_attached_object(self, attached_object_id: int):

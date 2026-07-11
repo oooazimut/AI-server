@@ -624,6 +624,7 @@ def _task_search_title(data: dict[str, Any]) -> str:
     status = _text(data.get("status")) or "active"
     query = _text(data.get("query"))
     comment_query = _text(data.get("comment_query"))
+    ai_close_problem_type = _text(data.get("ai_close_problem_type"))
     if project_name:
         base = f"Задачи в проекте {project_name}"
     elif status == "overdue":
@@ -634,6 +635,8 @@ def _task_search_title(data: dict[str, Any]) -> str:
         base = scope_label
     else:
         base = f"Активные {scope_label}"
+    if ai_close_problem_type:
+        base = f"{base} {_ai_close_problem_filter_label(ai_close_problem_type)}"
     if query:
         base = f"{base} по запросу «{query}»"
     if comment_query:
@@ -652,6 +655,8 @@ def _task_details(item: dict[str, Any], *, include_roles: bool) -> list[str]:
         details.append(f"исполнитель: {responsible}")
     if creator:
         details.append(f"постановщик: {creator}")
+    if item.get("ai_close_incomplete"):
+        details.append(f"AI-закрытие: {_ai_close_problem_detail_label(item.get('ai_close_problem_types'))}")
     roles = item.get("roles") if isinstance(item.get("roles"), list) else []
     roles_label = ", ".join(_text(role) for role in roles if _text(role))
     if include_roles and roles_label:
@@ -661,6 +666,24 @@ def _task_details(item: dict[str, Any], *, include_roles: bool) -> list[str]:
     if first_snippet:
         details.append(f"комментарий: {first_snippet}")
     return details
+
+
+def _ai_close_problem_filter_label(problem_type: str) -> str:
+    return {
+        "not_done": "с невыполненными пунктами",
+        "unconfirmed": "с неподтверждённым результатом",
+        "any": "с неполным AI-закрытием",
+    }.get(problem_type, "с неполным AI-закрытием")
+
+
+def _ai_close_problem_detail_label(value: object) -> str:
+    problem_types = set(_text_items(value))
+    labels = []
+    if "not_done" in problem_types:
+        labels.append("есть невыполненные пункты")
+    if "unconfirmed" in problem_types:
+        labels.append("результат не подтверждён")
+    return ", ".join(labels) or "неполное/неподтверждённое"
 
 
 def _capitalize_first(value: str) -> str:
@@ -788,21 +811,45 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
     task_title = _text(preview.get("task_title")) or _text(draft.get("task_title")) or _task_fallback_title(task_id)
     action_label = _text(preview.get("action_label")) or "отметить задачу выполненной"
     result_text = _text(preview.get("completion_summary")) or _text(draft.get("completion_summary"))
-    unresolved = preview.get("unresolved_items") if isinstance(preview.get("unresolved_items"), list) else []
-    unresolved = [_text(item) for item in unresolved if _text(item)]
+    task_points = _text_items(preview.get("task_points") or draft.get("task_points"))
+    equipment = _text(preview.get("equipment_consumables")) or _text(draft.get("equipment_consumables"))
+    overall = _text(preview.get("overall_status_label")) or _text(draft.get("overall_status_label"))
+    not_done = _text_items(preview.get("not_done_items") or draft.get("not_done_items"))
+    unconfirmed = _text_items(preview.get("unconfirmed_items") or draft.get("unconfirmed_items"))
+    unresolved = _text_items(preview.get("unresolved_items") or draft.get("unresolved_items"))
+    if not unconfirmed and unresolved:
+        unconfirmed = unresolved
+    missing_fields = _text_items(preview.get("missing_fields") or draft.get("missing_fields"))
+    marker = _text(preview.get("ai_close_marker")) or _text(draft.get("ai_close_marker"))
+    if not marker and (not_done or unconfirmed):
+        marker = "AI_SERVER_TASK_CLOSE_INCOMPLETE"
     lines = [
         "Черновик закрытия задачи:",
         f"Задача: {task_title}",
         f"Действие: {action_label}",
+        "Пункты задачи:",
     ]
+    if task_points:
+        lines.extend(f"{index}. {item}" for index, item in enumerate(task_points, start=1))
+    else:
+        lines.append("- ? что было сделано по пунктам задачи")
+    lines.append(f"Оборудование, расходники: {equipment or '? что использовано'}")
     if result_text:
         lines.append(f"Результат: {result_text}")
-    if unresolved:
-        lines.append("Непроверенные пункты:")
-        lines.extend(f"- {item}" for item in unresolved)
-        lines.append("При подтверждении будет добавлена метка AI_SERVER_TASK_CLOSE_INCOMPLETE.")
+    lines.append(f"Итог: {overall or '? выполнена полностью / частично / не выполнена / не подтверждено'}")
+    if not_done:
+        lines.append("Не выполнено:")
+        lines.extend(f"- {item}" for item in not_done)
+    if unconfirmed:
+        lines.append("Не подтверждено:")
+        lines.extend(f"- {item}" for item in unconfirmed)
+    if missing_fields:
+        lines.append("Нужно дописать:")
+        lines.extend(f"- {item}" for item in missing_fields)
+    if marker:
+        lines.append(f"Метка при закрытии: {marker}.")
     lines.append("")
-    lines.append("Если всё верно, напишите: да, закрывай.")
+    lines.append('Действия: допишите данные или напишите "да, закрывай как есть".')
     return "\n".join(lines)
 
 
@@ -938,6 +985,25 @@ def _text(value: object) -> str:
     return str(value or "").strip()
 
 
+def _text_items(value: object) -> list[str]:
+    if isinstance(value, str):
+        raw_items = [value]
+    elif isinstance(value, list | tuple | set):
+        raw_items = list(value)
+    else:
+        raw_items = []
+    items: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        text = _text(item).strip(" -•")
+        key = text.casefold()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        items.append(text)
+    return items
+
+
 def _int_value(value: object) -> int | None:
     try:
         return int(value)
@@ -991,7 +1057,9 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Для сложного поиска задач по нескольким критериям тоже используй bitrix_task_search: "
         "deadline_from/deadline_to для срока, created_from/created_to для даты создания, "
         "closed_from/closed_to для даты закрытия, comment_query для текста в комментариях, "
-        "include_comments=true если общий query нужно искать и в комментариях. "
+        "include_comments=true если общий query нужно искать и в комментариях, "
+        "ai_close_problem_type=not_done для AI-закрытий с невыполненными пунктами, "
+        "ai_close_problem_type=unconfirmed для AI-закрытий с неизвестным/неподтверждённым результатом. "
         "Если пользователь просит закрытые задачи или дату закрытия, передай status=closed и include_closed=true. "
         "Для поиска сотрудника по имени — bitrix_api с user.search, получи numeric ID. "
         "Для чтения/поиска проекта по названию используй bitrix_project_search. "
@@ -1031,8 +1099,10 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Метод calendar.event.add не вызывай через bitrix_api: для него есть calendar_event_* tools. "
         "Для закрытия задачи не вызывай tasks.task.result.add/tasks.task.complete/tasks.task.approve через bitrix_api напрямую. "
         "Сначала найди задачу через bitrix_task_search, собери результат выполнения, затем вызови task_close_draft. "
-        "Если после уточнений пользователь явно разрешает закрыть с непроверенными пунктами, передай их в unresolved_items: "
-        "backend добавит метку AI_SERVER_TASK_CLOSE_INCOMPLETE для будущей индексации. "
+        "В task_close_draft передавай короткий полный черновик: task_points, equipment_consumables, overall_status, "
+        "not_done_items для невыполненных пунктов и unconfirmed_items для неизвестного/неподтверждённого результата. "
+        "Если после уточнений пользователь явно разрешает закрыть с такими проблемами, backend добавит метку "
+        "AI_SERVER_TASK_CLOSE_INCOMPLETE для будущей индексации. "
         "Для уведомления пользователя используй bitrix_api с im.notify.system.add. "
         "Методы закрытия задач complete/approve/result.add не вызывай через bitrix_api: для них есть task_close_* tools. "
         "Остальные разрешённые Bitrix-методы вызывай через bitrix_api. "
@@ -1062,7 +1132,7 @@ def _compose_system_prompt(portal_base_url: str = "") -> str:
         "Не выдумывай данные, которых нет в tool_results. "
         "Для результата task_create_draft черновик должен быть обычным текстом без ссылок: название, ответственный, проект если указан, срок, описание, запрос подтверждения. "
         "Для результата task_create_confirm дай ссылку только на созданную задачу; ссылки на профиль сотрудника запрещены. "
-        "Для результата task_close_draft покажи обычный текст без ссылок: задача, действие, результат, непроверенные пункты, запрос подтверждения. "
+        "Для результата task_close_draft покажи обычный текст без ссылок: задача, пункты задачи, оборудование/расходники, итог, невыполненное, неподтверждённое, что нужно дописать, действия. "
         "Для результата task_close_confirm дай ссылку только на задачу; ссылки на профиль сотрудника запрещены. "
         "Для результата calendar_event_draft покажи обычный текст без ссылок: название, начало, окончание, участники, описание, запрос подтверждения. "
         "Для результата calendar_event_confirm не выдумывай ссылку на календарь; если готовой ссылки нет, дай обычный текст. "
@@ -1408,6 +1478,13 @@ def _common_task_read_args(request: str) -> dict[str, Any] | None:
     }
     if status in {"closed", "deferred", "declined", "all"}:
         args["include_closed"] = True
+    ai_close_problem_type = _extract_ai_close_problem_type(lowered)
+    if ai_close_problem_type:
+        args["ai_close_problem_type"] = ai_close_problem_type
+        args["status"] = "closed"
+        args["include_closed"] = True
+        if args["scope"] == "all":
+            args["scope"] = "member"
     project_name = _extract_project_name_from_task_request(request)
     if project_name:
         args["project_name"] = project_name
@@ -1476,6 +1553,22 @@ def _extract_closed_date_range(request: str) -> tuple[str, str]:
     if not match:
         return "", ""
     return _normalize_task_date(match.group(1)), _normalize_task_date(match.group(2))
+
+
+def _extract_ai_close_problem_type(lowered: str) -> str:
+    if "невыполн" in lowered or "не выполн" in lowered or "не сделан" in lowered:
+        return "not_done"
+    if (
+        "неподтверж" in lowered
+        or "не подтверж" in lowered
+        or "неизвест" in lowered
+        or "непровер" in lowered
+        or "не смогли подтверд" in lowered
+    ):
+        return "unconfirmed"
+    if "неполностью" in lowered or "не полностью" in lowered:
+        return "any"
+    return ""
 
 
 def _normalize_task_date(value: str) -> str:

@@ -24,6 +24,8 @@ _BITRIX_PAIRED_TAG_RE = re.compile(
 _BITRIX_SINGLE_TAG_RE = re.compile(r"\[/?[A-Z][A-Z0-9_]*(?:=[^\]]*)?\]", re.IGNORECASE)
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _BITRIX_BATCH_COMMENT_SIZE = 50
+_BITRIX_TASK_RESULT_LIMIT = 10
+_TASK_CLOSE_INCOMPLETE_MARKER = "AI_SERVER_TASK_CLOSE_INCOMPLETE"
 
 
 def _first(data: dict[str, Any], *keys: str) -> object | None:
@@ -88,6 +90,82 @@ async def _task_comments_by_id(
     return comments_by_id
 
 
+async def _task_results_by_id(
+    bitrix: BitrixClient,
+    task_ids: list[object],
+    *,
+    limit: int,
+) -> dict[str, list[str]]:
+    if limit <= 0:
+        return {}
+    unique_ids = list(dict.fromkeys(str(task_id) for task_id in task_ids if task_id is not None))
+    results_by_id: dict[str, list[str]] = {}
+    for offset in range(0, len(unique_ids), _BITRIX_BATCH_COMMENT_SIZE):
+        chunk = unique_ids[offset : offset + _BITRIX_BATCH_COMMENT_SIZE]
+        cmd = {
+            f"task_result_{index}": "tasks.task.result.list?" + urlencode({"taskId": task_id})
+            for index, task_id in enumerate(chunk)
+        }
+        try:
+            batch_result = await bitrix.result("batch", {"halt": 0, "cmd": cmd})
+        except Exception:
+            for task_id in chunk:
+                results_by_id[task_id] = await _task_result_texts(bitrix, task_id, limit=limit)
+            continue
+
+        results = batch_result.get("result") if isinstance(batch_result, dict) else None
+        if not isinstance(results, dict):
+            for task_id in chunk:
+                results_by_id[task_id] = []
+            continue
+        for index, task_id in enumerate(chunk):
+            results_by_id[task_id] = _task_result_texts_from_result(results.get(f"task_result_{index}"), limit=limit)
+    return results_by_id
+
+
+async def _task_result_texts(bitrix: BitrixClient, task_id: object, *, limit: int) -> list[str]:
+    if limit <= 0:
+        return []
+    try:
+        result = await bitrix.result("tasks.task.result.list", {"taskId": task_id})
+    except Exception:
+        return []
+    return _task_result_texts_from_result(result, limit=limit)
+
+
+def _task_result_texts_from_result(result: Any, *, limit: int) -> list[str]:
+    texts: list[str] = []
+    for item in _extract_task_results(result):
+        text = _task_result_text(item)
+        if not text:
+            continue
+        texts.append(text)
+        if len(texts) >= limit:
+            break
+    return texts
+
+
+def _extract_task_results(result: Any) -> list[dict[str, Any]]:
+    if isinstance(result, list):
+        return [item for item in result if isinstance(item, dict)]
+    if isinstance(result, dict):
+        for key in ("results", "RESULTS", "items", "result"):
+            value = result.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                nested = _extract_task_results(value)
+                if nested:
+                    return nested
+    return []
+
+
+def _task_result_text(item: dict[str, Any]) -> str:
+    return _clean_bitrix_comment_text(
+        to_str(_first(item, "TEXT", "text", "POST_MESSAGE", "message", "comment", "COMMENT")) or ""
+    )
+
+
 def _comment_texts_from_result(result: Any, *, limit: int) -> list[str]:
     texts: list[str] = []
     for comment in _extract_comments(result):
@@ -119,6 +197,37 @@ def _comment_text(comment: dict[str, Any]) -> str:
     return _clean_bitrix_comment_text(
         to_str(_first(comment, "POST_MESSAGE", "POST_MESSAGE_HTML", "POST_MESSAGE_TEXT", "text", "message")) or ""
     )
+
+
+def _task_close_marker_metadata(*, task_results: list[str], comments: list[str]) -> dict[str, Any]:
+    texts = [*task_results, *comments]
+    marker_texts = [text for text in texts if _TASK_CLOSE_INCOMPLETE_MARKER in text]
+    has_marker = bool(marker_texts)
+    problem_types: list[str] = []
+    marker_blob = "\n".join(marker_texts).casefold()
+    if has_marker and any(marker in marker_blob for marker in ("невыполн", "не выполн", "not_done", "not done")):
+        problem_types.append("not_done")
+    if has_marker and (
+        any(marker in marker_blob for marker in ("неподтверж", "не подтверж", "непровер", "unknown", "unconfirmed"))
+        or not problem_types
+    ):
+        problem_types.append("unconfirmed")
+    return {
+        "ai_close_incomplete": has_marker,
+        "ai_close_marker": _TASK_CLOSE_INCOMPLETE_MARKER if has_marker else "",
+        "ai_close_problem_types": problem_types,
+        "ai_close_has_not_done": "not_done" in problem_types,
+        "ai_close_has_unconfirmed": "unconfirmed" in problem_types,
+        "ai_close_marker_source": _task_close_marker_source(task_results=task_results, comments=comments),
+    }
+
+
+def _task_close_marker_source(*, task_results: list[str], comments: list[str]) -> str:
+    if any(_TASK_CLOSE_INCOMPLETE_MARKER in text for text in task_results):
+        return "task_result"
+    if any(_TASK_CLOSE_INCOMPLETE_MARKER in text for text in comments):
+        return "comment"
+    return ""
 
 
 def _clean_bitrix_comment_text(value: object) -> str:
@@ -390,12 +499,19 @@ async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: 
         if settings.search_index_include_task_comments
         else {}
     )
+    results_by_task_id = await _task_results_by_id(
+        bitrix,
+        [_first(task, "id", "ID") for task in tasks],
+        limit=_BITRIX_TASK_RESULT_LIMIT,
+    )
     for task in tasks:
         task_id = _first(task, "id", "ID")
         if task_id is None:
             continue
         title = str(_first(task, "title", "TITLE") or "Без названия")
         comments = comments_by_task_id.get(str(task_id), [])
+        task_results = results_by_task_id.get(str(task_id), [])
+        close_marker_metadata = _task_close_marker_metadata(task_results=task_results, comments=comments)
         responsible_label = _person_label(_first(task, "responsible", "RESPONSIBLE"))
         creator_label = _person_label(_first(task, "creator", "CREATOR"))
         responsible = responsible_label or to_str(_first(task, "responsibleId", "RESPONSIBLE_ID"))
@@ -409,6 +525,7 @@ async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: 
             f"Срок: {_first(task, 'deadline', 'DEADLINE')}",
             f"Дата создания: {_first(task, 'createdDate', 'CREATED_DATE')}",
             f"Дата закрытия: {_first(task, 'closedDate', 'CLOSED_DATE')}",
+            "Результаты:\n" + "\n".join(f"- {result}" for result in task_results) if task_results else "",
             "Комментарии:\n" + "\n".join(f"- {comment}" for comment in comments) if comments else "",
         ]
         index.upsert_item(
@@ -432,6 +549,9 @@ async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: 
                 "auditors": _first(task, "auditors", "AUDITORS"),
                 "comments_indexed": bool(comments),
                 "comments_count": len(comments),
+                "task_results_indexed": bool(task_results),
+                "task_results_count": len(task_results),
+                **close_marker_metadata,
             },
             source_updated_at=to_str(_first(task, "changedDate", "CHANGED_DATE")),
         )
