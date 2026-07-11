@@ -42,7 +42,14 @@ def health(request: Request) -> dict[str, Any]:
         "learning_events_path": str(settings.learning_events_path),
         "bitrix_webhook_queue_enabled": settings.webhook_event_queue_enabled,
         "bitrix_webhook_worker_enabled": settings.webhook_event_worker_enabled,
-        "bitrix_search_indexer_enabled": settings.search_background_indexer_enabled,
+        "bitrix_search_indexer_enabled": settings.search_background_periodic_enabled,
+        "bitrix_search_metadata_enabled": settings.search_background_periodic_metadata_enabled,
+        "bitrix_search_content_enabled": (
+            settings.search_content_enabled and settings.search_background_periodic_content_enabled
+        ),
+        "bitrix_search_delta_enabled": (
+            settings.search_delta_indexer_enabled and settings.search_background_periodic_delta_enabled
+        ),
         "bitrix_quality_control_enabled": settings.quality_control_webhook_enabled,
         "bitrix_quality_control_dry_run": settings.quality_control_dry_run,
         "bitrix_task_supervisor_enabled": settings.supervisor_enabled,
