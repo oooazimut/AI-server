@@ -9,7 +9,11 @@ from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.tools.bitrix_policy import apply_write_policy, decide_bitrix_method_policy
 from ai_server.tools.bitrix_ports import BitrixToolClientPort, BitrixWritePort
 
-PROJECT_WRITE_METHODS_WITH_DEDICATED_TOOLS = {"sonet_group.create"}
+WRITE_METHODS_WITH_DEDICATED_DRAFT_TOOLS = {
+    "calendar.event.add": "Use calendar_event_draft/calendar_event_confirm for Bitrix calendar event creation.",
+    "sonet_group.create": "Use project_create_draft/project_create_confirm for Bitrix project creation.",
+    "tasks.task.add": "Use task_create_draft/task_create_confirm for Bitrix task creation.",
+}
 
 
 class BitrixApiTool:
@@ -37,6 +41,7 @@ class BitrixApiTool:
                 "Bitrix24 REST API access. Read methods (ending in .get/.list/.search) execute immediately. "
                 "Write methods execute after explicit user confirmation in the conversation. "
                 "When OAuth is required, writes execute only as the current Bitrix user. "
+                "Dedicated draft workflows must be used for task, project and calendar event creation. "
                 "Dangerous methods (user management, bots) are denied."
             ),
             parameters={
@@ -74,11 +79,12 @@ class BitrixApiTool:
     ) -> ToolResult:
         if self._client is None and self._write_client is None:
             return ToolResult(status=ToolStatus.NOT_CONFIGURED, tool="bitrix_api", error="BitrixClient is not injected")
-        if method.strip().casefold() in PROJECT_WRITE_METHODS_WITH_DEDICATED_TOOLS:
+        dedicated_tool_error = WRITE_METHODS_WITH_DEDICATED_DRAFT_TOOLS.get(method.strip().casefold())
+        if dedicated_tool_error:
             return ToolResult(
                 status=ToolStatus.DENIED,
                 tool="bitrix_api",
-                error="Use project_create_draft/project_create_confirm for Bitrix project creation.",
+                error=dedicated_tool_error,
                 data={"method": method},
             )
         decision = decide_bitrix_method_policy(method)

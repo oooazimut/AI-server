@@ -153,13 +153,17 @@ def test_bitrix_api_tool_write_executes_directly_when_oauth_not_required():
 
     result = anyio_run(
         tool.execute(
-            {"method": "tasks.task.add", "params": {"fields": {"TITLE": "Тест"}}, "summary": "создать задачу"},
+            {
+                "method": "crm.deal.update",
+                "params": {"id": 1, "fields": {"TITLE": "Тест"}},
+                "summary": "обновить сделку",
+            },
             user_id=9,
         )
     )
 
     assert result.status == ToolStatus.OK
-    assert any(method == "tasks.task.add" for method, _ in fake_bitrix.calls)
+    assert any(method == "crm.deal.update" for method, _ in fake_bitrix.calls)
 
 
 def test_bitrix_api_tool_write_uses_oauth_when_required():
@@ -175,7 +179,11 @@ def test_bitrix_api_tool_write_uses_oauth_when_required():
 
     result = anyio_run(
         tool.execute(
-            {"method": "tasks.task.add", "params": {"fields": {"TITLE": "Тест"}}, "summary": "создать задачу"},
+            {
+                "method": "crm.deal.update",
+                "params": {"id": 1, "fields": {"TITLE": "Тест"}},
+                "summary": "обновить сделку",
+            },
             user_id=9,
             dialog_id="chat99",
         )
@@ -183,7 +191,7 @@ def test_bitrix_api_tool_write_uses_oauth_when_required():
 
     assert result.status == ToolStatus.OK
     assert oauth.user_ids == [9]
-    assert any(method == "tasks.task.add" for method, _ in oauth_bitrix.calls)
+    assert any(method == "crm.deal.update" for method, _ in oauth_bitrix.calls)
     assert fallback_bitrix.calls == []
 
 
@@ -193,7 +201,11 @@ def test_bitrix_api_tool_required_oauth_blocks_missing_dialog_id():
 
     result = anyio_run(
         tool.execute(
-            {"method": "tasks.task.add", "params": {"fields": {"TITLE": "Тест"}}, "summary": "создать задачу"},
+            {
+                "method": "crm.deal.update",
+                "params": {"id": 1, "fields": {"TITLE": "Тест"}},
+                "summary": "обновить сделку",
+            },
             user_id=9,
             dialog_id=None,
         )
@@ -209,7 +221,11 @@ def test_bitrix_api_tool_required_oauth_does_not_fallback_to_write_client():
 
     result = anyio_run(
         tool.execute(
-            {"method": "tasks.task.add", "params": {"fields": {"TITLE": "Тест"}}, "summary": "создать задачу"},
+            {
+                "method": "crm.deal.update",
+                "params": {"id": 1, "fields": {"TITLE": "Тест"}},
+                "summary": "обновить сделку",
+            },
             user_id=9,
             dialog_id="chat99",
         )
@@ -223,7 +239,9 @@ def test_bitrix_api_tool_dry_run_blocks_write():
     fake_bitrix = FakeBitrixClient()
     tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, dry_run=True)
 
-    result = anyio_run(tool.execute({"method": "tasks.task.add", "params": {"fields": {"TITLE": "Тест"}}}, user_id=9))
+    result = anyio_run(
+        tool.execute({"method": "crm.deal.update", "params": {"id": 1, "fields": {"TITLE": "Тест"}}}, user_id=9)
+    )
 
     assert result.status == ToolStatus.DRY_RUN
     assert fake_bitrix.calls == []
@@ -233,7 +251,9 @@ def test_bitrix_api_tool_write_no_write_client_returns_not_configured():
     fake_bitrix = FakeBitrixClient()
     tool = BitrixApiTool(client=fake_bitrix, write_client=None, oauth_required_for_writes=False)
 
-    result = anyio_run(tool.execute({"method": "tasks.task.add", "params": {"fields": {"TITLE": "Тест"}}}, user_id=9))
+    result = anyio_run(
+        tool.execute({"method": "crm.deal.update", "params": {"id": 1, "fields": {"TITLE": "Тест"}}}, user_id=9)
+    )
 
     assert result.status == ToolStatus.NOT_CONFIGURED
 
@@ -242,7 +262,7 @@ def test_bitrix_api_tool_write_empty_params_returns_invalid():
     fake_bitrix = FakeBitrixClient()
     tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=False)
 
-    result = anyio_run(tool.execute({"method": "tasks.task.add", "params": {}}))
+    result = anyio_run(tool.execute({"method": "crm.deal.update", "params": {}}))
 
     assert result.status == ToolStatus.INVALID_TOOL_CALL
 
@@ -265,6 +285,28 @@ def test_bitrix_api_tool_denies_direct_project_creation():
 
     assert result.status == ToolStatus.DENIED
     assert result.error == "Use project_create_draft/project_create_confirm for Bitrix project creation."
+    assert fake_bitrix.calls == []
+
+
+def test_bitrix_api_tool_denies_direct_task_creation():
+    fake_bitrix = FakeBitrixClient()
+    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=False)
+
+    result = anyio_run(tool.execute({"method": "tasks.task.add", "params": {"fields": {"TITLE": "Тест"}}}))
+
+    assert result.status == ToolStatus.DENIED
+    assert result.error == "Use task_create_draft/task_create_confirm for Bitrix task creation."
+    assert fake_bitrix.calls == []
+
+
+def test_bitrix_api_tool_denies_direct_calendar_event_creation():
+    fake_bitrix = FakeBitrixClient()
+    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=False)
+
+    result = anyio_run(tool.execute({"method": "calendar.event.add", "params": {"name": "Позвонить"}}))
+
+    assert result.status == ToolStatus.DENIED
+    assert result.error == "Use calendar_event_draft/calendar_event_confirm for Bitrix calendar event creation."
     assert fake_bitrix.calls == []
 
 
