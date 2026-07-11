@@ -24,6 +24,7 @@ MAX_MY_TASKS_LIMIT = 50
 MAX_TASK_SEARCH_LIMIT = 50
 MAX_PROJECT_SEARCH_LIMIT = 20
 ACTIVE_STATUS_VALUES = [1, 2, 3, 4]
+AI_CLOSE_INCOMPLETE_MARKER = "AI_SERVER_TASK_CLOSE_INCOMPLETE"
 _BITRIX_PAIRED_TAG_RE = re.compile(
     r"\[(USER|URL|B|I|U|S|QUOTE|CODE|COLOR|SIZE)[^\]]*\](.*?)\[/\1\]", re.IGNORECASE | re.DOTALL
 )
@@ -209,6 +210,14 @@ class BitrixTaskSearchTool:
                         "type": "string",
                         "description": "Text that must be present in at least one task comment.",
                     },
+                    "ai_close_problem_type": {
+                        "type": "string",
+                        "enum": ["any", "not_done", "unconfirmed"],
+                        "description": (
+                            "Search AI-marked incomplete task closings in the local index. "
+                            "Use not_done for unfinished task points, unconfirmed for unknown/unverified result."
+                        ),
+                    },
                     "project_id": {"type": "integer", "description": "Bitrix workgroup/project ID."},
                     "project_name": {
                         "type": "string",
@@ -306,6 +315,10 @@ class BitrixTaskSearchTool:
         query = _first_arg_text(args, "query", "text", "title")
         comment_query = _first_arg_text(args, "comment_query", "comments_query", "comment_text", "comment")
         include_comments = _truthy(args.get("include_comments")) or bool(comment_query)
+        ai_close_problem_type = _ai_close_problem_type(
+            args.get("ai_close_problem_type") or args.get("close_problem_type")
+        )
+        ai_close_incomplete = bool(ai_close_problem_type)
         comment_lookup_limit = _bounded_int(
             args.get("comment_lookup_task_limit"),
             default=DEFAULT_COMMENT_LOOKUP_TASK_LIMIT,
@@ -368,7 +381,7 @@ class BitrixTaskSearchTool:
 
         snapshot_result = _snapshot_task_search(
             self._portal_search,
-            query=comment_query or query,
+            query=comment_query or query or (AI_CLOSE_INCOMPLETE_MARKER if ai_close_incomplete else ""),
             scope=scope,
             status=status,
             user_id=user_id,
@@ -384,10 +397,33 @@ class BitrixTaskSearchTool:
             project=project,
             include_comments=include_comments,
             comment_query=comment_query,
+            ai_close_incomplete=ai_close_incomplete,
+            ai_close_problem_type=ai_close_problem_type,
             access_actor=access_actor,
         )
         if snapshot_result is not None:
             return snapshot_result
+        if ai_close_incomplete:
+            return ToolResult(
+                status=ToolStatus.NOT_CONFIGURED,
+                tool=self.name,
+                data={
+                    "mode": "list",
+                    "source": "postgres_portal_snapshot",
+                    "access_actor": access_actor,
+                    "scope": scope,
+                    "scope_label": _scope_label(scope),
+                    "status": status,
+                    "include_closed": True,
+                    "ai_close_problem_type": ai_close_problem_type,
+                    "items": [],
+                    "total": 0,
+                    "limit": limit,
+                    "offset": offset,
+                    "has_more": False,
+                    "message": "AI-close marker search requires a local portal task index and user-bounded scope.",
+                },
+            )
 
         if read_client is None:
             read_client, access_actor, access_error = await resolve_current_user_read_client(
@@ -470,6 +506,7 @@ class BitrixTaskSearchTool:
                 "query": query,
                 "comment_query": comment_query,
                 "include_comments": include_comments,
+                "ai_close_problem_type": ai_close_problem_type,
                 "comment_lookup_task_limit": comment_lookup_limit if include_comments else 0,
                 "project": project,
                 "project_query": project_query,
@@ -532,9 +569,11 @@ def _snapshot_task_search(
     project: dict[str, Any] | None,
     include_comments: bool,
     comment_query: str,
+    ai_close_incomplete: bool,
+    ai_close_problem_type: str,
     access_actor: str,
 ) -> ToolResult | None:
-    if portal_search is None or not query or not include_comments:
+    if portal_search is None or not query or (not include_comments and not ai_close_incomplete):
         return None
     if not _snapshot_scope_is_user_bounded(scope, user_id=user_id):
         return None
@@ -569,6 +608,7 @@ def _snapshot_task_search(
         and (status != "overdue" or _is_overdue(task))
         and _matches_text_query(task, query, include_comments=True)
         and _matches_comment_query(task, comment_query)
+        and _matches_ai_close_problem(task, enabled=ai_close_incomplete, problem_type=ai_close_problem_type)
     ]
     filtered.sort(
         key=lambda task: (
@@ -578,6 +618,8 @@ def _snapshot_task_search(
         )
     )
     page = filtered[offset : offset + limit]
+    display_query = "" if ai_close_incomplete and query == AI_CLOSE_INCOMPLETE_MARKER else query
+    display_comment_query = comment_query or ("" if ai_close_incomplete else query)
     return ToolResult(
         status=ToolStatus.OK,
         tool=BitrixTaskSearchTool.name,
@@ -588,9 +630,10 @@ def _snapshot_task_search(
             "scope": scope,
             "scope_label": _scope_label(scope),
             "status": status,
-            "query": query if query != comment_query else "",
-            "comment_query": comment_query or query,
-            "include_comments": True,
+            "query": display_query if display_query != display_comment_query else "",
+            "comment_query": display_comment_query,
+            "include_comments": include_comments,
+            "ai_close_problem_type": ai_close_problem_type,
             "comment_lookup_task_limit": 0,
             "project": project,
             "project_query": project.get("name", "") if project else "",
@@ -631,6 +674,8 @@ def _snapshot_result_to_task(item: Any, *, query: str) -> dict[str, Any]:
         "closedDate": str(metadata.get("closed_date") or ""),
         "accomplices": metadata.get("accomplices") or [],
         "auditors": metadata.get("auditors") or [],
+        "_ai_close_incomplete": bool(metadata.get("ai_close_incomplete")),
+        "_ai_close_problem_types": metadata.get("ai_close_problem_types") or [],
         "responsible": {"name": responsible_label} if responsible_label else {},
         "creator": {"name": creator_label} if creator_label else {},
         "_comments": [{"POST_MESSAGE": comment} for comment in comments],
@@ -686,6 +731,16 @@ def _matches_snapshot_scope(task: dict[str, Any], *, scope: str, user_id: int | 
         *_int_list(task.get("accomplices") or task.get("ACCOMPLICES")),
         *_int_list(task.get("auditors") or task.get("AUDITORS")),
     }
+
+
+def _matches_ai_close_problem(task: dict[str, Any], *, enabled: bool, problem_type: str) -> bool:
+    if not enabled:
+        return True
+    if not bool(task.get("_ai_close_incomplete")):
+        return False
+    if not problem_type or problem_type == "any":
+        return True
+    return problem_type in {str(item) for item in _list_value(task.get("_ai_close_problem_types"))}
 
 
 class BitrixProjectSearchTool:
@@ -814,6 +869,11 @@ def _task_search_status_arg(value: object) -> str:
     if text == "open":
         return "active"
     return text if text in {"active", "closed", "overdue", "deferred", "declined", "all"} else "active"
+
+
+def _ai_close_problem_type(value: object) -> str:
+    text = str(value or "").strip().casefold()
+    return text if text in {"any", "not_done", "unconfirmed"} else ""
 
 
 def _scope_arg(value: object) -> str:
@@ -1057,6 +1117,8 @@ def _task_summary(task: dict[str, Any], *, user_id: int) -> dict[str, Any]:
         "creator_label": _person_label(task.get("creator") or task.get("CREATOR")),
         "comment_snippets": list(task.get("_comment_snippets") or []),
         "matched_comment_count": len(task.get("_matched_comments") or []),
+        "ai_close_incomplete": bool(task.get("_ai_close_incomplete")),
+        "ai_close_problem_types": _list_value(task.get("_ai_close_problem_types")),
     }
 
 
@@ -1124,6 +1186,14 @@ def _int_list(value: object) -> list[int]:
         if parsed is not None:
             result.append(parsed)
     return result
+
+
+def _list_value(value: object) -> list[object]:
+    if isinstance(value, list | tuple | set):
+        return list(value)
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
 
 
 def _task_id(task: dict[str, Any]) -> str:

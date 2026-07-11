@@ -48,6 +48,43 @@ def test_close_draft_saves_incomplete_marker():
     assert result.data["preview"]["unresolved_items"] == ["не приложен акт проверки"]
 
 
+def test_close_draft_structures_problem_types_and_mobile_blocks():
+    store = FakeTaskDraftStore()
+    tool = TaskCloseDraftTool(store=store)
+
+    result = _exec(
+        tool,
+        {
+            "task_id": 139,
+            "task_title": "Проверить камеры",
+            "completion_summary": "Пользователь сообщил, что часть работ выполнена.",
+            "task_points": ["камеры подключены", "архив не проверен"],
+            "equipment_consumables": "4 камеры, 30 метров кабеля",
+            "overall_status": "partial",
+            "not_done_items": ["не проверен архив"],
+            "unconfirmed_items": ["нет фото результата"],
+            "missing_fields": ["причина, почему архив не проверен"],
+        },
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+
+    assert result.status == ToolStatus.OK
+    draft = store._drafts["d:13"]
+    assert draft["overall_status"] == "partial"
+    assert draft["overall_status_label"] == "выполнена частично"
+    assert draft["not_done_items"] == ["не проверен архив"]
+    assert draft["unconfirmed_items"] == ["нет фото результата"]
+    assert draft["unresolved_items"] == ["не проверен архив", "нет фото результата"]
+    assert draft["problem_types"] == ["not_done", "unconfirmed"]
+    assert draft["ai_close_incomplete"] is True
+    assert draft["ai_close_marker"] == INCOMPLETE_CLOSE_MARKER
+    assert "Оборудование, расходники: 4 камеры, 30 метров кабеля" in draft["result_text"]
+    assert "Невыполненные пункты:" in draft["result_text"]
+    assert "Неподтверждённые пункты:" in draft["result_text"]
+
+
 def test_close_draft_denies_missing_dialog_id():
     store = FakeTaskDraftStore()
     tool = TaskCloseDraftTool(store=store)

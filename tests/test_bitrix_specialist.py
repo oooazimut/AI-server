@@ -269,6 +269,43 @@ def test_bitrix_llm_decide_routes_advanced_comment_closed_search(monkeypatch):
     }
 
 
+def test_bitrix_llm_decide_routes_ai_close_problem_search(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient(
+        json.dumps(
+            {
+                "status": "completed",
+                "answer": "",
+                "confidence": 0.2,
+                "tool_calls": [{"name": "none", "args": {}}],
+            }
+        )
+    )
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request="Битрикс найди задачи с невыполненными пунктами после AI-закрытия.",
+                user={"id": "13"},
+            ),
+            retrieval_hits=[],
+            tool_definitions=_bitrix_read_tool_definitions(),
+        )
+    )
+
+    assert [call.name for call in result.decision.tool_calls] == ["bitrix_task_search"]
+    assert result.decision.tool_calls[0].args == {
+        "scope": "member",
+        "status": "closed",
+        "limit": 10,
+        "include_closed": True,
+        "ai_close_problem_type": "not_done",
+    }
+
+
 def test_bitrix_llm_decide_routes_project_search_to_deterministic_tool(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient(
@@ -1247,6 +1284,55 @@ def test_bitrix_llm_compose_formats_task_close_draft(monkeypatch):
     assert "[URL" not in result.answer
 
 
+def test_bitrix_llm_compose_formats_structured_task_close_draft(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="закрой задачу", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="task_close_draft",
+                    data={
+                        "draft": {"_draft_type": "task_close", "task_id": 139, "task_title": "Проверить камеры"},
+                        "preview": {
+                            "task_title": "Проверить камеры",
+                            "action_label": "отметить задачу выполненной",
+                            "completion_summary": "Часть работ выполнена.",
+                            "task_points": ["камеры подключены", "архив не проверен"],
+                            "equipment_consumables": "4 камеры, 30 метров кабеля",
+                            "overall_status_label": "выполнена частично",
+                            "not_done_items": ["не проверен архив"],
+                            "unconfirmed_items": ["нет фото результата"],
+                            "missing_fields": ["причина, почему архив не проверен"],
+                            "ai_close_marker": "AI_SERVER_TASK_CLOSE_INCOMPLETE",
+                        },
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert "Пункты задачи:" in result.answer
+    assert "1. камеры подключены" in result.answer
+    assert "Оборудование, расходники: 4 камеры, 30 метров кабеля" in result.answer
+    assert "Итог: выполнена частично" in result.answer
+    assert "Не выполнено:" in result.answer
+    assert "не проверен архив" in result.answer
+    assert "Не подтверждено:" in result.answer
+    assert "нет фото результата" in result.answer
+    assert "Нужно дописать:" in result.answer
+    assert "да, закрывай как есть" in result.answer
+    assert "[URL" not in result.answer
+
+
 def test_bitrix_llm_compose_formats_task_close_draft_with_id_fallback(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
@@ -1533,6 +1619,50 @@ def test_bitrix_llm_compose_formats_task_search_comment_snippet(monkeypatch):
         "[URL=https://asutp-expert.bitrix24.ru/company/personal/user/0/tasks/task/view/101/]Проверить документы[/URL]"
         in result.answer
     )
+
+
+def test_bitrix_llm_compose_formats_ai_close_problem_task_search(monkeypatch):
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    service = BitrixLLMService(client=RecordingLLMClient("{}"), settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="найди задачи с невыполненными пунктами", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="bitrix_task_search",
+                    data={
+                        "mode": "list",
+                        "scope": "member",
+                        "scope_label": "мои задачи",
+                        "status": "closed",
+                        "ai_close_problem_type": "not_done",
+                        "items": [
+                            {
+                                "id": "101",
+                                "title": "Проверить камеры",
+                                "deadline_label": "10.07.2026 19:00",
+                                "status_label": "завершена",
+                                "ai_close_incomplete": True,
+                                "ai_close_problem_types": ["not_done", "unconfirmed"],
+                            }
+                        ],
+                        "total": 1,
+                        "limit": 10,
+                        "offset": 0,
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert result.status == "completed"
+    assert "Завершённые мои задачи с невыполненными пунктами:" in result.answer
+    assert "AI-закрытие: есть невыполненные пункты, результат не подтверждён" in result.answer
+    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" not in result.answer
 
 
 def test_bitrix_llm_compose_formats_task_search_list_without_duplicate_detail_or_ids(monkeypatch):

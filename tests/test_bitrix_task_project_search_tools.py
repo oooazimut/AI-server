@@ -322,6 +322,80 @@ def test_task_search_uses_snapshot_for_comment_query():
     assert client.calls == []
 
 
+def test_task_search_uses_snapshot_for_ai_close_problem_type():
+    client = _FakeBitrixSearchClient()
+    index = _FakePortalTaskIndex(
+        [
+            SimpleNamespace(
+                entity_id="65",
+                title="AI incomplete close",
+                body=(
+                    "Status: 5\n"
+                    "Результаты:\n"
+                    "- Метка: AI_SERVER_TASK_CLOSE_INCOMPLETE\n"
+                    "Невыполненные пункты:\n"
+                    "- не проверен архив"
+                ),
+                score=81,
+                url="https://example.test/tasks/65",
+                metadata={
+                    "status": "5",
+                    "responsible_id": "13",
+                    "created_by": "9",
+                    "closed_date": "2025-01-15T09:12:40+03:00",
+                    "ai_close_incomplete": True,
+                    "ai_close_problem_types": ["not_done"],
+                },
+            )
+        ]
+    )
+    tool = BitrixTaskSearchTool(client=client, portal_search=index)
+
+    result = anyio.run(
+        lambda: tool.execute(
+            {
+                "scope": "member",
+                "status": "closed",
+                "include_closed": True,
+                "ai_close_problem_type": "not_done",
+            },
+            user_id=13,
+        )
+    )
+
+    assert result.status == "ok"
+    assert result.data["source"] == "postgres_portal_snapshot"
+    assert result.data["query"] == ""
+    assert result.data["comment_query"] == ""
+    assert result.data["ai_close_problem_type"] == "not_done"
+    assert [item["id"] for item in result.data["items"]] == ["65"]
+    assert result.data["items"][0]["ai_close_incomplete"] is True
+    assert result.data["items"][0]["ai_close_problem_types"] == ["not_done"]
+    assert client.calls == []
+
+
+def test_task_search_ai_close_problem_does_not_fallback_to_live_bitrix_without_index():
+    client = _FakeBitrixSearchClient()
+    tool = BitrixTaskSearchTool(client=client, portal_search=None)
+
+    result = anyio.run(
+        lambda: tool.execute(
+            {
+                "scope": "member",
+                "status": "closed",
+                "include_closed": True,
+                "ai_close_problem_type": "not_done",
+            },
+            user_id=13,
+        )
+    )
+
+    assert result.status == "not_configured"
+    assert result.data["ai_close_problem_type"] == "not_done"
+    assert result.data["items"] == []
+    assert client.calls == []
+
+
 def test_task_search_snapshot_uses_oauth_actor_before_returning_index_data():
     fallback_client = _FakeBitrixSearchClient()
     oauth_client = _FakeBitrixSearchClient()
