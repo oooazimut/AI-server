@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ai_server.agents.bitrix24.tools.read_client import oauth_authorization_data, oauth_missing_error
 from ai_server.integrations.bitrix.oauth import BitrixOAuthError, BitrixOAuthService, BitrixOAuthTokenMissing
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.tools.bitrix_ports import BitrixFileDownloadPort
@@ -185,13 +186,19 @@ async def _resolve_index_access_actor(
     try:
         await bitrix_oauth.client_for_user(user_id)
     except BitrixOAuthTokenMissing as exc:
+        data = {"query": query, "scope": scope, "limit": limit}
+        data.update(oauth_authorization_data(bitrix_oauth, user_id=exc.user_id))
         return (
             "none",
             ToolResult(
                 status=ToolStatus.DENIED,
                 tool=tool_name,
-                error=f"portal_search lookup denied: OAuth token for user {exc.user_id} is missing.",
-                data={"query": query, "scope": scope, "limit": limit},
+                error=oauth_missing_error(
+                    "portal_search lookup denied",
+                    user_id=exc.user_id,
+                    authorization=data.get("authorization"),
+                ),
+                data=data,
             ),
         )
     except BitrixOAuthError as exc:
@@ -246,14 +253,20 @@ async def _resolve_document_access_client(
     try:
         return await bitrix_oauth.client_for_user(user_id), "oauth_current_user", None
     except BitrixOAuthTokenMissing as exc:
+        data = {"query": query, "scope": scope, "limit": limit}
+        data.update(oauth_authorization_data(bitrix_oauth, user_id=exc.user_id))
         return (
             None,
             "none",
             ToolResult(
                 status=ToolStatus.DENIED,
                 tool=tool_name,
-                error=f"portal_search document/file lookup denied: OAuth token for user {exc.user_id} is missing.",
-                data={"query": query, "scope": scope, "limit": limit},
+                error=oauth_missing_error(
+                    "portal_search document/file lookup denied",
+                    user_id=exc.user_id,
+                    authorization=data.get("authorization"),
+                ),
+                data=data,
             ),
         )
     except BitrixOAuthError as exc:
