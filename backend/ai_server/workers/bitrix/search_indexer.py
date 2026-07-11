@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Any
 
 from ai_server.agents.ports import AgentQueuePort
@@ -41,6 +41,9 @@ PERSISTED_STATUS_KEYS = {
     "last_content_started_at",
     "last_metadata_started_at",
     "last_delta_started_at",
+    "next_content_sync_at",
+    "next_metadata_sync_at",
+    "next_delta_sync_at",
     "last_content_duration_seconds",
     "last_metadata_duration_seconds",
     "last_delta_duration_seconds",
@@ -178,12 +181,7 @@ class PortalSearchIndexerWorker:
         initial_delay = timedelta(seconds=self._settings.search_background_initial_delay_seconds)
         now = _now()
         next_metadata_at = (
-            self._next_run_at(
-                "last_metadata_sync_at",
-                self._settings.search_background_metadata_interval_seconds,
-                initial_delay=initial_delay,
-                now=now,
-            )
+            self._next_metadata_run_at(initial_delay=initial_delay, now=now)
             if self._metadata_enabled()
             else None
         )
@@ -199,6 +197,7 @@ class PortalSearchIndexerWorker:
         )
         next_delta_at = now + initial_delay if self._delta_enabled() else None
         self._set_next_times(next_metadata_at, next_content_at, next_delta_at)
+        self._save_state()
 
         try:
             while self.status["running"]:
@@ -222,10 +221,9 @@ class PortalSearchIndexerWorker:
                 if self._metadata_enabled() and next_metadata_at and now >= next_metadata_at:
                     await self.run_metadata_once()
                     self._heartbeat_lock()
-                    next_metadata_at = _now() + timedelta(
-                        seconds=self._settings.search_background_metadata_interval_seconds
-                    )
+                    next_metadata_at = self._next_metadata_run_at(initial_delay=timedelta(seconds=0), now=_now())
                     self.status["next_metadata_sync_at"] = _format_time(next_metadata_at)
+                    self._save_state()
 
                 now = _now()
                 if self._content_enabled() and next_content_at and now >= next_content_at:
@@ -235,6 +233,7 @@ class PortalSearchIndexerWorker:
                         seconds=self._settings.search_background_content_interval_seconds
                     )
                     self.status["next_content_sync_at"] = _format_time(next_content_at)
+                    self._save_state()
 
                 now = _now()
                 if self._delta_enabled() and next_delta_at and now >= next_delta_at:
@@ -242,6 +241,7 @@ class PortalSearchIndexerWorker:
                     self._heartbeat_lock()
                     next_delta_at = _now() + timedelta(seconds=self._settings.search_delta_interval_seconds)
                     self.status["next_delta_sync_at"] = _format_time(next_delta_at)
+                    self._save_state()
 
                 sleep_candidates = [30]
                 if self._metadata_enabled() and next_metadata_at:
@@ -416,6 +416,21 @@ class PortalSearchIndexerWorker:
 
     def _delta_enabled(self) -> bool:
         return self._settings.search_delta_indexer_enabled and self._settings.search_background_periodic_delta_enabled
+
+    def _next_metadata_run_at(self, *, initial_delay: timedelta, now: datetime) -> datetime:
+        scheduled_at = _next_scheduled_run_at(
+            now,
+            time_spec=self._settings.search_background_metadata_time,
+            weekday_spec=self._settings.search_background_metadata_weekday,
+        )
+        if scheduled_at is not None:
+            return scheduled_at
+        return self._next_run_at(
+            "last_metadata_sync_at",
+            self._settings.search_background_metadata_interval_seconds,
+            initial_delay=initial_delay,
+            now=now,
+        )
 
     def _next_run_at(
         self,
@@ -593,3 +608,74 @@ def _parse_time(value: object) -> datetime | None:
     except ValueError:
         return None
     return parsed.astimezone(MOSCOW_TZ)
+
+
+def _next_scheduled_run_at(now: datetime, *, time_spec: str, weekday_spec: str = "") -> datetime | None:
+    clock_time = _parse_clock_time(time_spec)
+    if clock_time is None:
+        return None
+
+    candidate = now.replace(
+        hour=clock_time.hour,
+        minute=clock_time.minute,
+        second=clock_time.second,
+        microsecond=0,
+    )
+    weekday = _parse_weekday(weekday_spec)
+    if weekday is None:
+        if (weekday_spec or "").strip():
+            return None
+        if candidate <= now:
+            candidate += timedelta(days=1)
+        return candidate
+
+    days_ahead = (weekday - now.weekday()) % 7
+    candidate += timedelta(days=days_ahead)
+    if candidate <= now:
+        candidate += timedelta(days=7)
+    return candidate
+
+
+def _parse_clock_time(value: str) -> time | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    parts = raw.split(":")
+    if len(parts) not in {2, 3}:
+        return None
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+        second = int(parts[2]) if len(parts) == 3 else 0
+        return time(hour=hour, minute=minute, second=second)
+    except ValueError:
+        return None
+
+
+def _parse_weekday(value: str) -> int | None:
+    raw = (value or "").strip().lower()
+    if not raw:
+        return None
+    names = {
+        "mon": 0,
+        "monday": 0,
+        "tue": 1,
+        "tuesday": 1,
+        "wed": 2,
+        "wednesday": 2,
+        "thu": 3,
+        "thursday": 3,
+        "fri": 4,
+        "friday": 4,
+        "sat": 5,
+        "saturday": 5,
+        "sun": 6,
+        "sunday": 6,
+    }
+    if raw in names:
+        return names[raw]
+    try:
+        numeric = int(raw)
+    except ValueError:
+        return None
+    return numeric if 0 <= numeric <= 6 else None

@@ -88,6 +88,8 @@ class Settings:
     search_background_delta_enabled: bool
     search_background_initial_delay_seconds: int
     search_background_metadata_interval_seconds: int
+    search_background_metadata_time: str
+    search_background_metadata_weekday: str
     search_background_content_interval_seconds: int
     search_delta_indexer_enabled: bool
     search_delta_interval_seconds: int
@@ -470,6 +472,8 @@ def get_settings() -> Settings:
         search_background_initial_delay_seconds=_env_int("SEARCH_BACKGROUND_INITIAL_DELAY_SECONDS", 60) or 60,
         search_background_metadata_interval_seconds=_env_int("SEARCH_BACKGROUND_METADATA_INTERVAL_SECONDS", 6 * 60 * 60)
         or (6 * 60 * 60),
+        search_background_metadata_time=_env("SEARCH_BACKGROUND_METADATA_TIME"),
+        search_background_metadata_weekday=_env("SEARCH_BACKGROUND_METADATA_WEEKDAY"),
         search_background_content_interval_seconds=_env_int("SEARCH_BACKGROUND_CONTENT_INTERVAL_SECONDS", 10 * 60)
         or (10 * 60),
         search_delta_indexer_enabled=_env_bool("SEARCH_DELTA_INDEXER_ENABLED", True),
