@@ -181,9 +181,7 @@ class PortalSearchIndexerWorker:
         initial_delay = timedelta(seconds=self._settings.search_background_initial_delay_seconds)
         now = _now()
         next_metadata_at = (
-            self._next_metadata_run_at(initial_delay=initial_delay, now=now)
-            if self._metadata_enabled()
-            else None
+            self._next_metadata_run_at(initial_delay=initial_delay, now=now) if self._metadata_enabled() else None
         )
         next_content_at = (
             self._next_run_at(
