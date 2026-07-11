@@ -27,6 +27,24 @@ def test_health_includes_config_flags():
     assert "logistics_vehicle_usage_enabled" in data
 
 
+def test_health_reports_split_search_indexer_flags(monkeypatch):
+    monkeypatch.setenv("SEARCH_BACKGROUND_INDEXER_ENABLED", "false")
+    monkeypatch.setenv("SEARCH_BACKGROUND_METADATA_ENABLED", "true")
+    monkeypatch.setenv("SEARCH_BACKGROUND_CONTENT_ENABLED", "true")
+    monkeypatch.setenv("SEARCH_BACKGROUND_DELTA_ENABLED", "true")
+    monkeypatch.setenv("SEARCH_CONTENT_ENABLED", "true")
+    monkeypatch.setenv("SEARCH_DELTA_INDEXER_ENABLED", "true")
+
+    with TestClient(app) as client:
+        response = client.get("/health")
+
+    data = response.json()
+    assert data["bitrix_search_indexer_enabled"] is True
+    assert data["bitrix_search_metadata_enabled"] is True
+    assert data["bitrix_search_content_enabled"] is True
+    assert data["bitrix_search_delta_enabled"] is True
+
+
 def test_agents_list():
     with TestClient(app) as client:
         response = client.get("/agents")
