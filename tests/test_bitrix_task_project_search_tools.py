@@ -174,10 +174,22 @@ def test_project_search_oauth_missing_returns_authorization_link():
     result = anyio.run(lambda: tool.execute({"query": "Ларгус"}, user_id=1))
 
     assert result.status == "denied"
+    assert "Меню справа внизу -> Маркет -> ИИ Агент-помощник" in result.error
+    assert "Ссылка для авторизации с компьютера" in result.error
     assert "https://asutp-expert.bitrix24.ru/oauth/authorize/" in result.error
     assert result.data["authorization"]["marketplace_app_url"] == (
         "https://asutp-expert.bitrix24.ru/marketplace/view/local.prod/"
     )
+    assert result.data["authorization"]["primary_authorization_url"] == (
+        "https://asutp-expert.bitrix24.ru/oauth/authorize/?client_id=local.prod"
+    )
+    assert result.data["authorization"]["app_authorization_url"] == (
+        "https://asutp-expert.bitrix24.ru/marketplace/view/local.prod/"
+    )
+    assert result.data["authorization"]["fallback_oauth_url"] == (
+        "https://asutp-expert.bitrix24.ru/oauth/authorize/?client_id=local.prod"
+    )
+    assert "ИИ Агент-помощник" in result.data["authorization"]["mobile_instruction"]
     assert fallback_client.calls == []
 
 
