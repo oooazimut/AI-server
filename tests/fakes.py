@@ -1001,7 +1001,6 @@ class FakeTaskDraftStore:
 
     def set_task_close_operators(self, *, operator_user_ids: list[int], actor_user_id: int | None) -> list[int]:
         self._task_close_operators = {int(item) for item in operator_user_ids}
-        self._task_close_controlled_users.update(self._task_close_operators)
         saved = sorted(self._task_close_operators)
         self._task_close_revisions.append(
             {"action": "set_operators", "actor_user_id": actor_user_id, "payload": {"operator_user_ids": saved}}

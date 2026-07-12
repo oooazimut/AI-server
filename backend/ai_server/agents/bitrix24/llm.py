@@ -918,15 +918,29 @@ def _format_task_close_report_incident_answer(data: dict[str, Any]) -> str:
 
 
 def _format_task_close_control_get_answer(data: dict[str, Any]) -> str:
-    return "\n".join(
-        [
-            "Настройки контроля закрытия задач:",
-            f"- Операторы: {_ids_label(data.get('operator_user_ids'))}",
-            f"- Контролируемые пользователи: {_ids_label(data.get('controlled_user_ids'))}",
-            f"- Автозакрытие: {data.get('auto_close_time') or '20:00'}",
-            f"- Запуск контроля: {data.get('control_enabled_from') or 'не задан'}",
-        ]
-    )
+    lines = [
+        "Настройки контроля закрытия задач:",
+        f"- Автозакрытие: {data.get('auto_close_time') or '20:00'}",
+        f"- Запуск контроля: {data.get('control_enabled_from') or 'не задан'}",
+    ]
+    members = _task_close_control_member_lines(data.get("members"))
+    if members:
+        lines.append("- Сейчас включены:")
+        lines.extend(members)
+    else:
+        lines.append("- Сейчас включены: нет")
+
+    available = _task_close_control_available_lines(data)
+    if available:
+        lines.append("- Пользователи Bitrix:")
+        lines.extend(available)
+        if data.get("available_users_truncated"):
+            lines.append(f"  Показаны первые {data.get('available_users_limit') or 100}; можно уточнить по имени.")
+    elif data.get("user_lookup_status") == "not_configured":
+        lines.append("- Пользователи Bitrix: список недоступен, Bitrix user client не настроен.")
+    elif data.get("user_lookup_status") in {"failed", "partial"}:
+        lines.append(f"- Пользователи Bitrix: не удалось получить полный список ({data.get('user_lookup_error')}).")
+    return "\n".join(lines)
 
 
 def _format_task_close_control_update_answer(data: dict[str, Any]) -> str:
@@ -940,12 +954,66 @@ def _format_task_close_control_update_answer(data: dict[str, Any]) -> str:
         "set_control_enabled_from": "дата запуска контроля обновлена",
     }
     lines = [f"Готово: {action_labels.get(action, 'настройки обновлены')}."]
-    lines.append(f"Операторы: {_ids_label(data.get('operator_user_ids'))}.")
-    lines.append(f"Контролируемые пользователи: {_ids_label(data.get('controlled_user_ids'))}.")
+    lines.append(f"Сейчас включены: {_task_close_control_members_summary(data)}.")
     lines.append(f"Автозакрытие: {data.get('auto_close_time') or '20:00'}.")
     if data.get("control_enabled_from"):
         lines.append(f"Запуск контроля: {data['control_enabled_from']}.")
     return " ".join(lines)
+
+
+def _task_close_control_member_lines(value: object, *, limit: int = 50) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    lines = []
+    for item in value[:limit]:
+        if not isinstance(item, dict):
+            continue
+        lines.append(f"  {_task_close_control_user_label(item)}")
+    if len(value) > limit:
+        lines.append(f"  ... ещё {len(value) - limit}")
+    return lines
+
+
+def _task_close_control_available_lines(data: dict[str, Any], *, limit: int = 100) -> list[str]:
+    users = data.get("available_users")
+    if not isinstance(users, list):
+        return []
+    lines = []
+    for item in users[:limit]:
+        if not isinstance(item, dict):
+            continue
+        lines.append(f"  {_task_close_control_user_label(item)}")
+    return lines
+
+
+def _task_close_control_members_summary(data: dict[str, Any]) -> str:
+    members = data.get("members")
+    if isinstance(members, list) and members:
+        labels = [_task_close_control_user_label(item) for item in members[:8] if isinstance(item, dict)]
+        suffix = f"; ещё {len(members) - 8}" if len(members) > 8 else ""
+        return "; ".join(labels) + suffix
+    operator_ids = _ids_label(data.get("operator_user_ids"))
+    controlled_ids = _ids_label(data.get("controlled_user_ids"))
+    return f"операторы: {operator_ids}; контролируемые: {controlled_ids}"
+
+
+def _task_close_control_user_label(item: dict[str, Any]) -> str:
+    user_id = _text(item.get("user_id")) or "?"
+    name = _text(item.get("name")) or f"Bitrix user #{user_id}"
+    role = _task_close_control_role_label(item)
+    return f"ID {user_id} — {name} — {role}"
+
+
+def _task_close_control_role_label(item: dict[str, Any]) -> str:
+    is_operator = bool(item.get("is_operator"))
+    is_controlled = bool(item.get("is_controlled"))
+    if is_operator and is_controlled:
+        return "оператор, контролируемый"
+    if is_operator:
+        return "оператор"
+    if is_controlled:
+        return "контролируемый"
+    return "можно добавить"
 
 
 def _ids_label(value: object) -> str:
@@ -1193,6 +1261,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Для просмотра настроек контроля закрытия задач используй task_close_control_get. "
         "Для изменения операторов, контролируемых пользователей, времени автозакрытия и даты запуска контроля используй task_close_control_update. "
         "Не используй bitrix_api для этих настроек. Действия task_close_control_update: add_operator/remove_operator/add_controlled_user/remove_controlled_user/set_auto_close_time/set_control_enabled_from. "
+        "Статус оператора и статус контролируемого пользователя независимы: если оператор должен попадать под правила закрытия задач, отдельно добавь его как controlled user. "
         "Операторы могут менять только controlled users; операторов, время автозакрытия и дату запуска меняет только Bitrix-админ. "
         "Do not call confirm tools for ambiguous replies; ask a short clarification instead. "
         "Для фраз вида 'напомни мне завтра позвонить Борисову' используй календарь: подготовь calendar_event_draft, а не задачу и не прямой bitrix_api. "
@@ -1559,6 +1628,9 @@ def _looks_like_task_close_control_request(lowered: str) -> bool:
         ("контрол" in lowered and "закрыт" in lowered)
         or "контролируем" in lowered
         or ("автозакрыт" in lowered and "задач" in lowered)
+        or ("спис" in lowered and ("оператор" in lowered or "контролируем" in lowered))
+        or ("спис" in lowered and "оператор" in lowered and "обычн" in lowered and "пользовател" in lowered)
+        or ("кто" in lowered and ("оператор" in lowered or "контролируем" in lowered))
         or ("оператор" in lowered and ("задач" in lowered or "закрыт" in lowered or "контрол" in lowered))
     )
 

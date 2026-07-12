@@ -389,6 +389,34 @@ def test_bitrix_llm_decide_routes_task_close_control_get(monkeypatch):
     assert [call.name for call in result.decision.tool_calls] == ["task_close_control_get"]
     assert result.decision.tool_calls[0].args == {}
 
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t2", request="Покажи список операторов и контролируемых пользователей", user={"id": "1"}
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_control_get"]
+    assert result.decision.tool_calls[0].args == {}
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t3", request="Покажи список операторов и обычных пользователей", user={"id": "1"}),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_control_get"]
+    assert result.decision.tool_calls[0].args == {}
+
 
 def test_bitrix_llm_decide_routes_task_close_control_update(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
@@ -459,7 +487,7 @@ def test_bitrix_specialist_injects_admin_context_for_task_close_control_tool(mon
 
     assert result.status == "completed"
     assert store.task_close_operator_ids() == {13}
-    assert store.task_close_controlled_user_ids() == {13}
+    assert store.task_close_controlled_user_ids() == set()
 
 
 def test_bitrix_llm_decide_routes_project_search_to_deterministic_tool(monkeypatch):

@@ -378,17 +378,6 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                     """,
                     (user_id, actor_user_id),
                 )
-                db.execute(
-                    """
-                    INSERT INTO bitrix24.task_close_controlled_users (user_id, active, updated_by, updated_at)
-                    VALUES (%s, TRUE, %s, now())
-                    ON CONFLICT (user_id) DO UPDATE SET
-                        active = TRUE,
-                        updated_by = EXCLUDED.updated_by,
-                        updated_at = now()
-                    """,
-                    (user_id, actor_user_id),
-                )
             self._record_task_close_control_revision(
                 db,
                 actor_user_id=actor_user_id,

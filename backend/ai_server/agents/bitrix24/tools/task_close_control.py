@@ -4,6 +4,7 @@ import re
 from datetime import datetime
 from typing import Any
 
+from ai_server.integrations.bitrix.profile import compact_user_profile
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.utils import optional_int
 
@@ -19,17 +20,35 @@ _TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 class TaskCloseControlGetTool:
     name = "task_close_control_get"
 
-    def __init__(self, store: Any | None = None) -> None:
+    def __init__(self, store: Any | None = None, user_client: Any | None = None) -> None:
         self._store = store
+        self._user_client = user_client
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name=self.name,
             description=(
                 "Read Bitrix task close control settings: operators, controlled users, auto-close time, "
-                "and control start date. Admins and task-close operators only."
+                "control start date, named current members, and active Bitrix users available for assignment. "
+                "Admins and task-close operators only."
             ),
-            parameters={"type": "object", "properties": {}},
+            parameters={
+                "type": "object",
+                "properties": {
+                    "include_available_users": {
+                        "type": "boolean",
+                        "description": "Include active Bitrix users that can be assigned. Default: true.",
+                    },
+                    "available_limit": {
+                        "type": "integer",
+                        "description": "Maximum Bitrix users to return, default 100, max 200.",
+                    },
+                    "user_query": {
+                        "type": "string",
+                        "description": "Optional Bitrix user search text to narrow the candidate list.",
+                    },
+                },
+            },
         )
 
     async def execute(
@@ -45,14 +64,22 @@ class TaskCloseControlGetTool:
         actor = _actor_context(self._store, user_id=user_id, actor_is_admin=_truthy(args.get("_actor_is_admin")))
         if not actor["is_admin"] and not actor["is_operator"]:
             return _denied(self.name, user_id=user_id)
-        return ToolResult(status=ToolStatus.OK, tool=self.name, data=_control_snapshot(self._store, actor=actor))
+        data = await _control_snapshot(
+            self._store,
+            actor=actor,
+            user_client=self._user_client,
+            args=args,
+            include_available_default=True,
+        )
+        return ToolResult(status=ToolStatus.OK, tool=self.name, data=data)
 
 
 class TaskCloseControlUpdateTool:
     name = "task_close_control_update"
 
-    def __init__(self, store: Any | None = None) -> None:
+    def __init__(self, store: Any | None = None, user_client: Any | None = None) -> None:
         self._store = store
+        self._user_client = user_client
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -118,10 +145,17 @@ class TaskCloseControlUpdateTool:
 
         if result is not None:
             return result
+        data = await _control_snapshot(
+            self._store,
+            actor=actor,
+            user_client=self._user_client,
+            args=args,
+            include_available_default=False,
+        )
         return ToolResult(
             status=ToolStatus.OK,
             tool=self.name,
-            data={**_control_snapshot(self._store, actor=actor), "action": action},
+            data={**data, "action": action},
         )
 
 
@@ -191,14 +225,53 @@ def _set_setting(store: Any, *, key: str, value: str, actor_user_id: int | None)
     return None
 
 
-def _control_snapshot(store: Any, *, actor: dict[str, Any]) -> dict[str, Any]:
+async def _control_snapshot(
+    store: Any,
+    *,
+    actor: dict[str, Any],
+    user_client: Any | None = None,
+    args: dict[str, Any] | None = None,
+    include_available_default: bool,
+) -> dict[str, Any]:
     operator_ids = _ids_from_store(store, "task_close_operator_ids")
     controlled_user_ids = _ids_from_store(store, "task_close_controlled_user_ids")
     auto_close_time = _setting_value(store, TASK_CLOSE_AUTO_CLOSE_TIME_KEY, TASK_CLOSE_DEFAULT_AUTO_CLOSE_TIME)
     control_enabled_from = _setting_value(store, TASK_CLOSE_CONTROL_ENABLED_FROM_KEY, "")
+    member_ids = sorted(set(operator_ids) | set(controlled_user_ids))
+    directory = await _load_user_directory(
+        user_client,
+        member_ids=member_ids,
+        operator_ids=set(operator_ids),
+        controlled_user_ids=set(controlled_user_ids),
+        args=args or {},
+        include_available_default=include_available_default,
+    )
     return {
         "operator_user_ids": operator_ids,
         "controlled_user_ids": controlled_user_ids,
+        "members": [
+            _user_entry(
+                user_id=item,
+                profile=directory["profiles"].get(item),
+                operator_ids=set(operator_ids),
+                controlled_user_ids=set(controlled_user_ids),
+            )
+            for item in member_ids
+        ],
+        "available_users": [
+            _user_entry(
+                user_id=int(profile["user_id"]),
+                profile=profile,
+                operator_ids=set(operator_ids),
+                controlled_user_ids=set(controlled_user_ids),
+            )
+            for profile in directory["available_users"]
+        ],
+        "available_users_truncated": directory["available_users_truncated"],
+        "available_users_limit": directory["available_users_limit"],
+        "available_users_query": directory["available_users_query"],
+        "user_lookup_status": directory["status"],
+        "user_lookup_error": directory["error"],
         "auto_close_time": auto_close_time,
         "control_enabled_from": control_enabled_from,
         "actor_role": actor["role"],
@@ -226,6 +299,153 @@ def _setting_value(store: Any, key: str, default: str) -> str:
     if not isinstance(setting, dict):
         return default
     return str(setting.get("value") or default)
+
+
+async def _load_user_directory(
+    user_client: Any | None,
+    *,
+    member_ids: list[int],
+    operator_ids: set[int],
+    controlled_user_ids: set[int],
+    args: dict[str, Any],
+    include_available_default: bool,
+) -> dict[str, Any]:
+    limit = _available_limit(args)
+    include_available = _include_available_users(args, default=include_available_default) and limit > 0
+    query = str(args.get("user_query") or args.get("query") or "").strip()
+    profiles: dict[int, dict[str, Any]] = {}
+    available_users: list[dict[str, Any]] = []
+    truncated = False
+    status = "not_configured" if user_client is None else "ok"
+    error = ""
+
+    if user_client is not None and include_available:
+        try:
+            raw_users = await _load_available_users(user_client, query=query, limit=limit + 1)
+            truncated = len(raw_users) > limit
+            for raw in raw_users[:limit]:
+                profile = _compact_user(raw)
+                if profile is None:
+                    continue
+                user_id = int(profile["user_id"])
+                profiles[user_id] = profile
+                available_users.append(profile)
+        except Exception as exc:  # pragma: no cover - exact Bitrix errors depend on portal/runtime
+            status = "failed"
+            error = str(exc)
+
+    if user_client is not None:
+        for user_id in member_ids:
+            if user_id in profiles:
+                continue
+            try:
+                user = await user_client.get_user(user_id)
+            except Exception as exc:  # pragma: no cover - exact Bitrix errors depend on portal/runtime
+                if status == "ok":
+                    status = "partial"
+                    error = str(exc)
+                continue
+            profile = _compact_user(user) if isinstance(user, dict) else None
+            if profile is not None:
+                profiles[int(profile["user_id"])] = profile
+
+    available_users = sorted(
+        available_users,
+        key=lambda item: (
+            int(item["user_id"]) not in operator_ids and int(item["user_id"]) not in controlled_user_ids,
+            _user_name(item).casefold(),
+            int(item["user_id"]),
+        ),
+    )
+    return {
+        "profiles": profiles,
+        "available_users": available_users,
+        "available_users_truncated": truncated,
+        "available_users_limit": limit,
+        "available_users_query": query,
+        "status": status,
+        "error": error,
+    }
+
+
+async def _load_available_users(user_client: Any, *, query: str, limit: int) -> list[dict[str, Any]]:
+    if query:
+        search = getattr(user_client, "search_users", None)
+        if callable(search):
+            users = await search(query, limit=limit)
+            return [item for item in users if isinstance(item, dict)]
+    list_all = getattr(user_client, "list_all_users", None)
+    if callable(list_all):
+        users = await list_all(
+            filter_={"ACTIVE": True},
+            select=["ID", "NAME", "LAST_NAME", "SECOND_NAME", "EMAIL", "WORK_POSITION", "ACTIVE"],
+            limit=limit,
+        )
+        return [item for item in users if isinstance(item, dict)]
+    search = getattr(user_client, "search_users", None)
+    if callable(search):
+        users = await search(query, limit=limit)
+        return [item for item in users if isinstance(item, dict)]
+    return []
+
+
+def _compact_user(user: dict[str, Any]) -> dict[str, Any] | None:
+    profile = compact_user_profile(user)
+    user_id = optional_int(profile.get("id"))
+    if user_id is None or user_id <= 0:
+        return None
+    return {
+        "user_id": user_id,
+        "name": str(profile.get("label") or f"Bitrix user #{user_id}"),
+        "active": bool(profile.get("active", True)),
+        "work_position": str(profile.get("work_position") or ""),
+    }
+
+
+def _user_entry(
+    *,
+    user_id: int,
+    profile: dict[str, Any] | None,
+    operator_ids: set[int],
+    controlled_user_ids: set[int],
+) -> dict[str, Any]:
+    is_operator = user_id in operator_ids
+    is_controlled = user_id in controlled_user_ids
+    roles: list[str] = []
+    if is_operator:
+        roles.append("operator")
+    if is_controlled:
+        roles.append("controlled_user")
+    return {
+        "user_id": user_id,
+        "name": _user_name(profile) if profile else f"Bitrix user #{user_id}",
+        "roles": roles,
+        "is_operator": is_operator,
+        "is_controlled": is_controlled,
+        "can_add_operator": not is_operator,
+        "can_add_controlled": not is_controlled,
+        "active": bool((profile or {}).get("active", True)),
+        "work_position": str((profile or {}).get("work_position") or ""),
+    }
+
+
+def _user_name(profile: dict[str, Any] | None) -> str:
+    if not profile:
+        return ""
+    return str(profile.get("name") or profile.get("label") or "").strip()
+
+
+def _include_available_users(args: dict[str, Any], *, default: bool) -> bool:
+    if "include_available_users" not in args:
+        return default
+    return _truthy(args.get("include_available_users"))
+
+
+def _available_limit(args: dict[str, Any]) -> int:
+    limit = optional_int(args.get("available_limit") or args.get("limit"))
+    if limit is None:
+        return 100
+    return max(0, min(limit, 200))
 
 
 def _target_user_id(args: dict[str, Any]) -> int | None:

@@ -519,7 +519,7 @@ def test_bitrix_store_task_close_operator_ids(monkeypatch):
     assert "task_close_control_operators" in conn.calls[0][0]
 
 
-def test_bitrix_store_set_task_close_operators_also_controls_operators(monkeypatch):
+def test_bitrix_store_set_task_close_operators_does_not_control_operators(monkeypatch):
     store = PostgresBitrixAgentStore("postgresql://fake")
     factory, conn = _sync_conn_factory()
     monkeypatch.setattr(store, "_sync_connect", factory)
@@ -529,7 +529,7 @@ def test_bitrix_store_set_task_close_operators_also_controls_operators(monkeypat
     assert saved == [13, 15]
     assert any("UPDATE bitrix24.task_close_control_operators" in sql for sql, _ in conn.calls)
     assert sum("INSERT INTO bitrix24.task_close_control_operators" in sql for sql, _ in conn.calls) == 2
-    assert sum("INSERT INTO bitrix24.task_close_controlled_users" in sql for sql, _ in conn.calls) == 2
+    assert sum("INSERT INTO bitrix24.task_close_controlled_users" in sql for sql, _ in conn.calls) == 0
     revision_calls = [params for sql, params in conn.calls if "task_close_control_revisions" in sql]
     assert revision_calls
     assert revision_calls[0][1] == "set_operators"

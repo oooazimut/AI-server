@@ -200,8 +200,8 @@ class Bitrix24Specialist(BaseSpecialist):
                 portal_search=portal_search_index,
                 settings=_settings,
             ),
-            TaskCloseControlGetTool(store=bitrix_store),
-            TaskCloseControlUpdateTool(store=bitrix_store),
+            TaskCloseControlGetTool(store=bitrix_store, user_client=bitrix_client),
+            TaskCloseControlUpdateTool(store=bitrix_store, user_client=bitrix_client),
             CalendarEventDraftTool(store=bitrix_store),
             CalendarEventConfirmTool(
                 store=bitrix_store,
