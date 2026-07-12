@@ -261,13 +261,13 @@ def test_tests_for_suite_task_close_creates_three_stateful_steps() -> None:
     tests = runner_tests_for_suite("task_close", include_draft=False)
 
     assert [test.test_id for test in tests] == [
-        "BITRIX-TASK-CLOSE-ASK-RESULT-01",
+        "BITRIX-TASK-CLOSE-INITIAL-DRAFT-01",
         "BITRIX-TASK-CLOSE-DRAFT-01",
         "BITRIX-TASK-CLOSE-DISCARD-01",
     ]
     assert suite_needs_task_close_task(tests)
-    assert expected_pending_draft(tests[0]) is False
-    assert expected_draft_type(tests[0]) == ""
+    assert expected_pending_draft(tests[0]) is True
+    assert expected_draft_type(tests[0]) == "task_close"
     assert expected_pending_draft(tests[1]) is True
     assert expected_draft_type(tests[1]) == "task_close"
     assert expected_pending_draft(tests[2]) is False

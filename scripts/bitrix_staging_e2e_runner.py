@@ -163,12 +163,12 @@ STATEFUL_TESTS: dict[str, list[TestCase]] = {
     ],
     "task_close": [
         TestCase(
-            test_id="BITRIX-TASK-CLOSE-ASK-RESULT-01",
+            test_id="BITRIX-TASK-CLOSE-INITIAL-DRAFT-01",
             text="Битрикс закрой задачу {task_close_task_id}.",
             timeout_seconds=300,
-            expect_all=("Для закрытия задачи необходимо указать результат", "Что сделано"),
-            reject_any=("Черновик закрытия задачи", "Задача закрыта", "Задача отмечена выполненной"),
-            kind="task_close_prompt",
+            expect_all=("Черновик закрытия задачи", "Пункты задачи", "Оборудование", "Итог", "Действия"),
+            reject_any=("Задача закрыта", "Задача отмечена выполненной"),
+            kind="task_close_draft",
             required_task_id_arg="task_close_task_id",
         ),
         TestCase(

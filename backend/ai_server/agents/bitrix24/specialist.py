@@ -185,7 +185,7 @@ class Bitrix24Specialist(BaseSpecialist):
                 draft_ttl_minutes=_settings.bitrix_task_draft_ttl_minutes,
             ),
             TaskDraftDiscardTool(store=bitrix_store),
-            TaskCloseDraftTool(store=bitrix_store),
+            TaskCloseDraftTool(store=bitrix_store, read_client=bitrix_client, bitrix_oauth=bitrix_oauth),
             TaskCloseConfirmTool(
                 store=bitrix_store,
                 write_client=bitrix_client,

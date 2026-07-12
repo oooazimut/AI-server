@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import base64
+import html
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
 from ai_server.agents.bitrix24.ports import TaskDraftStorePort
+from ai_server.agents.bitrix24.tools.read_client import resolve_current_user_read_client
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
 from ai_server.integrations.bitrix.portal_search.search_index import PortalSearchIndex
@@ -25,11 +28,17 @@ from ai_server.integrations.bitrix.task_close_reports import (
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.settings import Settings, get_settings
 from ai_server.tools.bitrix_policy import apply_write_policy
-from ai_server.tools.bitrix_ports import BitrixWritePort
+from ai_server.tools.bitrix_ports import BitrixToolClientPort, BitrixWritePort
 from ai_server.utils import MOSCOW_TZ, compact_text, optional_int
 
 TASK_CLOSE_DRAFT_TYPE = "task_close"
 INCOMPLETE_CLOSE_MARKER = "AI_SERVER_TASK_CLOSE_INCOMPLETE"
+_TASK_CLOSE_READ_SELECT = ["ID", "TITLE", "DESCRIPTION", "STATUS", "CLOSED_DATE"]
+_BITRIX_PAIRED_TAG_RE = re.compile(
+    r"\[(USER|URL|B|I|U|S|QUOTE|CODE|COLOR|SIZE)[^\]]*\](.*?)\[/\1\]", re.IGNORECASE | re.DOTALL
+)
+_BITRIX_SINGLE_TAG_RE = re.compile(r"\[/?[A-Z][A-Z0-9_]*(?:=[^\]]*)?\]", re.IGNORECASE)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 _TASK_CLOSE_LIST_FIELDS = {
     "unresolved_items": ("unresolved_items", "missing_parts"),
@@ -196,15 +205,23 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
 class TaskCloseDraftTool:
     name = "task_close_draft"
 
-    def __init__(self, store: TaskDraftStorePort) -> None:
+    def __init__(
+        self,
+        store: TaskDraftStorePort,
+        read_client: BitrixToolClientPort | None = None,
+        bitrix_oauth: BitrixOAuthService | None = None,
+    ) -> None:
         self._store = store
+        self._read_client = read_client
+        self._bitrix_oauth = bitrix_oauth
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name=self.name,
             description=(
                 "Prepare a Bitrix task closing draft. Use instead of direct bitrix_api writes for task closing. "
-                "Call only after the task and completion result are understood. The user must confirm before "
+                "Call as soon as the task is identified; if completion details are missing, put them into "
+                "missing_fields/unconfirmed_items so the user sees a full draft. The user must confirm before "
                 "a protected AI close report file is saved and, when the task is still open, "
                 "tasks.task.complete/tasks.task.approve is executed."
             ),
@@ -293,7 +310,10 @@ class TaskCloseDraftTool:
                 tool=self.name,
                 error="task_close_draft requires dialog_key",
             )
-        draft = build_task_close_draft_from_args(args)
+        enriched_args, access_error = await self._enrich_args_from_task(args, user_id=user_id)
+        if access_error is not None:
+            return access_error
+        draft = build_task_close_draft_from_args(enriched_args)
         if not draft.is_ready:
             return ToolResult(
                 status=ToolStatus.CONTRACT_VIOLATION,
@@ -352,6 +372,73 @@ class TaskCloseDraftTool:
             tool=self.name,
             data={"status": "new_draft", "draft": draft.payload, "preview": draft.preview},
         )
+
+    async def _enrich_args_from_task(
+        self,
+        args: dict[str, Any],
+        *,
+        user_id: int | None,
+    ) -> tuple[dict[str, Any], ToolResult | None]:
+        task_id = optional_int((args or {}).get("task_id") or (args or {}).get("id") or (args or {}).get("ID"))
+        if task_id is None or self._read_client is None:
+            return dict(args or {}), None
+
+        read_client, _, access_error = await resolve_current_user_read_client(
+            self.name,
+            fallback_client=self._read_client,
+            bitrix_oauth=self._bitrix_oauth,
+            user_id=user_id,
+        )
+        if access_error is not None:
+            return {}, access_error
+
+        try:
+            result = await read_client.result("tasks.task.get", {"taskId": task_id, "select": _TASK_CLOSE_READ_SELECT})
+        except (BitrixApiError, BitrixConfigError) as exc:
+            return (
+                {},
+                ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool=self.name,
+                    error=f"Bitrix task lookup failed for task_close_draft: {exc}",
+                    data={"task_id": task_id},
+                ),
+            )
+
+        task = _extract_bitrix_task(result)
+        if not task:
+            return dict(args or {}), None
+
+        enriched = dict(args or {})
+        title = _first_text(task, "title", "TITLE")
+        if title and not compact_text(str(enriched.get("task_title") or enriched.get("title") or "")):
+            enriched["task_title"] = title
+
+        description = _first_text(task, "description", "DESCRIPTION")
+        description_points = _task_description_points(description)
+        if not _string_list(
+            enriched.get("task_points") or enriched.get("task_items") or enriched.get("checklist_items")
+        ):
+            enriched["task_points"] = description_points
+        if "source_task_description_empty" not in enriched and "task_description_empty" not in enriched:
+            enriched["source_task_description_empty"] = not bool(description_points)
+
+        status = compact_text(_first_text(task, "status", "STATUS"))
+        if "already_closed" not in enriched and "task_already_closed" not in enriched:
+            enriched["already_closed"] = status == "5" or bool(_first_text(task, "closedDate", "CLOSED_DATE"))
+
+        if not _task_close_has_user_result(enriched):
+            enriched.setdefault("overall_status", "unconfirmed")
+            enriched.setdefault("unconfirmed_items", description_points or ["результат выполнения не указан"])
+            enriched.setdefault(
+                "missing_fields",
+                [
+                    "что сделано по задаче",
+                    "оборудование/расходники, если использовались",
+                    "итог: выполнена полностью, частично или не выполнена",
+                ],
+            )
+        return enriched, None
 
 
 class TaskCloseConfirmTool:
@@ -781,6 +868,65 @@ def _discard_direct_close_queue_from_draft(
         close_event_key=close_event_key,
         now_iso=datetime.now(MOSCOW_TZ).isoformat(timespec="seconds"),
         actor_user_id=actor_user_id,
+    )
+
+
+def _extract_bitrix_task(result: Any) -> dict[str, Any]:
+    if isinstance(result, dict):
+        for key in ("task", "TASK"):
+            value = result.get(key)
+            if isinstance(value, dict):
+                return value
+        result_value = result.get("result")
+        if isinstance(result_value, dict):
+            return _extract_bitrix_task(result_value)
+    return {}
+
+
+def _first_text(values: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = values.get(key)
+        if value is None:
+            continue
+        text = compact_text(str(value))
+        if text:
+            return text
+    return ""
+
+
+def _task_description_points(description: object) -> list[str]:
+    text = _clean_task_description(description)
+    if not text:
+        return []
+    raw_parts = re.split(r"(?:\r?\n)+|(?:^|\s)(?:\d+[.)]|[-*•])\s+", text)
+    points = _unique_strings([compact_text(part).strip(" .;:-") for part in raw_parts if compact_text(part)])
+    if len(points) > 1:
+        return points[:12]
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    points = _unique_strings([compact_text(part).strip(" .;:-") for part in sentences if compact_text(part)])
+    return points[:12] if points else []
+
+
+def _clean_task_description(description: object) -> str:
+    text = html.unescape(str(description or ""))
+    previous = None
+    while previous != text:
+        previous = text
+        text = _BITRIX_PAIRED_TAG_RE.sub(lambda match: str(match.group(2) or ""), text)
+    text = _BITRIX_SINGLE_TAG_RE.sub(" ", text)
+    text = _HTML_TAG_RE.sub(" ", text)
+    return compact_text(text)
+
+
+def _task_close_has_user_result(args: dict[str, Any]) -> bool:
+    if compact_text(str(args.get("completion_summary") or args.get("result_text") or args.get("summary") or "")):
+        return True
+    if compact_text(str(args.get("equipment_consumables") or args.get("equipment") or args.get("consumables") or "")):
+        return True
+    if _overall_status(args.get("overall_status") or args.get("completion_status")) not in {"", "unconfirmed"}:
+        return True
+    return bool(
+        _string_list(args.get("not_done_items") or args.get("unfinished_items") or args.get("incomplete_items"))
     )
 
 
