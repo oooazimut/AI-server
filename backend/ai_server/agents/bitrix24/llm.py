@@ -23,7 +23,7 @@ from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
 from ai_server.retrieval import RetrievalHit
 from ai_server.settings import Settings
-from ai_server.utils import MOSCOW_TZ, confidence, optional_int
+from ai_server.utils import MOSCOW_TZ, compact_text, confidence, optional_int
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +150,14 @@ class BitrixLLMService:
                 decision=local_decision,
                 model_usage=_local_model_usage(manifest.id, "task_close_draft_conflict_route"),
                 raw={"source": "task_close_draft_conflict_route"},
+            )
+
+        local_decision = _common_task_close_active_update_decision(task.request, task.context, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "task_close_active_update_route"),
+                raw={"source": "task_close_active_update_route"},
             )
 
         local_decision = _common_task_close_report_incident_decision(task.request, dialog_history, tool_definitions)
@@ -1691,6 +1699,114 @@ def _task_close_draft_replay_args(draft: dict[str, Any]) -> dict[str, Any]:
         "unresolved_items": _text_items(draft.get("unresolved_items")),
         "missing_fields": _text_items(draft.get("missing_fields")),
     }
+
+
+def _common_task_close_active_update_decision(
+    request: str,
+    context: dict[str, Any],
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    if not _draft_discard_tool_available(tool_definitions, "task_close_draft"):
+        return None
+    draft = context.get("pending_task_draft") if isinstance(context, dict) else None
+    if not isinstance(draft, dict) or draft.get("_draft_type") != "task_close":
+        return None
+    if isinstance(draft.get("_task_close_conflict_pending"), dict):
+        return None
+
+    clean_request = _strip_command_prefix(request)
+    lowered = clean_request.casefold()
+    if _is_draft_discard_request(lowered) or _is_draft_confirm_request(lowered):
+        return None
+    if _task_close_report_incident_action(clean_request):
+        return None
+
+    current_task_id = optional_int(draft.get("task_id"))
+    requested_task_id = _extract_task_id(clean_request)
+    task_id = requested_task_id or current_task_id
+    if task_id is None:
+        return None
+
+    args = _task_close_active_update_args(clean_request, draft=draft, task_id=task_id)
+    return BitrixLLMDecision(
+        status="completed",
+        answer="",
+        confidence=0.9,
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="task_close_draft",
+                args=args,
+                summary="deterministic task close active draft update routing",
+            )
+        ],
+    )
+
+
+def _task_close_active_update_args(request: str, *, draft: dict[str, Any], task_id: int) -> dict[str, Any]:
+    summary = _task_close_update_summary(request, task_id=task_id)
+    lowered = summary.casefold()
+    args = {
+        "task_id": task_id,
+        "task_title": _text(draft.get("task_title")),
+        "completion_summary": summary,
+    }
+    equipment = _task_close_equipment_from_text(lowered)
+    if equipment:
+        args["equipment_consumables"] = equipment
+    overall_status = _task_close_overall_status_from_text(lowered)
+    if overall_status:
+        args["overall_status"] = overall_status
+    not_done_items = _task_close_not_done_items_from_text(summary, lowered)
+    if not_done_items:
+        args["not_done_items"] = not_done_items
+    unconfirmed_items = _task_close_unconfirmed_items_from_text(summary, lowered)
+    if unconfirmed_items:
+        args["unconfirmed_items"] = unconfirmed_items
+    if equipment or overall_status:
+        args["missing_fields"] = []
+    return args
+
+
+def _task_close_update_summary(request: str, *, task_id: int) -> str:
+    text = re.sub(
+        rf"^\s*(?:по\s+)?задач[аеуы]?\s+#?{task_id}\s*:?\s*",
+        "",
+        request,
+        flags=re.IGNORECASE,
+    )
+    return compact_text(text) or compact_text(request)
+
+
+def _task_close_equipment_from_text(lowered: str) -> str:
+    if "оборуд" not in lowered and "расход" not in lowered:
+        return ""
+    if "не использ" in lowered or "не примен" in lowered:
+        return "не использовалось"
+    return ""
+
+
+def _task_close_overall_status_from_text(lowered: str) -> str:
+    if "не выполн" in lowered or "не сделан" in lowered:
+        return "not_done"
+    if "частич" in lowered or "не все" in lowered:
+        return "partial"
+    if "не подтверж" in lowered or "неизвест" in lowered or "не провер" in lowered:
+        return "unconfirmed"
+    if "выполн" in lowered or "готов" in lowered or "сделан" in lowered:
+        return "completed"
+    return ""
+
+
+def _task_close_not_done_items_from_text(summary: str, lowered: str) -> list[str]:
+    if "не выполн" in lowered or "не сделан" in lowered:
+        return [summary]
+    return []
+
+
+def _task_close_unconfirmed_items_from_text(summary: str, lowered: str) -> list[str]:
+    if "не подтверж" in lowered or "неизвест" in lowered or "не провер" in lowered or "не все" in lowered:
+        return [summary]
+    return []
 
 
 def _common_task_close_report_incident_decision(

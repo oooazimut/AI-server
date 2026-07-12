@@ -976,6 +976,56 @@ def test_bitrix_llm_routes_task_close_start_to_draft_without_llm(monkeypatch):
     assert "что сделано по задаче" in args["missing_fields"]
 
 
+def test_bitrix_llm_routes_task_close_followup_to_active_draft_without_llm(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_close_draft", "description": "", "parameters": {}},
+        {"name": "task_close_confirm", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request=(
+                    "По задаче 8899: проверка выполнена частично, не все пункты подтверждены, "
+                    "оборудование не использовалось."
+                ),
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "task_close",
+                        "task_id": 8899,
+                        "task_title": "Проверить камеры",
+                        "task_points": ["Проверить камеру", "Проверить архив"],
+                        "overall_status": "unconfirmed",
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_close_active_update_route"}
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_draft"]
+    args = result.decision.tool_calls[0].args
+    assert args["task_id"] == 8899
+    assert args["task_title"] == "Проверить камеры"
+    assert args["overall_status"] == "partial"
+    assert args["equipment_consumables"] == "не использовалось"
+    assert args["unconfirmed_items"] == [
+        "проверка выполнена частично, не все пункты подтверждены, оборудование не использовалось."
+    ]
+    assert args["missing_fields"] == []
+
+
 def test_bitrix_llm_routes_task_close_conflict_switch_to_requested_without_llm(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
