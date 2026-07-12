@@ -292,7 +292,7 @@ def test_close_confirm_uses_oauth_close_then_system_report_file():
     system_client.call = AsyncMock(
         side_effect=[
             {"result": []},
-            {"result": {"ATTACHMENT_ID": 5509, "FILE_ID": 62357, "NAME": "AI-close-139-ok.txt"}},
+            {"result": {"ATTACHMENT_ID": 5509, "FILE_ID": 62357, "NAME": "AI-close-139.txt"}},
         ]
     )
 
@@ -312,18 +312,18 @@ def test_close_confirm_uses_oauth_close_then_system_report_file():
     assert addfile_call.args[0] == "task.item.addfile"
     addfile_payload = addfile_call.args[1]
     assert addfile_payload["taskId"] == 139
-    assert addfile_payload["fileParameters"]["NAME"] == "AI-close-139-ok.txt"
+    assert addfile_payload["fileParameters"]["NAME"] == "AI-close-139.txt"
     report_text = base64.b64decode(addfile_payload["fileParameters"]["CONTENT"]).decode("utf-8")
     assert "AI task close report" in report_text
     assert "Task ID: 139" in report_text
     assert "Status: ok" in report_text
     assert "Выполнено" in report_text
-    assert result.data["report_file_name"] == "AI-close-139-ok.txt"
+    assert result.data["report_file_name"] == "AI-close-139.txt"
     assert result.data["report_file_owner"] == "system_bitrix_client"
     assert "d:13" not in store._drafts
 
 
-def test_close_confirm_reuses_existing_system_report_file():
+def test_close_confirm_updates_existing_system_report_file_version():
     store = FakeTaskDraftStore()
     anyio.run(
         lambda: store.save_task_draft(
@@ -358,13 +358,21 @@ def test_close_confirm_reuses_existing_system_report_file():
     result = _exec(tool, {}, user_id=13, dialog_key="d:13", dialog_id="chat4321")
 
     assert result.status == ToolStatus.OK
-    assert result.data["result_method"] == "task.item.getfiles"
-    assert result.data["report_file_name"] == "AI-close-139-unconfirmed.txt"
-    assert result.data["report_add"] == existing
+    assert result.data["result_method"] == "disk.file.uploadversion"
+    assert result.data["report_file_name"] == "AI-close-139.txt"
     assert oauth_client.call.await_args_list == [
         call("tasks.task.complete", {"taskId": 139}),
     ]
-    assert system_client.call.await_args_list == [call("task.item.getfiles", {"taskId": 139})]
+    assert system_client.call.await_args_list[0] == call("task.item.getfiles", {"taskId": 139})
+    upload_call = system_client.call.await_args_list[1]
+    assert upload_call.args[0] == "disk.file.uploadversion"
+    upload_payload = upload_call.args[1]
+    assert upload_payload["id"] == 62357
+    assert upload_payload["fileContent"][0] == "AI-close-139.txt"
+    uploaded_report = base64.b64decode(upload_payload["fileContent"][1]).decode("utf-8")
+    assert "Status: unconfirmed" in uploaded_report
+    assert "Problem types: unconfirmed" in uploaded_report
+    assert "AI marker: AI_SERVER_TASK_CLOSE_INCOMPLETE" in uploaded_report
     assert "d:13" not in store._drafts
 
 

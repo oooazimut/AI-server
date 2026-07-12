@@ -11,9 +11,16 @@ from ai_server.integrations.bitrix.portal_search.text_utils import safe_int, to_
 
 TASK_CLOSE_INCOMPLETE_MARKER = "AI_SERVER_TASK_CLOSE_INCOMPLETE"
 TASK_CLOSE_REPORT_FILE_RE = re.compile(
-    r"^(?P<stem>AI-close-\d+-(?P<status>ok|partial|unconfirmed|failed))(?: \(\d+\))?\.txt$",
+    r"^AI-close-(?P<task_id>\d+)(?:-(?P<status>ok|partial|unconfirmed|failed))?(?: \(\d+\))?\.txt$",
     re.IGNORECASE,
 )
+
+
+def stable_task_close_report_file_name(task_id: object) -> str:
+    task_id_int = safe_int(task_id)
+    if task_id_int is None:
+        return ""
+    return f"AI-close-{task_id_int}.txt"
 
 
 def is_task_close_report_file_name(name: object) -> bool:
@@ -24,7 +31,7 @@ def canonical_task_close_report_file_name(name: object) -> str:
     match = TASK_CLOSE_REPORT_FILE_RE.match(str(name or "").strip())
     if not match:
         return ""
-    return f"{match.group('stem')}.txt"
+    return stable_task_close_report_file_name(match.group("task_id"))
 
 
 def task_close_report_problem_types(attachment_names: list[str]) -> list[str]:
@@ -33,12 +40,43 @@ def task_close_report_problem_types(attachment_names: list[str]) -> list[str]:
         match = TASK_CLOSE_REPORT_FILE_RE.match(str(name or "").strip())
         if not match:
             continue
-        status = match.group("status").casefold()
+        status = str(match.group("status") or "").casefold()
         if status in {"partial", "failed"}:
             problem_types.append("not_done")
         if status == "unconfirmed":
             problem_types.append("unconfirmed")
     return _unique_problem_types(problem_types)
+
+
+def task_close_report_problem_types_from_text(text: object) -> list[str]:
+    content = str(text or "")
+    lowered = content.casefold()
+    problem_types: list[str] = []
+    explicit_problem_types = _problem_types_line_values(content)
+    problem_types.extend(explicit_problem_types)
+    status = task_close_report_status_from_text(content)
+    if status in {"partial", "failed", "not_done"}:
+        problem_types.append("not_done")
+    if status in {"unconfirmed", "unknown"}:
+        problem_types.append("unconfirmed")
+    if "not done:" in lowered or "невыполн" in lowered:
+        problem_types.append("not_done")
+    if "unconfirmed:" in lowered or "неподтверж" in lowered or "не подтверж" in lowered:
+        problem_types.append("unconfirmed")
+    if TASK_CLOSE_INCOMPLETE_MARKER.casefold() in lowered and not problem_types:
+        problem_types.append("unconfirmed")
+    return _unique_problem_types(problem_types)
+
+
+def task_close_report_status_from_text(text: object) -> str:
+    for line in str(text or "").splitlines():
+        key, _, value = line.partition(":")
+        if key.strip().casefold() != "status":
+            continue
+        status = value.strip().casefold().replace(" ", "_")
+        if status in {"ok", "partial", "failed", "unconfirmed", "not_done", "unknown"}:
+            return status
+    return ""
 
 
 def task_close_report_record(attached: dict[str, Any]) -> dict[str, Any] | None:
@@ -53,6 +91,7 @@ def task_close_report_record(attached: dict[str, Any]) -> dict[str, Any] | None:
         "size": _first(attached, "SIZE", "size"),
         "created_by": _first(attached, "CREATED_BY", "createdBy"),
         "create_time": _first(attached, "CREATE_TIME", "createTime"),
+        "download_url": _first(attached, "DOWNLOAD_URL", "downloadUrl"),
         "problem_types": task_close_report_problem_types([name]),
     }
 
@@ -168,4 +207,18 @@ def _unique_problem_types(values: list[str]) -> list[str]:
         if value not in {"not_done", "unconfirmed"} or value in result:
             continue
         result.append(value)
+    return result
+
+
+def _problem_types_line_values(text: str) -> list[str]:
+    result: list[str] = []
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        if key.strip().casefold() not in {"problem types", "ai close problem types", "problems"}:
+            continue
+        for part in re.split(r"[,;\s]+", value.strip().casefold()):
+            if part in {"not_done", "not-done", "notdone", "failed", "partial"}:
+                result.append("not_done")
+            elif part in {"unconfirmed", "unknown", "unverified"}:
+                result.append("unconfirmed")
     return result

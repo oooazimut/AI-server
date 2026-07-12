@@ -17,6 +17,7 @@ from ai_server.integrations.bitrix.task_close_direct_queue import (
 from ai_server.integrations.bitrix.task_close_reports import (
     canonical_task_close_report_file_name,
     restore_task_close_report_file,
+    stable_task_close_report_file_name,
     task_close_report_key,
     task_close_report_problem_types,
     task_close_report_state_key,
@@ -688,12 +689,25 @@ async def _execute_task_close(
     if result_text:
         if report_call is None:
             raise BitrixConfigError("system Bitrix write_client is required to attach protected task close report.")
-        report_file_name = _report_file_name(task_id, draft)
+        report_file_name = _report_file_name(task_id)
         report_file_content = _report_file_content(task_id=task_id, action=action, draft=draft)
         existing_report = await _find_existing_report_file(report_call, task_id=task_id, file_name=report_file_name)
         if existing_report is not None:
-            report_add = existing_report
-            report_method = "task.item.getfiles"
+            disk_file_id = _report_disk_file_id(existing_report)
+            if disk_file_id is None:
+                raise BitrixConfigError("Cannot update existing AI close report: disk file id is missing.")
+            report_params = apply_write_policy(
+                "disk.file.uploadversion",
+                {
+                    "id": disk_file_id,
+                    "fileContent": [
+                        report_file_name,
+                        base64.b64encode(report_file_content.encode("utf-8")).decode("ascii"),
+                    ],
+                },
+            )
+            report_add = await report_call("disk.file.uploadversion", report_params)
+            report_method = "disk.file.uploadversion"
         else:
             report_params = apply_write_policy(
                 "task.item.addfile",
@@ -877,10 +891,27 @@ async def _find_existing_report_file(
         result = await call("task.item.getfiles", {"taskId": task_id})
     except Exception:
         return None
+    logical_name = canonical_task_close_report_file_name(file_name)
+    fallback: dict[str, Any] | None = None
     for item in _extract_file_items(result):
-        if str(item.get("NAME") or item.get("name") or "") == file_name:
+        item_name = str(item.get("NAME") or item.get("name") or "")
+        if item_name == file_name:
             return item
+        if logical_name and canonical_task_close_report_file_name(item_name).casefold() == logical_name.casefold():
+            fallback = item
+    if fallback is not None:
+        return fallback
     return None
+
+
+def _report_disk_file_id(report_file: dict[str, Any]) -> int | None:
+    return optional_int(
+        report_file.get("FILE_ID")
+        or report_file.get("fileId")
+        or report_file.get("OBJECT_ID")
+        or report_file.get("objectId")
+        or report_file.get("disk_object_id")
+    )
 
 
 def _extract_file_items(result: Any) -> list[dict[str, Any]]:
@@ -900,9 +931,8 @@ def _extract_file_items(result: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _report_file_name(task_id: int, draft: dict[str, Any]) -> str:
-    suffix = _report_file_status(draft)
-    return f"AI-close-{task_id}-{suffix}.txt"
+def _report_file_name(task_id: int) -> str:
+    return stable_task_close_report_file_name(task_id)
 
 
 def _report_file_status(draft: dict[str, Any]) -> str:
@@ -937,6 +967,15 @@ def _report_file_content(*, task_id: int, action: str, draft: dict[str, Any]) ->
         f"Created at: {datetime.now(MOSCOW_TZ).isoformat(timespec='seconds')}",
         "Source: AI-server task_close_confirm",
     ]
+    problem_types = _string_list(draft.get("problem_types"))
+    if not problem_types:
+        if not_done_items:
+            problem_types.append("not_done")
+        if unconfirmed_items:
+            problem_types.append("unconfirmed")
+    if problem_types:
+        lines.append(f"Problem types: {', '.join(_unique_strings(problem_types))}")
+        lines.append(f"AI marker: {INCOMPLETE_CLOSE_MARKER}")
     if completion_summary:
         lines.extend(["", "Summary:", completion_summary])
     if task_points:

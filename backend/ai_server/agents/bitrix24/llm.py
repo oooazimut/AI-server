@@ -1714,7 +1714,11 @@ def _task_close_report_task_id(text: str) -> int | None:
 
 
 def _task_close_report_file_name(text: str) -> str:
-    match = re.search(r"\bAI-close-\d+-(?:ok|partial|unconfirmed|failed)\.txt\b", text, flags=re.IGNORECASE)
+    match = re.search(
+        r"\bAI-close-\d+(?:-(?:ok|partial|unconfirmed|failed))?(?: \(\d+\))?\.txt\b",
+        text,
+        flags=re.IGNORECASE,
+    )
     return match.group(0) if match else ""
 
 
