@@ -185,6 +185,54 @@ def auto_close_direct_close_queue_as_unconfirmed(
     return closed
 
 
+def auto_close_direct_close_event_as_unconfirmed(
+    store: Any,
+    *,
+    task_id: object,
+    close_event_key: object,
+    now_iso: str | None = None,
+    reason: str = "control_time_reached",
+    payload_updates: dict[str, Any] | None = None,
+    actor_user_id: int | None = None,
+) -> TaskCloseDirectQueueEvent | None:
+    task_id_int = safe_int(task_id)
+    if task_id_int is None:
+        return None
+    state_key = direct_close_state_key(close_event_key)
+    state = _get_state(store, task_id=task_id_int, state_key=state_key)
+    if not state:
+        event = None
+        payload: dict[str, Any] = {}
+    else:
+        event = _event_from_state(state)
+        if event.status in TASK_CLOSE_DIRECT_TERMINAL_STATUSES:
+            return event
+        payload = dict(event.payload)
+    payload.update(payload_updates or {})
+    payload["auto_closed_at"] = now_iso
+    payload["auto_close_reason"] = reason
+    payload["problem_types"] = ["unconfirmed"]
+    payload.setdefault(
+        "unconfirmed_items",
+        ["Result was not confirmed before the control time."],
+    )
+    _upsert_state(
+        store,
+        task_id=task_id_int,
+        state_key=state_key,
+        status=TASK_CLOSE_DIRECT_STATUS_AUTO_CLOSED_UNCONFIRMED,
+        payload=payload,
+        actor_user_id=actor_user_id if actor_user_id is not None else event.actor_user_id if event else None,
+    )
+    return TaskCloseDirectQueueEvent(
+        task_id=task_id_int,
+        state_key=state_key,
+        status=TASK_CLOSE_DIRECT_STATUS_AUTO_CLOSED_UNCONFIRMED,
+        payload=payload,
+        actor_user_id=actor_user_id if actor_user_id is not None else event.actor_user_id if event else None,
+    )
+
+
 def complete_direct_close_event(
     store: Any,
     *,

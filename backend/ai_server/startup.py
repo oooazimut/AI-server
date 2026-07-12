@@ -92,7 +92,12 @@ async def lifespan(app: FastAPI):
     bitrix = BitrixClient(settings=settings, oauth_service=bitrix_oauth)
     bitrix_store = await _make_bitrix_store(settings)
     portal_search = bitrix_store
-    portal_search_indexer = PortalSearchIndexerWorker(bitrix, portal_search, settings=settings)
+    portal_search_indexer = PortalSearchIndexerWorker(
+        bitrix,
+        portal_search,
+        settings=settings,
+        bitrix_oauth=bitrix_oauth,
+    )
     webhook_event_queue = _make_event_queue(settings)
     pto_store = await _make_pto_store(settings)
     orchestrator_store = await _make_orchestrator_store(settings)
