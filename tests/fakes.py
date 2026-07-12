@@ -967,6 +967,10 @@ class FakeTaskDraftStore:
     def __init__(self) -> None:
         self._drafts: dict[str, dict] = {}
         self._expired: set[str] = set()
+        self._task_close_operators: set[int] = set()
+        self._task_close_controlled_users: set[int] = set()
+        self._task_close_settings: dict[str, dict[str, Any]] = {}
+        self._task_close_revisions: list[dict[str, Any]] = []
 
     async def save_task_draft(self, dialog_key: str, params: dict[str, Any]) -> None:
         self._drafts[dialog_key] = params
@@ -981,6 +985,46 @@ class FakeTaskDraftStore:
 
     async def delete_task_draft(self, dialog_key: str) -> None:
         self._drafts.pop(dialog_key, None)
+
+    def get_task_close_control_setting(self, key: str) -> dict[str, Any] | None:
+        setting = self._task_close_settings.get(key)
+        return dict(setting) if setting else None
+
+    def set_task_close_control_setting(self, *, key: str, value: str, updated_by: int | None = None) -> None:
+        self._task_close_settings[key] = {"key": key, "value": value, "updated_by": updated_by}
+        self._task_close_revisions.append(
+            {"action": "set_setting", "actor_user_id": updated_by, "payload": {"key": key, "value": value}}
+        )
+
+    def task_close_operator_ids(self) -> set[int]:
+        return set(self._task_close_operators)
+
+    def set_task_close_operators(self, *, operator_user_ids: list[int], actor_user_id: int | None) -> list[int]:
+        self._task_close_operators = {int(item) for item in operator_user_ids}
+        self._task_close_controlled_users.update(self._task_close_operators)
+        saved = sorted(self._task_close_operators)
+        self._task_close_revisions.append(
+            {"action": "set_operators", "actor_user_id": actor_user_id, "payload": {"operator_user_ids": saved}}
+        )
+        return saved
+
+    def task_close_controlled_user_ids(self) -> set[int]:
+        return set(self._task_close_controlled_users)
+
+    def upsert_task_close_controlled_user(
+        self, *, user_id: int, active: bool = True, updated_by: int | None = None
+    ) -> None:
+        if active:
+            self._task_close_controlled_users.add(user_id)
+        else:
+            self._task_close_controlled_users.discard(user_id)
+        self._task_close_revisions.append(
+            {
+                "action": "set_controlled_user",
+                "actor_user_id": updated_by,
+                "payload": {"user_id": user_id, "active": active},
+            }
+        )
 
 
 class FakeProposalStore:
