@@ -26,6 +26,21 @@ from ai_server.utils import MOSCOW_TZ, compact_text, optional_int
 TASK_CLOSE_DRAFT_TYPE = "task_close"
 INCOMPLETE_CLOSE_MARKER = "AI_SERVER_TASK_CLOSE_INCOMPLETE"
 
+_TASK_CLOSE_LIST_FIELDS = {
+    "unresolved_items": ("unresolved_items", "missing_parts"),
+    "task_points": ("task_points", "task_items", "checklist_items"),
+    "not_done_items": ("not_done_items", "unfinished_items", "incomplete_items"),
+    "unconfirmed_items": ("unconfirmed_items", "unknown_items", "unverified_items"),
+    "missing_fields": ("missing_fields", "questions", "needed_details"),
+}
+_TASK_CLOSE_SCALAR_FIELDS = {
+    "task_title": ("task_title", "title"),
+    "action": ("action", "close_action"),
+    "completion_summary": ("completion_summary", "result_text", "summary"),
+    "equipment_consumables": ("equipment_consumables", "equipment", "consumables"),
+    "overall_status": ("overall_status", "completion_status"),
+}
+
 
 @dataclass(frozen=True)
 class BitrixTaskCloseDraft:
@@ -238,11 +253,56 @@ class TaskCloseDraftTool:
                 error=f"task_close_draft called outside contract: {'; '.join(draft.contract_errors)}",
                 data=draft.as_action_details(),
             )
+        existing = await self._store.get_task_draft(dialog_key)
+        if isinstance(existing, dict) and existing.get("_draft_type") == TASK_CLOSE_DRAFT_TYPE:
+            current_task_id = optional_int(existing.get("task_id"))
+            requested_task_id = optional_int(draft.payload.get("task_id"))
+            if current_task_id is not None and requested_task_id is not None and current_task_id != requested_task_id:
+                conflict_draft = {
+                    **existing,
+                    "_task_close_conflict_pending": draft.payload,
+                    "_task_close_conflict_pending_preview": draft.preview,
+                }
+                await self._store.save_task_draft(dialog_key, conflict_draft)
+                return ToolResult(
+                    status=ToolStatus.OK,
+                    tool=self.name,
+                    data={
+                        "status": "active_draft_conflict",
+                        "draft": conflict_draft,
+                        "preview": _preview_from_payload(conflict_draft),
+                        "incoming_draft": draft.payload,
+                        "incoming_preview": draft.preview,
+                        "conflict": {
+                            "current_task_id": current_task_id,
+                            "requested_task_id": requested_task_id,
+                            "actions": [
+                                "continue_current_draft",
+                                "close_current_as_is_with_marker",
+                                "discard_current_and_start_requested",
+                            ],
+                        },
+                    },
+                )
+            merged = build_task_close_draft_from_args(_merge_task_close_draft_args(existing, args, draft.payload))
+            if not merged.is_ready:
+                return ToolResult(
+                    status=ToolStatus.CONTRACT_VIOLATION,
+                    tool=self.name,
+                    error=f"merged task_close_draft is invalid: {'; '.join(merged.contract_errors)}",
+                    data=merged.as_action_details(),
+                )
+            await self._store.save_task_draft(dialog_key, merged.payload)
+            return ToolResult(
+                status=ToolStatus.OK,
+                tool=self.name,
+                data={"status": "updated_draft", "draft": merged.payload, "preview": merged.preview},
+            )
         await self._store.save_task_draft(dialog_key, draft.payload)
         return ToolResult(
             status=ToolStatus.OK,
             tool=self.name,
-            data={"draft": draft.payload, "preview": draft.preview},
+            data={"status": "new_draft", "draft": draft.payload, "preview": draft.preview},
         )
 
 
@@ -643,6 +703,54 @@ def _result_text(
         lines.append("Неподтверждённые пункты:")
         lines.extend(f"- {item}" for item in unconfirmed_items)
     return "\n".join(lines).strip()
+
+
+def _merge_task_close_draft_args(
+    existing: dict[str, Any],
+    raw_args: dict[str, Any],
+    update_payload: dict[str, Any],
+) -> dict[str, Any]:
+    merged = dict(existing)
+    merged["task_id"] = update_payload.get("task_id") or existing.get("task_id")
+
+    for payload_field, aliases in _TASK_CLOSE_SCALAR_FIELDS.items():
+        if not _has_any_key(raw_args, aliases):
+            continue
+        value = compact_text(str(update_payload.get(payload_field) or ""))
+        if value:
+            merged[payload_field] = value
+
+    for payload_field, aliases in _TASK_CLOSE_LIST_FIELDS.items():
+        if not _has_any_key(raw_args, aliases):
+            continue
+        merged[payload_field] = _string_list(update_payload.get(payload_field))
+
+    return merged
+
+
+def _preview_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "task_title": str(payload.get("task_title") or ""),
+        "action": _close_action(payload.get("action")),
+        "action_label": _action_label(_close_action(payload.get("action"))),
+        "completion_summary": str(payload.get("completion_summary") or ""),
+        "task_points": _string_list(payload.get("task_points")),
+        "equipment_consumables": str(payload.get("equipment_consumables") or ""),
+        "overall_status": _overall_status(payload.get("overall_status")),
+        "overall_status_label": str(payload.get("overall_status_label") or ""),
+        "not_done_items": _string_list(payload.get("not_done_items")),
+        "unconfirmed_items": _string_list(payload.get("unconfirmed_items")),
+        "unresolved_items": _string_list(payload.get("unresolved_items")),
+        "missing_fields": _string_list(payload.get("missing_fields")),
+        "problem_types": _string_list(payload.get("problem_types")),
+        "ai_close_incomplete": bool(payload.get("ai_close_incomplete")),
+        "ai_close_marker": str(payload.get("ai_close_marker") or ""),
+        "result_text": str(payload.get("result_text") or ""),
+    }
+
+
+def _has_any_key(values: dict[str, Any], keys: tuple[str, ...]) -> bool:
+    return any(key in values for key in keys)
 
 
 async def _find_existing_report_file(
