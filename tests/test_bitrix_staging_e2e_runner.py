@@ -12,11 +12,15 @@ from scripts.bitrix_staging_e2e_runner import (
     default_lock_path,
     evaluate_response_text,
     event_processed,
+    expected_draft_type,
     expected_pending_draft,
     make_run_id,
     matching_response_messages,
+    missing_required_test_arg,
     queue_is_idle,
     release_dialog_lock,
+    render_test_text,
+    suite_needs_task_close_task,
     verify_draft_state,
 )
 from scripts.bitrix_staging_e2e_runner import (
@@ -239,3 +243,45 @@ def test_cleanup_tests_after_failure_ignores_read_failures() -> None:
     ]
 
     assert cleanup_tests_after_failure(tests, 0) == []
+
+
+def test_cleanup_tests_after_failure_handles_task_close_cleanup() -> None:
+    tests = [
+        RunnerTestCase(test_id="task-close", text="", kind="task_close_draft"),
+        RunnerTestCase(test_id="task-close-cleanup", text="", kind="task_close_cleanup"),
+        RunnerTestCase(test_id="read", text="", kind="read"),
+    ]
+
+    cleanup = cleanup_tests_after_failure(tests, 0)
+
+    assert [test.test_id for test in cleanup] == ["task-close-cleanup"]
+
+
+def test_tests_for_suite_task_close_creates_two_stateful_steps() -> None:
+    tests = runner_tests_for_suite("task_close", include_draft=False)
+
+    assert [test.test_id for test in tests] == [
+        "BITRIX-TASK-CLOSE-DRAFT-01",
+        "BITRIX-TASK-CLOSE-DISCARD-01",
+    ]
+    assert suite_needs_task_close_task(tests)
+    assert expected_pending_draft(tests[0]) is True
+    assert expected_draft_type(tests[0]) == "task_close"
+    assert expected_pending_draft(tests[1]) is False
+    assert expected_draft_type(tests[1]) == "task_close"
+
+
+def test_task_close_suite_formats_task_id_and_requires_numeric_id() -> None:
+    test = runner_tests_for_suite("task_close", include_draft=False)[0]
+
+    assert missing_required_test_arg(SimpleNamespace(task_close_task_id=""), test) == "task_close_task_id"
+    assert missing_required_test_arg(SimpleNamespace(task_close_task_id="abc"), test) == "task_close_task_id"
+    assert missing_required_test_arg(SimpleNamespace(task_close_task_id="8875"), test) == ""
+    assert render_test_text(test, args=SimpleNamespace(task_close_task_id="8875")) == "Битрикс закрой задачу 8875."
+
+
+def test_tests_for_suite_release_does_not_include_task_close_writes() -> None:
+    tests = runner_tests_for_suite("release", include_draft=False)
+
+    assert not suite_needs_task_close_task(tests)
+    assert all(test.kind not in {"task_close_draft", "task_close_cleanup"} for test in tests)
