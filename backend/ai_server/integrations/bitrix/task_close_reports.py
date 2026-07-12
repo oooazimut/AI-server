@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
-from ai_server.integrations.bitrix.portal_search.text_utils import safe_int, to_str
+from ai_server.utils import optional_int
 
 TASK_CLOSE_INCOMPLETE_MARKER = "AI_SERVER_TASK_CLOSE_INCOMPLETE"
 TASK_CLOSE_REPORT_FILE_RE = re.compile(
@@ -199,6 +199,14 @@ def _first(data: dict[str, Any], *keys: str) -> object | None:
         if key in data and data[key] is not None:
             return data[key]
     return None
+
+
+def safe_int(value: object) -> int | None:
+    return optional_int(value)
+
+
+def to_str(value: object) -> str:
+    return "" if value is None else str(value)
 
 
 def _unique_problem_types(values: list[str]) -> list[str]:
