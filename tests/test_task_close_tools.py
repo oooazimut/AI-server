@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+from pathlib import Path
 from unittest.mock import AsyncMock, call
 
 import anyio
@@ -11,10 +13,11 @@ from ai_server.agents.bitrix24.tools.task_close import (
     TASK_CLOSE_DRAFT_TYPE,
     TaskCloseConfirmTool,
     TaskCloseDraftTool,
+    TaskCloseReportIncidentTool,
 )
-from ai_server.integrations.bitrix.client import BitrixApiError
 from ai_server.models import ToolStatus
-from tests.fakes import FakeTaskDraftStore
+from ai_server.settings import get_settings
+from tests.fakes import FakePortalSearchIndex, FakeTaskDraftStore
 
 
 def _exec(tool, args, *, user_id=None, dialog_key=None, dialog_id=None):
@@ -45,7 +48,9 @@ def test_close_draft_saves_incomplete_marker():
     draft = store._drafts["d:13"]
     assert draft["_draft_type"] == TASK_CLOSE_DRAFT_TYPE
     assert draft["task_id"] == 139
-    assert INCOMPLETE_CLOSE_MARKER in draft["result_text"]
+    assert draft["ai_close_marker"] == INCOMPLETE_CLOSE_MARKER
+    assert INCOMPLETE_CLOSE_MARKER not in draft["result_text"]
+    assert "Статус AI-закрытия: неподтвержденная" in draft["result_text"]
     assert result.data["preview"]["unresolved_items"] == ["не приложен акт проверки"]
 
 
@@ -102,7 +107,7 @@ def test_close_draft_denies_missing_dialog_id():
     assert not store._drafts
 
 
-def test_close_confirm_uses_oauth_result_then_complete():
+def test_close_confirm_uses_oauth_close_then_system_report_file():
     store = FakeTaskDraftStore()
     anyio.run(
         lambda: store.save_task_draft(
@@ -118,22 +123,44 @@ def test_close_confirm_uses_oauth_result_then_complete():
         )
     )
     oauth_client = AsyncMock()
-    oauth_client.call = AsyncMock(side_effect=[{"result": 1}, {"result": True}])
+    oauth_client.call = AsyncMock(return_value={"result": True})
     oauth = FakeBitrixOAuth(oauth_client)
+    system_client = AsyncMock()
+    system_client.call = AsyncMock(
+        side_effect=[
+            {"result": []},
+            {"result": {"ATTACHMENT_ID": 5509, "FILE_ID": 62357, "NAME": "AI-close-139-ok.txt"}},
+        ]
+    )
 
-    tool = TaskCloseConfirmTool(store=store, bitrix_oauth=oauth, oauth_required_for_writes=True)
+    tool = TaskCloseConfirmTool(
+        store=store,
+        write_client=system_client,
+        bitrix_oauth=oauth,
+        oauth_required_for_writes=True,
+    )
     result = _exec(tool, {}, user_id=13, dialog_key="d:13", dialog_id="chat4321")
 
     assert result.status == ToolStatus.OK
     assert oauth.user_ids == [13]
-    assert oauth_client.call.await_args_list == [
-        call("tasks.task.result.add", {"taskId": 139, "fields": {"TEXT": "Выполнено"}}),
-        call("tasks.task.complete", {"taskId": 139}),
-    ]
+    assert oauth_client.call.await_args_list == [call("tasks.task.complete", {"taskId": 139})]
+    assert system_client.call.await_args_list[0] == call("task.item.getfiles", {"taskId": 139})
+    addfile_call = system_client.call.await_args_list[1]
+    assert addfile_call.args[0] == "task.item.addfile"
+    addfile_payload = addfile_call.args[1]
+    assert addfile_payload["taskId"] == 139
+    assert addfile_payload["fileParameters"]["NAME"] == "AI-close-139-ok.txt"
+    report_text = base64.b64decode(addfile_payload["fileParameters"]["CONTENT"]).decode("utf-8")
+    assert "AI task close report" in report_text
+    assert "Task ID: 139" in report_text
+    assert "Status: ok" in report_text
+    assert "Выполнено" in report_text
+    assert result.data["report_file_name"] == "AI-close-139-ok.txt"
+    assert result.data["report_file_owner"] == "system_bitrix_client"
     assert "d:13" not in store._drafts
 
 
-def test_close_confirm_falls_back_to_comment_when_task_result_add_is_missing():
+def test_close_confirm_reuses_existing_system_report_file():
     store = FakeTaskDraftStore()
     anyio.run(
         lambda: store.save_task_draft(
@@ -143,42 +170,64 @@ def test_close_confirm_falls_back_to_comment_when_task_result_add_is_missing():
                 "task_id": 139,
                 "task_title": "Task",
                 "action": "complete",
-                "result_text": "Done with marker AI_SERVER_TASK_CLOSE_INCOMPLETE",
+                "result_text": "Done with unconfirmed status",
+                "overall_status": "unconfirmed",
+                "ai_close_incomplete": True,
+                "ai_close_marker": INCOMPLETE_CLOSE_MARKER,
                 "unresolved_items": ["no photo"],
+                "unconfirmed_items": ["no photo"],
             },
         )
     )
     oauth_client = AsyncMock()
-    oauth_client.call = AsyncMock(
-        side_effect=[
-            BitrixApiError(
-                "tasks.task.result.add",
-                "ERROR_METHOD_NOT_FOUND",
-                "Could not find description of add in Bitrix\\Tasks\\Rest\\Controllers\\Task\\Result.",
-            ),
-            {"result": 125639},
-            {"result": True},
-        ]
+    oauth_client.call = AsyncMock(return_value={"result": True})
+    oauth = FakeBitrixOAuth(oauth_client)
+    system_client = AsyncMock()
+    existing = {"ATTACHMENT_ID": 5509, "FILE_ID": 62357, "NAME": "AI-close-139-unconfirmed.txt"}
+    system_client.call = AsyncMock(return_value={"result": [existing]})
+
+    tool = TaskCloseConfirmTool(
+        store=store,
+        write_client=system_client,
+        bitrix_oauth=oauth,
+        oauth_required_for_writes=True,
     )
+    result = _exec(tool, {}, user_id=13, dialog_key="d:13", dialog_id="chat4321")
+
+    assert result.status == ToolStatus.OK
+    assert result.data["result_method"] == "task.item.getfiles"
+    assert result.data["report_file_name"] == "AI-close-139-unconfirmed.txt"
+    assert result.data["report_add"] == existing
+    assert oauth_client.call.await_args_list == [
+        call("tasks.task.complete", {"taskId": 139}),
+    ]
+    assert system_client.call.await_args_list == [call("task.item.getfiles", {"taskId": 139})]
+    assert "d:13" not in store._drafts
+
+
+def test_close_confirm_denies_without_system_report_client():
+    store = FakeTaskDraftStore()
+    anyio.run(
+        lambda: store.save_task_draft(
+            "d:13",
+            {
+                "_draft_type": TASK_CLOSE_DRAFT_TYPE,
+                "task_id": 139,
+                "action": "complete",
+                "result_text": "Выполнено",
+            },
+        )
+    )
+    oauth_client = AsyncMock()
     oauth = FakeBitrixOAuth(oauth_client)
 
     tool = TaskCloseConfirmTool(store=store, bitrix_oauth=oauth, oauth_required_for_writes=True)
     result = _exec(tool, {}, user_id=13, dialog_key="d:13", dialog_id="chat4321")
 
-    assert result.status == ToolStatus.OK
-    assert result.data["result_method"] == "task.commentitem.add"
-    assert oauth_client.call.await_args_list == [
-        call(
-            "tasks.task.result.add",
-            {"taskId": 139, "fields": {"TEXT": "Done with marker AI_SERVER_TASK_CLOSE_INCOMPLETE"}},
-        ),
-        call(
-            "task.commentitem.add",
-            {"TASKID": 139, "FIELDS": {"POST_MESSAGE": "Done with marker AI_SERVER_TASK_CLOSE_INCOMPLETE"}},
-        ),
-        call("tasks.task.complete", {"taskId": 139}),
-    ]
-    assert "d:13" not in store._drafts
+    assert result.status == ToolStatus.NOT_CONFIGURED
+    assert "write_client" in result.error
+    assert oauth_client.call.await_args_list == []
+    assert "d:13" in store._drafts
 
 
 def test_close_confirm_can_approve_task():
@@ -197,14 +246,26 @@ def test_close_confirm_can_approve_task():
         )
     )
     oauth_client = AsyncMock()
-    oauth_client.call = AsyncMock(side_effect=[{"result": 1}, {"result": True}])
+    oauth_client.call = AsyncMock(return_value={"result": True})
     oauth = FakeBitrixOAuth(oauth_client)
+    system_client = AsyncMock()
+    system_client.call = AsyncMock(
+        side_effect=[
+            {"result": []},
+            {"result": {"ATTACHMENT_ID": 5510, "FILE_ID": 62358, "NAME": "AI-close-139-ok.txt"}},
+        ]
+    )
 
-    tool = TaskCloseConfirmTool(store=store, bitrix_oauth=oauth, oauth_required_for_writes=True)
+    tool = TaskCloseConfirmTool(
+        store=store,
+        write_client=system_client,
+        bitrix_oauth=oauth,
+        oauth_required_for_writes=True,
+    )
     result = _exec(tool, {}, user_id=13, dialog_key="d:13", dialog_id="chat4321")
 
     assert result.status == ToolStatus.OK
-    assert oauth_client.call.await_args_list[-1] == call("tasks.task.approve", {"taskId": 139})
+    assert oauth_client.call.await_args_list == [call("tasks.task.approve", {"taskId": 139})]
 
 
 def test_close_confirm_missing_close_draft():
@@ -215,6 +276,130 @@ def test_close_confirm_missing_close_draft():
     result = _exec(tool, {}, user_id=13, dialog_key="d:13", dialog_id="chat4321")
 
     assert result.status == ToolStatus.NOT_FOUND
+
+
+def test_task_close_report_incident_restore_readds_missing_report(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_TASK_CLOSE_REPORT_ADMIN_USER_IDS", "1")
+    index = FakePortalSearchIndex()
+    index.upsert_item(
+        entity_type="task",
+        entity_id=139,
+        title="Task",
+        body="AI close marker: AI_SERVER_TASK_CLOSE_INCOMPLETE",
+        metadata={
+            "ai_close_report_files": [
+                {
+                    "name": "AI-close-139-unconfirmed.txt",
+                    "attached_object_id": 5509,
+                    "disk_object_id": 62357,
+                    "problem_types": ["unconfirmed"],
+                }
+            ],
+            "ai_close_report_missing": True,
+            "ai_close_report_missing_files": [
+                {
+                    "name": "AI-close-139-unconfirmed.txt",
+                    "attached_object_id": 5509,
+                    "disk_object_id": 62357,
+                    "problem_types": ["unconfirmed"],
+                }
+            ],
+            "ai_close_report_incident_status": "pending",
+            "ai_close_incomplete": True,
+            "ai_close_marker": "AI_SERVER_TASK_CLOSE_INCOMPLETE",
+            "ai_close_problem_types": ["unconfirmed"],
+            "ai_close_marker_source": "task_attachment",
+        },
+    )
+
+    class RestoreClient:
+        def __init__(self) -> None:
+            self.addfile_payloads: list[dict] = []
+
+        async def get_disk_file_download_url(self, file_id: int) -> str:
+            return f"fake://disk/{file_id}"
+
+        async def download_file_from_url(self, url: str, destination: Path, *, max_bytes: int):
+            data = b"AI task close report\nStatus: unconfirmed\n"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(data)
+            return len(data)
+
+        async def result(self, method: str, payload: dict):
+            assert method == "task.item.addfile"
+            self.addfile_payloads.append(payload)
+            return {"ATTACHMENT_ID": 901, "FILE_ID": 62357, "NAME": payload["fileParameters"]["NAME"]}
+
+    client = RestoreClient()
+    tool = TaskCloseReportIncidentTool(client=client, portal_search=index, settings=get_settings())
+    result = _exec(
+        tool,
+        {"task_id": 139, "action": "restore"},
+        user_id=1,
+        dialog_key="d:1",
+        dialog_id="1",
+    )
+
+    assert result.status == ToolStatus.OK
+    assert client.addfile_payloads[0]["fileParameters"]["NAME"] == "AI-close-139-unconfirmed.txt"
+    task = index.get_item(entity_type="task", entity_id=139)
+    assert task is not None
+    assert task.metadata["ai_close_report_missing"] is False
+    assert task.metadata["ai_close_report_incident_status"] == "restored"
+    assert task.metadata["ai_close_report_files"][0]["attached_object_id"] == 901
+
+
+def test_task_close_report_incident_accept_missing_clears_index_metadata(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_TASK_CLOSE_REPORT_ADMIN_USER_IDS", "1")
+    index = FakePortalSearchIndex()
+    report_file = {
+        "name": "AI-close-139-unconfirmed.txt",
+        "attached_object_id": 5509,
+        "disk_object_id": 62357,
+        "problem_types": ["unconfirmed"],
+    }
+    index.upsert_item(
+        entity_type="task",
+        entity_id=139,
+        title="Task",
+        body=("Task body\nAI close marker: AI_SERVER_TASK_CLOSE_INCOMPLETE\nAI close problem types: unconfirmed"),
+        metadata={
+            "ai_close_report_files": [report_file],
+            "ai_close_report_missing": True,
+            "ai_close_report_missing_files": [report_file],
+            "ai_close_report_incident_status": "pending",
+            "ai_close_incomplete": True,
+            "ai_close_marker": "AI_SERVER_TASK_CLOSE_INCOMPLETE",
+            "ai_close_problem_types": ["unconfirmed"],
+            "ai_close_marker_source": "task_attachment",
+        },
+    )
+    index.upsert_item(
+        entity_type="task_attachment",
+        entity_id=5509,
+        title="AI-close-139-unconfirmed.txt",
+        metadata={"ai_close_report": True},
+    )
+
+    tool = TaskCloseReportIncidentTool(portal_search=index, settings=get_settings())
+    result = _exec(
+        tool,
+        {"task_id": 139, "action": "accept_missing"},
+        user_id=1,
+        dialog_key="d:1",
+        dialog_id="1",
+    )
+
+    assert result.status == ToolStatus.OK
+    assert index.get_item(entity_type="task_attachment", entity_id=5509) is None
+    task = index.get_item(entity_type="task", entity_id=139)
+    assert task is not None
+    assert "ai_close_report_missing" not in task.metadata
+    assert task.metadata["ai_close_report_files"] == []
+    assert task.metadata["ai_close_incomplete"] is False
+    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" not in task.body
 
 
 class FakeBitrixOAuth:

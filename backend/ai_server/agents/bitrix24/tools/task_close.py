@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import base64
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from ai_server.agents.bitrix24.ports import TaskDraftStorePort
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
+from ai_server.integrations.bitrix.portal_search.search_index import PortalSearchIndex
+from ai_server.integrations.bitrix.task_close_reports import (
+    restore_task_close_report_file,
+    task_close_report_key,
+    task_close_report_problem_types,
+)
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
+from ai_server.settings import Settings, get_settings
 from ai_server.tools.bitrix_policy import apply_write_policy
 from ai_server.tools.bitrix_ports import BitrixWritePort
-from ai_server.utils import compact_text, optional_int
+from ai_server.utils import MOSCOW_TZ, compact_text, optional_int
 
 TASK_CLOSE_DRAFT_TYPE = "task_close"
 INCOMPLETE_CLOSE_MARKER = "AI_SERVER_TASK_CLOSE_INCOMPLETE"
@@ -146,7 +155,7 @@ class TaskCloseDraftTool:
             description=(
                 "Prepare a Bitrix task closing draft. Use instead of direct bitrix_api writes for task closing. "
                 "Call only after the task and completion result are understood. The user must confirm before "
-                "tasks.task.result.add plus tasks.task.complete/tasks.task.approve is executed."
+                "a protected AI close report file plus tasks.task.complete/tasks.task.approve is executed."
             ),
             parameters={
                 "type": "object",
@@ -296,9 +305,20 @@ class TaskCloseConfirmTool:
                     error="Bitrix OAuth is required for task closing.",
                     data={"draft": draft},
                 )
+            if compact_text(str(draft.get("result_text") or "")) and self._write_client is None:
+                return ToolResult(
+                    status=ToolStatus.NOT_CONFIGURED,
+                    tool=self.name,
+                    error="System Bitrix write_client is required to attach protected task close report.",
+                    data={"draft": draft},
+                )
             try:
                 oauth_client = await self._bitrix_oauth.client_for_user(user_id)
-                result = await _execute_task_close(oauth_client.call, draft)
+                result = await _execute_task_close(
+                    close_call=oauth_client.call,
+                    report_call=self._write_client.call if self._write_client is not None else None,
+                    draft=draft,
+                )
             except BitrixOAuthTokenMissing as exc:
                 return ToolResult(
                     status=ToolStatus.NOT_CONFIGURED, tool=self.name, error=str(exc), data={"draft": draft}
@@ -328,7 +348,11 @@ class TaskCloseConfirmTool:
                 data={"draft": draft},
             )
         try:
-            result = await _execute_task_close(self._write_client.call, draft)
+            result = await _execute_task_close(
+                close_call=self._write_client.call,
+                report_call=self._write_client.call,
+                draft=draft,
+            )
         except Exception as exc:
             return ToolResult(
                 status=ToolStatus.ERROR, tool=self.name, error=f"{type(exc).__name__}: {exc}", data={"draft": draft}
@@ -363,8 +387,149 @@ class TaskCloseDiscardTool:
         return ToolResult(status=ToolStatus.OK, tool=self.name, data={"discarded": bool(dialog_key)})
 
 
+class TaskCloseReportIncidentTool:
+    name = "task_close_report_incident"
+
+    def __init__(
+        self,
+        *,
+        client: Any | None = None,
+        portal_search: PortalSearchIndex | None = None,
+        settings: Settings | None = None,
+    ) -> None:
+        self._client = client
+        self._portal_search = portal_search
+        self._settings = settings or get_settings()
+
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name=self.name,
+            description=(
+                "Resolve an AI task close report integrity incident after an admin text reply. "
+                "Use action=restore for option 1 and action=accept_missing for option 2."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "integer"},
+                    "action": {"type": "string", "enum": ["restore", "accept_missing"]},
+                    "file_name": {"type": "string"},
+                },
+                "required": ["task_id", "action"],
+            },
+        )
+
+    async def execute(
+        self,
+        args: dict[str, Any],
+        *,
+        user_id: int | None = None,
+        dialog_key: str | None = None,
+        dialog_id: str | None = None,
+    ) -> ToolResult:
+        if context_error := _write_context_error(user_id=user_id, dialog_id=dialog_id):
+            return ToolResult(status=ToolStatus.DENIED, tool=self.name, error=context_error)
+        if user_id not in set(self._settings.resolved_task_close_report_admin_user_ids):
+            return ToolResult(
+                status=ToolStatus.DENIED,
+                tool=self.name,
+                error="Only configured Bitrix task close report admins can resolve this incident.",
+            )
+        if self._portal_search is None:
+            return ToolResult(
+                status=ToolStatus.NOT_CONFIGURED,
+                tool=self.name,
+                error="PortalSearchIndex is required to resolve task close report incidents.",
+            )
+
+        task_id = optional_int(args.get("task_id"))
+        action = _report_incident_action(args.get("action"))
+        if task_id is None or not action:
+            return ToolResult(
+                status=ToolStatus.INVALID_TOOL_CALL,
+                tool=self.name,
+                error="task_close_report_incident requires task_id and action=restore|accept_missing.",
+            )
+
+        task = self._portal_search.get_item(entity_type="task", entity_id=task_id)
+        if task is None:
+            return ToolResult(status=ToolStatus.NOT_FOUND, tool=self.name, error=f"Task #{task_id} is not indexed.")
+        metadata = dict(task.metadata or {})
+        missing_files = _dict_list(metadata.get("ai_close_report_missing_files"))
+        if not missing_files:
+            return ToolResult(
+                status=ToolStatus.NOT_FOUND,
+                tool=self.name,
+                error=f"No pending AI close report incident found for task #{task_id}.",
+            )
+        file_record = _select_report_file(missing_files, str(args.get("file_name") or ""))
+        if file_record is None:
+            return ToolResult(
+                status=ToolStatus.NOT_FOUND,
+                tool=self.name,
+                error="Requested AI close report file is not pending for this task.",
+            )
+
+        if action == "restore":
+            if self._client is None:
+                return ToolResult(
+                    status=ToolStatus.NOT_CONFIGURED,
+                    tool=self.name,
+                    error="Bitrix client is required to restore the AI close report file.",
+                )
+            try:
+                restore_result = await restore_task_close_report_file(
+                    self._client,
+                    task_id=task_id,
+                    file_record=file_record,
+                    max_bytes=self._settings.attachment_max_bytes,
+                )
+            except (BitrixApiError, BitrixConfigError) as exc:
+                return ToolResult(status=ToolStatus.ERROR, tool=self.name, error=str(exc))
+            except Exception as exc:
+                return ToolResult(status=ToolStatus.ERROR, tool=self.name, error=f"{type(exc).__name__}: {exc}")
+            updated_metadata = _metadata_after_report_restore(metadata, restore_result.get("restored_file"))
+            updated_body = _body_with_ai_close_marker(task.body, updated_metadata)
+            self._portal_search.update_item_body_metadata(
+                entity_type="task",
+                entity_id=task_id,
+                body=updated_body,
+                metadata=updated_metadata,
+            )
+            return ToolResult(
+                status=ToolStatus.OK,
+                tool=self.name,
+                data={
+                    "action": "restore",
+                    "task_id": task_id,
+                    "file_name": file_record.get("name"),
+                    "restore_result": restore_result,
+                },
+            )
+
+        updated_metadata = _metadata_after_report_accept_missing(metadata)
+        updated_body = _body_without_ai_close_marker(task.body)
+        for record in missing_files:
+            attached_object_id = optional_int(record.get("attached_object_id"))
+            if attached_object_id is not None:
+                self._portal_search.delete_item(entity_type="task_attachment", entity_id=attached_object_id)
+        self._portal_search.update_item_body_metadata(
+            entity_type="task",
+            entity_id=task_id,
+            body=updated_body,
+            metadata=updated_metadata,
+        )
+        return ToolResult(
+            status=ToolStatus.OK,
+            tool=self.name,
+            data={"action": "accept_missing", "task_id": task_id, "file_name": file_record.get("name")},
+        )
+
+
 async def _execute_task_close(
-    call: Callable[[str, dict[str, Any]], Awaitable[Any]],
+    *,
+    close_call: Callable[[str, dict[str, Any]], Awaitable[Any]],
+    report_call: Callable[[str, dict[str, Any]], Awaitable[Any]] | None,
     draft: dict[str, Any],
 ) -> dict[str, Any]:
     task_id = optional_int(draft.get("task_id"))
@@ -373,35 +538,50 @@ async def _execute_task_close(
     result_text = compact_text(str(draft.get("result_text") or ""))
     action = _close_action(draft.get("action"))
 
-    result_add = None
-    result_method = ""
-    if result_text:
-        result_params = apply_write_policy(
-            "tasks.task.result.add",
-            {"taskId": task_id, "fields": {"TEXT": result_text}},
-        )
-        try:
-            result_add = await call("tasks.task.result.add", result_params)
-            result_method = "tasks.task.result.add"
-        except BitrixApiError as exc:
-            if not _task_result_add_method_missing(exc):
-                raise
-            result_params = apply_write_policy(
-                "task.commentitem.add",
-                {"TASKID": task_id, "FIELDS": {"POST_MESSAGE": result_text}},
-            )
-            result_add = await call("task.commentitem.add", result_params)
-            result_method = "task.commentitem.add"
-
     close_method = "tasks.task.approve" if action == "approve" else "tasks.task.complete"
     close_params = apply_write_policy(close_method, {"taskId": task_id})
-    close_result = await call(close_method, close_params)
+    close_result = await close_call(close_method, close_params)
+
+    report_add = None
+    report_method = ""
+    report_file_name = ""
+    report_file_content = ""
+    if result_text:
+        if report_call is None:
+            raise BitrixConfigError("system Bitrix write_client is required to attach protected task close report.")
+        report_file_name = _report_file_name(task_id, draft)
+        report_file_content = _report_file_content(task_id=task_id, action=action, draft=draft)
+        existing_report = await _find_existing_report_file(report_call, task_id=task_id, file_name=report_file_name)
+        if existing_report is not None:
+            report_add = existing_report
+            report_method = "task.item.getfiles"
+        else:
+            report_params = apply_write_policy(
+                "task.item.addfile",
+                {
+                    "taskId": task_id,
+                    "fileParameters": {
+                        "NAME": report_file_name,
+                        "CONTENT": base64.b64encode(report_file_content.encode("utf-8")).decode("ascii"),
+                    },
+                },
+            )
+            report_add = await report_call("task.item.addfile", report_params)
+            report_method = "task.item.addfile"
     return {
         "task_id": task_id,
         "task_title": str(draft.get("task_title") or ""),
         "action": action,
-        "result_method": result_method,
-        "result_add": result_add,
+        "result_method": report_method,
+        "result_add": report_add,
+        "report_method": report_method,
+        "report_file_name": report_file_name,
+        "report_file_content": report_file_content,
+        "report_add": report_add,
+        "report_file_owner": "system_bitrix_client" if report_file_name else "",
+        "report_file_edit_protection": "content_edit_denied_for_regular_users_when_created_by_system_client"
+        if report_file_name
+        else "",
         "close_method": close_method,
         "close_result": close_result,
         "not_done_items": _string_list(draft.get("not_done_items")),
@@ -411,18 +591,6 @@ async def _execute_task_close(
         "ai_close_incomplete": bool(draft.get("ai_close_incomplete")),
         "ai_close_marker": str(draft.get("ai_close_marker") or ""),
     }
-
-
-def _task_result_add_method_missing(exc: BitrixApiError) -> bool:
-    if exc.method != "tasks.task.result.add":
-        return False
-    text = f"{exc.error} {exc.description}".casefold()
-    return (
-        "method_not_found" in text
-        or "error_method_not_found" in text
-        or "could not find description" in text
-        or "task\\result" in text
-    )
 
 
 def _result_text(
@@ -449,7 +617,7 @@ def _result_text(
         lines.append(f"Общий итог: {overall_status_label}")
     if not_done_items or unconfirmed_items:
         lines.append("")
-        lines.append(f"Метка: {INCOMPLETE_CLOSE_MARKER}")
+        lines.append(f"Статус AI-закрытия: {_ai_close_human_status(not_done_items, unconfirmed_items)}")
     if not_done_items:
         lines.append("Невыполненные пункты:")
         lines.extend(f"- {item}" for item in not_done_items)
@@ -457,6 +625,109 @@ def _result_text(
         lines.append("Неподтверждённые пункты:")
         lines.extend(f"- {item}" for item in unconfirmed_items)
     return "\n".join(lines).strip()
+
+
+async def _find_existing_report_file(
+    call: Callable[[str, dict[str, Any]], Awaitable[Any]],
+    *,
+    task_id: int,
+    file_name: str,
+) -> dict[str, Any] | None:
+    try:
+        result = await call("task.item.getfiles", {"taskId": task_id})
+    except Exception:
+        return None
+    for item in _extract_file_items(result):
+        if str(item.get("NAME") or item.get("name") or "") == file_name:
+            return item
+    return None
+
+
+def _extract_file_items(result: Any) -> list[dict[str, Any]]:
+    if isinstance(result, list):
+        return [item for item in result if isinstance(item, dict)]
+    if not isinstance(result, dict):
+        return []
+    value = result.get("result")
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        return _extract_file_items(value)
+    for key in ("files", "FILES", "items"):
+        nested = result.get(key)
+        if isinstance(nested, list):
+            return [item for item in nested if isinstance(item, dict)]
+    return []
+
+
+def _report_file_name(task_id: int, draft: dict[str, Any]) -> str:
+    suffix = _report_file_status(draft)
+    return f"AI-close-{task_id}-{suffix}.txt"
+
+
+def _report_file_status(draft: dict[str, Any]) -> str:
+    not_done_items = _string_list(draft.get("not_done_items"))
+    unconfirmed_items = _string_list(draft.get("unconfirmed_items") or draft.get("unresolved_items"))
+    overall_status = _overall_status(draft.get("overall_status"))
+    if unconfirmed_items or overall_status == "unconfirmed":
+        return "unconfirmed"
+    if overall_status == "not_done":
+        return "failed"
+    if not_done_items or overall_status == "partial":
+        return "partial"
+    return "ok"
+
+
+def _report_file_content(*, task_id: int, action: str, draft: dict[str, Any]) -> str:
+    task_title = compact_text(str(draft.get("task_title") or ""))
+    completion_summary = compact_text(str(draft.get("completion_summary") or draft.get("result_text") or ""))
+    task_points = _string_list(draft.get("task_points"))
+    equipment_consumables = compact_text(str(draft.get("equipment_consumables") or ""))
+    overall_status_label = compact_text(str(draft.get("overall_status_label") or ""))
+    not_done_items = _string_list(draft.get("not_done_items"))
+    unconfirmed_items = _string_list(draft.get("unconfirmed_items") or draft.get("unresolved_items"))
+    missing_fields = _string_list(draft.get("missing_fields"))
+    status = _report_file_status(draft)
+    lines = [
+        "AI task close report",
+        f"Task ID: {task_id}",
+        f"Task: {task_title or f'#{task_id}'}",
+        f"Action: {action}",
+        f"Status: {status}",
+        f"Created at: {datetime.now(MOSCOW_TZ).isoformat(timespec='seconds')}",
+        "Source: AI-server task_close_confirm",
+    ]
+    if completion_summary:
+        lines.extend(["", "Summary:", completion_summary])
+    if task_points:
+        lines.append("")
+        lines.append("Task points:")
+        lines.extend(f"{index}. {item}" for index, item in enumerate(task_points, start=1))
+    if equipment_consumables:
+        lines.extend(["", "Equipment and consumables:", equipment_consumables])
+    if overall_status_label:
+        lines.extend(["", "Overall:", overall_status_label])
+    if not_done_items:
+        lines.append("")
+        lines.append("Not done:")
+        lines.extend(f"- {item}" for item in not_done_items)
+    if unconfirmed_items:
+        lines.append("")
+        lines.append("Unconfirmed:")
+        lines.extend(f"- {item}" for item in unconfirmed_items)
+    if missing_fields:
+        lines.append("")
+        lines.append("Missing details:")
+        lines.extend(f"- {item}" for item in missing_fields)
+    return "\n".join(lines).strip() + "\n"
+
+
+def _ai_close_human_status(not_done_items: list[str], unconfirmed_items: list[str]) -> str:
+    if not_done_items and unconfirmed_items:
+        return "выполнена частично, неподтвержденная"
+    if not_done_items:
+        return "выполнена частично"
+    return "неподтвержденная"
 
 
 def _string_list(value: object) -> list[str]:
@@ -534,6 +805,158 @@ def _write_context_error(*, user_id: int | None, dialog_id: str | None) -> str:
     return ""
 
 
+def _report_incident_action(value: object) -> str:
+    text = str(value or "").strip().casefold()
+    if text in {"restore", "1", "one", "first", "первый", "первый вариант", "восстановить", "вернуть"}:
+        return "restore"
+    if text in {
+        "accept_missing",
+        "accept",
+        "2",
+        "two",
+        "second",
+        "второй",
+        "второй вариант",
+        "удалить",
+        "всё в порядке",
+        "все в порядке",
+    }:
+        return "accept_missing"
+    return ""
+
+
+def _select_report_file(files: list[dict[str, Any]], file_name: str) -> dict[str, Any] | None:
+    if not files:
+        return None
+    normalized = file_name.strip().casefold()
+    if not normalized:
+        return files[0]
+    for record in files:
+        if str(record.get("name") or "").strip().casefold() == normalized:
+            return record
+    return None
+
+
+def _metadata_after_report_restore(metadata: dict[str, Any], restored_file: object) -> dict[str, Any]:
+    result = dict(metadata)
+    restored = dict(restored_file) if isinstance(restored_file, dict) else {}
+    files = _dict_list(result.get("ai_close_report_files"))
+    if restored:
+        files = _replace_report_file(files, restored)
+    result["ai_close_report_files"] = files
+    result["ai_close_report_missing"] = False
+    result["ai_close_report_missing_files"] = []
+    result["ai_close_report_incident_status"] = "restored"
+    result["ai_close_report_restored_at"] = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
+    _drop_report_incident_error_keys(result)
+    _apply_ai_close_metadata_from_report_files(result, files)
+    return result
+
+
+def _metadata_after_report_accept_missing(metadata: dict[str, Any]) -> dict[str, Any]:
+    result = dict(metadata)
+    missing_files = _dict_list(result.get("ai_close_report_missing_files"))
+    missing_keys = {task_close_report_key(record) for record in missing_files}
+    files = [
+        record
+        for record in _dict_list(result.get("ai_close_report_files"))
+        if task_close_report_key(record) not in missing_keys
+    ]
+    result["ai_close_report_files"] = files
+    for key in (
+        "ai_close_report_missing",
+        "ai_close_report_missing_files",
+        "ai_close_report_incident_status",
+        "ai_close_report_incident_key",
+        "ai_close_report_detected_at",
+        "ai_close_report_auto_restore_after",
+        "ai_close_report_alert_sent_at",
+        "ai_close_report_restored_at",
+    ):
+        result.pop(key, None)
+    _drop_report_incident_error_keys(result)
+    _apply_ai_close_metadata_from_report_files(result, files)
+    return result
+
+
+def _replace_report_file(files: list[dict[str, Any]], restored: dict[str, Any]) -> list[dict[str, Any]]:
+    restored_key = task_close_report_key(restored)
+    replaced = False
+    result: list[dict[str, Any]] = []
+    for record in files:
+        if task_close_report_key(record) == restored_key or str(record.get("name") or "") == str(
+            restored.get("name") or ""
+        ):
+            result.append(restored)
+            replaced = True
+        else:
+            result.append(record)
+    if not replaced:
+        result.append(restored)
+    return result
+
+
+def _drop_report_incident_error_keys(metadata: dict[str, Any]) -> None:
+    for key in ("ai_close_report_alert_error", "ai_close_report_restore_error"):
+        metadata.pop(key, None)
+
+
+def _apply_ai_close_metadata_from_report_files(metadata: dict[str, Any], files: list[dict[str, Any]]) -> None:
+    problem_types = _unique_strings(
+        [
+            problem_type
+            for record in files
+            for problem_type in [
+                *task_close_report_problem_types([str(record.get("name") or "")]),
+                *_string_list(record.get("problem_types")),
+            ]
+        ]
+    )
+    problem_types = [item for item in problem_types if item in {"not_done", "unconfirmed"}]
+    if problem_types:
+        metadata["ai_close_incomplete"] = True
+        metadata["ai_close_marker"] = INCOMPLETE_CLOSE_MARKER
+        metadata["ai_close_problem_types"] = problem_types
+        metadata["ai_close_has_not_done"] = "not_done" in problem_types
+        metadata["ai_close_has_unconfirmed"] = "unconfirmed" in problem_types
+        metadata["ai_close_marker_source"] = "task_attachment"
+        return
+    if metadata.get("ai_close_marker_source") == "task_attachment":
+        metadata["ai_close_incomplete"] = False
+        metadata["ai_close_marker"] = ""
+        metadata["ai_close_problem_types"] = []
+        metadata["ai_close_has_not_done"] = False
+        metadata["ai_close_has_unconfirmed"] = False
+        metadata["ai_close_marker_source"] = ""
+
+
+def _body_without_ai_close_marker(body: str) -> str:
+    return "\n".join(
+        line
+        for line in str(body or "").splitlines()
+        if not line.startswith("AI close marker:") and not line.startswith("AI close problem types:")
+    ).strip()
+
+
+def _body_with_ai_close_marker(body: str, metadata: dict[str, Any]) -> str:
+    cleaned = _body_without_ai_close_marker(body)
+    if not metadata.get("ai_close_incomplete"):
+        return cleaned
+    parts = [cleaned] if cleaned else []
+    if INCOMPLETE_CLOSE_MARKER not in cleaned:
+        parts.append(f"AI close marker: {INCOMPLETE_CLOSE_MARKER}")
+    problem_types = _string_list(metadata.get("ai_close_problem_types"))
+    if problem_types and "AI close problem types:" not in cleaned:
+        parts.append("AI close problem types: " + ", ".join(problem_types))
+    return "\n".join(parts).strip()
+
+
+def _dict_list(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
+
+
 __all__ = [
     "BitrixTaskCloseDraft",
     "INCOMPLETE_CLOSE_MARKER",
@@ -541,5 +964,6 @@ __all__ = [
     "TaskCloseDraftTool",
     "TaskCloseConfirmTool",
     "TaskCloseDiscardTool",
+    "TaskCloseReportIncidentTool",
     "build_task_close_draft_from_args",
 ]

@@ -307,6 +307,64 @@ def test_bitrix_llm_decide_routes_ai_close_problem_search(monkeypatch):
     }
 
 
+def test_bitrix_llm_decide_routes_task_close_report_incident_reply(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    service = BitrixLLMService(client, settings=get_settings())
+    tool_definitions = [
+        ToolDefinition(name="task_close_report_incident", description="", parameters={}).model_dump(),
+        ToolDefinition(name="none", description="", parameters={}).model_dump(),
+    ]
+    history = [
+        {
+            "role": "assistant",
+            "content": (
+                "Контроль AI-закрытия: файл отчёта исчез из задачи.\n"
+                "Задача #303: Проверить архив\n"
+                "Файл: AI-close-303-unconfirmed.txt\n"
+                "1 — восстановить файл в задаче\n"
+                "2 — всё в порядке, удалить эти данные из индекса"
+            ),
+        }
+    ]
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t1", request="1", user={"id": "1"}),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+            dialog_history=history,
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_report_incident"]
+    assert result.decision.tool_calls[0].args == {
+        "task_id": 303,
+        "action": "restore",
+        "file_name": "AI-close-303-unconfirmed.txt",
+    }
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t2", request="второй вариант", user={"id": "1"}),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+            dialog_history=history,
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_report_incident"]
+    assert result.decision.tool_calls[0].args == {
+        "task_id": 303,
+        "action": "accept_missing",
+        "file_name": "AI-close-303-unconfirmed.txt",
+    }
+
+
 def test_bitrix_llm_decide_routes_project_search_to_deterministic_tool(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient(
@@ -482,7 +540,8 @@ def test_bitrix_specialist_enforces_structured_task_close_draft_response():
     assert "Итог: выполнена частично" in result.answer
     assert "Не выполнено:" in result.answer
     assert "Не подтверждено:" in result.answer
-    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" in result.answer
+    assert "Статус AI-закрытия: выполнена частично, неподтвержденная" in result.answer
+    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" not in result.answer
     assert "уже подготовлен" not in result.answer
 
 
@@ -1331,7 +1390,8 @@ def test_bitrix_llm_compose_formats_task_close_draft(monkeypatch):
     assert "Черновик закрытия задачи" in result.answer
     assert "Обучение сотрудников" in result.answer
     assert "не приложен акт проверки" in result.answer
-    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" in result.answer
+    assert "Статус AI-закрытия: неподтвержденная" in result.answer
+    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" not in result.answer
     assert "[URL" not in result.answer
 
 
@@ -1457,8 +1517,7 @@ def test_bitrix_llm_compose_formats_task_close_confirm_with_task_link(monkeypatc
     assert result.answer == (
         "Задача отмечена выполненной: "
         "[URL=https://asutp-expert.bitrix24.ru/company/personal/user/0/tasks/task/view/139/]"
-        "Обучение сотрудников[/URL]. С непроверенными пунктами добавлена метка "
-        "AI_SERVER_TASK_CLOSE_INCOMPLETE."
+        "Обучение сотрудников[/URL]. Статус: неподтвержденная."
     )
     assert "/company/personal/user/13/" not in result.answer
 
