@@ -15,6 +15,7 @@ from ai_server.integrations.bitrix.task_close_reports import (
     restore_task_close_report_file,
     task_close_report_key,
     task_close_report_problem_types,
+    task_close_report_state_key,
 )
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.settings import Settings, get_settings
@@ -497,6 +498,14 @@ class TaskCloseReportIncidentTool:
                 body=updated_body,
                 metadata=updated_metadata,
             )
+            _upsert_report_incident_state(
+                self._portal_search,
+                task_id=task_id,
+                file_record=file_record,
+                status="restored",
+                payload={"restore_result": restore_result},
+                actor_user_id=user_id,
+            )
             return ToolResult(
                 status=ToolStatus.OK,
                 tool=self.name,
@@ -514,6 +523,14 @@ class TaskCloseReportIncidentTool:
             attached_object_id = optional_int(record.get("attached_object_id"))
             if attached_object_id is not None:
                 self._portal_search.delete_item(entity_type="task_attachment", entity_id=attached_object_id)
+            _upsert_report_incident_state(
+                self._portal_search,
+                task_id=task_id,
+                file_record=record,
+                status="accepted_missing",
+                payload={"accepted_file": record},
+                actor_user_id=user_id,
+            )
         self._portal_search.update_item_body_metadata(
             entity_type="task",
             entity_id=task_id,
@@ -899,6 +916,27 @@ def _same_logical_report_file(left: dict[str, Any], right: dict[str, Any]) -> bo
     left_name = str(left.get("canonical_name") or canonical_task_close_report_file_name(left.get("name"))).casefold()
     right_name = str(right.get("canonical_name") or canonical_task_close_report_file_name(right.get("name"))).casefold()
     return bool(left_name and left_name == right_name)
+
+
+def _upsert_report_incident_state(
+    portal_search: PortalSearchIndex,
+    *,
+    task_id: int,
+    file_record: dict[str, Any],
+    status: str,
+    payload: dict[str, Any] | None = None,
+    actor_user_id: int | None = None,
+) -> None:
+    upsert = getattr(portal_search, "upsert_task_close_processing_state", None)
+    if not callable(upsert):
+        return
+    upsert(
+        task_id=task_id,
+        state_key=task_close_report_state_key(file_record),
+        status=status,
+        payload=payload,
+        actor_user_id=actor_user_id,
+    )
 
 
 def _drop_report_incident_error_keys(metadata: dict[str, Any]) -> None:

@@ -600,6 +600,8 @@ class FakePortalSearchIndex:
     def __init__(self, *, exists: bool = True) -> None:
         self._exists = exists
         self._items: dict[tuple[str, str], dict[str, Any]] = {}
+        self._task_close_processing_state: dict[tuple[str, str], dict[str, Any]] = {}
+        self._task_close_control_events: dict[tuple[str, str], dict[str, Any]] = {}
 
     def ensure_schema(self) -> None:
         pass
@@ -794,6 +796,56 @@ class FakePortalSearchIndex:
         if key in self._items:
             self._items[key]["body"] = body
             self._items[key]["metadata"] = metadata
+
+    def get_task_close_processing_state(self, *, task_id: object, state_key: str) -> dict[str, Any] | None:
+        state = self._task_close_processing_state.get((str(task_id), state_key))
+        return dict(state) if state else None
+
+    def upsert_task_close_processing_state(
+        self,
+        *,
+        task_id: object,
+        state_key: str,
+        status: str,
+        payload: dict[str, Any] | None = None,
+        actor_user_id: int | None = None,
+    ) -> None:
+        self._task_close_processing_state[(str(task_id), state_key)] = {
+            "task_id": str(task_id),
+            "state_key": state_key,
+            "status": status,
+            "payload": dict(payload or {}),
+            "actor_user_id": actor_user_id,
+        }
+
+    def get_task_close_control_event(self, *, task_id: object, close_event_key: str) -> dict[str, Any] | None:
+        event = self._task_close_control_events.get((str(task_id), close_event_key))
+        return dict(event) if event else None
+
+    def upsert_task_close_control_event(
+        self,
+        *,
+        task_id: object,
+        close_event_key: str,
+        decision: str,
+        reason: str = "",
+        closed_at: str | None = None,
+        responsible_id: int | None = None,
+        closed_by_user_id: int | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        if not close_event_key or not decision:
+            return
+        self._task_close_control_events[(str(task_id), close_event_key)] = {
+            "task_id": str(task_id),
+            "close_event_key": close_event_key,
+            "decision": decision,
+            "reason": reason,
+            "closed_at": closed_at,
+            "responsible_id": responsible_id,
+            "closed_by_user_id": closed_by_user_id,
+            "payload": dict(payload or {}),
+        }
 
 
 class FakeOrchestratorStore:

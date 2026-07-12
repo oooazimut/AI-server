@@ -76,6 +76,10 @@ def task_close_report_key(record: dict[str, Any]) -> str:
     return f"name:{str(record.get('name') or '').casefold()}"
 
 
+def task_close_report_state_key(record: dict[str, Any]) -> str:
+    return f"ai_close_report:{task_close_report_key(record)}"
+
+
 async def restore_task_close_report_file(
     bitrix: Any,
     *,

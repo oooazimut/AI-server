@@ -482,6 +482,77 @@ def test_bitrix_store_update_responsible_response(monkeypatch):
     assert any("responsible_response" in sql for sql, _ in conn.calls)
 
 
+def test_bitrix_store_upserts_task_close_controlled_user_without_controlled_from(monkeypatch):
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    factory, conn = _sync_conn_factory()
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    store.upsert_task_close_controlled_user(user_id=231, active=True, updated_by=1)
+
+    sql, params = conn.calls[0]
+    assert "task_close_controlled_users" in sql
+    assert "controlled_from" not in sql
+    assert params == (231, True, 1)
+
+
+def test_bitrix_store_get_task_close_control_event_parses_payload(monkeypatch):
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    row = {
+        "task_id": 8875,
+        "close_event_key": "closed_at:2026-07-12T12:00:00+03:00",
+        "responsible_id": 231,
+        "closed_by_user_id": 231,
+        "closed_at": "2026-07-12T12:00:00+03:00",
+        "decision": "controlled",
+        "reason": "controlled_at_close_time",
+        "payload_json": json.dumps({"source": "sync"}),
+        "seen_at": "2026-07-12T12:01:00+03:00",
+        "updated_at": "2026-07-12T12:01:00+03:00",
+    }
+    factory, conn = _sync_conn_factory(rows=[row])
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    result = store.get_task_close_control_event(
+        task_id=8875,
+        close_event_key="closed_at:2026-07-12T12:00:00+03:00",
+    )
+
+    assert result is not None
+    assert result["decision"] == "controlled"
+    assert result["payload"] == {"source": "sync"}
+    assert conn.calls[0][1] == (8875, "closed_at:2026-07-12T12:00:00+03:00")
+
+
+def test_bitrix_store_upserts_task_close_control_event(monkeypatch):
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    factory, conn = _sync_conn_factory()
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    store.upsert_task_close_control_event(
+        task_id=8875,
+        close_event_key="closed_at:2026-07-12T12:00:00+03:00",
+        decision="ignored_user_not_controlled_at_close",
+        reason="user_not_controlled_at_close_time",
+        closed_at="2026-07-12T12:00:00+03:00",
+        responsible_id=231,
+        closed_by_user_id=231,
+        payload={"status": 5},
+    )
+
+    sql, params = conn.calls[0]
+    assert "task_close_control_events" in sql
+    assert params[:7] == (
+        8875,
+        "closed_at:2026-07-12T12:00:00+03:00",
+        231,
+        231,
+        "2026-07-12T12:00:00+03:00",
+        "ignored_user_not_controlled_at_close",
+        "user_not_controlled_at_close_time",
+    )
+    assert json.loads(params[7]) == {"status": 5}
+
+
 def test_bitrix_store_content_candidates_filters_completed_items(monkeypatch):
     store = PostgresBitrixAgentStore("postgresql://fake")
     rows = [
