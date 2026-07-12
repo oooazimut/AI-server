@@ -67,6 +67,7 @@ def test_dispatcher_creates_direct_close_draft_and_sends_message(monkeypatch):
     assert "dialog:231:user:231" in store._drafts
     draft = store._drafts["dialog:231:user:231"]
     assert draft["_draft_type"] == "task_close"
+    assert draft["already_closed"] is True
     assert draft["_direct_close_already_closed"] is True
     assert draft["_direct_close_close_event_key"] == "closed_at:2026-07-12T12:00:00+03:00"
     assert draft["completion_summary"] == "Камеры проверены"

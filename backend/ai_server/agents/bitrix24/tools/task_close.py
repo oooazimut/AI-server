@@ -45,6 +45,12 @@ _TASK_CLOSE_SCALAR_FIELDS = {
     "overall_status": ("overall_status", "completion_status"),
 }
 _TASK_CLOSE_BOOL_FIELDS = {
+    "already_closed": (
+        "already_closed",
+        "task_already_closed",
+        "bitrix_task_already_closed",
+        "closed_in_bitrix",
+    ),
     "source_task_description_empty": (
         "source_task_description_empty",
         "task_description_empty",
@@ -85,6 +91,12 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
         args.get("source_task_description_empty")
         or args.get("task_description_empty")
         or args.get("empty_task_description")
+    )
+    already_closed = _truthy(
+        args.get("already_closed")
+        or args.get("task_already_closed")
+        or args.get("bitrix_task_already_closed")
+        or args.get("closed_in_bitrix")
     )
     equipment_consumables = compact_text(
         str(args.get("equipment_consumables") or args.get("equipment") or args.get("consumables") or "")
@@ -144,6 +156,7 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
         "completion_summary": completion_summary,
         "task_points": task_points,
         "source_task_description_empty": source_task_description_empty,
+        "already_closed": already_closed,
         "equipment_consumables": equipment_consumables,
         "overall_status": overall_status,
         "overall_status_label": overall_status_label,
@@ -163,6 +176,7 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
         "completion_summary": completion_summary,
         "task_points": task_points,
         "source_task_description_empty": source_task_description_empty,
+        "already_closed": already_closed,
         "equipment_consumables": equipment_consumables,
         "overall_status": overall_status,
         "overall_status_label": overall_status_label,
@@ -190,7 +204,8 @@ class TaskCloseDraftTool:
             description=(
                 "Prepare a Bitrix task closing draft. Use instead of direct bitrix_api writes for task closing. "
                 "Call only after the task and completion result are understood. The user must confirm before "
-                "a protected AI close report file plus tasks.task.complete/tasks.task.approve is executed."
+                "a protected AI close report file is saved and, when the task is still open, "
+                "tasks.task.complete/tasks.task.approve is executed."
             ),
             parameters={
                 "type": "object",
@@ -218,6 +233,13 @@ class TaskCloseDraftTool:
                         "description": (
                             "True when the original Bitrix task has no meaningful description/checklist. "
                             "Then block 1 is a free-form work description instead of task points."
+                        ),
+                    },
+                    "already_closed": {
+                        "type": "boolean",
+                        "description": (
+                            "True when the Bitrix task is already closed. Confirm then saves the AI close report "
+                            "without calling tasks.task.complete/tasks.task.approve again."
                         ),
                     },
                     "equipment_consumables": {
@@ -652,6 +674,9 @@ async def _execute_task_close(
     if _truthy(draft.get("_direct_close_already_closed")):
         close_method = "already_closed"
         close_result = {"skipped": True, "reason": "task_already_closed_directly"}
+    elif _truthy(draft.get("already_closed") or draft.get("task_already_closed") or draft.get("_task_already_closed")):
+        close_method = "already_closed"
+        close_result = {"skipped": True, "reason": "task_already_closed"}
     else:
         close_params = apply_write_policy(close_method, {"taskId": task_id})
         close_result = await close_call(close_method, close_params)
@@ -815,6 +840,7 @@ def _preview_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "completion_summary": str(payload.get("completion_summary") or ""),
         "task_points": _string_list(payload.get("task_points")),
         "source_task_description_empty": bool(payload.get("source_task_description_empty")),
+        "already_closed": bool(payload.get("already_closed")),
         "equipment_consumables": str(payload.get("equipment_consumables") or ""),
         "overall_status": _overall_status(payload.get("overall_status")),
         "overall_status_label": str(payload.get("overall_status_label") or ""),

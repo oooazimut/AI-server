@@ -181,6 +181,7 @@ def _build_direct_close_draft(*, state: dict[str, Any], payload: dict[str, Any])
     ).payload
     draft.update(
         {
+            "already_closed": True,
             "_direct_close_already_closed": True,
             "_direct_close_queue_state_key": state.get("state_key"),
             "_direct_close_close_event_key": payload.get("close_event_key"),

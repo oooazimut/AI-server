@@ -1312,6 +1312,8 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Сначала найди задачу через bitrix_task_search, собери результат выполнения, затем вызови task_close_draft. "
         "В task_close_draft передавай короткий полный черновик: task_points, equipment_consumables, overall_status, "
         "not_done_items для невыполненных пунктов и unconfirmed_items для неизвестного/неподтверждённого результата. "
+        "Если задача уже закрыта в Bitrix, всё равно используй task_close_draft/task_close_confirm, но передай already_closed=true: "
+        "backend сохранит AI-отчёт и не будет повторно вызывать tasks.task.complete/tasks.task.approve. "
         "Если описание/чеклист исходной задачи пустые, не выдумывай task_points: передай source_task_description_empty=true, "
         "а результат пользователя положи в completion_summary как свободное описание выполненной работы. "
         "Если после уточнений пользователь явно разрешает закрыть с такими проблемами, backend сохранит признак неполного AI-закрытия для будущей индексации. "
