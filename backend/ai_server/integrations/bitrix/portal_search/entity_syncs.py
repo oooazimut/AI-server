@@ -15,6 +15,15 @@ from ai_server.integrations.bitrix.portal_search.text_utils import (
     to_str,
 )
 from ai_server.integrations.bitrix.portal_search.types import PortalSearchResult
+from ai_server.integrations.bitrix.task_close_control import (
+    TASK_CLOSE_DECISION_CONTROLLED,
+    decide_task_close_control,
+    task_close_event_key,
+)
+from ai_server.integrations.bitrix.task_close_direct_queue import (
+    activate_next_direct_close_event,
+    enqueue_direct_close_event,
+)
 from ai_server.integrations.bitrix.task_close_reports import (
     TASK_CLOSE_INCOMPLETE_MARKER as _TASK_CLOSE_INCOMPLETE_MARKER,
 )
@@ -41,6 +50,8 @@ _BITRIX_TASK_RESULT_LIMIT = 10
 _TASK_CLOSE_REPORT_INCIDENT_STATUS_PENDING = "pending"
 _TASK_CLOSE_REPORT_INCIDENT_STATUS_RESTORED = "restored"
 _TASK_CLOSE_REPORT_INCIDENT_STATUS_ACCEPTED_MISSING = "accepted_missing"
+_TASK_CLOSE_CONTROL_ENABLED_FROM_KEY = "control_enabled_from"
+_BITRIX_TASK_STATUS_COMPLETED = 5
 
 
 def _first(data: dict[str, Any], *keys: str) -> object | None:
@@ -260,6 +271,201 @@ def _task_close_marker_source(*, task_results: list[str], comments: list[str], a
 
 def _task_close_report_problem_types(attachment_names: list[str]) -> list[str]:
     return task_close_report_problem_types(attachment_names)
+
+
+def _task_close_direct_control_metadata(
+    index: PortalSearchIndex,
+    *,
+    task: dict[str, Any],
+    task_id: object,
+    task_title: str,
+    current_report_files: list[dict[str, Any]],
+    close_marker_metadata: dict[str, Any],
+    now_iso: str,
+) -> tuple[dict[str, Any], tuple[int | None, str] | None]:
+    task_id_int = safe_int(task_id)
+    if task_id_int is None or not _task_is_closed(task):
+        return {}, None
+
+    closed_at = _first(task, "closedDate", "CLOSED_DATE")
+    changed_at = _first(task, "changedDate", "CHANGED_DATE")
+    event_key = task_close_event_key(task_id=task_id_int, closed_at=closed_at, first_seen_at=changed_at)
+    existing_event = _task_close_control_event(index, task_id=task_id_int, close_event_key=event_key)
+    if existing_event:
+        activation_key = (
+            _activation_key_from_payload(existing_event)
+            if str(existing_event.get("decision") or "") == TASK_CLOSE_DECISION_CONTROLLED
+            else None
+        )
+        return _task_close_control_event_metadata(existing_event), activation_key
+
+    if current_report_files or close_marker_metadata.get("ai_close_incomplete"):
+        return {
+            "task_close_control_event_key": event_key,
+            "task_close_control_decision": "skipped_ai_close_report_present",
+            "task_close_control_reason": "ai_close_report_or_marker_present",
+        }, None
+
+    control_enabled_from = _task_close_control_setting(index, _TASK_CLOSE_CONTROL_ENABLED_FROM_KEY)
+    if not control_enabled_from:
+        return {
+            "task_close_control_event_key": event_key,
+            "task_close_control_decision": "disabled",
+            "task_close_control_reason": "control_start_not_configured",
+        }, None
+
+    responsible_id = safe_int(_first(task, "responsibleId", "RESPONSIBLE_ID"))
+    closed_by_user_id = safe_int(_first(task, "closedBy", "CLOSED_BY", "closedByUserId", "CLOSED_BY_USER_ID"))
+    dialog_key = str(responsible_id or "")
+    controlled_user_ids = _task_close_controlled_user_ids(index)
+    decision = decide_task_close_control(
+        closed_at=closed_at,
+        control_enabled_from=control_enabled_from,
+        user_is_controlled=bool(responsible_id is not None and responsible_id in controlled_user_ids),
+    )
+    payload = {
+        "task_title": task_title,
+        "task_status": _first(task, "status", "STATUS"),
+        "responsible_id": responsible_id,
+        "closed_by_user_id": closed_by_user_id,
+        "dialog_key": dialog_key,
+        "closed_at": to_str(closed_at),
+        "changed_at": to_str(changed_at),
+        "control_enabled_from": control_enabled_from,
+        "seen_at": now_iso,
+    }
+    _upsert_task_close_control_event(
+        index,
+        task_id=task_id_int,
+        close_event_key=event_key,
+        decision=decision.decision,
+        reason=decision.reason,
+        closed_at=to_str(closed_at) or None,
+        responsible_id=responsible_id,
+        closed_by_user_id=closed_by_user_id,
+        payload=payload,
+    )
+    queue_event = None
+    activation_key = None
+    if decision.decision == TASK_CLOSE_DECISION_CONTROLLED:
+        queue_event = enqueue_direct_close_event(
+            index,
+            task_id=task_id_int,
+            close_event_key=event_key,
+            responsible_id=responsible_id,
+            dialog_key=dialog_key,
+            closed_at=closed_at,
+            task_title=task_title,
+            payload=payload,
+            now_iso=now_iso,
+            actor_user_id=closed_by_user_id,
+        )
+        activation_key = (responsible_id, dialog_key)
+
+    return (
+        _task_close_control_event_metadata(
+            {
+                "close_event_key": event_key,
+                "decision": decision.decision,
+                "reason": decision.reason,
+                "payload": payload,
+            },
+            queue_status=queue_event.status if queue_event else "",
+        ),
+        activation_key,
+    )
+
+
+def _task_is_closed(task: dict[str, Any]) -> bool:
+    status = safe_int(_first(task, "status", "STATUS"))
+    return bool(status == _BITRIX_TASK_STATUS_COMPLETED or _first(task, "closedDate", "CLOSED_DATE"))
+
+
+def _task_close_control_event(index: PortalSearchIndex, *, task_id: int, close_event_key: str) -> dict[str, Any] | None:
+    getter = getattr(index, "get_task_close_control_event", None)
+    if not callable(getter):
+        return None
+    event = getter(task_id=task_id, close_event_key=close_event_key)
+    return event if isinstance(event, dict) else None
+
+
+def _upsert_task_close_control_event(
+    index: PortalSearchIndex,
+    *,
+    task_id: int,
+    close_event_key: str,
+    decision: str,
+    reason: str,
+    closed_at: str | None,
+    responsible_id: int | None,
+    closed_by_user_id: int | None,
+    payload: dict[str, Any],
+) -> None:
+    upsert = getattr(index, "upsert_task_close_control_event", None)
+    if not callable(upsert):
+        return
+    upsert(
+        task_id=task_id,
+        close_event_key=close_event_key,
+        decision=decision,
+        reason=reason,
+        closed_at=closed_at,
+        responsible_id=responsible_id,
+        closed_by_user_id=closed_by_user_id,
+        payload=payload,
+    )
+
+
+def _task_close_control_setting(index: PortalSearchIndex, key: str) -> str:
+    getter = getattr(index, "get_task_close_control_setting", None)
+    if not callable(getter):
+        return ""
+    setting = getter(key)
+    if not isinstance(setting, dict):
+        return ""
+    return str(setting.get("value") or "").strip()
+
+
+def _task_close_controlled_user_ids(index: PortalSearchIndex) -> set[int]:
+    getter = getattr(index, "task_close_controlled_user_ids", None)
+    if not callable(getter):
+        return set()
+    return {item for item in (safe_int(value) for value in getter()) if item is not None and item > 0}
+
+
+def _task_close_control_event_metadata(
+    event: dict[str, Any],
+    *,
+    queue_status: str = "",
+) -> dict[str, Any]:
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    result = {
+        "task_close_control_event_key": str(event.get("close_event_key") or payload.get("close_event_key") or ""),
+        "task_close_control_decision": str(event.get("decision") or ""),
+        "task_close_control_reason": str(event.get("reason") or ""),
+        "task_close_control_responsible_id": payload.get("responsible_id"),
+        "task_close_control_dialog_key": str(payload.get("dialog_key") or ""),
+    }
+    if queue_status:
+        result["task_close_direct_queue_status"] = queue_status
+    return result
+
+
+def _activation_key_from_payload(event: dict[str, Any]) -> tuple[int | None, str] | None:
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    responsible_id = safe_int(payload.get("responsible_id"))
+    dialog_key = str(payload.get("dialog_key") or "")
+    return (responsible_id, dialog_key) if dialog_key else None
+
+
+def _activate_task_close_direct_queues(
+    index: PortalSearchIndex,
+    activation_keys: set[tuple[int | None, str]],
+    *,
+    now_iso: str,
+) -> None:
+    for responsible_id, dialog_key in sorted(activation_keys, key=lambda item: (item[0] or 0, item[1])):
+        activate_next_direct_close_event(index, responsible_id=responsible_id, dialog_key=dialog_key, now_iso=now_iso)
 
 
 def _unique_problem_types(values: list[str]) -> list[str]:
@@ -801,6 +1007,8 @@ async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: 
             "CREATED_DATE",
             "CHANGED_DATE",
             "CLOSED_DATE",
+            "CLOSED_BY",
+            "CLOSED_BY_USER_ID",
             "ACCOMPLICES",
             "AUDITORS",
             "UF_TASK_WEBDAV_FILES",
@@ -824,6 +1032,8 @@ async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: 
         [_first(task, "id", "ID") for task in tasks],
         limit=_BITRIX_TASK_RESULT_LIMIT,
     )
+    now_iso = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
+    task_close_activation_keys: set[tuple[int | None, str]] = set()
     for task in tasks:
         task_id = _first(task, "id", "ID")
         if task_id is None:
@@ -868,6 +1078,17 @@ async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: 
         report_marker_metadata = _task_close_marker_metadata_from_report_files(effective_report_files)
         if report_marker_metadata:
             close_marker_metadata = {**close_marker_metadata, **report_marker_metadata}
+        task_close_control_metadata, activation_key = _task_close_direct_control_metadata(
+            index,
+            task=task,
+            task_id=task_id,
+            task_title=title,
+            current_report_files=effective_report_files,
+            close_marker_metadata=close_marker_metadata,
+            now_iso=now_iso,
+        )
+        if activation_key is not None:
+            task_close_activation_keys.add(activation_key)
         responsible_label = _person_label(_first(task, "responsible", "RESPONSIBLE"))
         creator_label = _person_label(_first(task, "creator", "CREATOR"))
         responsible = responsible_label or to_str(_first(task, "responsibleId", "RESPONSIBLE_ID"))
@@ -913,6 +1134,7 @@ async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: 
                 "task_results_count": len(task_results),
                 **report_integrity_metadata,
                 **close_marker_metadata,
+                **task_close_control_metadata,
             },
             source_updated_at=to_str(_first(task, "changedDate", "CHANGED_DATE")),
         )
@@ -927,6 +1149,7 @@ async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: 
                 settings=settings,
             )
             indexed_attachments += 1
+    _activate_task_close_direct_queues(index, task_close_activation_keys, now_iso=now_iso)
     return {
         "tasks": len(tasks),
         "attachments": indexed_attachments,

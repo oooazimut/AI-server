@@ -602,6 +602,8 @@ class FakePortalSearchIndex:
         self._items: dict[tuple[str, str], dict[str, Any]] = {}
         self._task_close_processing_state: dict[tuple[str, str], dict[str, Any]] = {}
         self._task_close_control_events: dict[tuple[str, str], dict[str, Any]] = {}
+        self._task_close_settings: dict[str, dict[str, Any]] = {}
+        self._task_close_controlled_users: set[int] = set()
 
     def ensure_schema(self) -> None:
         pass
@@ -874,6 +876,24 @@ class FakePortalSearchIndex:
             "closed_by_user_id": closed_by_user_id,
             "payload": dict(payload or {}),
         }
+
+    def get_task_close_control_setting(self, key: str) -> dict[str, Any] | None:
+        setting = self._task_close_settings.get(key)
+        return dict(setting) if setting else None
+
+    def set_task_close_control_setting(self, *, key: str, value: str, updated_by: int | None = None) -> None:
+        self._task_close_settings[key] = {"key": key, "value": value, "updated_by": updated_by}
+
+    def task_close_controlled_user_ids(self) -> set[int]:
+        return set(self._task_close_controlled_users)
+
+    def upsert_task_close_controlled_user(
+        self, *, user_id: int, active: bool = True, updated_by: int | None = None
+    ) -> None:
+        if active:
+            self._task_close_controlled_users.add(int(user_id))
+        else:
+            self._task_close_controlled_users.discard(int(user_id))
 
 
 class FakeOrchestratorStore:
