@@ -637,6 +637,37 @@ def test_bitrix_store_lists_task_close_processing_states(monkeypatch):
     assert params == (["pending_direct_close"], "direct\\_close:%", "231", "chat231", 50)
 
 
+def test_bitrix_store_lists_task_close_drafts(monkeypatch):
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    rows = [
+        {
+            "dialog_key": "dialog:231:user:231",
+            "params_json": json.dumps({"_draft_type": "task_close", "task_id": 8875}),
+            "created_at": "2026-07-12T19:00:00+03:00",
+        },
+        {
+            "dialog_key": "dialog:231:user:231:task-create",
+            "params_json": json.dumps({"_draft_type": "task_create", "title": "skip"}),
+            "created_at": "2026-07-12T19:01:00+03:00",
+        },
+    ]
+    factory, conn = _sync_conn_factory(rows=rows)
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    result = store.list_task_drafts(draft_type="task_close", limit=50)
+
+    assert result == [
+        {
+            "dialog_key": "dialog:231:user:231",
+            "params": {"_draft_type": "task_close", "task_id": 8875},
+            "created_at": "2026-07-12T19:00:00+03:00",
+        }
+    ]
+    sql, params = conn.calls[0]
+    assert "pending_task_draft" in sql
+    assert params == (50,)
+
+
 def test_bitrix_store_content_candidates_filters_completed_items(monkeypatch):
     store = PostgresBitrixAgentStore("postgresql://fake")
     rows = [

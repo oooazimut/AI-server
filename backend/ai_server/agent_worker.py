@@ -110,7 +110,12 @@ async def main() -> None:
     diagnost_store = PostgresDiagnostStore(settings.database_url)
     await diagnost_store.ensure_schema()
 
-    portal_search_indexer = PortalSearchIndexerWorker(bitrix, portal_search, settings=settings)
+    portal_search_indexer = PortalSearchIndexerWorker(
+        bitrix,
+        portal_search,
+        settings=settings,
+        bitrix_oauth=bitrix_oauth,
+    )
     diagnost_queue = RedisDiagnostQueue(settings.redis_url)
     result_publisher = OrchestratorResultPublisher(diagnost_queue)
     specialist_result_publisher = SpecialistResultPublisher(diagnost_queue)

@@ -301,6 +301,34 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
         raw = row["params_json"]
         return json.loads(raw) if isinstance(raw, str) else raw
 
+    def list_task_drafts(self, *, draft_type: str = "", limit: int = 100) -> list[dict[str, Any]]:
+        with self._sync_connect() as db:
+            rows = db.execute(
+                """
+                SELECT dialog_key, params_json, created_at
+                FROM bitrix24.pending_task_draft
+                ORDER BY created_at
+                LIMIT %s
+                """,
+                (limit,),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            raw = row["params_json"]
+            params = json.loads(raw) if isinstance(raw, str) else raw
+            if not isinstance(params, dict):
+                continue
+            if draft_type and str(params.get("_draft_type") or "") != draft_type:
+                continue
+            result.append(
+                {
+                    "dialog_key": row["dialog_key"],
+                    "params": params,
+                    "created_at": row["created_at"],
+                }
+            )
+        return result
+
     async def delete_task_draft(self, dialog_key: str) -> None:
         async with await self._connect() as db:
             await db.execute(
