@@ -12,6 +12,7 @@ from ai_server.agents.bitrix24.tools.task_close import (
     TaskCloseConfirmTool,
     TaskCloseDraftTool,
 )
+from ai_server.integrations.bitrix.client import BitrixApiError
 from ai_server.models import ToolStatus
 from tests.fakes import FakeTaskDraftStore
 
@@ -127,6 +128,54 @@ def test_close_confirm_uses_oauth_result_then_complete():
     assert oauth.user_ids == [13]
     assert oauth_client.call.await_args_list == [
         call("tasks.task.result.add", {"taskId": 139, "fields": {"TEXT": "Выполнено"}}),
+        call("tasks.task.complete", {"taskId": 139}),
+    ]
+    assert "d:13" not in store._drafts
+
+
+def test_close_confirm_falls_back_to_comment_when_task_result_add_is_missing():
+    store = FakeTaskDraftStore()
+    anyio.run(
+        lambda: store.save_task_draft(
+            "d:13",
+            {
+                "_draft_type": TASK_CLOSE_DRAFT_TYPE,
+                "task_id": 139,
+                "task_title": "Task",
+                "action": "complete",
+                "result_text": "Done with marker AI_SERVER_TASK_CLOSE_INCOMPLETE",
+                "unresolved_items": ["no photo"],
+            },
+        )
+    )
+    oauth_client = AsyncMock()
+    oauth_client.call = AsyncMock(
+        side_effect=[
+            BitrixApiError(
+                "tasks.task.result.add",
+                "ERROR_METHOD_NOT_FOUND",
+                "Could not find description of add in Bitrix\\Tasks\\Rest\\Controllers\\Task\\Result.",
+            ),
+            {"result": 125639},
+            {"result": True},
+        ]
+    )
+    oauth = FakeBitrixOAuth(oauth_client)
+
+    tool = TaskCloseConfirmTool(store=store, bitrix_oauth=oauth, oauth_required_for_writes=True)
+    result = _exec(tool, {}, user_id=13, dialog_key="d:13", dialog_id="chat4321")
+
+    assert result.status == ToolStatus.OK
+    assert result.data["result_method"] == "task.commentitem.add"
+    assert oauth_client.call.await_args_list == [
+        call(
+            "tasks.task.result.add",
+            {"taskId": 139, "fields": {"TEXT": "Done with marker AI_SERVER_TASK_CLOSE_INCOMPLETE"}},
+        ),
+        call(
+            "task.commentitem.add",
+            {"TASKID": 139, "FIELDS": {"POST_MESSAGE": "Done with marker AI_SERVER_TASK_CLOSE_INCOMPLETE"}},
+        ),
         call("tasks.task.complete", {"taskId": 139}),
     ]
     assert "d:13" not in store._drafts

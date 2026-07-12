@@ -374,12 +374,24 @@ async def _execute_task_close(
     action = _close_action(draft.get("action"))
 
     result_add = None
+    result_method = ""
     if result_text:
         result_params = apply_write_policy(
             "tasks.task.result.add",
             {"taskId": task_id, "fields": {"TEXT": result_text}},
         )
-        result_add = await call("tasks.task.result.add", result_params)
+        try:
+            result_add = await call("tasks.task.result.add", result_params)
+            result_method = "tasks.task.result.add"
+        except BitrixApiError as exc:
+            if not _task_result_add_method_missing(exc):
+                raise
+            result_params = apply_write_policy(
+                "task.commentitem.add",
+                {"TASKID": task_id, "FIELDS": {"POST_MESSAGE": result_text}},
+            )
+            result_add = await call("task.commentitem.add", result_params)
+            result_method = "task.commentitem.add"
 
     close_method = "tasks.task.approve" if action == "approve" else "tasks.task.complete"
     close_params = apply_write_policy(close_method, {"taskId": task_id})
@@ -388,7 +400,7 @@ async def _execute_task_close(
         "task_id": task_id,
         "task_title": str(draft.get("task_title") or ""),
         "action": action,
-        "result_method": "tasks.task.result.add" if result_text else "",
+        "result_method": result_method,
         "result_add": result_add,
         "close_method": close_method,
         "close_result": close_result,
@@ -399,6 +411,18 @@ async def _execute_task_close(
         "ai_close_incomplete": bool(draft.get("ai_close_incomplete")),
         "ai_close_marker": str(draft.get("ai_close_marker") or ""),
     }
+
+
+def _task_result_add_method_missing(exc: BitrixApiError) -> bool:
+    if exc.method != "tasks.task.result.add":
+        return False
+    text = f"{exc.error} {exc.description}".casefold()
+    return (
+        "method_not_found" in text
+        or "error_method_not_found" in text
+        or "could not find description" in text
+        or "task\\result" in text
+    )
 
 
 def _result_text(
