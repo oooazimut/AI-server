@@ -152,7 +152,9 @@ async def auto_close_direct_task_close_reports(
             stats.skipped += 1
             continue
         try:
-            draft_dialog_key = str(payload.get("draft_dialog_key") or _private_dialog_key(safe_int(payload.get("responsible_id"))))
+            draft_dialog_key = str(
+                payload.get("draft_dialog_key") or _private_dialog_key(safe_int(payload.get("responsible_id")))
+            )
             existing_draft = await _existing_draft(store, draft_dialog_key)
             draft = _auto_close_draft_from_state(state=state, payload=payload, existing_draft=existing_draft)
             result = await _execute_task_close(close_call=bitrix.call, report_call=bitrix.call, draft=draft)
