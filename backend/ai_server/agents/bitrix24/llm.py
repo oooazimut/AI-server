@@ -859,6 +859,9 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
     action_label = _text(preview.get("action_label")) or "отметить задачу выполненной"
     result_text = _text(preview.get("completion_summary")) or _text(draft.get("completion_summary"))
     task_points = _text_items(preview.get("task_points") or draft.get("task_points"))
+    source_task_description_empty = bool(
+        preview.get("source_task_description_empty") or draft.get("source_task_description_empty")
+    )
     equipment = _text(preview.get("equipment_consumables")) or _text(draft.get("equipment_consumables"))
     overall = _text(preview.get("overall_status_label")) or _text(draft.get("overall_status_label"))
     not_done = _text_items(preview.get("not_done_items") or draft.get("not_done_items"))
@@ -871,14 +874,18 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
         "Черновик закрытия задачи:",
         f"Задача: {task_title}",
         f"Действие: {action_label}",
-        "Пункты задачи:",
     ]
     if task_points:
+        lines.append("Пункты задачи:")
         lines.extend(f"{index}. {item}" for index, item in enumerate(task_points, start=1))
+    elif source_task_description_empty:
+        lines.append("Описание выполненной работы:")
+        lines.append(f"- {result_text or '? кратко напишите, что было сделано'}")
     else:
+        lines.append("Пункты задачи:")
         lines.append("- ? что было сделано по пунктам задачи")
     lines.append(f"Оборудование, расходники: {equipment or '? что использовано'}")
-    if result_text:
+    if result_text and not source_task_description_empty:
         lines.append(f"Результат: {result_text}")
     lines.append(f"Итог: {overall or '? выполнена полностью / частично / не выполнена / не подтверждено'}")
     if not_done:
@@ -1305,6 +1312,8 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Сначала найди задачу через bitrix_task_search, собери результат выполнения, затем вызови task_close_draft. "
         "В task_close_draft передавай короткий полный черновик: task_points, equipment_consumables, overall_status, "
         "not_done_items для невыполненных пунктов и unconfirmed_items для неизвестного/неподтверждённого результата. "
+        "Если описание/чеклист исходной задачи пустые, не выдумывай task_points: передай source_task_description_empty=true, "
+        "а результат пользователя положи в completion_summary как свободное описание выполненной работы. "
         "Если после уточнений пользователь явно разрешает закрыть с такими проблемами, backend сохранит признак неполного AI-закрытия для будущей индексации. "
         "Не показывай пользователю технический код AI_SERVER_TASK_CLOSE_INCOMPLETE; в видимом тексте пиши коротко: неподтвержденная или выполнена частично. "
         "Для уведомления пользователя используй bitrix_api с im.notify.system.add. "
@@ -1619,6 +1628,7 @@ def _task_close_draft_replay_args(draft: dict[str, Any]) -> dict[str, Any]:
         "action": _text(draft.get("action")) or "complete",
         "completion_summary": _text(draft.get("completion_summary")),
         "task_points": _text_items(draft.get("task_points")),
+        "source_task_description_empty": bool(draft.get("source_task_description_empty")),
         "equipment_consumables": _text(draft.get("equipment_consumables")),
         "overall_status": _text(draft.get("overall_status")),
         "not_done_items": _text_items(draft.get("not_done_items")),

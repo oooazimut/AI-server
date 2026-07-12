@@ -40,6 +40,13 @@ _TASK_CLOSE_SCALAR_FIELDS = {
     "equipment_consumables": ("equipment_consumables", "equipment", "consumables"),
     "overall_status": ("overall_status", "completion_status"),
 }
+_TASK_CLOSE_BOOL_FIELDS = {
+    "source_task_description_empty": (
+        "source_task_description_empty",
+        "task_description_empty",
+        "empty_task_description",
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -70,6 +77,11 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
     )
     unresolved_items = _string_list(args.get("unresolved_items") or args.get("missing_parts"))
     task_points = _string_list(args.get("task_points") or args.get("task_items") or args.get("checklist_items"))
+    source_task_description_empty = _truthy(
+        args.get("source_task_description_empty")
+        or args.get("task_description_empty")
+        or args.get("empty_task_description")
+    )
     equipment_consumables = compact_text(
         str(args.get("equipment_consumables") or args.get("equipment") or args.get("consumables") or "")
     )
@@ -127,6 +139,7 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
         "action": action,
         "completion_summary": completion_summary,
         "task_points": task_points,
+        "source_task_description_empty": source_task_description_empty,
         "equipment_consumables": equipment_consumables,
         "overall_status": overall_status,
         "overall_status_label": overall_status_label,
@@ -145,6 +158,7 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
         "action_label": _action_label(action),
         "completion_summary": completion_summary,
         "task_points": task_points,
+        "source_task_description_empty": source_task_description_empty,
         "equipment_consumables": equipment_consumables,
         "overall_status": overall_status,
         "overall_status_label": overall_status_label,
@@ -194,6 +208,13 @@ class TaskCloseDraftTool:
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Short task/checklist points and what is known about their completion.",
+                    },
+                    "source_task_description_empty": {
+                        "type": "boolean",
+                        "description": (
+                            "True when the original Bitrix task has no meaningful description/checklist. "
+                            "Then block 1 is a free-form work description instead of task points."
+                        ),
                     },
                     "equipment_consumables": {
                         "type": "string",
@@ -725,6 +746,11 @@ def _merge_task_close_draft_args(
             continue
         merged[payload_field] = _string_list(update_payload.get(payload_field))
 
+    for payload_field, aliases in _TASK_CLOSE_BOOL_FIELDS.items():
+        if not _has_any_key(raw_args, aliases):
+            continue
+        merged[payload_field] = bool(update_payload.get(payload_field))
+
     return merged
 
 
@@ -735,6 +761,7 @@ def _preview_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "action_label": _action_label(_close_action(payload.get("action"))),
         "completion_summary": str(payload.get("completion_summary") or ""),
         "task_points": _string_list(payload.get("task_points")),
+        "source_task_description_empty": bool(payload.get("source_task_description_empty")),
         "equipment_consumables": str(payload.get("equipment_consumables") or ""),
         "overall_status": _overall_status(payload.get("overall_status")),
         "overall_status_label": str(payload.get("overall_status_label") or ""),
@@ -751,6 +778,14 @@ def _preview_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _has_any_key(values: dict[str, Any], keys: tuple[str, ...]) -> bool:
     return any(key in values for key in keys)
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().casefold() in {"1", "true", "yes", "y", "on", "да"}
 
 
 async def _find_existing_report_file(

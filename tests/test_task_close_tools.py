@@ -134,6 +134,31 @@ def test_close_draft_merges_same_task_update_without_resetting_known_fields():
     assert draft["missing_fields"] == []
 
 
+def test_close_draft_marks_empty_source_description_for_freeform_result():
+    store = FakeTaskDraftStore()
+    tool = TaskCloseDraftTool(store=store)
+
+    result = _exec(
+        tool,
+        {
+            "task_id": 139,
+            "task_title": "Пустая задача",
+            "source_task_description_empty": True,
+            "completion_summary": "Проверил объект, устранил замечания.",
+            "overall_status": "completed",
+        },
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+
+    assert result.status == ToolStatus.OK
+    draft = store._drafts["d:13"]
+    assert draft["source_task_description_empty"] is True
+    assert draft["task_points"] == []
+    assert result.data["preview"]["source_task_description_empty"] is True
+
+
 def test_close_draft_blocks_other_task_when_active_draft_exists():
     store = FakeTaskDraftStore()
     tool = TaskCloseDraftTool(store=store)

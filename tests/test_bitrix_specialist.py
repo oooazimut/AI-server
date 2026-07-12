@@ -1615,6 +1615,50 @@ def test_bitrix_llm_compose_formats_structured_task_close_draft(monkeypatch):
     assert "[URL" not in result.answer
 
 
+def test_bitrix_llm_compose_formats_empty_description_task_close_draft(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="закрой задачу", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="task_close_draft",
+                    data={
+                        "draft": {
+                            "_draft_type": "task_close",
+                            "task_id": 139,
+                            "task_title": "Пустая задача",
+                            "source_task_description_empty": True,
+                        },
+                        "preview": {
+                            "task_title": "Пустая задача",
+                            "action_label": "отметить задачу выполненной",
+                            "source_task_description_empty": True,
+                            "completion_summary": "Проверил объект, устранил замечания.",
+                            "equipment_consumables": "не использовались",
+                            "overall_status_label": "выполнена полностью",
+                        },
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert "Описание выполненной работы:" in result.answer
+    assert "Проверил объект, устранил замечания." in result.answer
+    assert "Пункты задачи:" not in result.answer
+    assert "Оборудование, расходники: не использовались" in result.answer
+    assert "Итог: выполнена полностью" in result.answer
+
+
 def test_bitrix_llm_compose_formats_task_close_active_draft_conflict(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
