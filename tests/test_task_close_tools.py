@@ -55,11 +55,49 @@ class DirectCloseDraftStore(FakeTaskDraftStore):
         }
 
 
+class _TaskDetailClient:
+    def __init__(self, task: dict) -> None:
+        self.task = task
+        self.calls: list[tuple[str, dict]] = []
+
+    async def result(self, method: str, params: dict) -> dict:
+        self.calls.append((method, params))
+        return {"task": self.task}
+
+
 def _exec(tool, args, *, user_id=None, dialog_key=None, dialog_id=None):
     async def _run():
         return await tool.execute(args, user_id=user_id, dialog_key=dialog_key, dialog_id=dialog_id)
 
     return anyio.run(_run)
+
+
+def test_close_draft_with_only_task_id_loads_task_points_and_missing_fields():
+    store = FakeTaskDraftStore()
+    client = _TaskDetailClient(
+        {
+            "ID": "139",
+            "TITLE": "Проверить камеры",
+            "DESCRIPTION": "1. Проверить камеру на входе\n2. Проверить архив",
+            "STATUS": "3",
+        }
+    )
+    tool = TaskCloseDraftTool(store=store, read_client=client)
+
+    result = _exec(tool, {"task_id": 139}, user_id=13, dialog_key="d:13", dialog_id="chat4321")
+
+    assert result.status == ToolStatus.OK
+    assert client.calls == [
+        ("tasks.task.get", {"taskId": 139, "select": ["ID", "TITLE", "DESCRIPTION", "STATUS", "CLOSED_DATE"]})
+    ]
+    draft = store._drafts["d:13"]
+    assert draft["task_title"] == "Проверить камеры"
+    assert draft["task_points"] == ["Проверить камеру на входе", "Проверить архив"]
+    assert draft["overall_status"] == "unconfirmed"
+    assert draft["unconfirmed_items"] == ["Проверить камеру на входе", "Проверить архив"]
+    assert "что сделано по задаче" in draft["missing_fields"]
+    assert draft["source_task_description_empty"] is False
+    assert result.data["preview"]["task_points"] == ["Проверить камеру на входе", "Проверить архив"]
 
 
 def test_close_draft_saves_incomplete_marker():

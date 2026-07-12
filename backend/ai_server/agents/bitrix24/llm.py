@@ -168,6 +168,14 @@ class BitrixLLMService:
                 raw={"source": "task_close_control_route"},
             )
 
+        local_decision = _common_task_close_start_decision(task.request, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "task_close_start_route"),
+                raw={"source": "task_close_start_route"},
+            )
+
         local_decision = _common_calendar_event_draft_decision(task.request, tool_definitions)
         if local_decision is not None:
             return BitrixLLMDecisionResult(
@@ -1290,6 +1298,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "If permission_context.pending_task_draft._draft_type is task_close and the current user explicitly confirms closing, call task_close_confirm. "
         "If permission_context.pending_task_draft._draft_type is task_close and the user adds details for the same task, call task_close_draft with the same task_id and the updated full draft fields; backend will merge without resetting old fields. "
         "If a user starts closing another task while task_close draft is active, call task_close_draft for the requested task so backend returns the active-draft choice instead of overwriting the current draft. "
+        "For task closing, missing completion details are not a reason to return needs_clarification after the task is identified: call task_close_draft and put unknown fields into missing_fields/unconfirmed_items so the user always sees the full draft. "
         "If permission_context.pending_task_draft._draft_type is calendar_event and the current user explicitly confirms calendar creation, call calendar_event_confirm. "
         "If permission_context.pending_task_draft._draft_type is project_create and the current user explicitly confirms project creation, call project_create_confirm. "
         "If the current user explicitly cancels or rejects a task creation draft, call task_draft_discard. "
@@ -1543,6 +1552,50 @@ def _confirm_decision_tool(name: str, summary: str) -> BitrixLLMDecision:
             )
         ],
     )
+
+
+def _common_task_close_start_decision(
+    request: str,
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    if not _draft_discard_tool_available(tool_definitions, "task_close_draft"):
+        return None
+    clean_request = _strip_command_prefix(request)
+    lowered = clean_request.casefold()
+    if not _is_task_close_start_request(lowered):
+        return None
+    task_id = _extract_task_id(clean_request)
+    if task_id is None:
+        return None
+    return BitrixLLMDecision(
+        status="completed",
+        answer="",
+        confidence=0.92,
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="task_close_draft",
+                args={
+                    "task_id": task_id,
+                    "overall_status": "unconfirmed",
+                    "unconfirmed_items": ["результат выполнения не указан"],
+                    "missing_fields": [
+                        "что сделано по задаче",
+                        "оборудование/расходники, если использовались",
+                        "итог: выполнена полностью, частично или не выполнена",
+                    ],
+                },
+                summary="deterministic task close draft start routing",
+            )
+        ],
+    )
+
+
+def _is_task_close_start_request(lowered_request: str) -> bool:
+    if "задач" not in lowered_request:
+        return False
+    if any(marker in lowered_request for marker in ("найди", "найти", "покажи", "выведи", "список", "какие", "ищи")):
+        return False
+    return any(marker in lowered_request for marker in ("закрой", "закрыть", "закроем", "закрываем", "заверши"))
 
 
 def _common_task_close_draft_conflict_decision(

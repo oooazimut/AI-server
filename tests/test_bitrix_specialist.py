@@ -941,6 +941,41 @@ def test_bitrix_llm_routes_task_close_confirmation_without_llm(monkeypatch):
     assert [call.name for call in result.decision.tool_calls] == ["task_close_confirm"]
 
 
+def test_bitrix_llm_routes_task_close_start_to_draft_without_llm(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_close_draft", "description": "", "parameters": {}},
+        {"name": "task_close_confirm", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request="Битрикс закрой задачу 8899.",
+                user={"id": "15"},
+                context={"dialog_id": "chat4321"},
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_close_start_route"}
+    assert result.decision.status == "completed"
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_draft"]
+    args = result.decision.tool_calls[0].args
+    assert args["task_id"] == 8899
+    assert args["overall_status"] == "unconfirmed"
+    assert args["unconfirmed_items"] == ["результат выполнения не указан"]
+    assert "что сделано по задаче" in args["missing_fields"]
+
+
 def test_bitrix_llm_routes_task_close_conflict_switch_to_requested_without_llm(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
