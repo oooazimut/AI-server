@@ -279,8 +279,10 @@ def _task_close_direct_control_metadata(
     task: dict[str, Any],
     task_id: object,
     task_title: str,
+    task_results: list[str],
     current_report_files: list[dict[str, Any]],
     close_marker_metadata: dict[str, Any],
+    settings: Settings,
     now_iso: str,
 ) -> tuple[dict[str, Any], tuple[int | None, str] | None]:
     task_id_int = safe_int(task_id)
@@ -317,6 +319,7 @@ def _task_close_direct_control_metadata(
     responsible_id = safe_int(_first(task, "responsibleId", "RESPONSIBLE_ID"))
     closed_by_user_id = safe_int(_first(task, "closedBy", "CLOSED_BY", "closedByUserId", "CLOSED_BY_USER_ID"))
     dialog_key = str(responsible_id or "")
+    description = str(_first(task, "description", "DESCRIPTION") or "")
     controlled_user_ids = _task_close_controlled_user_ids(index)
     decision = decide_task_close_control(
         closed_at=closed_at,
@@ -329,10 +332,17 @@ def _task_close_direct_control_metadata(
         "responsible_id": responsible_id,
         "closed_by_user_id": closed_by_user_id,
         "dialog_key": dialog_key,
+        "recipient_id": str(responsible_id or ""),
+        "draft_dialog_key": _task_close_private_dialog_key(responsible_id),
         "closed_at": to_str(closed_at),
         "changed_at": to_str(changed_at),
         "control_enabled_from": control_enabled_from,
         "seen_at": now_iso,
+        "task_description": description,
+        "task_points": _task_points_from_description(description),
+        "task_results": task_results[:5],
+        "source_task_description_empty": not bool(description.strip()),
+        "task_url": _task_url(task_id_int, settings),
     }
     _upsert_task_close_control_event(
         index,
@@ -379,6 +389,23 @@ def _task_close_direct_control_metadata(
 def _task_is_closed(task: dict[str, Any]) -> bool:
     status = safe_int(_first(task, "status", "STATUS"))
     return bool(status == _BITRIX_TASK_STATUS_COMPLETED or _first(task, "closedDate", "CLOSED_DATE"))
+
+
+def _task_close_private_dialog_key(user_id: int | None) -> str:
+    if user_id is None or user_id <= 0:
+        return ""
+    return f"dialog:{user_id}:user:{user_id}"
+
+
+def _task_points_from_description(description: object) -> list[str]:
+    text = str(description or "").strip()
+    if not text:
+        return []
+    lines = [re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip() for line in text.splitlines()]
+    points = [line for line in lines if line]
+    if not points and text:
+        points = [text]
+    return points[:10]
 
 
 def _task_close_control_event(index: PortalSearchIndex, *, task_id: int, close_event_key: str) -> dict[str, Any] | None:
@@ -1083,8 +1110,10 @@ async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: 
             task=task,
             task_id=task_id,
             task_title=title,
+            task_results=task_results,
             current_report_files=effective_report_files,
             close_marker_metadata=close_marker_metadata,
+            settings=settings,
             now_iso=now_iso,
         )
         if activation_key is not None:

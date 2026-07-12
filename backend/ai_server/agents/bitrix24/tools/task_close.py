@@ -10,6 +10,10 @@ from ai_server.agents.bitrix24.ports import TaskDraftStorePort
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
 from ai_server.integrations.bitrix.portal_search.search_index import PortalSearchIndex
+from ai_server.integrations.bitrix.task_close_direct_queue import (
+    complete_direct_close_event,
+    discard_direct_close_event,
+)
 from ai_server.integrations.bitrix.task_close_reports import (
     canonical_task_close_report_file_name,
     restore_task_close_report_file,
@@ -420,6 +424,7 @@ class TaskCloseConfirmTool:
                     error=f"{type(exc).__name__}: {exc}",
                     data={"draft": draft},
                 )
+            _complete_direct_close_queue_from_draft(self._store, draft, actor_user_id=user_id)
             await self._store.delete_task_draft(dialog_key)
             return ToolResult(status=ToolStatus.OK, tool=self.name, data={**result, "draft": draft})
 
@@ -440,6 +445,7 @@ class TaskCloseConfirmTool:
             return ToolResult(
                 status=ToolStatus.ERROR, tool=self.name, error=f"{type(exc).__name__}: {exc}", data={"draft": draft}
             )
+        _complete_direct_close_queue_from_draft(self._store, draft, actor_user_id=user_id)
         await self._store.delete_task_draft(dialog_key)
         return ToolResult(status=ToolStatus.OK, tool=self.name, data={**result, "draft": draft})
 
@@ -465,8 +471,13 @@ class TaskCloseDiscardTool:
         dialog_key: str | None = None,
         dialog_id: str | None = None,
     ) -> ToolResult:
+        draft = None
+        if dialog_key:
+            draft = await self._store.get_task_draft(dialog_key)
         if dialog_key:
             await self._store.delete_task_draft(dialog_key)
+        if isinstance(draft, dict):
+            _discard_direct_close_queue_from_draft(self._store, draft, actor_user_id=user_id)
         return ToolResult(status=ToolStatus.OK, tool=self.name, data={"discarded": bool(dialog_key)})
 
 
@@ -638,8 +649,12 @@ async def _execute_task_close(
     action = _close_action(draft.get("action"))
 
     close_method = "tasks.task.approve" if action == "approve" else "tasks.task.complete"
-    close_params = apply_write_policy(close_method, {"taskId": task_id})
-    close_result = await close_call(close_method, close_params)
+    if _truthy(draft.get("_direct_close_already_closed")):
+        close_method = "already_closed"
+        close_result = {"skipped": True, "reason": "task_already_closed_directly"}
+    else:
+        close_params = apply_write_policy(close_method, {"taskId": task_id})
+        close_result = await close_call(close_method, close_params)
 
     report_add = None
     report_method = ""
@@ -690,6 +705,44 @@ async def _execute_task_close(
         "ai_close_incomplete": bool(draft.get("ai_close_incomplete")),
         "ai_close_marker": str(draft.get("ai_close_marker") or ""),
     }
+
+
+def _complete_direct_close_queue_from_draft(
+    store: Any,
+    draft: dict[str, Any],
+    *,
+    actor_user_id: int | None = None,
+) -> None:
+    task_id = optional_int(draft.get("task_id"))
+    close_event_key = str(draft.get("_direct_close_close_event_key") or "").strip()
+    if task_id is None or not close_event_key:
+        return
+    complete_direct_close_event(
+        store,
+        task_id=task_id,
+        close_event_key=close_event_key,
+        now_iso=datetime.now(MOSCOW_TZ).isoformat(timespec="seconds"),
+        actor_user_id=actor_user_id,
+    )
+
+
+def _discard_direct_close_queue_from_draft(
+    store: Any,
+    draft: dict[str, Any],
+    *,
+    actor_user_id: int | None = None,
+) -> None:
+    task_id = optional_int(draft.get("task_id"))
+    close_event_key = str(draft.get("_direct_close_close_event_key") or "").strip()
+    if task_id is None or not close_event_key:
+        return
+    discard_direct_close_event(
+        store,
+        task_id=task_id,
+        close_event_key=close_event_key,
+        now_iso=datetime.now(MOSCOW_TZ).isoformat(timespec="seconds"),
+        actor_user_id=actor_user_id,
+    )
 
 
 def _result_text(

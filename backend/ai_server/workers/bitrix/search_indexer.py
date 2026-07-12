@@ -24,6 +24,7 @@ from ai_server.integrations.bitrix.portal_search import (
 from ai_server.settings import Settings
 from ai_server.utils import MOSCOW_TZ
 from ai_server.workers.bitrix.search_webhook_indexer import prepare_search_webhook_job, process_search_webhook_job
+from ai_server.workers.bitrix.task_close_direct_dispatcher import dispatch_direct_task_close_drafts
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,8 @@ PERSISTED_STATUS_KEYS = {
     "last_delta_deleted",
     "delta_folder_cursor_type",
     "delta_folder_cursor_id",
+    "last_task_close_direct_dispatch_at",
+    "last_task_close_direct_dispatch",
 }
 
 
@@ -120,6 +123,8 @@ class PortalSearchIndexerWorker:
             "lock_owner": None,
             "lock_last_heartbeat_at": None,
             "lock_retry_at": None,
+            "last_task_close_direct_dispatch_at": None,
+            "last_task_close_direct_dispatch": None,
         }
         self._load_state()
         self.event_status: dict[str, Any] = {
@@ -288,6 +293,13 @@ class PortalSearchIndexerWorker:
                 self.status["last_metadata_total"] = stats.total
                 if stats.content:
                     self._save_content_status(stats.content)
+                dispatch_stats = await dispatch_direct_task_close_drafts(
+                    bitrix=self.bitrix,
+                    store=self.index,
+                    settings=self._settings,
+                )
+                self.status["last_task_close_direct_dispatch_at"] = _format_time(_now())
+                self.status["last_task_close_direct_dispatch"] = dispatch_stats.as_dict()
                 self._record_success()
                 self._save_state()
                 return stats
