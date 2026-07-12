@@ -660,15 +660,16 @@ def test_bitrix_specialist_enforces_structured_task_close_draft_response():
     assert result.status == "needs_human"
     assert "d:13" in store._drafts
     assert "Черновик #8869: Проверить камеру" in result.answer
-    assert "1. Пункты задачи" in result.answer
+    assert "1. Выполненные работы" in result.answer
     assert "1.1 камера проверена - уточнить по этому пункту ... ???" in result.answer
-    assert "1.3 дополнительно, если не вошло в пункты задачи - ... ???" in result.answer
-    assert "2. Оборудование, расходники" in result.answer
-    assert "- не указано" in result.answer
-    assert "- итог: выполнена частично" in result.answer
-    assert "- не выполнено:" in result.answer
-    assert "- не подтверждено:" in result.answer
-    assert "Статус: выполнена частично, неподтвержденная" in result.answer
+    assert "1.3 Другое - ... ???" in result.answer
+    assert "2. Использованное оборудование" in result.answer
+    assert "2.1 не указано" in result.answer
+    assert "3. Выполнение работ" in result.answer
+    assert "3.1 Статус: выполнена частично" in result.answer
+    assert "3.2 Причина/что не выполнено: архив не проверен" in result.answer
+    assert "3.3 Не подтверждено: нет фото результата" in result.answer
+    assert "4. Дополнительная информация" in result.answer
     assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" not in result.answer
     assert "уже подготовлен" not in result.answer
 
@@ -1648,8 +1649,9 @@ def test_bitrix_llm_compose_formats_task_close_draft(monkeypatch):
     assert result.status == "needs_human"
     assert "Черновик #139: Обучение сотрудников" in result.answer
     assert "Обучение сотрудников" in result.answer
+    assert "1.1 Пользователь подтвердил выполнение" in result.answer
     assert "не приложен акт проверки" in result.answer
-    assert "Статус: неподтвержденная" in result.answer
+    assert "Не подтверждено: не приложен акт проверки" in result.answer
     assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" not in result.answer
     assert "[URL" not in result.answer
 
@@ -1690,17 +1692,18 @@ def test_bitrix_llm_compose_formats_structured_task_close_draft(monkeypatch):
 
     assert client.calls == []
     assert result.status == "needs_human"
-    assert "1. Пункты задачи" in result.answer
+    assert "1. Выполненные работы" in result.answer
     assert "1.1 камеры подключены - уточнить по этому пункту ... ???" in result.answer
-    assert "1.3 дополнительно, если не вошло в пункты задачи - ... ???" in result.answer
-    assert "2. Оборудование, расходники" in result.answer
-    assert "- 4 камеры, 30 метров кабеля" in result.answer
-    assert "- итог: выполнена частично" in result.answer
-    assert "- не выполнено:" in result.answer
+    assert "1.3 Другое - ... ???" in result.answer
+    assert "2. Использованное оборудование" in result.answer
+    assert "2.1 4 камеры" in result.answer
+    assert "2.2 30 метров кабеля" in result.answer
+    assert "3.1 Статус: выполнена частично" in result.answer
+    assert "3.2 Причина/что не выполнено: не проверен архив" in result.answer
     assert "не проверен архив" in result.answer
-    assert "- не подтверждено:" in result.answer
+    assert "3.3 Не подтверждено: нет фото результата" in result.answer
     assert "нет фото результата" in result.answer
-    assert "4. Дополнительно" in result.answer
+    assert "4. Дополнительная информация" in result.answer
     assert "да, закрывай как есть" in result.answer
     assert "[URL" not in result.answer
 
@@ -1742,12 +1745,61 @@ def test_bitrix_llm_compose_formats_empty_description_task_close_draft(monkeypat
 
     assert client.calls == []
     assert result.status == "needs_human"
-    assert "1. Что сделано" in result.answer
-    assert "1.1 свободное описание - Проверил объект, устранил замечания." in result.answer
-    assert "1.2 дополнительно, если не вошло выше - ... ???" in result.answer
+    assert "1. Выполненные работы" in result.answer
+    assert "1.1 Проверил объект" in result.answer
+    assert "1.2 устранил замечания" in result.answer
     assert "1. Пункты задачи" not in result.answer
-    assert "- не использовались" in result.answer
-    assert "- итог: выполнена полностью" in result.answer
+    assert "2.1 не использовались" in result.answer
+    assert "3.1 Статус: выполнена полностью" in result.answer
+
+
+def test_bitrix_llm_compose_hides_initial_task_close_placeholder_summary(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="закрой задачу", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="task_close_draft",
+                    data={
+                        "draft": {
+                            "_draft_type": "task_close",
+                            "task_id": 139,
+                            "task_title": "Пустая задача",
+                            "source_task_description_empty": True,
+                        },
+                        "preview": {
+                            "task_title": "Пустая задача",
+                            "source_task_description_empty": True,
+                            "completion_summary": (
+                                "Общий итог: результат не подтверждён "
+                                "Статус AI-закрытия: неподтвержденная "
+                                "Неподтверждённые пункты: - результат выполнения не указан"
+                            ),
+                            "overall_status_label": "результат не подтверждён",
+                            "unconfirmed_items": ["результат выполнения не указан"],
+                        },
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert "1. Выполненные работы" in result.answer
+    assert "1.1 что сделано - ... ???" in result.answer
+    assert "2.1 не было / что использовано - ... ???" in result.answer
+    assert "3.1 Статус: выполнено / частично выполнено / не выполнено - ... ???" in result.answer
+    assert "результат не подтверждён" not in result.answer
+    assert "результат выполнения не указан" not in result.answer
+    assert "Статус AI-закрытия" not in result.answer
 
 
 def test_bitrix_llm_compose_formats_task_close_active_draft_conflict(monkeypatch):
