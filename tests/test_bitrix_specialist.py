@@ -5,6 +5,7 @@ from datetime import date
 import ai_server.agents.bitrix24.llm as bitrix_llm
 from ai_server.agents.bitrix24 import Bitrix24Specialist, BitrixLLMDecision, BitrixLLMService, BitrixLLMToolCall
 from ai_server.agents.bitrix24.llm import ALLOWED_TOOL_NAMES
+from ai_server.agents.bitrix24.tools.task_close import TaskCloseDraftTool
 from ai_server.agents.bitrix24.tools.task_create import TaskCreateDraftTool
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import AgentTask, ToolDefinition, ToolResult
@@ -433,6 +434,56 @@ def test_bitrix_specialist_task_create_draft_saves_to_store():
     assert draft_fields["RESPONSIBLE_ID"] == 9
     assert draft_fields["CREATED_BY"] == 9
     assert draft_fields["DEADLINE"]
+
+
+def test_bitrix_specialist_enforces_structured_task_close_draft_response():
+    store = FakeTaskDraftStore()
+    specialist = Bitrix24Specialist(
+        get_agent_manifest("bitrix24"),
+        retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
+        agent_tools=[TaskCloseDraftTool(store=store)],
+        llm=FakeBitrixLLM(
+            tool_calls=[
+                BitrixLLMToolCall(
+                    name="task_close_draft",
+                    args={
+                        "task_id": 8869,
+                        "task_title": "Проверить камеру",
+                        "completion_summary": "Камеру проверили, архив не проверяли.",
+                        "task_points": ["камера проверена", "архив не проверен"],
+                        "equipment_consumables": "не указано",
+                        "overall_status": "partial",
+                        "not_done_items": ["архив не проверен"],
+                        "unconfirmed_items": ["нет фото результата"],
+                    },
+                )
+            ],
+            final_status="needs_clarification",
+            final_answer="Черновик закрытия уже подготовлен: короткий свободный текст.",
+        ),
+    )
+
+    result = asyncio.run(
+        specialist.handle(
+            AgentTask(
+                task_id="t1",
+                request="закрой задачу 8869",
+                user={"id": "13"},
+                context={"dialog_key": "d:13", "dialog_id": "chat4321"},
+            )
+        )
+    )
+
+    assert result.status == "needs_human"
+    assert "d:13" in store._drafts
+    assert "Черновик закрытия задачи:" in result.answer
+    assert "Пункты задачи:" in result.answer
+    assert "Оборудование, расходники: не указано" in result.answer
+    assert "Итог: выполнена частично" in result.answer
+    assert "Не выполнено:" in result.answer
+    assert "Не подтверждено:" in result.answer
+    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" in result.answer
+    assert "уже подготовлен" not in result.answer
 
 
 def test_bitrix_specialist_task_create_draft_uses_current_user_profile_label():

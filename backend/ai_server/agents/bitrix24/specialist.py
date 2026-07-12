@@ -8,6 +8,8 @@ from ai_server.agents.base import BaseSpecialist
 from ai_server.agents.bitrix24.llm import (
     BitrixAgentLLM,
     BitrixLLMService,
+    _format_task_close_confirm_answer,
+    _format_task_close_draft_answer,
     llm_failure_result,
 )
 from ai_server.agents.bitrix24.ports import ProposalStorePort, TaskDraftStorePort
@@ -241,7 +243,8 @@ class Bitrix24Specialist(BaseSpecialist):
                 bitrix=self._bitrix_task_client,
                 settings=self._settings_for_qc,
             )
-        return await super().handle(task)
+        result = await super().handle(task)
+        return _enforce_task_close_response(result, settings=self._settings_for_qc)
 
     async def _execute_tool_call(
         self,
@@ -451,3 +454,23 @@ def _truthy(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().casefold() in {"1", "true", "yes", "y", "да", "on"}
     return bool(value)
+
+
+def _enforce_task_close_response(result: AgentResult, *, settings: Settings | None = None) -> AgentResult:
+    for action in reversed(result.actions_taken):
+        if str(action.status) != "ok":
+            continue
+        details = action.details if isinstance(action.details, dict) else {}
+        data = details.get("data") if isinstance(details.get("data"), dict) else {}
+        if action.name == "task_close_draft":
+            answer = _format_task_close_draft_answer(data)
+            return result.model_copy(update={"status": "needs_human", "answer": answer})
+        if action.name == "task_close_confirm":
+            answer = _format_task_close_confirm_answer(
+                data,
+                portal_base_url=settings.bitrix_portal_base_url if settings is not None else "",
+            )
+            return result.model_copy(update={"status": "completed", "answer": answer})
+        if action.name == "task_close_discard":
+            return result.model_copy(update={"status": "completed", "answer": "Черновик закрытия задачи удалён."})
+    return result
