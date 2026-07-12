@@ -11,6 +11,17 @@ from ai_server.integrations.bitrix.portal_search import (
     sync_portal_content_index,
     sync_portal_index,
 )
+from ai_server.integrations.bitrix.task_close_control import (
+    TASK_CLOSE_DECISION_CONTROLLED,
+    TASK_CLOSE_DECISION_IGNORED_BEFORE_START,
+    TASK_CLOSE_DECISION_IGNORED_USER_NOT_CONTROLLED,
+    task_close_event_key,
+)
+from ai_server.integrations.bitrix.task_close_direct_queue import (
+    TASK_CLOSE_DIRECT_STATUS_ACTIVE,
+    TASK_CLOSE_DIRECT_STATUS_PENDING,
+    direct_close_state_key,
+)
 from ai_server.integrations.bitrix.task_close_reports import task_close_report_state_key
 from ai_server.main import app
 from ai_server.models import AgentTask
@@ -358,6 +369,215 @@ def test_portal_metadata_sync_indexes_tasks_projects_and_disk(monkeypatch):
     assert index.search("AI_SERVER_TASK_CLOSE_INCOMPLETE", entity_types={"task"})
     assert index.search("Borisov Junction", entity_types={"catalog_store_stock"})
     assert any(method == "batch" for method, _payload in bitrix.calls)
+
+
+def test_portal_metadata_sync_queues_controlled_direct_closed_tasks(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    index = FakePortalSearchIndex()
+    index.set_task_close_control_setting(
+        key="control_enabled_from",
+        value="2026-07-12T00:00:00+03:00",
+        updated_by=1,
+    )
+    index.upsert_task_close_controlled_user(user_id=13, active=True, updated_by=1)
+
+    class DirectClosedBitrix(FakePortalBitrix):
+        async def list_all_tasks(self, **kwargs):
+            return [
+                {
+                    "ID": 402,
+                    "TITLE": "Later closed direct task",
+                    "DESCRIPTION": "Second direct close",
+                    "STATUS": 5,
+                    "RESPONSIBLE_ID": 13,
+                    "CREATED_BY": 1,
+                    "CHANGED_DATE": "2026-07-12T12:22:00+03:00",
+                    "CLOSED_DATE": "2026-07-12T12:20:00+03:00",
+                    "CLOSED_BY": 13,
+                    "UF_TASK_WEBDAV_FILES": [],
+                },
+                {
+                    "ID": 401,
+                    "TITLE": "Earlier closed direct task",
+                    "DESCRIPTION": "First direct close",
+                    "STATUS": 5,
+                    "RESPONSIBLE_ID": 13,
+                    "CREATED_BY": 1,
+                    "CHANGED_DATE": "2026-07-12T12:12:00+03:00",
+                    "CLOSED_DATE": "2026-07-12T12:10:00+03:00",
+                    "CLOSED_BY": 13,
+                    "UF_TASK_WEBDAV_FILES": [],
+                },
+            ]
+
+        async def result(self, method: str, payload: dict):
+            self.calls.append((method, payload))
+            if method == "batch":
+                return {"result": {key: [] for key in payload["cmd"]}, "result_error": []}
+            raise AssertionError(method)
+
+    anyio_run(sync_portal_index(DirectClosedBitrix(), index, settings=get_settings()))
+
+    early_key = task_close_event_key(task_id=401, closed_at="2026-07-12T12:10:00+03:00")
+    late_key = task_close_event_key(task_id=402, closed_at="2026-07-12T12:20:00+03:00")
+    early_event = index.get_task_close_control_event(task_id=401, close_event_key=early_key)
+    late_event = index.get_task_close_control_event(task_id=402, close_event_key=late_key)
+    assert early_event is not None
+    assert late_event is not None
+    assert early_event["decision"] == TASK_CLOSE_DECISION_CONTROLLED
+    assert late_event["decision"] == TASK_CLOSE_DECISION_CONTROLLED
+
+    early_state = index.get_task_close_processing_state(task_id=401, state_key=direct_close_state_key(early_key))
+    late_state = index.get_task_close_processing_state(task_id=402, state_key=direct_close_state_key(late_key))
+    assert early_state is not None
+    assert late_state is not None
+    assert early_state["status"] == TASK_CLOSE_DIRECT_STATUS_ACTIVE
+    assert late_state["status"] == TASK_CLOSE_DIRECT_STATUS_PENDING
+
+
+def test_portal_metadata_sync_keeps_uncontrolled_direct_close_ignored_after_user_added(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    index = FakePortalSearchIndex()
+    index.set_task_close_control_setting(
+        key="control_enabled_from",
+        value="2026-07-12T00:00:00+03:00",
+        updated_by=1,
+    )
+
+    class DirectClosedBitrix(FakePortalBitrix):
+        async def list_all_tasks(self, **kwargs):
+            return [
+                {
+                    "ID": 410,
+                    "TITLE": "Direct close by uncontrolled user",
+                    "DESCRIPTION": "Closed before user was added to control",
+                    "STATUS": 5,
+                    "RESPONSIBLE_ID": 99,
+                    "CREATED_BY": 1,
+                    "CHANGED_DATE": "2026-07-12T14:00:00+03:00",
+                    "CLOSED_DATE": "2026-07-12T13:55:00+03:00",
+                    "CLOSED_BY": 99,
+                    "UF_TASK_WEBDAV_FILES": [],
+                }
+            ]
+
+        async def result(self, method: str, payload: dict):
+            self.calls.append((method, payload))
+            if method == "batch":
+                return {"result": {key: [] for key in payload["cmd"]}, "result_error": []}
+            raise AssertionError(method)
+
+    anyio_run(sync_portal_index(DirectClosedBitrix(), index, settings=get_settings()))
+    index.upsert_task_close_controlled_user(user_id=99, active=True, updated_by=1)
+    anyio_run(sync_portal_index(DirectClosedBitrix(), index, settings=get_settings()))
+
+    close_key = task_close_event_key(task_id=410, closed_at="2026-07-12T13:55:00+03:00")
+    event = index.get_task_close_control_event(task_id=410, close_event_key=close_key)
+    state = index.get_task_close_processing_state(task_id=410, state_key=direct_close_state_key(close_key))
+    assert event is not None
+    assert event["decision"] == TASK_CLOSE_DECISION_IGNORED_USER_NOT_CONTROLLED
+    assert state is None
+
+
+def test_portal_metadata_sync_ignores_direct_close_before_control_start(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    index = FakePortalSearchIndex()
+    index.set_task_close_control_setting(
+        key="control_enabled_from",
+        value="2026-07-12T00:00:00+03:00",
+        updated_by=1,
+    )
+    index.upsert_task_close_controlled_user(user_id=13, active=True, updated_by=1)
+
+    class OldDirectClosedBitrix(FakePortalBitrix):
+        async def list_all_tasks(self, **kwargs):
+            return [
+                {
+                    "ID": 411,
+                    "TITLE": "Old direct close",
+                    "DESCRIPTION": "Closed before control launch",
+                    "STATUS": 5,
+                    "RESPONSIBLE_ID": 13,
+                    "CREATED_BY": 1,
+                    "CHANGED_DATE": "2026-07-10T12:05:00+03:00",
+                    "CLOSED_DATE": "2026-07-10T12:00:00+03:00",
+                    "CLOSED_BY": 13,
+                    "UF_TASK_WEBDAV_FILES": [],
+                }
+            ]
+
+        async def result(self, method: str, payload: dict):
+            self.calls.append((method, payload))
+            if method == "batch":
+                return {"result": {key: [] for key in payload["cmd"]}, "result_error": []}
+            raise AssertionError(method)
+
+    anyio_run(sync_portal_index(OldDirectClosedBitrix(), index, settings=get_settings()))
+
+    close_key = task_close_event_key(task_id=411, closed_at="2026-07-10T12:00:00+03:00")
+    event = index.get_task_close_control_event(task_id=411, close_event_key=close_key)
+    state = index.get_task_close_processing_state(task_id=411, state_key=direct_close_state_key(close_key))
+    assert event is not None
+    assert event["decision"] == TASK_CLOSE_DECISION_IGNORED_BEFORE_START
+    assert state is None
+
+
+def test_portal_metadata_sync_does_not_queue_task_with_ai_close_report(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    monkeypatch.setenv("SEARCH_INDEX_MAX_TASK_ATTACHMENTS", "10")
+    index = FakePortalSearchIndex()
+    index.set_task_close_control_setting(
+        key="control_enabled_from",
+        value="2026-07-12T00:00:00+03:00",
+        updated_by=1,
+    )
+    index.upsert_task_close_controlled_user(user_id=13, active=True, updated_by=1)
+
+    class ReportedClosedBitrix(FakePortalBitrix):
+        async def list_all_tasks(self, **kwargs):
+            return [
+                {
+                    "ID": 412,
+                    "TITLE": "Already closed through AI workflow",
+                    "DESCRIPTION": "Has protected report file",
+                    "STATUS": 5,
+                    "RESPONSIBLE_ID": 13,
+                    "CREATED_BY": 1,
+                    "CHANGED_DATE": "2026-07-12T15:00:00+03:00",
+                    "CLOSED_DATE": "2026-07-12T14:55:00+03:00",
+                    "CLOSED_BY": 13,
+                    "UF_TASK_WEBDAV_FILES": ["n812"],
+                }
+            ]
+
+        async def result(self, method: str, payload: dict):
+            self.calls.append((method, payload))
+            if method == "batch":
+                return {"result": {key: [] for key in payload["cmd"]}, "result_error": []}
+            raise AssertionError(method)
+
+        async def get_attached_object(self, attached_object_id: int):
+            return {
+                "ID": attached_object_id,
+                "OBJECT_ID": 62357,
+                "NAME": "AI-close-412-ok.txt",
+                "SIZE": 269,
+                "CREATE_TIME": "2026-07-12T14:56:00+03:00",
+                "DOWNLOAD_URL": "https://example.test/download/812",
+            }
+
+    anyio_run(sync_portal_index(ReportedClosedBitrix(), index, settings=get_settings()))
+
+    close_key = task_close_event_key(task_id=412, closed_at="2026-07-12T14:55:00+03:00")
+    task = index.get_item(entity_type="task", entity_id=412)
+    assert task is not None
+    assert task.metadata["task_close_control_decision"] == "skipped_ai_close_report_present"
+    assert index.get_task_close_control_event(task_id=412, close_event_key=close_key) is None
+    assert index.get_task_close_processing_state(task_id=412, state_key=direct_close_state_key(close_key)) is None
 
 
 def test_portal_metadata_sync_marks_ai_close_report_attachment(monkeypatch):
