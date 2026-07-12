@@ -39,6 +39,7 @@ ALLOWED_TOOL_NAMES = {
     "task_close_draft",
     "task_close_confirm",
     "task_close_discard",
+    "task_close_report_incident",
     "calendar_event_draft",
     "calendar_event_confirm",
     "calendar_event_discard",
@@ -139,6 +140,14 @@ class BitrixLLMService:
                 decision=local_decision,
                 model_usage=_local_model_usage(manifest.id, "draft_confirm_route"),
                 raw={"source": "draft_confirm_route"},
+            )
+
+        local_decision = _common_task_close_report_incident_decision(task.request, dialog_history, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "task_close_report_incident_route"),
+                raw={"source": "task_close_report_incident_route"},
             )
 
         local_decision = _common_calendar_event_draft_decision(task.request, tool_definitions)
@@ -349,6 +358,12 @@ def _direct_task_create_response(
                 status="completed",
                 answer="Черновик закрытия задачи удалён.",
                 model_usage=_local_model_usage(agent_id, "task_close_discard_response"),
+            )
+        if result.tool == "task_close_report_incident":
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer=_format_task_close_report_incident_answer(result.data),
+                model_usage=_local_model_usage(agent_id, "task_close_report_incident_response"),
             )
         if result.tool == "calendar_event_draft":
             return BitrixLLMFinalResult(
@@ -820,9 +835,6 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
     if not unconfirmed and unresolved:
         unconfirmed = unresolved
     missing_fields = _text_items(preview.get("missing_fields") or draft.get("missing_fields"))
-    marker = _text(preview.get("ai_close_marker")) or _text(draft.get("ai_close_marker"))
-    if not marker and (not_done or unconfirmed):
-        marker = "AI_SERVER_TASK_CLOSE_INCOMPLETE"
     lines = [
         "Черновик закрытия задачи:",
         f"Задача: {task_title}",
@@ -846,8 +858,8 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
     if missing_fields:
         lines.append("Нужно дописать:")
         lines.extend(f"- {item}" for item in missing_fields)
-    if marker:
-        lines.append(f"Метка при закрытии: {marker}.")
+    if not_done or unconfirmed:
+        lines.append(f"Статус AI-закрытия: {_task_close_human_status(not_done, unconfirmed)}.")
     lines.append("")
     lines.append('Действия: допишите данные или напишите "да, закрывай как есть".')
     return "\n".join(lines)
@@ -859,11 +871,36 @@ def _format_task_close_confirm_answer(data: dict[str, Any], *, portal_base_url: 
     task_title = _text(data.get("task_title")) or _text(draft.get("task_title")) or _task_fallback_title(task_id)
     action = _text(data.get("action")) or _text(draft.get("action"))
     label = _task_link(task_title, task_id, portal_base_url=portal_base_url)
-    unresolved = data.get("unresolved_items") if isinstance(data.get("unresolved_items"), list) else []
-    suffix = " С непроверенными пунктами добавлена метка AI_SERVER_TASK_CLOSE_INCOMPLETE." if unresolved else ""
+    not_done = _text_items(data.get("not_done_items") or draft.get("not_done_items"))
+    unconfirmed = _text_items(data.get("unconfirmed_items") or draft.get("unconfirmed_items"))
+    unresolved = _text_items(data.get("unresolved_items") or draft.get("unresolved_items"))
+    if not unconfirmed and unresolved:
+        unconfirmed = unresolved
+    suffix = f" Статус: {_task_close_human_status(not_done, unconfirmed)}." if not_done or unconfirmed else ""
     if action == "approve":
         return f"Задача закрыта: {label}.{suffix}"
     return f"Задача отмечена выполненной: {label}.{suffix}"
+
+
+def _format_task_close_report_incident_answer(data: dict[str, Any]) -> str:
+    task_id = _text(data.get("task_id"))
+    file_name = _text(data.get("file_name")) or "AI-close report"
+    action = _text(data.get("action"))
+    if action == "restore":
+        return f"Файл отчёта AI-закрытия восстановлен в задаче #{task_id}: {file_name}."
+    if action == "accept_missing":
+        return (
+            f"Принято: удаление отчёта AI-закрытия по задаче #{task_id} оставлено как есть, служебные данные очищены."
+        )
+    return f"Инцидент отчёта AI-закрытия по задаче #{task_id} обработан."
+
+
+def _task_close_human_status(not_done_items: list[str], unconfirmed_items: list[str]) -> str:
+    if not_done_items and unconfirmed_items:
+        return "выполнена частично, неподтвержденная"
+    if not_done_items:
+        return "выполнена частично"
+    return "неподтвержденная"
 
 
 def _format_calendar_event_draft_answer(data: dict[str, Any]) -> str:
@@ -1042,7 +1079,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
-        '"tool_calls":[{"name":"bitrix_warehouse_search|bitrix_my_tasks|bitrix_task_search|bitrix_project_search|bitrix_api|task_create_draft|task_create_confirm|task_draft_discard|task_close_draft|task_close_confirm|task_close_discard|calendar_event_draft|calendar_event_confirm|calendar_event_discard|project_create_draft|project_create_confirm|project_create_discard|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
+        '"tool_calls":[{"name":"bitrix_warehouse_search|bitrix_my_tasks|bitrix_task_search|bitrix_project_search|bitrix_api|task_create_draft|task_create_confirm|task_draft_discard|task_close_draft|task_close_confirm|task_close_discard|task_close_report_incident|calendar_event_draft|calendar_event_confirm|calendar_event_discard|project_create_draft|project_create_confirm|project_create_discard|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
         "Перед каждым tool_call сам проверь, хватает ли данных для его корректного вызова. "
         "Нельзя вызывать tool с надеждой, что backend или tool сам разберётся с недостающими данными. "
         'Если данных не хватает, не вызывай tool: верни status=needs_clarification, tool_calls=[{"name":"none"}], '
@@ -1092,6 +1129,8 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "If the current user explicitly cancels or rejects a task closing draft, call task_close_discard. "
         "If the current user explicitly cancels or rejects a calendar event draft, call calendar_event_discard. "
         "If the current user explicitly cancels or rejects a project creation draft, call project_create_discard. "
+        "If dialog_history contains an AI-close report missing alert and the admin replies with option 1/restore, call task_close_report_incident with action=restore. "
+        "If the admin replies with option 2/accept/delete for that alert, call task_close_report_incident with action=accept_missing. Do not add Bitrix buttons. "
         "Do not call confirm tools for ambiguous replies; ask a short clarification instead. "
         "Для фраз вида 'напомни мне завтра позвонить Борисову' используй календарь: подготовь calendar_event_draft, а не задачу и не прямой bitrix_api. "
         "Если время напоминания не указано, передай date_iso или start_iso с датой без времени: backend поставит 12:00 МСК. "
@@ -1101,8 +1140,8 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Сначала найди задачу через bitrix_task_search, собери результат выполнения, затем вызови task_close_draft. "
         "В task_close_draft передавай короткий полный черновик: task_points, equipment_consumables, overall_status, "
         "not_done_items для невыполненных пунктов и unconfirmed_items для неизвестного/неподтверждённого результата. "
-        "Если после уточнений пользователь явно разрешает закрыть с такими проблемами, backend добавит метку "
-        "AI_SERVER_TASK_CLOSE_INCOMPLETE для будущей индексации. "
+        "Если после уточнений пользователь явно разрешает закрыть с такими проблемами, backend сохранит признак неполного AI-закрытия для будущей индексации. "
+        "Не показывай пользователю технический код AI_SERVER_TASK_CLOSE_INCOMPLETE; в видимом тексте пиши коротко: неподтвержденная или выполнена частично. "
         "Для уведомления пользователя используй bitrix_api с im.notify.system.add. "
         "Методы закрытия задач complete/approve/result.add не вызывай через bitrix_api: для них есть task_close_* tools. "
         "Остальные разрешённые Bitrix-методы вызывай через bitrix_api. "
@@ -1181,6 +1220,7 @@ _WRITE_TOOL_NAMES = frozenset(
         "task_close_draft",
         "task_close_confirm",
         "task_close_discard",
+        "task_close_report_incident",
         "calendar_event_draft",
         "calendar_event_confirm",
         "calendar_event_discard",
@@ -1326,6 +1366,84 @@ def _confirm_decision_tool(name: str, summary: str) -> BitrixLLMDecision:
             )
         ],
     )
+
+
+def _common_task_close_report_incident_decision(
+    request: str,
+    dialog_history: list[dict[str, str]] | None,
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    if not _draft_discard_tool_available(tool_definitions, "task_close_report_incident"):
+        return None
+    action = _task_close_report_incident_action(request)
+    if not action:
+        return None
+    context_text = _task_close_report_incident_context(request, dialog_history)
+    if not _has_task_close_report_context(context_text):
+        return None
+    task_id = _task_close_report_task_id(context_text)
+    if task_id is None:
+        return None
+    args: dict[str, Any] = {"task_id": task_id, "action": action}
+    file_name = _task_close_report_file_name(context_text)
+    if file_name:
+        args["file_name"] = file_name
+    return BitrixLLMDecision(
+        status="completed",
+        answer="",
+        confidence=0.95,
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="task_close_report_incident",
+                args=args,
+                summary="deterministic task close report incident routing",
+            )
+        ],
+    )
+
+
+def _task_close_report_incident_action(request: str) -> str:
+    text = _strip_command_prefix(request).strip().casefold()
+    if text in {"1", "1.", "первый", "первый вариант"}:
+        return "restore"
+    if text in {"2", "2.", "второй", "второй вариант"}:
+        return "accept_missing"
+    if any(marker in text for marker in ("восстанов", "верни", "вернуть")):
+        return "restore"
+    if any(marker in text for marker in ("удали", "удалить", "все в порядке", "всё в порядке", "оставь как есть")):
+        return "accept_missing"
+    return ""
+
+
+def _task_close_report_incident_context(
+    request: str,
+    dialog_history: list[dict[str, str]] | None,
+) -> str:
+    parts = [request]
+    for item in reversed(dialog_history or []):
+        content = str(item.get("content") or "")
+        if _has_task_close_report_context(content):
+            parts.append(content)
+            break
+    return "\n".join(parts)
+
+
+def _has_task_close_report_context(text: str) -> bool:
+    lowered = text.casefold()
+    return "ai-close-" in lowered or "файл отчёта" in lowered or "отчет ai-закрытия" in lowered
+
+
+def _task_close_report_task_id(text: str) -> int | None:
+    for pattern in (r"задач[аеиу]?\s*#?\s*(\d+)", r"task\s*#?\s*(\d+)", r"#(\d+)"):
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return optional_int(match.group(1))
+    return None
+
+
+def _task_close_report_file_name(text: str) -> str:
+    match = re.search(r"\bAI-close-\d+-(?:ok|partial|unconfirmed|failed)\.txt\b", text, flags=re.IGNORECASE)
+    return match.group(0) if match else ""
 
 
 def _common_calendar_event_draft_decision(

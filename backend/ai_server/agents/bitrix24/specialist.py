@@ -36,6 +36,7 @@ from ai_server.agents.bitrix24.tools import (
     TaskCloseConfirmTool,
     TaskCloseDiscardTool,
     TaskCloseDraftTool,
+    TaskCloseReportIncidentTool,
     TaskCreateConfirmTool,
     TaskCreateDraftTool,
     TaskDraftDiscardTool,
@@ -71,6 +72,7 @@ _LLM_TOOL_NAMES = frozenset(
         "task_close_draft",
         "task_close_confirm",
         "task_close_discard",
+        "task_close_report_incident",
         "calendar_event_draft",
         "calendar_event_confirm",
         "calendar_event_discard",
@@ -189,6 +191,11 @@ class Bitrix24Specialist(BaseSpecialist):
                 draft_ttl_minutes=_settings.bitrix_task_draft_ttl_minutes,
             ),
             TaskCloseDiscardTool(store=bitrix_store),
+            TaskCloseReportIncidentTool(
+                client=bitrix_client,
+                portal_search=portal_search_index,
+                settings=_settings,
+            ),
             CalendarEventDraftTool(store=bitrix_store),
             CalendarEventConfirmTool(
                 store=bitrix_store,

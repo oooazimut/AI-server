@@ -20,6 +20,7 @@ from ai_server.agents.bitrix24.tools.task_close import (
     TaskCloseConfirmTool,
     TaskCloseDiscardTool,
     TaskCloseDraftTool,
+    TaskCloseReportIncidentTool,
 )
 from ai_server.agents.bitrix24.tools.task_create import (
     TaskCreateConfirmTool,
@@ -48,6 +49,7 @@ __all__ = [
     "TaskCloseDraftTool",
     "TaskCloseConfirmTool",
     "TaskCloseDiscardTool",
+    "TaskCloseReportIncidentTool",
     "SaveIncompleteProposalTool",
     "DeleteIncompleteProposalTool",
     "SaveResponsibleResponseTool",
