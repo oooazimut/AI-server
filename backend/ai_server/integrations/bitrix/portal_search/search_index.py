@@ -69,6 +69,16 @@ class PortalSearchIndex(Protocol):
 
     def get_task_close_processing_state(self, *, task_id: object, state_key: str) -> dict[str, Any] | None: ...
 
+    def list_task_close_processing_states(
+        self,
+        *,
+        statuses: list[str] | None = None,
+        state_key_prefix: str = "",
+        responsible_id: int | None = None,
+        dialog_key: str = "",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]: ...
+
     def upsert_task_close_processing_state(
         self,
         *,

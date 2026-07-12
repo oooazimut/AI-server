@@ -456,6 +456,51 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
         result["payload"] = safe_json(result.pop("payload_json"))
         return result
 
+    def list_task_close_processing_states(
+        self,
+        *,
+        statuses: list[str] | None = None,
+        state_key_prefix: str = "",
+        responsible_id: int | None = None,
+        dialog_key: str = "",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if limit <= 0:
+            return []
+        where: list[str] = ["TRUE"]
+        params: list[Any] = []
+        if statuses:
+            where.append("status = ANY(%s)")
+            params.append(list(statuses))
+        if state_key_prefix:
+            where.append("state_key LIKE %s ESCAPE '\\'")
+            params.append(f"{escape_like(state_key_prefix)}%")
+        if responsible_id is not None:
+            where.append("(payload_json::jsonb ->> 'responsible_id') = %s")
+            params.append(str(responsible_id))
+        if dialog_key:
+            where.append("(payload_json::jsonb ->> 'dialog_key') = %s")
+            params.append(dialog_key)
+        params.append(limit)
+
+        with self._sync_connect() as db:
+            rows = db.execute(
+                f"""
+                SELECT task_id, state_key, status, payload_json, actor_user_id, created_at, updated_at
+                FROM bitrix24.task_close_processing_state
+                WHERE {" AND ".join(where)}
+                ORDER BY created_at ASC, task_id ASC, state_key ASC
+                LIMIT %s
+                """,
+                tuple(params),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = safe_json(item.pop("payload_json"))
+            result.append(item)
+        return result
+
     def upsert_task_close_processing_state(
         self,
         *,
