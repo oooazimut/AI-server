@@ -880,77 +880,102 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
     )
     equipment = _text(preview.get("equipment_consumables")) or _text(draft.get("equipment_consumables"))
     additional_info = _text(preview.get("additional_info")) or _text(draft.get("additional_info"))
+    overall_status = _text(preview.get("overall_status")) or _text(draft.get("overall_status"))
     overall = _text(preview.get("overall_status_label")) or _text(draft.get("overall_status_label"))
     if overall.casefold() == "результат не подтверждён" and not result_text:
         overall = ""
     not_done = _text_items(preview.get("not_done_items") or draft.get("not_done_items"))
     unconfirmed = _text_items(preview.get("unconfirmed_items") or draft.get("unconfirmed_items"))
+    status_reasons = _text_items(preview.get("status_reasons") or draft.get("status_reasons"))
     unresolved = _text_items(preview.get("unresolved_items") or draft.get("unresolved_items"))
     if not unconfirmed and unresolved:
         unconfirmed = unresolved
     unconfirmed = _task_close_visible_unconfirmed(unconfirmed, task_points=task_points, result_text=result_text)
     lines = [f"Черновик #{task_id or '?'}: {task_title}"]
     lines.append("")
-    lines.append("1. Выполненные работы")
+    lines.append("1. Выполняемые работы")
     if source_task_description_empty:
         result_items = _task_close_display_items(result_text)
         if result_items:
             lines.extend(f"1.{index} {item}" for index, item in enumerate(result_items, start=1))
-            lines.append(f"1.{len(result_items) + 1} Другое - ... ???")
+            lines.append(f"1.{len(result_items) + 1} Еще работы - ... ???")
         else:
-            lines.append("1.1 что сделано - ... ???")
+            lines.append("1.1 Еще работы - ... ???")
     else:
         if task_points:
             lines.extend(
                 f"1.{index} {item} - {_task_close_point_status(item, result_text, not_done, unconfirmed)}"
                 for index, item in enumerate(task_points, start=1)
             )
-            lines.append(f"1.{len(task_points) + 1} Другое - ... ???")
+            lines.append(f"1.{len(task_points) + 1} Еще работы - ... ???")
         elif result_text:
             result_items = _task_close_display_items(result_text)
             lines.extend(f"1.{index} {item}" for index, item in enumerate(result_items, start=1))
-            lines.append(f"1.{len(result_items) + 1} Другое - ... ???")
+            lines.append(f"1.{len(result_items) + 1} Еще работы - ... ???")
         else:
-            lines.append("1.1 что сделано - ... ???")
+            lines.append("1.1 Еще работы - ... ???")
     lines.append("")
-    lines.append("2. Использованное оборудование")
+    lines.append("2. Использовано материалов, оборудование")
+    lines.append("   (перечисли, что использовали, или укажи: не использовалось)")
     equipment_items = _task_close_display_items(equipment)
     if equipment_items:
         lines.extend(f"2.{index} {item}" for index, item in enumerate(equipment_items, start=1))
-        lines.append(f"2.{len(equipment_items) + 1} Другое - ... ???")
-    else:
-        lines.append("2.1 не было / что использовано - ... ???")
+        lines.append(f"2.{len(equipment_items) + 1} Еще материалы - ... ???")
     lines.append("")
-    lines.append("3. Выполнение работ")
-    if overall:
-        lines.append(f"3.1 Статус: {overall}")
-    else:
-        lines.append("3.1 Статус: выполнено / частично выполнено / не выполнено - ... ???")
-    reason_index = 2
-    if not_done:
-        for item in not_done:
-            lines.append(f"3.{reason_index} Причина/что не выполнено: {item}")
-            reason_index += 1
-    elif not overall or overall.casefold() in {"выполнена частично", "не выполнена"}:
-        lines.append(f"3.{reason_index} Причина, если частично или не выполнено - ... ???")
-        reason_index += 1
-    if unconfirmed:
-        for item in unconfirmed:
-            lines.append(f"3.{reason_index} Не подтверждено: {item}")
-            reason_index += 1
-    if reason_index > 2:
-        lines.append(f"3.{reason_index} Другое - ... ???")
+    lines.append("3. Статус выполнения работ")
+    lines.append(f"   {_task_close_status_prompt(overall_status or overall)}")
+    if status_reasons:
+        for index, item in enumerate(status_reasons, start=1):
+            lines.append(f"3.{index} причина: {item}")
+        lines.append(f"3.{len(status_reasons) + 1} Еще причины невыполнения - ... ???")
+    elif _task_close_status_needs_reason(overall_status or overall):
+        lines.append("3.1 Еще причины невыполнения - ... ???")
     lines.append("")
     lines.append("4. Дополнительная информация")
-    additional_items = _task_close_display_items(additional_info)
-    if additional_items:
-        lines.extend(f"4.{index} {item}" for index, item in enumerate(additional_items, start=1))
-        lines.append(f"4.{len(additional_items) + 1} Другое - ... ???")
+    if _task_close_absent_value(additional_info):
+        lines.append("   (если есть — укажи; если нет — укажи: [ВЫБРАНО: отсутствует])")
     else:
-        lines.append("4.1 ... ???")
+        lines.append("   (если есть — укажи; если нет — укажи: отсутствует)")
+    additional_items = _task_close_display_items(additional_info)
+    if additional_items and not _task_close_absent_value(additional_info):
+        lines.extend(f"4.{index} {item}" for index, item in enumerate(additional_items, start=1))
+        lines.append(f"4.{len(additional_items) + 1} Еще информация - ... ???")
     lines.append("")
     lines.append('Действия: допишите данные или напишите "да, закрывай как есть".')
     return "\n".join(lines)
+
+
+def _task_close_status_prompt(status: str) -> str:
+    normalized = _task_close_normalized_status(status)
+    options = [
+        ("completed", "выполнено полностью"),
+        ("partial", "выполнено частично"),
+        ("not_done", "не выполнено"),
+    ]
+    rendered = [f"[ВЫБРАНО: {label}]" if normalized == key else label for key, label in options]
+    return (
+        f"({' / '.join(rendered)}; если выполнено частично или не выполнено — укажи причину неполного выполнения работ)"
+    )
+
+
+def _task_close_normalized_status(status: str) -> str:
+    text = compact_text(status).casefold()
+    if text in {"completed", "complete", "done"} or "полностью" in text:
+        return "completed"
+    if text in {"partial", "partially_done", "partly_done"} or "частич" in text:
+        return "partial"
+    if text in {"not_done", "not_completed", "not done"} or "не выполн" in text or "не сделан" in text:
+        return "not_done"
+    return ""
+
+
+def _task_close_status_needs_reason(status: str) -> bool:
+    return _task_close_normalized_status(status) in {"partial", "not_done"}
+
+
+def _task_close_absent_value(value: str) -> bool:
+    text = compact_text(value).casefold()
+    return text in {"отсутствует", "нет", "не было", "нет дополнительной информации"}
 
 
 def _task_close_is_placeholder_summary(value: str) -> bool:
@@ -1879,10 +1904,15 @@ def _common_task_close_active_update_decision(
 def _task_close_active_update_args(request: str, *, draft: dict[str, Any], task_id: int) -> dict[str, Any]:
     summary = _task_close_update_summary(request, task_id=task_id)
     lowered = summary.casefold()
+    work_summary = _task_close_work_summary_from_text(summary)
+    work_lowered = work_summary.casefold()
+    status_section = _task_close_section_text(summary, 3)
+    status_text = status_section or (summary if not _task_close_has_section_markers(summary) else "")
+    status_lowered = status_text.casefold()
     args = {
         "task_id": task_id,
         "task_title": _text(draft.get("task_title")),
-        "completion_summary": _task_close_work_summary_from_text(summary),
+        "completion_summary": work_summary,
     }
     equipment = _task_close_equipment_from_text(summary, lowered)
     if equipment:
@@ -1890,17 +1920,24 @@ def _task_close_active_update_args(request: str, *, draft: dict[str, Any], task_
     additional_info = _task_close_additional_info_from_text(summary)
     if additional_info:
         args["additional_info"] = additional_info
-    overall_status = _task_close_overall_status_from_text(lowered)
+    overall_status = _task_close_overall_status_from_text(status_lowered)
     if overall_status:
         args["overall_status"] = overall_status
+    status_reasons = (
+        _task_close_status_reasons_from_text(status_text)
+        if status_section or re.search(r"\bпричин[аы]?\b", status_text, flags=re.IGNORECASE)
+        else []
+    )
+    if status_reasons:
+        args["status_reasons"] = status_reasons
     task_points = _text_items(draft.get("task_points"))
-    not_done_items = _task_close_not_done_items_from_text(summary, lowered, task_points=task_points)
+    not_done_items = _task_close_not_done_items_from_text(work_summary, work_lowered, task_points=task_points)
     if not_done_items:
         args["not_done_items"] = not_done_items
-    unconfirmed_items = _task_close_unconfirmed_items_from_text(summary, lowered, task_points=task_points)
+    unconfirmed_items = _task_close_unconfirmed_items_from_text(work_summary, work_lowered, task_points=task_points)
     if unconfirmed_items:
         args["unconfirmed_items"] = unconfirmed_items
-    if equipment or additional_info or overall_status:
+    if equipment or additional_info or overall_status or status_reasons:
         args["missing_fields"] = []
     return args
 
@@ -1916,15 +1953,16 @@ def _task_close_update_summary(request: str, *, task_id: int) -> str:
 
 
 def _task_close_work_summary_from_text(summary: str) -> str:
-    text = _task_close_before_block(summary, 2)
+    text = _task_close_section_text(summary, 1) or _task_close_before_any_block(summary, (2, 3, 4))
     text = re.sub(r"^\s*(?:по\s+)?пункт[ау]?\s+1\s*:?", "", text, flags=re.IGNORECASE)
     return _task_close_clean_referenced_text(text)
 
 
 def _task_close_equipment_from_text(summary: str, lowered: str) -> str:
-    if "оборуд" not in lowered and "расход" not in lowered:
+    section = _task_close_section_text(summary, 2)
+    if not section and "оборуд" not in lowered and "расход" not in lowered and "материал" not in lowered:
         return ""
-    section = _task_close_section_text(summary, 2) or summary
+    section = section or summary
     section_lowered = section.casefold()
     if "не использ" in section_lowered or "не примен" in section_lowered:
         return "не использовалось"
@@ -1969,9 +2007,6 @@ def _task_close_not_done_items_from_text(summary: str, lowered: str, *, task_poi
         task_points=task_points,
         markers=("не выполн", "не сделан"),
     )
-    reason = _task_close_reason_from_text(summary)
-    if reason:
-        values.append(reason)
     if values:
         return _unique_text_items(values)
     if "не выполн" in lowered or "не сделан" in lowered:
@@ -1987,9 +2022,26 @@ def _task_close_unconfirmed_items_from_text(summary: str, lowered: str, *, task_
     )
     if values:
         return values
-    if "не подтверж" in lowered or "неизвест" in lowered or "не провер" in lowered or "не все" in lowered:
+    if "не подтверж" in lowered or "неизвест" in lowered or "не провер" in lowered:
         return [summary]
     return []
+
+
+def _task_close_status_reasons_from_text(summary: str) -> list[str]:
+    text = _task_close_clean_referenced_text(summary)
+    if not text:
+        return []
+    reason = _task_close_reason_from_text(text)
+    if reason:
+        return _task_close_display_items(reason)
+    text = re.sub(
+        r"\b(?:выполнено|выполнена)\s+(?:полностью|частично)\b|\bне\s+выполнено\b|\bне\s+выполнена\b",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"^\s*[,.;:-]*\s*(?:причин[аы]?\s*:?)?", "", text, flags=re.IGNORECASE)
+    return _task_close_display_items(text)
 
 
 def _task_close_status_items_from_text(summary: str, *, task_points: list[str], markers: tuple[str, ...]) -> list[str]:
@@ -2028,6 +2080,22 @@ def _task_close_section_text(summary: str, section_number: int) -> str:
     )
     end = match.end() + next_match.start() if next_match else len(summary)
     return compact_text(summary[match.start() : end]).strip(" .;")
+
+
+def _task_close_has_section_markers(summary: str) -> bool:
+    return bool(re.search(r"(?:по\s+)?пункт[ау]?\s+[1-4]\b", summary, flags=re.IGNORECASE))
+
+
+def _task_close_before_any_block(summary: str, section_numbers: tuple[int, ...]) -> str:
+    matches = [
+        match
+        for number in section_numbers
+        if (match := re.search(rf"(?:по\s+)?пункт[ау]?\s+{number}\b", summary, flags=re.IGNORECASE))
+    ]
+    if not matches:
+        return compact_text(summary).strip(" .;")
+    first = min(matches, key=lambda item: item.start())
+    return compact_text(summary[: first.start()]).strip(" .;")
 
 
 def _task_close_before_block(summary: str, section_number: int) -> str:
