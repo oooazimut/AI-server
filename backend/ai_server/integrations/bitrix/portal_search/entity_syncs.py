@@ -26,6 +26,7 @@ from ai_server.integrations.bitrix.task_close_reports import (
     task_close_report_key,
     task_close_report_problem_types,
     task_close_report_records,
+    task_close_report_state_key,
 )
 from ai_server.settings import Settings
 from ai_server.utils import MOSCOW_TZ
@@ -39,6 +40,7 @@ _BITRIX_BATCH_COMMENT_SIZE = 50
 _BITRIX_TASK_RESULT_LIMIT = 10
 _TASK_CLOSE_REPORT_INCIDENT_STATUS_PENDING = "pending"
 _TASK_CLOSE_REPORT_INCIDENT_STATUS_RESTORED = "restored"
+_TASK_CLOSE_REPORT_INCIDENT_STATUS_ACCEPTED_MISSING = "accepted_missing"
 
 
 def _first(data: dict[str, Any], *keys: str) -> object | None:
@@ -269,6 +271,44 @@ def _unique_problem_types(values: list[str]) -> list[str]:
     return result
 
 
+def _task_close_report_is_accepted_missing(
+    index: PortalSearchIndex, *, task_id: int, file_record: dict[str, Any]
+) -> bool:
+    state = _task_close_report_state(index, task_id=task_id, file_record=file_record)
+    return str((state or {}).get("status") or "") == _TASK_CLOSE_REPORT_INCIDENT_STATUS_ACCEPTED_MISSING
+
+
+def _task_close_report_state(
+    index: PortalSearchIndex, *, task_id: int, file_record: dict[str, Any]
+) -> dict[str, Any] | None:
+    getter = getattr(index, "get_task_close_processing_state", None)
+    if not callable(getter):
+        return None
+    state = getter(task_id=task_id, state_key=task_close_report_state_key(file_record))
+    return state if isinstance(state, dict) else None
+
+
+def _upsert_task_close_report_state(
+    index: PortalSearchIndex,
+    *,
+    task_id: int,
+    file_record: dict[str, Any],
+    status: str,
+    payload: dict[str, Any] | None = None,
+    actor_user_id: int | None = None,
+) -> None:
+    upsert = getattr(index, "upsert_task_close_processing_state", None)
+    if not callable(upsert):
+        return
+    upsert(
+        task_id=task_id,
+        state_key=task_close_report_state_key(file_record),
+        status=status,
+        payload=payload,
+        actor_user_id=actor_user_id,
+    )
+
+
 async def _task_close_report_integrity_metadata(
     *,
     bitrix: BitrixClient,
@@ -287,6 +327,14 @@ async def _task_close_report_integrity_metadata(
     if not isinstance(previous_metadata, dict):
         previous_metadata = {}
     previous_report_files = _dict_list(previous_metadata.get("ai_close_report_files"))
+    if not previous_report_files:
+        return {"ai_close_report_files": current_report_files}
+
+    previous_report_files = [
+        record
+        for record in previous_report_files
+        if not _task_close_report_is_accepted_missing(index, task_id=task_id_int, file_record=record)
+    ]
     if not previous_report_files:
         return {"ai_close_report_files": current_report_files}
 
@@ -315,6 +363,19 @@ async def _task_close_report_integrity_metadata(
         "ai_close_report_detected_at": detected_at,
         "ai_close_report_auto_restore_after": auto_restore_after,
     }
+    for file_record in missing_files:
+        _upsert_task_close_report_state(
+            index,
+            task_id=task_id_int,
+            file_record=file_record,
+            status=_TASK_CLOSE_REPORT_INCIDENT_STATUS_PENDING,
+            payload={
+                "task_title": task_title,
+                "detected_at": detected_at,
+                "auto_restore_after": auto_restore_after,
+                "file": file_record,
+            },
+        )
 
     if _should_auto_restore_task_close_report(auto_restore_after, now=now):
         restored_files: list[dict[str, Any]] = []
@@ -330,6 +391,13 @@ async def _task_close_report_integrity_metadata(
                 restored_file = restore_result.get("restored_file")
                 if isinstance(restored_file, dict):
                     restored_files.append(restored_file)
+                    _upsert_task_close_report_state(
+                        index,
+                        task_id=task_id_int,
+                        file_record=file_record,
+                        status=_TASK_CLOSE_REPORT_INCIDENT_STATUS_RESTORED,
+                        payload={"task_title": task_title, "restored_at": now_iso, "restored_file": restored_file},
+                    )
             except Exception as exc:
                 restore_errors.append(f"{file_record.get('name')}: {type(exc).__name__}: {exc}")
         if restored_files and not restore_errors:

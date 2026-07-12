@@ -95,6 +95,75 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                 )
                 """
             )
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bitrix24.task_close_control_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_by INTEGER,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bitrix24.task_close_controlled_users (
+                    user_id INTEGER PRIMARY KEY,
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    updated_by INTEGER,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bitrix24.task_close_processing_state (
+                    task_id INTEGER NOT NULL,
+                    state_key TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    actor_user_id INTEGER,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (task_id, state_key)
+                )
+                """
+            )
+            db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_task_close_processing_state_status
+                ON bitrix24.task_close_processing_state(status)
+                """
+            )
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bitrix24.task_close_control_events (
+                    task_id INTEGER NOT NULL,
+                    close_event_key TEXT NOT NULL,
+                    responsible_id INTEGER,
+                    closed_by_user_id INTEGER,
+                    closed_at TIMESTAMPTZ,
+                    decision TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (task_id, close_event_key)
+                )
+                """
+            )
+            db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_task_close_control_events_decision
+                ON bitrix24.task_close_control_events(decision)
+                """
+            )
+            db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_task_close_control_events_responsible
+                ON bitrix24.task_close_control_events(responsible_id)
+                """
+            )
 
     def save_proposal(
         self,
@@ -216,6 +285,178 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
             await db.execute(
                 "DELETE FROM bitrix24.pending_task_draft WHERE dialog_key = %s",
                 (dialog_key,),
+            )
+
+    # ------------------------------------------------------------------
+    # Bitrix task close control state
+    # ------------------------------------------------------------------
+
+    def get_task_close_control_setting(self, key: str) -> dict[str, Any] | None:
+        with self._sync_connect() as db:
+            row = db.execute(
+                """
+                SELECT key, value, updated_by, updated_at
+                FROM bitrix24.task_close_control_settings
+                WHERE key = %s
+                """,
+                (key,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def set_task_close_control_setting(self, *, key: str, value: str, updated_by: int | None = None) -> None:
+        with self._sync_connect() as db:
+            db.execute(
+                """
+                INSERT INTO bitrix24.task_close_control_settings (key, value, updated_by, updated_at)
+                VALUES (%s, %s, %s, now())
+                ON CONFLICT (key) DO UPDATE SET
+                    value = EXCLUDED.value,
+                    updated_by = EXCLUDED.updated_by,
+                    updated_at = now()
+                """,
+                (key, value, updated_by),
+            )
+
+    def get_task_close_controlled_user(self, user_id: int) -> dict[str, Any] | None:
+        with self._sync_connect() as db:
+            row = db.execute(
+                """
+                SELECT user_id, active, updated_by, updated_at
+                FROM bitrix24.task_close_controlled_users
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_task_close_controlled_user(
+        self,
+        *,
+        user_id: int,
+        active: bool = True,
+        updated_by: int | None = None,
+    ) -> None:
+        with self._sync_connect() as db:
+            db.execute(
+                """
+                INSERT INTO bitrix24.task_close_controlled_users
+                    (user_id, active, updated_by, updated_at)
+                VALUES (%s, %s, %s, now())
+                ON CONFLICT (user_id) DO UPDATE SET
+                    active = EXCLUDED.active,
+                    updated_by = EXCLUDED.updated_by,
+                    updated_at = now()
+                """,
+                (user_id, active, updated_by),
+            )
+
+    def get_task_close_processing_state(self, *, task_id: object, state_key: str) -> dict[str, Any] | None:
+        task_id_int = safe_int(task_id)
+        if task_id_int is None:
+            return None
+        with self._sync_connect() as db:
+            row = db.execute(
+                """
+                SELECT task_id, state_key, status, payload_json, actor_user_id, created_at, updated_at
+                FROM bitrix24.task_close_processing_state
+                WHERE task_id = %s AND state_key = %s
+                """,
+                (task_id_int, state_key),
+            ).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["payload"] = safe_json(result.pop("payload_json"))
+        return result
+
+    def upsert_task_close_processing_state(
+        self,
+        *,
+        task_id: object,
+        state_key: str,
+        status: str,
+        payload: dict[str, Any] | None = None,
+        actor_user_id: int | None = None,
+    ) -> None:
+        task_id_int = safe_int(task_id)
+        if task_id_int is None or not state_key:
+            return
+        with self._sync_connect() as db:
+            db.execute(
+                """
+                INSERT INTO bitrix24.task_close_processing_state
+                    (task_id, state_key, status, payload_json, actor_user_id, updated_at)
+                VALUES (%s, %s, %s, %s, %s, now())
+                ON CONFLICT (task_id, state_key) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    payload_json = EXCLUDED.payload_json,
+                    actor_user_id = EXCLUDED.actor_user_id,
+                    updated_at = now()
+                """,
+                (task_id_int, state_key, status, json.dumps(payload or {}, ensure_ascii=False), actor_user_id),
+            )
+
+    def get_task_close_control_event(self, *, task_id: object, close_event_key: str) -> dict[str, Any] | None:
+        task_id_int = safe_int(task_id)
+        if task_id_int is None or not close_event_key:
+            return None
+        with self._sync_connect() as db:
+            row = db.execute(
+                """
+                SELECT task_id, close_event_key, responsible_id, closed_by_user_id, closed_at,
+                       decision, reason, payload_json, seen_at, updated_at
+                FROM bitrix24.task_close_control_events
+                WHERE task_id = %s AND close_event_key = %s
+                """,
+                (task_id_int, close_event_key),
+            ).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["payload"] = safe_json(result.pop("payload_json"))
+        return result
+
+    def upsert_task_close_control_event(
+        self,
+        *,
+        task_id: object,
+        close_event_key: str,
+        decision: str,
+        reason: str = "",
+        closed_at: str | None = None,
+        responsible_id: int | None = None,
+        closed_by_user_id: int | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        task_id_int = safe_int(task_id)
+        if task_id_int is None or not close_event_key or not decision:
+            return
+        with self._sync_connect() as db:
+            db.execute(
+                """
+                INSERT INTO bitrix24.task_close_control_events
+                    (task_id, close_event_key, responsible_id, closed_by_user_id, closed_at,
+                     decision, reason, payload_json, updated_at)
+                VALUES (%s, %s, %s, %s, %s::timestamptz, %s, %s, %s, now())
+                ON CONFLICT (task_id, close_event_key) DO UPDATE SET
+                    responsible_id = EXCLUDED.responsible_id,
+                    closed_by_user_id = EXCLUDED.closed_by_user_id,
+                    closed_at = EXCLUDED.closed_at,
+                    decision = EXCLUDED.decision,
+                    reason = EXCLUDED.reason,
+                    payload_json = EXCLUDED.payload_json,
+                    updated_at = now()
+                """,
+                (
+                    task_id_int,
+                    close_event_key,
+                    responsible_id,
+                    closed_by_user_id,
+                    closed_at,
+                    decision,
+                    reason,
+                    json.dumps(payload or {}, ensure_ascii=False),
+                ),
             )
 
     # ------------------------------------------------------------------

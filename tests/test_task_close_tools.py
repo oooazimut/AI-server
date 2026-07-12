@@ -15,6 +15,7 @@ from ai_server.agents.bitrix24.tools.task_close import (
     TaskCloseDraftTool,
     TaskCloseReportIncidentTool,
 )
+from ai_server.integrations.bitrix.task_close_reports import task_close_report_state_key
 from ai_server.models import ToolStatus
 from ai_server.settings import get_settings
 from tests.fakes import FakePortalSearchIndex, FakeTaskDraftStore
@@ -401,6 +402,10 @@ def test_task_close_report_incident_accept_missing_clears_index_metadata(monkeyp
 
     assert result.status == ToolStatus.OK
     assert index.get_item(entity_type="task_attachment", entity_id=5509) is None
+    state = index.get_task_close_processing_state(task_id=139, state_key=task_close_report_state_key(report_file))
+    assert state is not None
+    assert state["status"] == "accepted_missing"
+    assert state["actor_user_id"] == 1
     task = index.get_item(entity_type="task", entity_id=139)
     assert task is not None
     assert "ai_close_report_missing" not in task.metadata

@@ -67,6 +67,33 @@ class PortalSearchIndex(Protocol):
         metadata: dict[str, Any],
     ) -> None: ...
 
+    def get_task_close_processing_state(self, *, task_id: object, state_key: str) -> dict[str, Any] | None: ...
+
+    def upsert_task_close_processing_state(
+        self,
+        *,
+        task_id: object,
+        state_key: str,
+        status: str,
+        payload: dict[str, Any] | None = None,
+        actor_user_id: int | None = None,
+    ) -> None: ...
+
+    def get_task_close_control_event(self, *, task_id: object, close_event_key: str) -> dict[str, Any] | None: ...
+
+    def upsert_task_close_control_event(
+        self,
+        *,
+        task_id: object,
+        close_event_key: str,
+        decision: str,
+        reason: str = "",
+        closed_at: str | None = None,
+        responsible_id: int | None = None,
+        closed_by_user_id: int | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None: ...
+
 
 def _score_result(
     normalized_query: str,
