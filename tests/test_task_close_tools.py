@@ -229,6 +229,46 @@ def test_close_draft_merges_same_task_update_without_resetting_known_fields():
     assert draft["missing_fields"] == []
 
 
+def test_close_draft_update_removes_initial_unknown_result_placeholder():
+    store = FakeTaskDraftStore()
+    tool = TaskCloseDraftTool(store=store)
+
+    first = _exec(
+        tool,
+        {
+            "task_id": 139,
+            "task_title": "Проверить камеры",
+            "task_points": ["проверить камеру", "проверить архив"],
+            "overall_status": "unconfirmed",
+            "unconfirmed_items": ["результат выполнения не указан"],
+            "missing_fields": ["что сделано по задаче"],
+        },
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+    second = _exec(
+        tool,
+        {
+            "task_id": 139,
+            "completion_summary": "Проверка выполнена частично, архив не подтвержден.",
+            "overall_status": "partial",
+            "unconfirmed_items": ["архив не подтвержден"],
+            "missing_fields": [],
+        },
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+
+    assert first.status == ToolStatus.OK
+    assert second.status == ToolStatus.OK
+    draft = store._drafts["d:13"]
+    assert draft["unconfirmed_items"] == ["архив не подтвержден"]
+    assert draft["unresolved_items"] == ["архив не подтвержден"]
+    assert "результат выполнения не указан" not in draft["result_text"]
+
+
 def test_close_draft_marks_empty_source_description_for_freeform_result():
     store = FakeTaskDraftStore()
     tool = TaskCloseDraftTool(store=store)

@@ -989,6 +989,13 @@ def _merge_task_close_draft_args(
             continue
         merged[payload_field] = bool(update_payload.get(payload_field))
 
+    if _task_close_has_user_result(update_payload):
+        for field_name in ("unconfirmed_items", "unresolved_items", "missing_fields"):
+            if field_name in merged and field_name not in raw_args:
+                merged[field_name] = _remove_initial_unknown_close_placeholders(merged.get(field_name))
+        if "unconfirmed_items" in raw_args:
+            merged["unconfirmed_items"] = _remove_initial_unknown_close_placeholders(merged.get("unconfirmed_items"))
+
     return merged
 
 
@@ -1017,6 +1024,14 @@ def _preview_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _has_any_key(values: dict[str, Any], keys: tuple[str, ...]) -> bool:
     return any(key in values for key in keys)
+
+
+def _remove_initial_unknown_close_placeholders(value: object) -> list[str]:
+    return [
+        item
+        for item in _string_list(value)
+        if item.casefold() not in {"результат выполнения не указан", "result is not specified"}
+    ]
 
 
 def _truthy(value: object) -> bool:
