@@ -4,19 +4,19 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from ai_server.integrations.bitrix.portal_search.text_utils import safe_int
-
 TASK_CLOSE_DIRECT_QUEUE_PREFIX = "direct_close:"
 
 TASK_CLOSE_DIRECT_STATUS_PENDING = "pending_direct_close"
 TASK_CLOSE_DIRECT_STATUS_ACTIVE = "active_direct_close_draft"
 TASK_CLOSE_DIRECT_STATUS_AUTO_CLOSED_UNCONFIRMED = "auto_closed_unconfirmed"
 TASK_CLOSE_DIRECT_STATUS_COMPLETED = "completed"
+TASK_CLOSE_DIRECT_STATUS_DISCARDED = "discarded"
 
 TASK_CLOSE_DIRECT_TERMINAL_STATUSES = frozenset(
     {
         TASK_CLOSE_DIRECT_STATUS_AUTO_CLOSED_UNCONFIRMED,
         TASK_CLOSE_DIRECT_STATUS_COMPLETED,
+        TASK_CLOSE_DIRECT_STATUS_DISCARDED,
     }
 )
 
@@ -220,6 +220,41 @@ def complete_direct_close_event(
     )
 
 
+def discard_direct_close_event(
+    store: Any,
+    *,
+    task_id: object,
+    close_event_key: object,
+    now_iso: str | None = None,
+    actor_user_id: int | None = None,
+) -> TaskCloseDirectQueueEvent | None:
+    task_id_int = safe_int(task_id)
+    if task_id_int is None:
+        return None
+    state_key = direct_close_state_key(close_event_key)
+    state = _get_state(store, task_id=task_id_int, state_key=state_key)
+    if not state:
+        return None
+    event = _event_from_state(state)
+    payload = dict(event.payload)
+    payload["discarded_at"] = now_iso
+    _upsert_state(
+        store,
+        task_id=task_id_int,
+        state_key=state_key,
+        status=TASK_CLOSE_DIRECT_STATUS_DISCARDED,
+        payload=payload,
+        actor_user_id=actor_user_id if actor_user_id is not None else event.actor_user_id,
+    )
+    return TaskCloseDirectQueueEvent(
+        task_id=task_id_int,
+        state_key=state_key,
+        status=TASK_CLOSE_DIRECT_STATUS_DISCARDED,
+        payload=payload,
+        actor_user_id=actor_user_id if actor_user_id is not None else event.actor_user_id,
+    )
+
+
 def _get_state(store: Any, *, task_id: int, state_key: str) -> dict[str, Any] | None:
     getter = getattr(store, "get_task_close_processing_state", None)
     if not callable(getter):
@@ -320,3 +355,12 @@ def _parse_datetime(value: object | None) -> datetime | None:
 
 def _clean(value: object | None) -> str:
     return str(value or "").strip()
+
+
+def safe_int(value: object | None) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None

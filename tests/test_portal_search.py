@@ -564,7 +564,7 @@ def test_portal_metadata_sync_does_not_queue_task_with_ai_close_report(monkeypat
             return {
                 "ID": attached_object_id,
                 "OBJECT_ID": 62357,
-                "NAME": "AI-close-412-ok.txt",
+                "NAME": "AI-close-412.txt",
                 "SIZE": 269,
                 "CREATE_TIME": "2026-07-12T14:56:00+03:00",
                 "DOWNLOAD_URL": "https://example.test/download/812",
@@ -615,11 +615,17 @@ def test_portal_metadata_sync_marks_ai_close_report_attachment(monkeypatch):
             return {
                 "ID": attached_object_id,
                 "OBJECT_ID": 62357,
-                "NAME": "AI-close-303-unconfirmed (1).txt",
+                "NAME": "AI-close-303.txt",
                 "SIZE": 269,
                 "CREATE_TIME": "2026-06-02T11:01:00+03:00",
                 "DOWNLOAD_URL": "https://example.test/download/801",
             }
+
+        async def download_file_from_url(self, url: str, destination: Path, *, max_bytes: int):
+            data = b"AI task close report\nStatus: unconfirmed\nAI marker: AI_SERVER_TASK_CLOSE_INCOMPLETE\n"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(data)
+            return len(data)
 
     stats = anyio_run(sync_portal_index(ReportAttachmentBitrix(), index, settings=get_settings()))
 
@@ -637,6 +643,66 @@ def test_portal_metadata_sync_marks_ai_close_report_attachment(monkeypatch):
     assert attachment.metadata["ai_close_report"] is True
     assert attachment.metadata["ai_close_problem_types"] == ["unconfirmed"]
     assert index.search("AI_SERVER_TASK_CLOSE_INCOMPLETE", entity_types={"task"})
+
+
+def test_portal_metadata_sync_uses_report_content_status_over_legacy_file_name(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    monkeypatch.setenv("SEARCH_INDEX_MAX_TASK_ATTACHMENTS", "10")
+    index = FakePortalSearchIndex()
+
+    class ReportAttachmentBitrix(FakePortalBitrix):
+        async def list_all_tasks(self, **kwargs):
+            tasks = await super().list_all_tasks(**kwargs)
+            task = dict(tasks[0])
+            task.update(
+                {
+                    "ID": 303,
+                    "TITLE": "Проверить архив",
+                    "STATUS": 5,
+                    "RESPONSIBLE_ID": 13,
+                    "CREATED_BY": 1,
+                    "CLOSED_DATE": "2026-06-02T11:00:00+03:00",
+                    "UF_TASK_WEBDAV_FILES": ["n801"],
+                }
+            )
+            return [task]
+
+        async def result(self, method: str, payload: dict):
+            self.calls.append((method, payload))
+            if method == "batch":
+                if "task_result_0" in payload["cmd"]:
+                    return {"result": {"task_result_0": []}, "result_error": []}
+                return {"result": {"task_0": []}, "result_error": []}
+            raise AssertionError(method)
+
+        async def get_attached_object(self, attached_object_id: int):
+            return {
+                "ID": attached_object_id,
+                "OBJECT_ID": 62357,
+                "NAME": "AI-close-303-unconfirmed.txt",
+                "SIZE": 269,
+                "CREATE_TIME": "2026-06-02T11:01:00+03:00",
+                "DOWNLOAD_URL": "https://example.test/download/801",
+            }
+
+        async def download_file_from_url(self, url: str, destination: Path, *, max_bytes: int):
+            data = b"AI task close report\nStatus: ok\n"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(data)
+            return len(data)
+
+    anyio_run(sync_portal_index(ReportAttachmentBitrix(), index, settings=get_settings()))
+
+    task = index.get_item(entity_type="task", entity_id=303)
+    assert task is not None
+    assert task.metadata["ai_close_report_files"][0]["status"] == "ok"
+    assert task.metadata["ai_close_incomplete"] is False
+    assert task.metadata["ai_close_problem_types"] == []
+    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" not in task.body
+    attachment = index.get_item(entity_type="task_attachment", entity_id=801)
+    assert attachment is not None
+    assert attachment.metadata["ai_close_problem_types"] == []
 
 
 def test_portal_metadata_sync_alerts_when_ai_close_report_attachment_disappears(monkeypatch):

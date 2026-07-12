@@ -4,11 +4,13 @@ from ai_server.integrations.bitrix.task_close_direct_queue import (
     TASK_CLOSE_DIRECT_STATUS_ACTIVE,
     TASK_CLOSE_DIRECT_STATUS_AUTO_CLOSED_UNCONFIRMED,
     TASK_CLOSE_DIRECT_STATUS_COMPLETED,
+    TASK_CLOSE_DIRECT_STATUS_DISCARDED,
     TASK_CLOSE_DIRECT_STATUS_PENDING,
     activate_next_direct_close_event,
     auto_close_direct_close_queue_as_unconfirmed,
     complete_direct_close_event,
     direct_close_state_key,
+    discard_direct_close_event,
     enqueue_direct_close_event,
 )
 from tests.fakes import FakePortalSearchIndex
@@ -151,3 +153,21 @@ def test_direct_close_queue_completed_event_is_terminal() -> None:
     duplicate = enqueue_direct_close_event(index, task_id=900, close_event_key="event-a", responsible_id=231)
     assert duplicate is not None
     assert duplicate.status == TASK_CLOSE_DIRECT_STATUS_COMPLETED
+
+
+def test_direct_close_queue_discarded_event_is_terminal() -> None:
+    index = FakePortalSearchIndex()
+    enqueue_direct_close_event(index, task_id=900, close_event_key="event-a", responsible_id=231, dialog_key="chat231")
+
+    discarded = discard_direct_close_event(
+        index,
+        task_id=900,
+        close_event_key="event-a",
+        now_iso="2026-07-12T13:00:00+03:00",
+    )
+
+    assert discarded is not None
+    assert discarded.status == TASK_CLOSE_DIRECT_STATUS_DISCARDED
+    duplicate = enqueue_direct_close_event(index, task_id=900, close_event_key="event-a", responsible_id=231)
+    assert duplicate is not None
+    assert duplicate.status == TASK_CLOSE_DIRECT_STATUS_DISCARDED

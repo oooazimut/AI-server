@@ -12,13 +12,47 @@ from ai_server.agents.bitrix24.tools.task_close import (
     INCOMPLETE_CLOSE_MARKER,
     TASK_CLOSE_DRAFT_TYPE,
     TaskCloseConfirmTool,
+    TaskCloseDiscardTool,
     TaskCloseDraftTool,
     TaskCloseReportIncidentTool,
+)
+from ai_server.integrations.bitrix.task_close_direct_queue import (
+    TASK_CLOSE_DIRECT_STATUS_ACTIVE,
+    TASK_CLOSE_DIRECT_STATUS_COMPLETED,
+    TASK_CLOSE_DIRECT_STATUS_DISCARDED,
+    direct_close_state_key,
 )
 from ai_server.integrations.bitrix.task_close_reports import task_close_report_state_key
 from ai_server.models import ToolStatus
 from ai_server.settings import get_settings
 from tests.fakes import FakePortalSearchIndex, FakeTaskDraftStore
+
+
+class DirectCloseDraftStore(FakeTaskDraftStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self._task_close_processing_state: dict[tuple[str, str], dict] = {}
+
+    def get_task_close_processing_state(self, *, task_id: object, state_key: str) -> dict | None:
+        state = self._task_close_processing_state.get((str(task_id), state_key))
+        return dict(state) if state else None
+
+    def upsert_task_close_processing_state(
+        self,
+        *,
+        task_id: object,
+        state_key: str,
+        status: str,
+        payload: dict | None = None,
+        actor_user_id: int | None = None,
+    ) -> None:
+        self._task_close_processing_state[(str(task_id), state_key)] = {
+            "task_id": str(task_id),
+            "state_key": state_key,
+            "status": status,
+            "payload": dict(payload or {}),
+            "actor_user_id": actor_user_id,
+        }
 
 
 def _exec(tool, args, *, user_id=None, dialog_key=None, dialog_id=None):
@@ -53,6 +87,29 @@ def test_close_draft_saves_incomplete_marker():
     assert INCOMPLETE_CLOSE_MARKER not in draft["result_text"]
     assert "Статус AI-закрытия: неподтвержденная" in draft["result_text"]
     assert result.data["preview"]["unresolved_items"] == ["не приложен акт проверки"]
+
+
+def test_close_draft_marks_already_closed_task():
+    store = FakeTaskDraftStore()
+    tool = TaskCloseDraftTool(store=store)
+
+    result = _exec(
+        tool,
+        {
+            "task_id": 139,
+            "task_title": "Обучение сотрудников",
+            "completion_summary": "Нужно уточнить закрытие уже закрытой задачи.",
+            "already_closed": True,
+        },
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+
+    assert result.status == ToolStatus.OK
+    draft = store._drafts["d:13"]
+    assert draft["already_closed"] is True
+    assert result.data["preview"]["already_closed"] is True
 
 
 def test_close_draft_structures_problem_types_and_mobile_blocks():
@@ -235,7 +292,7 @@ def test_close_confirm_uses_oauth_close_then_system_report_file():
     system_client.call = AsyncMock(
         side_effect=[
             {"result": []},
-            {"result": {"ATTACHMENT_ID": 5509, "FILE_ID": 62357, "NAME": "AI-close-139-ok.txt"}},
+            {"result": {"ATTACHMENT_ID": 5509, "FILE_ID": 62357, "NAME": "AI-close-139.txt"}},
         ]
     )
 
@@ -255,18 +312,18 @@ def test_close_confirm_uses_oauth_close_then_system_report_file():
     assert addfile_call.args[0] == "task.item.addfile"
     addfile_payload = addfile_call.args[1]
     assert addfile_payload["taskId"] == 139
-    assert addfile_payload["fileParameters"]["NAME"] == "AI-close-139-ok.txt"
+    assert addfile_payload["fileParameters"]["NAME"] == "AI-close-139.txt"
     report_text = base64.b64decode(addfile_payload["fileParameters"]["CONTENT"]).decode("utf-8")
     assert "AI task close report" in report_text
     assert "Task ID: 139" in report_text
     assert "Status: ok" in report_text
     assert "Выполнено" in report_text
-    assert result.data["report_file_name"] == "AI-close-139-ok.txt"
+    assert result.data["report_file_name"] == "AI-close-139.txt"
     assert result.data["report_file_owner"] == "system_bitrix_client"
     assert "d:13" not in store._drafts
 
 
-def test_close_confirm_reuses_existing_system_report_file():
+def test_close_confirm_updates_existing_system_report_file_version():
     store = FakeTaskDraftStore()
     anyio.run(
         lambda: store.save_task_draft(
@@ -301,13 +358,155 @@ def test_close_confirm_reuses_existing_system_report_file():
     result = _exec(tool, {}, user_id=13, dialog_key="d:13", dialog_id="chat4321")
 
     assert result.status == ToolStatus.OK
-    assert result.data["result_method"] == "task.item.getfiles"
-    assert result.data["report_file_name"] == "AI-close-139-unconfirmed.txt"
-    assert result.data["report_add"] == existing
+    assert result.data["result_method"] == "disk.file.uploadversion"
+    assert result.data["report_file_name"] == "AI-close-139.txt"
     assert oauth_client.call.await_args_list == [
         call("tasks.task.complete", {"taskId": 139}),
     ]
-    assert system_client.call.await_args_list == [call("task.item.getfiles", {"taskId": 139})]
+    assert system_client.call.await_args_list[0] == call("task.item.getfiles", {"taskId": 139})
+    upload_call = system_client.call.await_args_list[1]
+    assert upload_call.args[0] == "disk.file.uploadversion"
+    upload_payload = upload_call.args[1]
+    assert upload_payload["id"] == 62357
+    assert upload_payload["fileContent"][0] == "AI-close-139.txt"
+    uploaded_report = base64.b64decode(upload_payload["fileContent"][1]).decode("utf-8")
+    assert "Status: unconfirmed" in uploaded_report
+    assert "Problem types: unconfirmed" in uploaded_report
+    assert "AI marker: AI_SERVER_TASK_CLOSE_INCOMPLETE" in uploaded_report
+    assert "d:13" not in store._drafts
+
+
+def test_close_confirm_already_closed_draft_skips_reclosing_and_adds_report_file():
+    store = FakeTaskDraftStore()
+    anyio.run(
+        lambda: store.save_task_draft(
+            "d:13",
+            {
+                "_draft_type": TASK_CLOSE_DRAFT_TYPE,
+                "task_id": 139,
+                "task_title": "Task",
+                "action": "complete",
+                "result_text": "Updated AI close report",
+                "already_closed": True,
+            },
+        )
+    )
+    oauth_client = AsyncMock()
+    oauth_client.call = AsyncMock(return_value={"result": True})
+    oauth = FakeBitrixOAuth(oauth_client)
+    system_client = AsyncMock()
+    system_client.call = AsyncMock(
+        side_effect=[
+            {"result": []},
+            {"result": {"ATTACHMENT_ID": 5509, "FILE_ID": 62357, "NAME": "AI-close-139-ok.txt"}},
+        ]
+    )
+
+    tool = TaskCloseConfirmTool(
+        store=store,
+        write_client=system_client,
+        bitrix_oauth=oauth,
+        oauth_required_for_writes=True,
+    )
+    result = _exec(tool, {}, user_id=13, dialog_key="d:13", dialog_id="chat4321")
+
+    assert result.status == ToolStatus.OK
+    assert oauth.user_ids == [13]
+    assert oauth_client.call.await_args_list == []
+    assert result.data["close_method"] == "already_closed"
+    assert result.data["close_result"] == {"skipped": True, "reason": "task_already_closed"}
+    assert system_client.call.await_args_list[0] == call("task.item.getfiles", {"taskId": 139})
+    assert system_client.call.await_args_list[1].args[0] == "task.item.addfile"
+    assert "d:13" not in store._drafts
+
+
+def test_close_confirm_direct_close_draft_skips_reclosing_and_completes_queue():
+    store = DirectCloseDraftStore()
+    close_event_key = "closed_at:2026-07-12T12:00:00+03:00"
+    state_key = direct_close_state_key(close_event_key)
+    store.upsert_task_close_processing_state(
+        task_id=139,
+        state_key=state_key,
+        status=TASK_CLOSE_DIRECT_STATUS_ACTIVE,
+        payload={"close_event_key": close_event_key},
+    )
+    anyio.run(
+        lambda: store.save_task_draft(
+            "d:13",
+            {
+                "_draft_type": TASK_CLOSE_DRAFT_TYPE,
+                "task_id": 139,
+                "task_title": "Task",
+                "action": "complete",
+                "result_text": "Done with unconfirmed status",
+                "overall_status": "unconfirmed",
+                "ai_close_incomplete": True,
+                "ai_close_marker": INCOMPLETE_CLOSE_MARKER,
+                "unresolved_items": ["no photo"],
+                "unconfirmed_items": ["no photo"],
+                "_direct_close_already_closed": True,
+                "_direct_close_close_event_key": close_event_key,
+            },
+        )
+    )
+    oauth_client = AsyncMock()
+    oauth_client.call = AsyncMock(return_value={"result": True})
+    oauth = FakeBitrixOAuth(oauth_client)
+    system_client = AsyncMock()
+    system_client.call = AsyncMock(
+        side_effect=[
+            {"result": []},
+            {"result": {"ATTACHMENT_ID": 5509, "FILE_ID": 62357, "NAME": "AI-close-139-unconfirmed.txt"}},
+        ]
+    )
+
+    tool = TaskCloseConfirmTool(
+        store=store,
+        write_client=system_client,
+        bitrix_oauth=oauth,
+        oauth_required_for_writes=True,
+    )
+    result = _exec(tool, {}, user_id=13, dialog_key="d:13", dialog_id="chat4321")
+
+    assert result.status == ToolStatus.OK
+    assert result.data["close_method"] == "already_closed"
+    assert result.data["close_result"] == {"skipped": True, "reason": "task_already_closed_directly"}
+    assert oauth_client.call.await_args_list == []
+    assert system_client.call.await_args_list[0] == call("task.item.getfiles", {"taskId": 139})
+    assert system_client.call.await_args_list[1].args[0] == "task.item.addfile"
+    state = store.get_task_close_processing_state(task_id=139, state_key=state_key)
+    assert state is not None
+    assert state["status"] == TASK_CLOSE_DIRECT_STATUS_COMPLETED
+    assert "d:13" not in store._drafts
+
+
+def test_close_discard_direct_close_draft_discards_queue():
+    store = DirectCloseDraftStore()
+    close_event_key = "closed_at:2026-07-12T12:00:00+03:00"
+    state_key = direct_close_state_key(close_event_key)
+    store.upsert_task_close_processing_state(
+        task_id=139,
+        state_key=state_key,
+        status=TASK_CLOSE_DIRECT_STATUS_ACTIVE,
+        payload={"close_event_key": close_event_key},
+    )
+    anyio.run(
+        lambda: store.save_task_draft(
+            "d:13",
+            {
+                "_draft_type": TASK_CLOSE_DRAFT_TYPE,
+                "task_id": 139,
+                "_direct_close_close_event_key": close_event_key,
+            },
+        )
+    )
+
+    result = _exec(TaskCloseDiscardTool(store=store), {}, user_id=13, dialog_key="d:13", dialog_id="chat4321")
+
+    assert result.status == ToolStatus.OK
+    state = store.get_task_close_processing_state(task_id=139, state_key=state_key)
+    assert state is not None
+    assert state["status"] == TASK_CLOSE_DIRECT_STATUS_DISCARDED
     assert "d:13" not in store._drafts
 
 

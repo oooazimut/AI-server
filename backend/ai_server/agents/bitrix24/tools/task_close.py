@@ -10,9 +10,14 @@ from ai_server.agents.bitrix24.ports import TaskDraftStorePort
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
 from ai_server.integrations.bitrix.portal_search.search_index import PortalSearchIndex
+from ai_server.integrations.bitrix.task_close_direct_queue import (
+    complete_direct_close_event,
+    discard_direct_close_event,
+)
 from ai_server.integrations.bitrix.task_close_reports import (
     canonical_task_close_report_file_name,
     restore_task_close_report_file,
+    stable_task_close_report_file_name,
     task_close_report_key,
     task_close_report_problem_types,
     task_close_report_state_key,
@@ -41,6 +46,12 @@ _TASK_CLOSE_SCALAR_FIELDS = {
     "overall_status": ("overall_status", "completion_status"),
 }
 _TASK_CLOSE_BOOL_FIELDS = {
+    "already_closed": (
+        "already_closed",
+        "task_already_closed",
+        "bitrix_task_already_closed",
+        "closed_in_bitrix",
+    ),
     "source_task_description_empty": (
         "source_task_description_empty",
         "task_description_empty",
@@ -81,6 +92,12 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
         args.get("source_task_description_empty")
         or args.get("task_description_empty")
         or args.get("empty_task_description")
+    )
+    already_closed = _truthy(
+        args.get("already_closed")
+        or args.get("task_already_closed")
+        or args.get("bitrix_task_already_closed")
+        or args.get("closed_in_bitrix")
     )
     equipment_consumables = compact_text(
         str(args.get("equipment_consumables") or args.get("equipment") or args.get("consumables") or "")
@@ -140,6 +157,7 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
         "completion_summary": completion_summary,
         "task_points": task_points,
         "source_task_description_empty": source_task_description_empty,
+        "already_closed": already_closed,
         "equipment_consumables": equipment_consumables,
         "overall_status": overall_status,
         "overall_status_label": overall_status_label,
@@ -159,6 +177,7 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
         "completion_summary": completion_summary,
         "task_points": task_points,
         "source_task_description_empty": source_task_description_empty,
+        "already_closed": already_closed,
         "equipment_consumables": equipment_consumables,
         "overall_status": overall_status,
         "overall_status_label": overall_status_label,
@@ -186,7 +205,8 @@ class TaskCloseDraftTool:
             description=(
                 "Prepare a Bitrix task closing draft. Use instead of direct bitrix_api writes for task closing. "
                 "Call only after the task and completion result are understood. The user must confirm before "
-                "a protected AI close report file plus tasks.task.complete/tasks.task.approve is executed."
+                "a protected AI close report file is saved and, when the task is still open, "
+                "tasks.task.complete/tasks.task.approve is executed."
             ),
             parameters={
                 "type": "object",
@@ -214,6 +234,13 @@ class TaskCloseDraftTool:
                         "description": (
                             "True when the original Bitrix task has no meaningful description/checklist. "
                             "Then block 1 is a free-form work description instead of task points."
+                        ),
+                    },
+                    "already_closed": {
+                        "type": "boolean",
+                        "description": (
+                            "True when the Bitrix task is already closed. Confirm then saves the AI close report "
+                            "without calling tasks.task.complete/tasks.task.approve again."
                         ),
                     },
                     "equipment_consumables": {
@@ -420,6 +447,7 @@ class TaskCloseConfirmTool:
                     error=f"{type(exc).__name__}: {exc}",
                     data={"draft": draft},
                 )
+            _complete_direct_close_queue_from_draft(self._store, draft, actor_user_id=user_id)
             await self._store.delete_task_draft(dialog_key)
             return ToolResult(status=ToolStatus.OK, tool=self.name, data={**result, "draft": draft})
 
@@ -440,6 +468,7 @@ class TaskCloseConfirmTool:
             return ToolResult(
                 status=ToolStatus.ERROR, tool=self.name, error=f"{type(exc).__name__}: {exc}", data={"draft": draft}
             )
+        _complete_direct_close_queue_from_draft(self._store, draft, actor_user_id=user_id)
         await self._store.delete_task_draft(dialog_key)
         return ToolResult(status=ToolStatus.OK, tool=self.name, data={**result, "draft": draft})
 
@@ -465,8 +494,13 @@ class TaskCloseDiscardTool:
         dialog_key: str | None = None,
         dialog_id: str | None = None,
     ) -> ToolResult:
+        draft = None
+        if dialog_key:
+            draft = await self._store.get_task_draft(dialog_key)
         if dialog_key:
             await self._store.delete_task_draft(dialog_key)
+        if isinstance(draft, dict):
+            _discard_direct_close_queue_from_draft(self._store, draft, actor_user_id=user_id)
         return ToolResult(status=ToolStatus.OK, tool=self.name, data={"discarded": bool(dialog_key)})
 
 
@@ -638,8 +672,15 @@ async def _execute_task_close(
     action = _close_action(draft.get("action"))
 
     close_method = "tasks.task.approve" if action == "approve" else "tasks.task.complete"
-    close_params = apply_write_policy(close_method, {"taskId": task_id})
-    close_result = await close_call(close_method, close_params)
+    if _truthy(draft.get("_direct_close_already_closed")):
+        close_method = "already_closed"
+        close_result = {"skipped": True, "reason": "task_already_closed_directly"}
+    elif _truthy(draft.get("already_closed") or draft.get("task_already_closed") or draft.get("_task_already_closed")):
+        close_method = "already_closed"
+        close_result = {"skipped": True, "reason": "task_already_closed"}
+    else:
+        close_params = apply_write_policy(close_method, {"taskId": task_id})
+        close_result = await close_call(close_method, close_params)
 
     report_add = None
     report_method = ""
@@ -648,12 +689,25 @@ async def _execute_task_close(
     if result_text:
         if report_call is None:
             raise BitrixConfigError("system Bitrix write_client is required to attach protected task close report.")
-        report_file_name = _report_file_name(task_id, draft)
+        report_file_name = _report_file_name(task_id)
         report_file_content = _report_file_content(task_id=task_id, action=action, draft=draft)
         existing_report = await _find_existing_report_file(report_call, task_id=task_id, file_name=report_file_name)
         if existing_report is not None:
-            report_add = existing_report
-            report_method = "task.item.getfiles"
+            disk_file_id = _report_disk_file_id(existing_report)
+            if disk_file_id is None:
+                raise BitrixConfigError("Cannot update existing AI close report: disk file id is missing.")
+            report_params = apply_write_policy(
+                "disk.file.uploadversion",
+                {
+                    "id": disk_file_id,
+                    "fileContent": [
+                        report_file_name,
+                        base64.b64encode(report_file_content.encode("utf-8")).decode("ascii"),
+                    ],
+                },
+            )
+            report_add = await report_call("disk.file.uploadversion", report_params)
+            report_method = "disk.file.uploadversion"
         else:
             report_params = apply_write_policy(
                 "task.item.addfile",
@@ -690,6 +744,44 @@ async def _execute_task_close(
         "ai_close_incomplete": bool(draft.get("ai_close_incomplete")),
         "ai_close_marker": str(draft.get("ai_close_marker") or ""),
     }
+
+
+def _complete_direct_close_queue_from_draft(
+    store: Any,
+    draft: dict[str, Any],
+    *,
+    actor_user_id: int | None = None,
+) -> None:
+    task_id = optional_int(draft.get("task_id"))
+    close_event_key = str(draft.get("_direct_close_close_event_key") or "").strip()
+    if task_id is None or not close_event_key:
+        return
+    complete_direct_close_event(
+        store,
+        task_id=task_id,
+        close_event_key=close_event_key,
+        now_iso=datetime.now(MOSCOW_TZ).isoformat(timespec="seconds"),
+        actor_user_id=actor_user_id,
+    )
+
+
+def _discard_direct_close_queue_from_draft(
+    store: Any,
+    draft: dict[str, Any],
+    *,
+    actor_user_id: int | None = None,
+) -> None:
+    task_id = optional_int(draft.get("task_id"))
+    close_event_key = str(draft.get("_direct_close_close_event_key") or "").strip()
+    if task_id is None or not close_event_key:
+        return
+    discard_direct_close_event(
+        store,
+        task_id=task_id,
+        close_event_key=close_event_key,
+        now_iso=datetime.now(MOSCOW_TZ).isoformat(timespec="seconds"),
+        actor_user_id=actor_user_id,
+    )
 
 
 def _result_text(
@@ -762,6 +854,7 @@ def _preview_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "completion_summary": str(payload.get("completion_summary") or ""),
         "task_points": _string_list(payload.get("task_points")),
         "source_task_description_empty": bool(payload.get("source_task_description_empty")),
+        "already_closed": bool(payload.get("already_closed")),
         "equipment_consumables": str(payload.get("equipment_consumables") or ""),
         "overall_status": _overall_status(payload.get("overall_status")),
         "overall_status_label": str(payload.get("overall_status_label") or ""),
@@ -798,10 +891,27 @@ async def _find_existing_report_file(
         result = await call("task.item.getfiles", {"taskId": task_id})
     except Exception:
         return None
+    logical_name = canonical_task_close_report_file_name(file_name)
+    fallback: dict[str, Any] | None = None
     for item in _extract_file_items(result):
-        if str(item.get("NAME") or item.get("name") or "") == file_name:
+        item_name = str(item.get("NAME") or item.get("name") or "")
+        if item_name == file_name:
             return item
+        if logical_name and canonical_task_close_report_file_name(item_name).casefold() == logical_name.casefold():
+            fallback = item
+    if fallback is not None:
+        return fallback
     return None
+
+
+def _report_disk_file_id(report_file: dict[str, Any]) -> int | None:
+    return optional_int(
+        report_file.get("FILE_ID")
+        or report_file.get("fileId")
+        or report_file.get("OBJECT_ID")
+        or report_file.get("objectId")
+        or report_file.get("disk_object_id")
+    )
 
 
 def _extract_file_items(result: Any) -> list[dict[str, Any]]:
@@ -821,9 +931,8 @@ def _extract_file_items(result: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _report_file_name(task_id: int, draft: dict[str, Any]) -> str:
-    suffix = _report_file_status(draft)
-    return f"AI-close-{task_id}-{suffix}.txt"
+def _report_file_name(task_id: int) -> str:
+    return stable_task_close_report_file_name(task_id)
 
 
 def _report_file_status(draft: dict[str, Any]) -> str:
@@ -858,6 +967,15 @@ def _report_file_content(*, task_id: int, action: str, draft: dict[str, Any]) ->
         f"Created at: {datetime.now(MOSCOW_TZ).isoformat(timespec='seconds')}",
         "Source: AI-server task_close_confirm",
     ]
+    problem_types = _string_list(draft.get("problem_types"))
+    if not problem_types:
+        if not_done_items:
+            problem_types.append("not_done")
+        if unconfirmed_items:
+            problem_types.append("unconfirmed")
+    if problem_types:
+        lines.append(f"Problem types: {', '.join(_unique_strings(problem_types))}")
+        lines.append(f"AI marker: {INCOMPLETE_CLOSE_MARKER}")
     if completion_summary:
         lines.extend(["", "Summary:", completion_summary])
     if task_points:
