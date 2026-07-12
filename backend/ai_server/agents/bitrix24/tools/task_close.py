@@ -904,7 +904,13 @@ def _task_description_points(description: object) -> list[str]:
         return points[:12]
     sentences = re.split(r"(?<=[.!?])\s+", text)
     points = _unique_strings([compact_text(part).strip(" .;:-") for part in sentences if compact_text(part)])
-    return points[:12] if points else []
+    if len(points) > 1:
+        return points[:12]
+    comma_parts = re.split(r"[,;]+", text)
+    comma_points = _unique_strings(
+        [compact_text(part).strip(" .;:-") for part in comma_parts if len(compact_text(part).strip(" .;:-")) >= 6]
+    )
+    return comma_points[:12] if len(comma_points) > 1 else (points[:12] if points else [])
 
 
 def _clean_task_description(description: object) -> str:
