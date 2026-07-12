@@ -638,6 +638,7 @@ def test_bitrix_specialist_enforces_structured_task_close_draft_response():
                         "overall_status": "partial",
                         "not_done_items": ["архив не проверен"],
                         "unconfirmed_items": ["нет фото результата"],
+                        "status_reasons": ["нет доступа к архиву"],
                     },
                 )
             ],
@@ -660,15 +661,16 @@ def test_bitrix_specialist_enforces_structured_task_close_draft_response():
     assert result.status == "needs_human"
     assert "d:13" in store._drafts
     assert "Черновик #8869: Проверить камеру" in result.answer
-    assert "1. Выполненные работы" in result.answer
+    assert "1. Выполняемые работы" in result.answer
     assert "1.1 камера проверена - уточнить по этому пункту ... ???" in result.answer
-    assert "1.3 Другое - ... ???" in result.answer
-    assert "2. Использованное оборудование" in result.answer
+    assert "1.3 Еще работы - ... ???" in result.answer
+    assert "2. Использовано материалов, оборудование" in result.answer
     assert "2.1 не указано" in result.answer
-    assert "3. Выполнение работ" in result.answer
-    assert "3.1 Статус: выполнена частично" in result.answer
-    assert "3.2 Причина/что не выполнено: архив не проверен" in result.answer
-    assert "3.3 Не подтверждено: нет фото результата" in result.answer
+    assert "3. Статус выполнения работ" in result.answer
+    assert "[ВЫБРАНО: выполнено частично]" in result.answer
+    assert "3.1 причина: нет доступа к архиву" in result.answer
+    assert "Причина/что не выполнено: архив не проверен" not in result.answer
+    assert "Не подтверждено: нет фото результата" not in result.answer
     assert "4. Дополнительная информация" in result.answer
     assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" not in result.answer
     assert "уже подготовлен" not in result.answer
@@ -1024,9 +1026,61 @@ def test_bitrix_llm_routes_task_close_followup_to_active_draft_without_llm(monke
     assert args["task_title"] == "Проверить камеры"
     assert args["overall_status"] == "partial"
     assert args["equipment_consumables"] == "не использовалось"
-    assert args["unconfirmed_items"] == [
-        "проверка выполнена частично, не все пункты подтверждены, оборудование не использовалось."
+    assert "unconfirmed_items" not in args
+    assert args["missing_fields"] == []
+
+
+def test_bitrix_llm_routes_task_close_followup_extracts_four_block_fields(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_close_draft", "description": "", "parameters": {}},
+        {"name": "task_close_confirm", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
     ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request=(
+                    "По задаче 8899: 1.1 Проверить камеру выполнено, "
+                    "1.2 Забрать документы не выполнено, 1.3 Починить селектор не подтверждено. "
+                    "По пункту 2 оборудование: 3 видеокамеры, 40 метров кабеля. "
+                    "По пункту 3 выполнено частично, причина: не было доступа к архиву. "
+                    "По пункту 4 нужно вернуться завтра с доступом."
+                ),
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "task_close",
+                        "task_id": 8899,
+                        "task_title": "Проверить объект",
+                        "task_points": ["Проверить камеру", "Забрать документы", "Починить селектор"],
+                        "overall_status": "unconfirmed",
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_close_active_update_route"}
+    args = result.decision.tool_calls[0].args
+    assert args["completion_summary"] == (
+        "Проверить камеру выполнено, 1.2 Забрать документы не выполнено, 1.3 Починить селектор не подтверждено"
+    )
+    assert args["equipment_consumables"] == "3 видеокамеры, 40 метров кабеля"
+    assert args["additional_info"] == "нужно вернуться завтра с доступом"
+    assert args["overall_status"] == "partial"
+    assert args["not_done_items"] == ["Забрать документы"]
+    assert args["unconfirmed_items"] == ["Починить селектор"]
+    assert args["status_reasons"] == ["не было доступа к архиву"]
     assert args["missing_fields"] == []
 
 
@@ -1650,8 +1704,7 @@ def test_bitrix_llm_compose_formats_task_close_draft(monkeypatch):
     assert "Черновик #139: Обучение сотрудников" in result.answer
     assert "Обучение сотрудников" in result.answer
     assert "1.1 Пользователь подтвердил выполнение" in result.answer
-    assert "не приложен акт проверки" in result.answer
-    assert "Не подтверждено: не приложен акт проверки" in result.answer
+    assert "Не подтверждено: не приложен акт проверки" not in result.answer
     assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" not in result.answer
     assert "[URL" not in result.answer
 
@@ -1677,9 +1730,11 @@ def test_bitrix_llm_compose_formats_structured_task_close_draft(monkeypatch):
                             "completion_summary": "Часть работ выполнена.",
                             "task_points": ["камеры подключены", "архив не проверен"],
                             "equipment_consumables": "4 камеры, 30 метров кабеля",
+                            "additional_info": "вернуться завтра, проверить доступ",
                             "overall_status_label": "выполнена частично",
                             "not_done_items": ["не проверен архив"],
                             "unconfirmed_items": ["нет фото результата"],
+                            "status_reasons": ["не было доступа к архиву"],
                             "missing_fields": ["причина, почему архив не проверен"],
                             "ai_close_marker": "AI_SERVER_TASK_CLOSE_INCOMPLETE",
                         },
@@ -1692,18 +1747,20 @@ def test_bitrix_llm_compose_formats_structured_task_close_draft(monkeypatch):
 
     assert client.calls == []
     assert result.status == "needs_human"
-    assert "1. Выполненные работы" in result.answer
+    assert "1. Выполняемые работы" in result.answer
     assert "1.1 камеры подключены - уточнить по этому пункту ... ???" in result.answer
-    assert "1.3 Другое - ... ???" in result.answer
-    assert "2. Использованное оборудование" in result.answer
+    assert "1.3 Еще работы - ... ???" in result.answer
+    assert "2. Использовано материалов, оборудование" in result.answer
     assert "2.1 4 камеры" in result.answer
     assert "2.2 30 метров кабеля" in result.answer
-    assert "3.1 Статус: выполнена частично" in result.answer
-    assert "3.2 Причина/что не выполнено: не проверен архив" in result.answer
+    assert "[ВЫБРАНО: выполнено частично]" in result.answer
+    assert "3.1 причина: не было доступа к архиву" in result.answer
+    assert "Причина/что не выполнено: не проверен архив" not in result.answer
     assert "не проверен архив" in result.answer
-    assert "3.3 Не подтверждено: нет фото результата" in result.answer
-    assert "нет фото результата" in result.answer
+    assert "Не подтверждено: нет фото результата" not in result.answer
     assert "4. Дополнительная информация" in result.answer
+    assert "4.1 вернуться завтра" in result.answer
+    assert "4.2 проверить доступ" in result.answer
     assert "да, закрывай как есть" in result.answer
     assert "[URL" not in result.answer
 
@@ -1745,12 +1802,12 @@ def test_bitrix_llm_compose_formats_empty_description_task_close_draft(monkeypat
 
     assert client.calls == []
     assert result.status == "needs_human"
-    assert "1. Выполненные работы" in result.answer
+    assert "1. Выполняемые работы" in result.answer
     assert "1.1 Проверил объект" in result.answer
     assert "1.2 устранил замечания" in result.answer
     assert "1. Пункты задачи" not in result.answer
     assert "2.1 не использовались" in result.answer
-    assert "3.1 Статус: выполнена полностью" in result.answer
+    assert "[ВЫБРАНО: выполнено полностью]" in result.answer
 
 
 def test_bitrix_llm_compose_hides_initial_task_close_placeholder_summary(monkeypatch):
@@ -1793,10 +1850,12 @@ def test_bitrix_llm_compose_hides_initial_task_close_placeholder_summary(monkeyp
 
     assert client.calls == []
     assert result.status == "needs_human"
-    assert "1. Выполненные работы" in result.answer
-    assert "1.1 что сделано - ... ???" in result.answer
-    assert "2.1 не было / что использовано - ... ???" in result.answer
-    assert "3.1 Статус: выполнено / частично выполнено / не выполнено - ... ???" in result.answer
+    assert "1. Выполняемые работы" in result.answer
+    assert "1.1 Еще работы - ... ???" in result.answer
+    assert "2. Использовано материалов, оборудование" in result.answer
+    assert "2.1" not in result.answer
+    assert "3. Статус выполнения работ" in result.answer
+    assert "[ВЫБРАНО:" not in result.answer
     assert "результат не подтверждён" not in result.answer
     assert "результат выполнения не указан" not in result.answer
     assert "Статус AI-закрытия" not in result.answer

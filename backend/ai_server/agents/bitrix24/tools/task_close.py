@@ -45,6 +45,7 @@ _TASK_CLOSE_LIST_FIELDS = {
     "task_points": ("task_points", "task_items", "checklist_items"),
     "not_done_items": ("not_done_items", "unfinished_items", "incomplete_items"),
     "unconfirmed_items": ("unconfirmed_items", "unknown_items", "unverified_items"),
+    "status_reasons": ("status_reasons", "incomplete_reasons", "failure_reasons"),
     "missing_fields": ("missing_fields", "questions", "needed_details"),
 }
 _TASK_CLOSE_SCALAR_FIELDS = {
@@ -53,6 +54,7 @@ _TASK_CLOSE_SCALAR_FIELDS = {
     "completion_summary": ("completion_summary", "result_text", "summary"),
     "equipment_consumables": ("equipment_consumables", "equipment", "consumables"),
     "overall_status": ("overall_status", "completion_status"),
+    "additional_info": ("additional_info", "extra_info", "object_notes"),
 }
 _TASK_CLOSE_BOOL_FIELDS = {
     "already_closed": (
@@ -111,17 +113,21 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
     equipment_consumables = compact_text(
         str(args.get("equipment_consumables") or args.get("equipment") or args.get("consumables") or "")
     )
+    additional_info = compact_text(
+        str(args.get("additional_info") or args.get("extra_info") or args.get("object_notes") or "")
+    )
     overall_status = _overall_status(args.get("overall_status") or args.get("completion_status"))
     overall_status_label = _overall_status_label(overall_status)
     not_done_items = _string_list(
         args.get("not_done_items") or args.get("unfinished_items") or args.get("incomplete_items")
     )
-    unconfirmed_items = _unique_strings(
-        [
-            *_string_list(args.get("unconfirmed_items") or args.get("unknown_items") or args.get("unverified_items")),
-            *unresolved_items,
-        ]
+    status_reasons = _string_list(
+        args.get("status_reasons") or args.get("incomplete_reasons") or args.get("failure_reasons")
     )
+    explicit_unconfirmed_items = _string_list(
+        args.get("unconfirmed_items") or args.get("unknown_items") or args.get("unverified_items")
+    )
+    unconfirmed_items = _unique_strings(explicit_unconfirmed_items or unresolved_items)
     missing_fields = _string_list(args.get("missing_fields") or args.get("questions") or args.get("needed_details"))
     problem_types = _problem_types(
         overall_status=overall_status,
@@ -139,9 +145,11 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
             completion_summary,
             task_points,
             equipment_consumables,
+            additional_info,
             overall_status,
             not_done_items,
             unconfirmed_items,
+            status_reasons,
             missing_fields,
         ]
     ):
@@ -154,9 +162,11 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
         completion_summary=completion_summary,
         task_points=task_points,
         equipment_consumables=equipment_consumables,
+        additional_info=additional_info,
         overall_status_label=overall_status_label,
         not_done_items=not_done_items,
         unconfirmed_items=unconfirmed_items,
+        status_reasons=status_reasons,
     )
     payload = {
         "_draft_type": TASK_CLOSE_DRAFT_TYPE,
@@ -168,10 +178,12 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
         "source_task_description_empty": source_task_description_empty,
         "already_closed": already_closed,
         "equipment_consumables": equipment_consumables,
+        "additional_info": additional_info,
         "overall_status": overall_status,
         "overall_status_label": overall_status_label,
         "not_done_items": not_done_items,
         "unconfirmed_items": unconfirmed_items,
+        "status_reasons": status_reasons,
         "unresolved_items": _unique_strings([*not_done_items, *unconfirmed_items]),
         "missing_fields": missing_fields,
         "problem_types": problem_types,
@@ -188,10 +200,12 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
         "source_task_description_empty": source_task_description_empty,
         "already_closed": already_closed,
         "equipment_consumables": equipment_consumables,
+        "additional_info": additional_info,
         "overall_status": overall_status,
         "overall_status_label": overall_status_label,
         "not_done_items": not_done_items,
         "unconfirmed_items": unconfirmed_items,
+        "status_reasons": status_reasons,
         "unresolved_items": payload["unresolved_items"],
         "missing_fields": missing_fields,
         "problem_types": problem_types,
@@ -278,6 +292,11 @@ class TaskCloseDraftTool:
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Task points whose result is unknown or not confirmed.",
+                    },
+                    "status_reasons": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Reasons from block 3 only: why the overall work status is partial or not done.",
                     },
                     "missing_fields": {
                         "type": "array",
@@ -929,6 +948,10 @@ def _task_close_has_user_result(args: dict[str, Any]) -> bool:
         return True
     if compact_text(str(args.get("equipment_consumables") or args.get("equipment") or args.get("consumables") or "")):
         return True
+    if compact_text(str(args.get("additional_info") or args.get("extra_info") or args.get("object_notes") or "")):
+        return True
+    if _string_list(args.get("status_reasons") or args.get("incomplete_reasons") or args.get("failure_reasons")):
+        return True
     if _overall_status(args.get("overall_status") or args.get("completion_status")) not in {"", "unconfirmed"}:
         return True
     return bool(
@@ -941,9 +964,11 @@ def _result_text(
     completion_summary: str,
     task_points: list[str],
     equipment_consumables: str,
+    additional_info: str,
     overall_status_label: str,
     not_done_items: list[str],
     unconfirmed_items: list[str],
+    status_reasons: list[str],
 ) -> str:
     lines: list[str] = []
     if completion_summary:
@@ -955,9 +980,16 @@ def _result_text(
     if equipment_consumables:
         lines.append("")
         lines.append(f"Оборудование, расходники: {equipment_consumables}")
+    if additional_info:
+        lines.append("")
+        lines.append(f"Дополнительная информация: {additional_info}")
     if overall_status_label:
         lines.append("")
         lines.append(f"Общий итог: {overall_status_label}")
+    if status_reasons:
+        lines.append("")
+        lines.append("Причины неполного выполнения:")
+        lines.extend(f"- {item}" for item in status_reasons)
     if not_done_items or unconfirmed_items:
         lines.append("")
         lines.append(f"Статус AI-закрытия: {_ai_close_human_status(not_done_items, unconfirmed_items)}")
@@ -1001,6 +1033,13 @@ def _merge_task_close_draft_args(
                 merged[field_name] = _remove_initial_unknown_close_placeholders(merged.get(field_name))
         if "unconfirmed_items" in raw_args:
             merged["unconfirmed_items"] = _remove_initial_unknown_close_placeholders(merged.get("unconfirmed_items"))
+        if "unresolved_items" not in raw_args and "missing_parts" not in raw_args:
+            merged["unresolved_items"] = _unique_strings(
+                [
+                    *_string_list(merged.get("not_done_items")),
+                    *_string_list(merged.get("unconfirmed_items")),
+                ]
+            )
 
     return merged
 
@@ -1015,10 +1054,12 @@ def _preview_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "source_task_description_empty": bool(payload.get("source_task_description_empty")),
         "already_closed": bool(payload.get("already_closed")),
         "equipment_consumables": str(payload.get("equipment_consumables") or ""),
+        "additional_info": str(payload.get("additional_info") or ""),
         "overall_status": _overall_status(payload.get("overall_status")),
         "overall_status_label": str(payload.get("overall_status_label") or ""),
         "not_done_items": _string_list(payload.get("not_done_items")),
         "unconfirmed_items": _string_list(payload.get("unconfirmed_items")),
+        "status_reasons": _string_list(payload.get("status_reasons")),
         "unresolved_items": _string_list(payload.get("unresolved_items")),
         "missing_fields": _string_list(payload.get("missing_fields")),
         "problem_types": _string_list(payload.get("problem_types")),
@@ -1120,6 +1161,7 @@ def _report_file_content(*, task_id: int, action: str, draft: dict[str, Any]) ->
     completion_summary = compact_text(str(draft.get("completion_summary") or draft.get("result_text") or ""))
     task_points = _string_list(draft.get("task_points"))
     equipment_consumables = compact_text(str(draft.get("equipment_consumables") or ""))
+    additional_info = compact_text(str(draft.get("additional_info") or ""))
     overall_status_label = compact_text(str(draft.get("overall_status_label") or ""))
     not_done_items = _string_list(draft.get("not_done_items"))
     unconfirmed_items = _string_list(draft.get("unconfirmed_items") or draft.get("unresolved_items"))
@@ -1151,6 +1193,8 @@ def _report_file_content(*, task_id: int, action: str, draft: dict[str, Any]) ->
         lines.extend(f"{index}. {item}" for index, item in enumerate(task_points, start=1))
     if equipment_consumables:
         lines.extend(["", "Equipment and consumables:", equipment_consumables])
+    if additional_info:
+        lines.extend(["", "Additional information:", additional_info])
     if overall_status_label:
         lines.extend(["", "Overall:", overall_status_label])
     if not_done_items:
