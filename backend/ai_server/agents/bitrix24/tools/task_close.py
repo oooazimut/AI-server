@@ -53,6 +53,7 @@ _TASK_CLOSE_SCALAR_FIELDS = {
     "completion_summary": ("completion_summary", "result_text", "summary"),
     "equipment_consumables": ("equipment_consumables", "equipment", "consumables"),
     "overall_status": ("overall_status", "completion_status"),
+    "additional_info": ("additional_info", "extra_info", "object_notes"),
 }
 _TASK_CLOSE_BOOL_FIELDS = {
     "already_closed": (
@@ -111,6 +112,9 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
     equipment_consumables = compact_text(
         str(args.get("equipment_consumables") or args.get("equipment") or args.get("consumables") or "")
     )
+    additional_info = compact_text(
+        str(args.get("additional_info") or args.get("extra_info") or args.get("object_notes") or "")
+    )
     overall_status = _overall_status(args.get("overall_status") or args.get("completion_status"))
     overall_status_label = _overall_status_label(overall_status)
     not_done_items = _string_list(
@@ -139,6 +143,7 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
             completion_summary,
             task_points,
             equipment_consumables,
+            additional_info,
             overall_status,
             not_done_items,
             unconfirmed_items,
@@ -154,6 +159,7 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
         completion_summary=completion_summary,
         task_points=task_points,
         equipment_consumables=equipment_consumables,
+        additional_info=additional_info,
         overall_status_label=overall_status_label,
         not_done_items=not_done_items,
         unconfirmed_items=unconfirmed_items,
@@ -168,6 +174,7 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
         "source_task_description_empty": source_task_description_empty,
         "already_closed": already_closed,
         "equipment_consumables": equipment_consumables,
+        "additional_info": additional_info,
         "overall_status": overall_status,
         "overall_status_label": overall_status_label,
         "not_done_items": not_done_items,
@@ -188,6 +195,7 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
         "source_task_description_empty": source_task_description_empty,
         "already_closed": already_closed,
         "equipment_consumables": equipment_consumables,
+        "additional_info": additional_info,
         "overall_status": overall_status,
         "overall_status_label": overall_status_label,
         "not_done_items": not_done_items,
@@ -929,6 +937,8 @@ def _task_close_has_user_result(args: dict[str, Any]) -> bool:
         return True
     if compact_text(str(args.get("equipment_consumables") or args.get("equipment") or args.get("consumables") or "")):
         return True
+    if compact_text(str(args.get("additional_info") or args.get("extra_info") or args.get("object_notes") or "")):
+        return True
     if _overall_status(args.get("overall_status") or args.get("completion_status")) not in {"", "unconfirmed"}:
         return True
     return bool(
@@ -941,6 +951,7 @@ def _result_text(
     completion_summary: str,
     task_points: list[str],
     equipment_consumables: str,
+    additional_info: str,
     overall_status_label: str,
     not_done_items: list[str],
     unconfirmed_items: list[str],
@@ -955,6 +966,9 @@ def _result_text(
     if equipment_consumables:
         lines.append("")
         lines.append(f"Оборудование, расходники: {equipment_consumables}")
+    if additional_info:
+        lines.append("")
+        lines.append(f"Дополнительная информация: {additional_info}")
     if overall_status_label:
         lines.append("")
         lines.append(f"Общий итог: {overall_status_label}")
@@ -1015,6 +1029,7 @@ def _preview_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "source_task_description_empty": bool(payload.get("source_task_description_empty")),
         "already_closed": bool(payload.get("already_closed")),
         "equipment_consumables": str(payload.get("equipment_consumables") or ""),
+        "additional_info": str(payload.get("additional_info") or ""),
         "overall_status": _overall_status(payload.get("overall_status")),
         "overall_status_label": str(payload.get("overall_status_label") or ""),
         "not_done_items": _string_list(payload.get("not_done_items")),
@@ -1120,6 +1135,7 @@ def _report_file_content(*, task_id: int, action: str, draft: dict[str, Any]) ->
     completion_summary = compact_text(str(draft.get("completion_summary") or draft.get("result_text") or ""))
     task_points = _string_list(draft.get("task_points"))
     equipment_consumables = compact_text(str(draft.get("equipment_consumables") or ""))
+    additional_info = compact_text(str(draft.get("additional_info") or ""))
     overall_status_label = compact_text(str(draft.get("overall_status_label") or ""))
     not_done_items = _string_list(draft.get("not_done_items"))
     unconfirmed_items = _string_list(draft.get("unconfirmed_items") or draft.get("unresolved_items"))
@@ -1151,6 +1167,8 @@ def _report_file_content(*, task_id: int, action: str, draft: dict[str, Any]) ->
         lines.extend(f"{index}. {item}" for index, item in enumerate(task_points, start=1))
     if equipment_consumables:
         lines.extend(["", "Equipment and consumables:", equipment_consumables])
+    if additional_info:
+        lines.extend(["", "Additional information:", additional_info])
     if overall_status_label:
         lines.extend(["", "Overall:", overall_status_label])
     if not_done_items:

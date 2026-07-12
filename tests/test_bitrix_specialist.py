@@ -1030,6 +1030,59 @@ def test_bitrix_llm_routes_task_close_followup_to_active_draft_without_llm(monke
     assert args["missing_fields"] == []
 
 
+def test_bitrix_llm_routes_task_close_followup_extracts_four_block_fields(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_close_draft", "description": "", "parameters": {}},
+        {"name": "task_close_confirm", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request=(
+                    "По задаче 8899: 1.1 Проверить камеру выполнено, "
+                    "1.2 Забрать документы не выполнено, 1.3 Починить селектор не подтверждено. "
+                    "По пункту 2 оборудование: 3 видеокамеры, 40 метров кабеля. "
+                    "По пункту 3 выполнено частично, причина: не было доступа к архиву. "
+                    "По пункту 4 нужно вернуться завтра с доступом."
+                ),
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "task_close",
+                        "task_id": 8899,
+                        "task_title": "Проверить объект",
+                        "task_points": ["Проверить камеру", "Забрать документы", "Починить селектор"],
+                        "overall_status": "unconfirmed",
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_close_active_update_route"}
+    args = result.decision.tool_calls[0].args
+    assert args["completion_summary"] == (
+        "Проверить камеру выполнено, 1.2 Забрать документы не выполнено, 1.3 Починить селектор не подтверждено"
+    )
+    assert args["equipment_consumables"] == "3 видеокамеры, 40 метров кабеля"
+    assert args["additional_info"] == "нужно вернуться завтра с доступом"
+    assert args["overall_status"] == "partial"
+    assert args["not_done_items"] == ["Забрать документы", "не было доступа к архиву"]
+    assert args["unconfirmed_items"] == ["Починить селектор"]
+    assert args["missing_fields"] == []
+
+
 def test_bitrix_llm_routes_task_close_conflict_switch_to_requested_without_llm(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
@@ -1677,6 +1730,7 @@ def test_bitrix_llm_compose_formats_structured_task_close_draft(monkeypatch):
                             "completion_summary": "Часть работ выполнена.",
                             "task_points": ["камеры подключены", "архив не проверен"],
                             "equipment_consumables": "4 камеры, 30 метров кабеля",
+                            "additional_info": "вернуться завтра, проверить доступ",
                             "overall_status_label": "выполнена частично",
                             "not_done_items": ["не проверен архив"],
                             "unconfirmed_items": ["нет фото результата"],
@@ -1704,6 +1758,8 @@ def test_bitrix_llm_compose_formats_structured_task_close_draft(monkeypatch):
     assert "3.3 Не подтверждено: нет фото результата" in result.answer
     assert "нет фото результата" in result.answer
     assert "4. Дополнительная информация" in result.answer
+    assert "4.1 вернуться завтра" in result.answer
+    assert "4.2 проверить доступ" in result.answer
     assert "да, закрывай как есть" in result.answer
     assert "[URL" not in result.answer
 
