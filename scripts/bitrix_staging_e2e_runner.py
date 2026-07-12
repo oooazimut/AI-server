@@ -163,8 +163,20 @@ STATEFUL_TESTS: dict[str, list[TestCase]] = {
     ],
     "task_close": [
         TestCase(
-            test_id="BITRIX-TASK-CLOSE-DRAFT-01",
+            test_id="BITRIX-TASK-CLOSE-ASK-RESULT-01",
             text="Битрикс закрой задачу {task_close_task_id}.",
+            timeout_seconds=300,
+            expect_all=("Для закрытия задачи необходимо указать результат", "Что сделано"),
+            reject_any=("Черновик закрытия задачи", "Задача закрыта", "Задача отмечена выполненной"),
+            kind="task_close_prompt",
+            required_task_id_arg="task_close_task_id",
+        ),
+        TestCase(
+            test_id="BITRIX-TASK-CLOSE-DRAFT-01",
+            text=(
+                "По задаче {task_close_task_id}: проверка выполнена частично, "
+                "не все пункты подтверждены, оборудование не использовалось."
+            ),
             timeout_seconds=300,
             expect_all=("Черновик закрытия задачи", "Пункты задачи", "Оборудование", "Итог", "Действия"),
             reject_any=("Задача закрыта", "Задача отмечена выполненной"),
@@ -550,7 +562,7 @@ def missing_required_test_arg(args: argparse.Namespace, test: TestCase) -> str:
 def expected_pending_draft(test: TestCase) -> bool | None:
     if test.kind in {"draft", "task_close_draft"}:
         return True
-    if test.kind in {"draft_cleanup", "task_close_cleanup"}:
+    if test.kind in {"draft_cleanup", "task_close_cleanup", "task_close_prompt"}:
         return False
     return None
 
@@ -607,7 +619,7 @@ def verify_draft_state(args: argparse.Namespace, test: TestCase) -> dict[str, An
 
 
 def verify_task_state(args: argparse.Namespace, test: TestCase) -> dict[str, Any]:
-    if test.kind != "task_close_draft":
+    if test.kind not in {"task_close_prompt", "task_close_draft"}:
         return {"checked": False, "ok": True}
     status = get_task_status(args, getattr(args, "task_close_task_id", ""))
     if not status.get("ok"):
