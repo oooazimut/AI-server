@@ -144,6 +144,14 @@ class BitrixLLMService:
                 raw={"source": "draft_confirm_route"},
             )
 
+        local_decision = _common_task_close_draft_conflict_decision(task.request, task.context, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "task_close_draft_conflict_route"),
+                raw={"source": "task_close_draft_conflict_route"},
+            )
+
         local_decision = _common_task_close_report_incident_decision(task.request, dialog_history, tool_definitions)
         if local_decision is not None:
             return BitrixLLMDecisionResult(
@@ -842,6 +850,8 @@ def _format_task_create_confirm_answer(data: dict[str, Any], *, portal_base_url:
 
 
 def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
+    if data.get("status") == "active_draft_conflict":
+        return _format_task_close_draft_conflict_answer(data)
     preview = data.get("preview") if isinstance(data.get("preview"), dict) else {}
     draft = data.get("draft") if isinstance(data.get("draft"), dict) else {}
     task_id = _text(draft.get("task_id"))
@@ -849,6 +859,9 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
     action_label = _text(preview.get("action_label")) or "отметить задачу выполненной"
     result_text = _text(preview.get("completion_summary")) or _text(draft.get("completion_summary"))
     task_points = _text_items(preview.get("task_points") or draft.get("task_points"))
+    source_task_description_empty = bool(
+        preview.get("source_task_description_empty") or draft.get("source_task_description_empty")
+    )
     equipment = _text(preview.get("equipment_consumables")) or _text(draft.get("equipment_consumables"))
     overall = _text(preview.get("overall_status_label")) or _text(draft.get("overall_status_label"))
     not_done = _text_items(preview.get("not_done_items") or draft.get("not_done_items"))
@@ -861,14 +874,18 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
         "Черновик закрытия задачи:",
         f"Задача: {task_title}",
         f"Действие: {action_label}",
-        "Пункты задачи:",
     ]
     if task_points:
+        lines.append("Пункты задачи:")
         lines.extend(f"{index}. {item}" for index, item in enumerate(task_points, start=1))
+    elif source_task_description_empty:
+        lines.append("Описание выполненной работы:")
+        lines.append(f"- {result_text or '? кратко напишите, что было сделано'}")
     else:
+        lines.append("Пункты задачи:")
         lines.append("- ? что было сделано по пунктам задачи")
     lines.append(f"Оборудование, расходники: {equipment or '? что использовано'}")
-    if result_text:
+    if result_text and not source_task_description_empty:
         lines.append(f"Результат: {result_text}")
     lines.append(f"Итог: {overall or '? выполнена полностью / частично / не выполнена / не подтверждено'}")
     if not_done:
@@ -885,6 +902,27 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
     lines.append("")
     lines.append('Действия: допишите данные или напишите "да, закрывай как есть".')
     return "\n".join(lines)
+
+
+def _format_task_close_draft_conflict_answer(data: dict[str, Any]) -> str:
+    draft = data.get("draft") if isinstance(data.get("draft"), dict) else {}
+    incoming = data.get("incoming_draft") if isinstance(data.get("incoming_draft"), dict) else {}
+    current_task_id = _text(draft.get("task_id"))
+    requested_task_id = _text(incoming.get("task_id"))
+    current_title = _text(draft.get("task_title")) or _task_fallback_title(current_task_id)
+    requested_title = _text(incoming.get("task_title")) or _task_fallback_title(requested_task_id)
+    return "\n".join(
+        [
+            "Уже есть активный черновик закрытия.",
+            f"Текущий: {current_title}",
+            f"Новая задача: {requested_title}",
+            "",
+            "Сначала выберите действие:",
+            "1 — продолжить текущий черновик",
+            "2 — закрыть текущую задачу как есть с пометкой",
+            "3 — отменить текущий черновик и перейти к новой задаче",
+        ]
+    )
 
 
 def _format_task_close_confirm_answer(data: dict[str, Any], *, portal_base_url: str = "") -> str:
@@ -1250,6 +1288,8 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Не вызывай task_create_draft без title и одного из responsible_id/responsible_self. "
         "If permission_context.pending_task_draft._draft_type is absent/task_create and the current user explicitly confirms creation, call task_create_confirm. "
         "If permission_context.pending_task_draft._draft_type is task_close and the current user explicitly confirms closing, call task_close_confirm. "
+        "If permission_context.pending_task_draft._draft_type is task_close and the user adds details for the same task, call task_close_draft with the same task_id and the updated full draft fields; backend will merge without resetting old fields. "
+        "If a user starts closing another task while task_close draft is active, call task_close_draft for the requested task so backend returns the active-draft choice instead of overwriting the current draft. "
         "If permission_context.pending_task_draft._draft_type is calendar_event and the current user explicitly confirms calendar creation, call calendar_event_confirm. "
         "If permission_context.pending_task_draft._draft_type is project_create and the current user explicitly confirms project creation, call project_create_confirm. "
         "If the current user explicitly cancels or rejects a task creation draft, call task_draft_discard. "
@@ -1272,6 +1312,8 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Сначала найди задачу через bitrix_task_search, собери результат выполнения, затем вызови task_close_draft. "
         "В task_close_draft передавай короткий полный черновик: task_points, equipment_consumables, overall_status, "
         "not_done_items для невыполненных пунктов и unconfirmed_items для неизвестного/неподтверждённого результата. "
+        "Если описание/чеклист исходной задачи пустые, не выдумывай task_points: передай source_task_description_empty=true, "
+        "а результат пользователя положи в completion_summary как свободное описание выполненной работы. "
         "Если после уточнений пользователь явно разрешает закрыть с такими проблемами, backend сохранит признак неполного AI-закрытия для будущей индексации. "
         "Не показывай пользователю технический код AI_SERVER_TASK_CLOSE_INCOMPLETE; в видимом тексте пиши коротко: неподтвержденная или выполнена частично. "
         "Для уведомления пользователя используй bitrix_api с im.notify.system.add. "
@@ -1499,6 +1541,101 @@ def _confirm_decision_tool(name: str, summary: str) -> BitrixLLMDecision:
             )
         ],
     )
+
+
+def _common_task_close_draft_conflict_decision(
+    request: str,
+    context: dict[str, Any],
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    draft = context.get("pending_task_draft") if isinstance(context, dict) else None
+    if not isinstance(draft, dict) or draft.get("_draft_type") != "task_close":
+        return None
+    pending = draft.get("_task_close_conflict_pending")
+    if not isinstance(pending, dict) or not pending:
+        return None
+
+    action = _task_close_draft_conflict_action(request)
+    if not action:
+        return None
+    if action == "continue_current":
+        if not _draft_discard_tool_available(tool_definitions, "task_close_draft"):
+            return None
+        return BitrixLLMDecision(
+            status="completed",
+            answer="",
+            confidence=0.92,
+            tool_calls=[
+                BitrixLLMToolCall(
+                    name="task_close_draft",
+                    args=_task_close_draft_replay_args(draft),
+                    summary="deterministic task close active draft continue routing",
+                )
+            ],
+        )
+    if action == "close_current":
+        if not _draft_discard_tool_available(tool_definitions, "task_close_confirm"):
+            return None
+        return _confirm_decision_tool(
+            "task_close_confirm", "deterministic task close active draft close-current routing"
+        )
+
+    if not (
+        _draft_discard_tool_available(tool_definitions, "task_close_discard")
+        and _draft_discard_tool_available(tool_definitions, "task_close_draft")
+    ):
+        return None
+    return BitrixLLMDecision(
+        status="completed",
+        answer="",
+        confidence=0.92,
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="task_close_discard",
+                args={},
+                summary="deterministic task close active draft discard-current routing",
+            ),
+            BitrixLLMToolCall(
+                name="task_close_draft",
+                args=_task_close_draft_replay_args(pending),
+                summary="deterministic task close active draft start-requested routing",
+            ),
+        ],
+    )
+
+
+def _task_close_draft_conflict_action(request: str) -> str:
+    text = _strip_command_prefix(request).strip().casefold()
+    if text in {"1", "1.", "первый", "первый вариант"}:
+        return "continue_current"
+    if text in {"2", "2.", "второй", "второй вариант"}:
+        return "close_current"
+    if text in {"3", "3.", "третий", "третий вариант"}:
+        return "start_requested"
+    if "продолж" in text and "текущ" in text:
+        return "continue_current"
+    if "закр" in text and ("как есть" in text or "помет" in text):
+        return "close_current"
+    if any(marker in text for marker in ("перейти к нов", "к новой задач", "отменить текущ", "отмени текущ")):
+        return "start_requested"
+    return ""
+
+
+def _task_close_draft_replay_args(draft: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "task_id": optional_int(draft.get("task_id")),
+        "task_title": _text(draft.get("task_title")),
+        "action": _text(draft.get("action")) or "complete",
+        "completion_summary": _text(draft.get("completion_summary")),
+        "task_points": _text_items(draft.get("task_points")),
+        "source_task_description_empty": bool(draft.get("source_task_description_empty")),
+        "equipment_consumables": _text(draft.get("equipment_consumables")),
+        "overall_status": _text(draft.get("overall_status")),
+        "not_done_items": _text_items(draft.get("not_done_items")),
+        "unconfirmed_items": _text_items(draft.get("unconfirmed_items")),
+        "unresolved_items": _text_items(draft.get("unresolved_items")),
+        "missing_fields": _text_items(draft.get("missing_fields")),
+    }
 
 
 def _common_task_close_report_incident_decision(

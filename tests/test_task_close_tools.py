@@ -92,6 +92,111 @@ def test_close_draft_structures_problem_types_and_mobile_blocks():
     assert "Неподтверждённые пункты:" in draft["result_text"]
 
 
+def test_close_draft_merges_same_task_update_without_resetting_known_fields():
+    store = FakeTaskDraftStore()
+    tool = TaskCloseDraftTool(store=store)
+
+    first = _exec(
+        tool,
+        {
+            "task_id": 139,
+            "task_title": "Проверить камеры",
+            "completion_summary": "Проверены камеры на входе.",
+            "task_points": ["камеры проверены", "архив требует уточнения"],
+            "overall_status": "unconfirmed",
+            "unconfirmed_items": ["архив требует уточнения"],
+            "missing_fields": ["что использовано"],
+        },
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+    second = _exec(
+        tool,
+        {
+            "task_id": 139,
+            "equipment_consumables": "4 камеры, 30 метров кабеля",
+            "missing_fields": [],
+        },
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+
+    assert first.status == ToolStatus.OK
+    assert second.status == ToolStatus.OK
+    assert second.data["status"] == "updated_draft"
+    draft = store._drafts["d:13"]
+    assert draft["task_points"] == ["камеры проверены", "архив требует уточнения"]
+    assert draft["completion_summary"] == "Проверены камеры на входе."
+    assert draft["equipment_consumables"] == "4 камеры, 30 метров кабеля"
+    assert draft["unconfirmed_items"] == ["архив требует уточнения"]
+    assert draft["missing_fields"] == []
+
+
+def test_close_draft_marks_empty_source_description_for_freeform_result():
+    store = FakeTaskDraftStore()
+    tool = TaskCloseDraftTool(store=store)
+
+    result = _exec(
+        tool,
+        {
+            "task_id": 139,
+            "task_title": "Пустая задача",
+            "source_task_description_empty": True,
+            "completion_summary": "Проверил объект, устранил замечания.",
+            "overall_status": "completed",
+        },
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+
+    assert result.status == ToolStatus.OK
+    draft = store._drafts["d:13"]
+    assert draft["source_task_description_empty"] is True
+    assert draft["task_points"] == []
+    assert result.data["preview"]["source_task_description_empty"] is True
+
+
+def test_close_draft_blocks_other_task_when_active_draft_exists():
+    store = FakeTaskDraftStore()
+    tool = TaskCloseDraftTool(store=store)
+
+    first = _exec(
+        tool,
+        {
+            "task_id": 139,
+            "task_title": "Проверить камеры",
+            "completion_summary": "Проверены камеры на входе.",
+        },
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+    second = _exec(
+        tool,
+        {
+            "task_id": 140,
+            "task_title": "Проверить регистратор",
+            "completion_summary": "Регистратор проверен.",
+        },
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+
+    assert first.status == ToolStatus.OK
+    assert second.status == ToolStatus.OK
+    assert second.data["status"] == "active_draft_conflict"
+    assert second.data["conflict"]["current_task_id"] == 139
+    assert second.data["conflict"]["requested_task_id"] == 140
+    assert store._drafts["d:13"]["task_id"] == 139
+    assert store._drafts["d:13"]["task_title"] == "Проверить камеры"
+    assert store._drafts["d:13"]["_task_close_conflict_pending"]["task_id"] == 140
+    assert store._drafts["d:13"]["_task_close_conflict_pending"]["task_title"] == "Проверить регистратор"
+
+
 def test_close_draft_denies_missing_dialog_id():
     store = FakeTaskDraftStore()
     tool = TaskCloseDraftTool(store=store)
