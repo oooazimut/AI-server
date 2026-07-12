@@ -801,6 +801,31 @@ class FakePortalSearchIndex:
         state = self._task_close_processing_state.get((str(task_id), state_key))
         return dict(state) if state else None
 
+    def list_task_close_processing_states(
+        self,
+        *,
+        statuses: list[str] | None = None,
+        state_key_prefix: str = "",
+        responsible_id: int | None = None,
+        dialog_key: str = "",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        status_set = set(statuses or [])
+        rows: list[dict[str, Any]] = []
+        for state in self._task_close_processing_state.values():
+            payload = dict(state.get("payload") or {})
+            if status_set and state.get("status") not in status_set:
+                continue
+            if state_key_prefix and not str(state.get("state_key") or "").startswith(state_key_prefix):
+                continue
+            if responsible_id is not None and payload.get("responsible_id") != responsible_id:
+                continue
+            if dialog_key and payload.get("dialog_key") != dialog_key:
+                continue
+            rows.append(dict(state))
+        rows.sort(key=lambda row: (row.get("created_at") or 0, row.get("task_id") or "", row.get("state_key") or ""))
+        return rows[:limit]
+
     def upsert_task_close_processing_state(
         self,
         *,
@@ -810,12 +835,15 @@ class FakePortalSearchIndex:
         payload: dict[str, Any] | None = None,
         actor_user_id: int | None = None,
     ) -> None:
+        existing = self._task_close_processing_state.get((str(task_id), state_key))
         self._task_close_processing_state[(str(task_id), state_key)] = {
             "task_id": str(task_id),
             "state_key": state_key,
             "status": status,
             "payload": dict(payload or {}),
             "actor_user_id": actor_user_id,
+            "created_at": (existing or {}).get("created_at", len(self._task_close_processing_state) + 1),
+            "updated_at": len(self._task_close_processing_state) + 1,
         }
 
     def get_task_close_control_event(self, *, task_id: object, close_event_key: str) -> dict[str, Any] | None:

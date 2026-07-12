@@ -603,6 +603,40 @@ def test_bitrix_store_upserts_task_close_control_event(monkeypatch):
     assert json.loads(params[7]) == {"status": 5}
 
 
+def test_bitrix_store_lists_task_close_processing_states(monkeypatch):
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    rows = [
+        {
+            "task_id": 8875,
+            "state_key": "direct_close:event-a",
+            "status": "pending_direct_close",
+            "payload_json": json.dumps({"responsible_id": 231, "dialog_key": "chat231"}),
+            "actor_user_id": None,
+            "created_at": "2026-07-12T12:00:00+03:00",
+            "updated_at": "2026-07-12T12:00:00+03:00",
+        }
+    ]
+    factory, conn = _sync_conn_factory(rows=rows)
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    result = store.list_task_close_processing_states(
+        statuses=["pending_direct_close"],
+        state_key_prefix="direct_close:",
+        responsible_id=231,
+        dialog_key="chat231",
+        limit=50,
+    )
+
+    assert result[0]["payload"] == {"responsible_id": 231, "dialog_key": "chat231"}
+    sql, params = conn.calls[0]
+    assert "task_close_processing_state" in sql
+    assert "status = ANY" in sql
+    assert "state_key LIKE" in sql
+    assert "payload_json::jsonb ->> 'responsible_id'" in sql
+    assert "payload_json::jsonb ->> 'dialog_key'" in sql
+    assert params == (["pending_direct_close"], "direct\\_close:%", "231", "chat231", 50)
+
+
 def test_bitrix_store_content_candidates_filters_completed_items(monkeypatch):
     store = PostgresBitrixAgentStore("postgresql://fake")
     rows = [
