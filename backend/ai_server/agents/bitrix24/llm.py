@@ -872,7 +872,6 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
     draft = data.get("draft") if isinstance(data.get("draft"), dict) else {}
     task_id = _text(draft.get("task_id"))
     task_title = _text(preview.get("task_title")) or _text(draft.get("task_title")) or _task_fallback_title(task_id)
-    action_label = _text(preview.get("action_label")) or "отметить задачу выполненной"
     result_text = _text(preview.get("completion_summary")) or _text(draft.get("completion_summary"))
     task_points = _text_items(preview.get("task_points") or draft.get("task_points"))
     source_task_description_empty = bool(
@@ -886,38 +885,77 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
     if not unconfirmed and unresolved:
         unconfirmed = unresolved
     missing_fields = _text_items(preview.get("missing_fields") or draft.get("missing_fields"))
-    lines = [
-        "Черновик закрытия задачи:",
-        f"Задача: {task_title}",
-        f"Действие: {action_label}",
-    ]
-    if task_points:
-        lines.append("Пункты задачи:")
-        lines.extend(f"{index}. {item}" for index, item in enumerate(task_points, start=1))
-    elif source_task_description_empty:
-        lines.append("Описание выполненной работы:")
-        lines.append(f"- {result_text or '? кратко напишите, что было сделано'}")
+    lines = [f"Черновик #{task_id or '?'}: {task_title}"]
+    lines.append("")
+    if source_task_description_empty:
+        lines.append("1. Что сделано")
+        lines.append(f"1.1 свободное описание - {result_text or '... ???'}")
+        lines.append("1.2 дополнительно, если не вошло выше - ... ???")
     else:
-        lines.append("Пункты задачи:")
-        lines.append("- ? что было сделано по пунктам задачи")
-    lines.append(f"Оборудование, расходники: {equipment or '? что использовано'}")
-    if result_text and not source_task_description_empty:
-        lines.append(f"Результат: {result_text}")
-    lines.append(f"Итог: {overall or '? выполнена полностью / частично / не выполнена / не подтверждено'}")
+        lines.append("1. Пункты задачи")
+        if task_points:
+            lines.extend(
+                f"1.{index} {item} - {_task_close_point_status(item, result_text, not_done, unconfirmed)}"
+                for index, item in enumerate(task_points, start=1)
+            )
+            lines.append(f"1.{len(task_points) + 1} дополнительно, если не вошло в пункты задачи - ... ???")
+        else:
+            lines.append("1.1 что было в задаче - ... ???")
+            lines.append("1.2 дополнительно, если не вошло выше - ... ???")
+    lines.append("")
+    lines.append("2. Оборудование, расходники")
+    lines.append(f"- {equipment or 'что использовано ... ???'}")
+    lines.append("")
+    lines.append("3. Результат")
+    lines.append(f"- {result_text or 'выполнено / частично / не выполнено ... ???'}")
+    if overall:
+        lines.append(f"- итог: {overall}")
+    elif not result_text:
+        lines.append("- итог ... ???")
     if not_done:
-        lines.append("Не выполнено:")
-        lines.extend(f"- {item}" for item in not_done)
+        lines.append("- не выполнено:")
+        lines.extend(f"  - {item}" for item in not_done)
     if unconfirmed:
-        lines.append("Не подтверждено:")
-        lines.extend(f"- {item}" for item in unconfirmed)
+        lines.append("- не подтверждено:")
+        lines.extend(f"  - {item}" for item in unconfirmed)
+    lines.append("")
+    lines.append("4. Дополнительно")
     if missing_fields:
-        lines.append("Нужно дописать:")
-        lines.extend(f"- {item}" for item in missing_fields)
+        lines.extend(f"- {item} ... ???" for item in missing_fields)
+    else:
+        lines.append("- что ещё важно по объекту ... ???")
     if not_done or unconfirmed:
-        lines.append(f"Статус AI-закрытия: {_task_close_human_status(not_done, unconfirmed)}.")
+        lines.append("")
+        lines.append(f"Статус: {_task_close_human_status(not_done, unconfirmed)}.")
     lines.append("")
     lines.append('Действия: допишите данные или напишите "да, закрывай как есть".')
     return "\n".join(lines)
+
+
+def _task_close_point_status(
+    point: str,
+    result_text: str,
+    not_done: list[str],
+    unconfirmed: list[str],
+) -> str:
+    point_cf = point.casefold()
+    for item in not_done:
+        if _task_close_texts_overlap(point_cf, item):
+            return f"не выполнено: {item}"
+    for item in unconfirmed:
+        if _task_close_texts_overlap(point_cf, item):
+            return f"не подтверждено: {item}"
+    if result_text:
+        return "уточнить по этому пункту ... ???"
+    return "... ???"
+
+
+def _task_close_texts_overlap(point_cf: str, value: str) -> bool:
+    value_cf = value.casefold()
+    if point_cf and point_cf in value_cf:
+        return True
+    words = [word for word in re.findall(r"[0-9A-Za-zА-Яа-яЁё]+", point_cf) if len(word) >= 5]
+    return bool(words and any(word in value_cf for word in words[:4]))
 
 
 def _format_task_close_draft_conflict_answer(data: dict[str, Any]) -> str:

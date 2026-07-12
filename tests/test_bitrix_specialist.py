@@ -659,13 +659,16 @@ def test_bitrix_specialist_enforces_structured_task_close_draft_response():
 
     assert result.status == "needs_human"
     assert "d:13" in store._drafts
-    assert "Черновик закрытия задачи:" in result.answer
-    assert "Пункты задачи:" in result.answer
-    assert "Оборудование, расходники: не указано" in result.answer
-    assert "Итог: выполнена частично" in result.answer
-    assert "Не выполнено:" in result.answer
-    assert "Не подтверждено:" in result.answer
-    assert "Статус AI-закрытия: выполнена частично, неподтвержденная" in result.answer
+    assert "Черновик #8869: Проверить камеру" in result.answer
+    assert "1. Пункты задачи" in result.answer
+    assert "1.1 камера проверена - уточнить по этому пункту ... ???" in result.answer
+    assert "1.3 дополнительно, если не вошло в пункты задачи - ... ???" in result.answer
+    assert "2. Оборудование, расходники" in result.answer
+    assert "- не указано" in result.answer
+    assert "- итог: выполнена частично" in result.answer
+    assert "- не выполнено:" in result.answer
+    assert "- не подтверждено:" in result.answer
+    assert "Статус: выполнена частично, неподтвержденная" in result.answer
     assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" not in result.answer
     assert "уже подготовлен" not in result.answer
 
@@ -1643,10 +1646,10 @@ def test_bitrix_llm_compose_formats_task_close_draft(monkeypatch):
 
     assert client.calls == []
     assert result.status == "needs_human"
-    assert "Черновик закрытия задачи" in result.answer
+    assert "Черновик #139: Обучение сотрудников" in result.answer
     assert "Обучение сотрудников" in result.answer
     assert "не приложен акт проверки" in result.answer
-    assert "Статус AI-закрытия: неподтвержденная" in result.answer
+    assert "Статус: неподтвержденная" in result.answer
     assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" not in result.answer
     assert "[URL" not in result.answer
 
@@ -1687,15 +1690,17 @@ def test_bitrix_llm_compose_formats_structured_task_close_draft(monkeypatch):
 
     assert client.calls == []
     assert result.status == "needs_human"
-    assert "Пункты задачи:" in result.answer
-    assert "1. камеры подключены" in result.answer
-    assert "Оборудование, расходники: 4 камеры, 30 метров кабеля" in result.answer
-    assert "Итог: выполнена частично" in result.answer
-    assert "Не выполнено:" in result.answer
+    assert "1. Пункты задачи" in result.answer
+    assert "1.1 камеры подключены - уточнить по этому пункту ... ???" in result.answer
+    assert "1.3 дополнительно, если не вошло в пункты задачи - ... ???" in result.answer
+    assert "2. Оборудование, расходники" in result.answer
+    assert "- 4 камеры, 30 метров кабеля" in result.answer
+    assert "- итог: выполнена частично" in result.answer
+    assert "- не выполнено:" in result.answer
     assert "не проверен архив" in result.answer
-    assert "Не подтверждено:" in result.answer
+    assert "- не подтверждено:" in result.answer
     assert "нет фото результата" in result.answer
-    assert "Нужно дописать:" in result.answer
+    assert "4. Дополнительно" in result.answer
     assert "да, закрывай как есть" in result.answer
     assert "[URL" not in result.answer
 
@@ -1737,11 +1742,12 @@ def test_bitrix_llm_compose_formats_empty_description_task_close_draft(monkeypat
 
     assert client.calls == []
     assert result.status == "needs_human"
-    assert "Описание выполненной работы:" in result.answer
-    assert "Проверил объект, устранил замечания." in result.answer
-    assert "Пункты задачи:" not in result.answer
-    assert "Оборудование, расходники: не использовались" in result.answer
-    assert "Итог: выполнена полностью" in result.answer
+    assert "1. Что сделано" in result.answer
+    assert "1.1 свободное описание - Проверил объект, устранил замечания." in result.answer
+    assert "1.2 дополнительно, если не вошло выше - ... ???" in result.answer
+    assert "1. Пункты задачи" not in result.answer
+    assert "- не использовались" in result.answer
+    assert "- итог: выполнена полностью" in result.answer
 
 
 def test_bitrix_llm_compose_formats_task_close_active_draft_conflict(monkeypatch):
@@ -1818,7 +1824,7 @@ def test_bitrix_llm_compose_formats_task_close_draft_with_id_fallback(monkeypatc
 
     assert client.calls == []
     assert result.status == "needs_human"
-    assert "Задача: задача #139" in result.answer
+    assert "Черновик #139: задача #139" in result.answer
     assert "Задача: указанная задача" not in result.answer
 
 
