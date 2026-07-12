@@ -394,7 +394,7 @@ def test_portal_metadata_sync_marks_ai_close_report_attachment(monkeypatch):
             return {
                 "ID": attached_object_id,
                 "OBJECT_ID": 62357,
-                "NAME": "AI-close-303-unconfirmed.txt",
+                "NAME": "AI-close-303-unconfirmed (1).txt",
                 "SIZE": 269,
                 "CREATE_TIME": "2026-06-02T11:01:00+03:00",
                 "DOWNLOAD_URL": "https://example.test/download/801",

@@ -11,6 +11,7 @@ from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigErr
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
 from ai_server.integrations.bitrix.portal_search.search_index import PortalSearchIndex
 from ai_server.integrations.bitrix.task_close_reports import (
+    canonical_task_close_report_file_name,
     restore_task_close_report_file,
     task_close_report_key,
     task_close_report_problem_types,
@@ -884,9 +885,7 @@ def _replace_report_file(files: list[dict[str, Any]], restored: dict[str, Any]) 
     replaced = False
     result: list[dict[str, Any]] = []
     for record in files:
-        if task_close_report_key(record) == restored_key or str(record.get("name") or "") == str(
-            restored.get("name") or ""
-        ):
+        if task_close_report_key(record) == restored_key or _same_logical_report_file(record, restored):
             result.append(restored)
             replaced = True
         else:
@@ -894,6 +893,12 @@ def _replace_report_file(files: list[dict[str, Any]], restored: dict[str, Any]) 
     if not replaced:
         result.append(restored)
     return result
+
+
+def _same_logical_report_file(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_name = str(left.get("canonical_name") or canonical_task_close_report_file_name(left.get("name"))).casefold()
+    right_name = str(right.get("canonical_name") or canonical_task_close_report_file_name(right.get("name"))).casefold()
+    return bool(left_name and left_name == right_name)
 
 
 def _drop_report_incident_error_keys(metadata: dict[str, Any]) -> None:
