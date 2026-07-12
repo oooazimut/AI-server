@@ -257,18 +257,21 @@ def test_cleanup_tests_after_failure_handles_task_close_cleanup() -> None:
     assert [test.test_id for test in cleanup] == ["task-close-cleanup"]
 
 
-def test_tests_for_suite_task_close_creates_two_stateful_steps() -> None:
+def test_tests_for_suite_task_close_creates_three_stateful_steps() -> None:
     tests = runner_tests_for_suite("task_close", include_draft=False)
 
     assert [test.test_id for test in tests] == [
+        "BITRIX-TASK-CLOSE-ASK-RESULT-01",
         "BITRIX-TASK-CLOSE-DRAFT-01",
         "BITRIX-TASK-CLOSE-DISCARD-01",
     ]
     assert suite_needs_task_close_task(tests)
-    assert expected_pending_draft(tests[0]) is True
-    assert expected_draft_type(tests[0]) == "task_close"
-    assert expected_pending_draft(tests[1]) is False
+    assert expected_pending_draft(tests[0]) is False
+    assert expected_draft_type(tests[0]) == ""
+    assert expected_pending_draft(tests[1]) is True
     assert expected_draft_type(tests[1]) == "task_close"
+    assert expected_pending_draft(tests[2]) is False
+    assert expected_draft_type(tests[2]) == "task_close"
 
 
 def test_task_close_suite_formats_task_id_and_requires_numeric_id() -> None:
