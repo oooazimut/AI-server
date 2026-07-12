@@ -889,16 +889,19 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
     lines.append("")
     if source_task_description_empty:
         lines.append("1. Что сделано")
-        lines.append(f"- {result_text or 'свободное описание ... ???'}")
+        lines.append(f"1.1 свободное описание - {result_text or '... ???'}")
+        lines.append("1.2 дополнительно, если не вошло выше - ... ???")
     else:
         lines.append("1. Пункты задачи")
         if task_points:
             lines.extend(
-                f"{index}. {item} - {_task_close_point_status(item, result_text, not_done, unconfirmed)}"
+                f"1.{index} {item} - {_task_close_point_status(item, result_text, not_done, unconfirmed)}"
                 for index, item in enumerate(task_points, start=1)
             )
+            lines.append(f"1.{len(task_points) + 1} дополнительно, если не вошло в пункты задачи - ... ???")
         else:
-            lines.append("1. что было в задаче ... ???")
+            lines.append("1.1 что было в задаче - ... ???")
+            lines.append("1.2 дополнительно, если не вошло выше - ... ???")
     lines.append("")
     lines.append("2. Оборудование, расходники")
     lines.append(f"- {equipment or 'что использовано ... ???'}")
