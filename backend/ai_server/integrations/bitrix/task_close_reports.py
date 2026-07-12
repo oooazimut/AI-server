@@ -10,11 +10,21 @@ from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigErr
 from ai_server.integrations.bitrix.portal_search.text_utils import safe_int, to_str
 
 TASK_CLOSE_INCOMPLETE_MARKER = "AI_SERVER_TASK_CLOSE_INCOMPLETE"
-TASK_CLOSE_REPORT_FILE_RE = re.compile(r"^AI-close-\d+-(ok|partial|unconfirmed|failed)\.txt$", re.IGNORECASE)
+TASK_CLOSE_REPORT_FILE_RE = re.compile(
+    r"^(?P<stem>AI-close-\d+-(?P<status>ok|partial|unconfirmed|failed))(?: \(\d+\))?\.txt$",
+    re.IGNORECASE,
+)
 
 
 def is_task_close_report_file_name(name: object) -> bool:
     return bool(TASK_CLOSE_REPORT_FILE_RE.match(str(name or "").strip()))
+
+
+def canonical_task_close_report_file_name(name: object) -> str:
+    match = TASK_CLOSE_REPORT_FILE_RE.match(str(name or "").strip())
+    if not match:
+        return ""
+    return f"{match.group('stem')}.txt"
 
 
 def task_close_report_problem_types(attachment_names: list[str]) -> list[str]:
@@ -23,7 +33,7 @@ def task_close_report_problem_types(attachment_names: list[str]) -> list[str]:
         match = TASK_CLOSE_REPORT_FILE_RE.match(str(name or "").strip())
         if not match:
             continue
-        status = match.group(1).casefold()
+        status = match.group("status").casefold()
         if status in {"partial", "failed"}:
             problem_types.append("not_done")
         if status == "unconfirmed":
@@ -37,6 +47,7 @@ def task_close_report_record(attached: dict[str, Any]) -> dict[str, Any] | None:
         return None
     return {
         "name": name,
+        "canonical_name": canonical_task_close_report_file_name(name),
         "attached_object_id": _first(attached, "ID", "id", "ATTACHMENT_ID", "attachmentId"),
         "disk_object_id": _first(attached, "OBJECT_ID", "objectId", "FILE_ID", "fileId"),
         "size": _first(attached, "SIZE", "size"),

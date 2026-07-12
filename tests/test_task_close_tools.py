@@ -329,7 +329,7 @@ def test_task_close_report_incident_restore_readds_missing_report(monkeypatch):
         async def result(self, method: str, payload: dict):
             assert method == "task.item.addfile"
             self.addfile_payloads.append(payload)
-            return {"ATTACHMENT_ID": 901, "FILE_ID": 62357, "NAME": payload["fileParameters"]["NAME"]}
+            return {"ATTACHMENT_ID": 901, "FILE_ID": 62358, "NAME": "AI-close-139-unconfirmed (1).txt"}
 
     client = RestoreClient()
     tool = TaskCloseReportIncidentTool(client=client, portal_search=index, settings=get_settings())
@@ -347,7 +347,14 @@ def test_task_close_report_incident_restore_readds_missing_report(monkeypatch):
     assert task is not None
     assert task.metadata["ai_close_report_missing"] is False
     assert task.metadata["ai_close_report_incident_status"] == "restored"
-    assert task.metadata["ai_close_report_files"][0]["attached_object_id"] == 901
+    assert task.metadata["ai_close_report_files"] == [
+        {
+            "name": "AI-close-139-unconfirmed (1).txt",
+            "attached_object_id": 901,
+            "disk_object_id": 62358,
+            "problem_types": ["unconfirmed"],
+        }
+    ]
 
 
 def test_task_close_report_incident_accept_missing_clears_index_metadata(monkeypatch):
