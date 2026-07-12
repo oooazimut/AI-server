@@ -293,6 +293,47 @@ def test_close_draft_update_removes_initial_unknown_result_placeholder():
     assert "результат выполнения не указан" not in draft["result_text"]
 
 
+def test_close_draft_update_recomputes_unresolved_items_from_current_lists():
+    store = FakeTaskDraftStore()
+    tool = TaskCloseDraftTool(store=store)
+
+    first = _exec(
+        tool,
+        {
+            "task_id": 139,
+            "task_title": "Check object",
+            "task_points": ["Check camera", "Take documents", "Fix selector"],
+            "overall_status": "unconfirmed",
+            "unconfirmed_items": ["Check camera", "Take documents", "Fix selector"],
+            "missing_fields": ["result"],
+        },
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+    second = _exec(
+        tool,
+        {
+            "task_id": 139,
+            "completion_summary": "Check camera completed, Take documents not done, Fix selector unconfirmed.",
+            "overall_status": "partial",
+            "not_done_items": ["Take documents", "No archive access"],
+            "unconfirmed_items": ["Fix selector"],
+            "missing_fields": [],
+        },
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+
+    assert first.status == ToolStatus.OK
+    assert second.status == ToolStatus.OK
+    draft = store._drafts["d:13"]
+    assert draft["not_done_items"] == ["Take documents", "No archive access"]
+    assert draft["unconfirmed_items"] == ["Fix selector"]
+    assert draft["unresolved_items"] == ["Take documents", "No archive access", "Fix selector"]
+
+
 def test_close_draft_marks_empty_source_description_for_freeform_result():
     store = FakeTaskDraftStore()
     tool = TaskCloseDraftTool(store=store)

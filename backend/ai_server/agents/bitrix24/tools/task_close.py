@@ -120,12 +120,10 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
     not_done_items = _string_list(
         args.get("not_done_items") or args.get("unfinished_items") or args.get("incomplete_items")
     )
-    unconfirmed_items = _unique_strings(
-        [
-            *_string_list(args.get("unconfirmed_items") or args.get("unknown_items") or args.get("unverified_items")),
-            *unresolved_items,
-        ]
+    explicit_unconfirmed_items = _string_list(
+        args.get("unconfirmed_items") or args.get("unknown_items") or args.get("unverified_items")
     )
+    unconfirmed_items = _unique_strings(explicit_unconfirmed_items or unresolved_items)
     missing_fields = _string_list(args.get("missing_fields") or args.get("questions") or args.get("needed_details"))
     problem_types = _problem_types(
         overall_status=overall_status,
@@ -1015,6 +1013,13 @@ def _merge_task_close_draft_args(
                 merged[field_name] = _remove_initial_unknown_close_placeholders(merged.get(field_name))
         if "unconfirmed_items" in raw_args:
             merged["unconfirmed_items"] = _remove_initial_unknown_close_placeholders(merged.get("unconfirmed_items"))
+        if "unresolved_items" not in raw_args and "missing_parts" not in raw_args:
+            merged["unresolved_items"] = _unique_strings(
+                [
+                    *_string_list(merged.get("not_done_items")),
+                    *_string_list(merged.get("unconfirmed_items")),
+                ]
+            )
 
     return merged
 
