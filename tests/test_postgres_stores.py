@@ -495,6 +495,56 @@ def test_bitrix_store_upserts_task_close_controlled_user_without_controlled_from
     assert params == (231, True, 1)
 
 
+def test_bitrix_store_set_task_close_setting_records_revision(monkeypatch):
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    factory, conn = _sync_conn_factory()
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    store.set_task_close_control_setting(key="auto_close_time", value="19:30", updated_by=1)
+
+    assert any("INSERT INTO bitrix24.task_close_control_settings" in sql for sql, _ in conn.calls)
+    revision_calls = [params for sql, params in conn.calls if "task_close_control_revisions" in sql]
+    assert revision_calls
+    assert revision_calls[0][0] == 1
+    assert revision_calls[0][1] == "set_setting"
+    assert json.loads(revision_calls[0][2]) == {"key": "auto_close_time", "value": "19:30"}
+
+
+def test_bitrix_store_task_close_operator_ids(monkeypatch):
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    factory, conn = _sync_conn_factory(rows=[{"user_id": 13}, {"user_id": 15}])
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    assert store.task_close_operator_ids() == {13, 15}
+    assert "task_close_control_operators" in conn.calls[0][0]
+
+
+def test_bitrix_store_set_task_close_operators_does_not_control_operators(monkeypatch):
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    factory, conn = _sync_conn_factory()
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    saved = store.set_task_close_operators(operator_user_ids=[15, 13, 13], actor_user_id=1)
+
+    assert saved == [13, 15]
+    assert any("UPDATE bitrix24.task_close_control_operators" in sql for sql, _ in conn.calls)
+    assert sum("INSERT INTO bitrix24.task_close_control_operators" in sql for sql, _ in conn.calls) == 2
+    assert sum("INSERT INTO bitrix24.task_close_controlled_users" in sql for sql, _ in conn.calls) == 0
+    revision_calls = [params for sql, params in conn.calls if "task_close_control_revisions" in sql]
+    assert revision_calls
+    assert revision_calls[0][1] == "set_operators"
+    assert json.loads(revision_calls[0][2]) == {"operator_user_ids": [13, 15]}
+
+
+def test_bitrix_store_task_close_controlled_user_ids(monkeypatch):
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    factory, conn = _sync_conn_factory(rows=[{"user_id": 13}, {"user_id": 15}])
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    assert store.task_close_controlled_user_ids() == {13, 15}
+    assert "task_close_controlled_users" in conn.calls[0][0]
+
+
 def test_bitrix_store_get_task_close_control_event_parses_payload(monkeypatch):
     store = PostgresBitrixAgentStore("postgresql://fake")
     row = {

@@ -40,6 +40,8 @@ ALLOWED_TOOL_NAMES = {
     "task_close_confirm",
     "task_close_discard",
     "task_close_report_incident",
+    "task_close_control_get",
+    "task_close_control_update",
     "calendar_event_draft",
     "calendar_event_confirm",
     "calendar_event_discard",
@@ -148,6 +150,14 @@ class BitrixLLMService:
                 decision=local_decision,
                 model_usage=_local_model_usage(manifest.id, "task_close_report_incident_route"),
                 raw={"source": "task_close_report_incident_route"},
+            )
+
+        local_decision = _common_task_close_control_decision(task.request, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "task_close_control_route"),
+                raw={"source": "task_close_control_route"},
             )
 
         local_decision = _common_calendar_event_draft_decision(task.request, tool_definitions)
@@ -364,6 +374,18 @@ def _direct_task_create_response(
                 status="completed",
                 answer=_format_task_close_report_incident_answer(result.data),
                 model_usage=_local_model_usage(agent_id, "task_close_report_incident_response"),
+            )
+        if result.tool == "task_close_control_get":
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer=_format_task_close_control_get_answer(result.data),
+                model_usage=_local_model_usage(agent_id, "task_close_control_get_response"),
+            )
+        if result.tool == "task_close_control_update":
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer=_format_task_close_control_update_answer(result.data),
+                model_usage=_local_model_usage(agent_id, "task_close_control_update_response"),
             )
         if result.tool == "calendar_event_draft":
             return BitrixLLMFinalResult(
@@ -895,6 +917,111 @@ def _format_task_close_report_incident_answer(data: dict[str, Any]) -> str:
     return f"Инцидент отчёта AI-закрытия по задаче #{task_id} обработан."
 
 
+def _format_task_close_control_get_answer(data: dict[str, Any]) -> str:
+    lines = [
+        "Настройки контроля закрытия задач:",
+        f"- Автозакрытие: {data.get('auto_close_time') or '20:00'}",
+        f"- Запуск контроля: {data.get('control_enabled_from') or 'не задан'}",
+    ]
+    members = _task_close_control_member_lines(data.get("members"))
+    if members:
+        lines.append("- Сейчас включены:")
+        lines.extend(members)
+    else:
+        lines.append("- Сейчас включены: нет")
+
+    available = _task_close_control_available_lines(data)
+    if available:
+        lines.append("- Пользователи Bitrix:")
+        lines.extend(available)
+        if data.get("available_users_truncated"):
+            lines.append(f"  Показаны первые {data.get('available_users_limit') or 100}; можно уточнить по имени.")
+    elif data.get("user_lookup_status") == "not_configured":
+        lines.append("- Пользователи Bitrix: список недоступен, Bitrix user client не настроен.")
+    elif data.get("user_lookup_status") in {"failed", "partial"}:
+        lines.append(f"- Пользователи Bitrix: не удалось получить полный список ({data.get('user_lookup_error')}).")
+    return "\n".join(lines)
+
+
+def _format_task_close_control_update_answer(data: dict[str, Any]) -> str:
+    action = str(data.get("action") or "")
+    action_labels = {
+        "add_operator": "оператор добавлен",
+        "remove_operator": "оператор удалён",
+        "add_controlled_user": "контролируемый пользователь добавлен",
+        "remove_controlled_user": "контролируемый пользователь удалён",
+        "set_auto_close_time": "время автозакрытия обновлено",
+        "set_control_enabled_from": "дата запуска контроля обновлена",
+    }
+    lines = [f"Готово: {action_labels.get(action, 'настройки обновлены')}."]
+    lines.append(f"Сейчас включены: {_task_close_control_members_summary(data)}.")
+    lines.append(f"Автозакрытие: {data.get('auto_close_time') or '20:00'}.")
+    if data.get("control_enabled_from"):
+        lines.append(f"Запуск контроля: {data['control_enabled_from']}.")
+    return " ".join(lines)
+
+
+def _task_close_control_member_lines(value: object, *, limit: int = 50) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    lines = []
+    for item in value[:limit]:
+        if not isinstance(item, dict):
+            continue
+        lines.append(f"  {_task_close_control_user_label(item)}")
+    if len(value) > limit:
+        lines.append(f"  ... ещё {len(value) - limit}")
+    return lines
+
+
+def _task_close_control_available_lines(data: dict[str, Any], *, limit: int = 100) -> list[str]:
+    users = data.get("available_users")
+    if not isinstance(users, list):
+        return []
+    lines = []
+    for item in users[:limit]:
+        if not isinstance(item, dict):
+            continue
+        lines.append(f"  {_task_close_control_user_label(item)}")
+    return lines
+
+
+def _task_close_control_members_summary(data: dict[str, Any]) -> str:
+    members = data.get("members")
+    if isinstance(members, list) and members:
+        labels = [_task_close_control_user_label(item) for item in members[:8] if isinstance(item, dict)]
+        suffix = f"; ещё {len(members) - 8}" if len(members) > 8 else ""
+        return "; ".join(labels) + suffix
+    operator_ids = _ids_label(data.get("operator_user_ids"))
+    controlled_ids = _ids_label(data.get("controlled_user_ids"))
+    return f"операторы: {operator_ids}; контролируемые: {controlled_ids}"
+
+
+def _task_close_control_user_label(item: dict[str, Any]) -> str:
+    user_id = _text(item.get("user_id")) or "?"
+    name = _text(item.get("name")) or f"Bitrix user #{user_id}"
+    role = _task_close_control_role_label(item)
+    return f"ID {user_id} — {name} — {role}"
+
+
+def _task_close_control_role_label(item: dict[str, Any]) -> str:
+    is_operator = bool(item.get("is_operator"))
+    is_controlled = bool(item.get("is_controlled"))
+    if is_operator and is_controlled:
+        return "оператор, контролируемый"
+    if is_operator:
+        return "оператор"
+    if is_controlled:
+        return "контролируемый"
+    return "можно добавить"
+
+
+def _ids_label(value: object) -> str:
+    if not isinstance(value, list) or not value:
+        return "нет"
+    return ", ".join(str(item) for item in value)
+
+
 def _task_close_human_status(not_done_items: list[str], unconfirmed_items: list[str]) -> str:
     if not_done_items and unconfirmed_items:
         return "выполнена частично, неподтвержденная"
@@ -1079,7 +1206,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
-        '"tool_calls":[{"name":"bitrix_warehouse_search|bitrix_my_tasks|bitrix_task_search|bitrix_project_search|bitrix_api|task_create_draft|task_create_confirm|task_draft_discard|task_close_draft|task_close_confirm|task_close_discard|task_close_report_incident|calendar_event_draft|calendar_event_confirm|calendar_event_discard|project_create_draft|project_create_confirm|project_create_discard|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
+        '"tool_calls":[{"name":"bitrix_warehouse_search|bitrix_my_tasks|bitrix_task_search|bitrix_project_search|bitrix_api|task_create_draft|task_create_confirm|task_draft_discard|task_close_draft|task_close_confirm|task_close_discard|task_close_report_incident|task_close_control_get|task_close_control_update|calendar_event_draft|calendar_event_confirm|calendar_event_discard|project_create_draft|project_create_confirm|project_create_discard|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
         "Перед каждым tool_call сам проверь, хватает ли данных для его корректного вызова. "
         "Нельзя вызывать tool с надеждой, что backend или tool сам разберётся с недостающими данными. "
         'Если данных не хватает, не вызывай tool: верни status=needs_clarification, tool_calls=[{"name":"none"}], '
@@ -1131,6 +1258,11 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "If the current user explicitly cancels or rejects a project creation draft, call project_create_discard. "
         "If dialog_history contains an AI-close report missing alert and the admin replies with option 1/restore, call task_close_report_incident with action=restore. "
         "If the admin replies with option 2/accept/delete for that alert, call task_close_report_incident with action=accept_missing. Do not add Bitrix buttons. "
+        "Для просмотра настроек контроля закрытия задач используй task_close_control_get. "
+        "Для изменения операторов, контролируемых пользователей, времени автозакрытия и даты запуска контроля используй task_close_control_update. "
+        "Не используй bitrix_api для этих настроек. Действия task_close_control_update: add_operator/remove_operator/add_controlled_user/remove_controlled_user/set_auto_close_time/set_control_enabled_from. "
+        "Статус оператора и статус контролируемого пользователя независимы: если оператор должен попадать под правила закрытия задач, отдельно добавь его как controlled user. "
+        "Операторы могут менять только controlled users; операторов, время автозакрытия и дату запуска меняет только Bitrix-админ. "
         "Do not call confirm tools for ambiguous replies; ask a short clarification instead. "
         "Для фраз вида 'напомни мне завтра позвонить Борисову' используй календарь: подготовь calendar_event_draft, а не задачу и не прямой bitrix_api. "
         "Если время напоминания не указано, передай date_iso или start_iso с датой без времени: backend поставит 12:00 МСК. "
@@ -1221,6 +1353,7 @@ _WRITE_TOOL_NAMES = frozenset(
         "task_close_confirm",
         "task_close_discard",
         "task_close_report_incident",
+        "task_close_control_update",
         "calendar_event_draft",
         "calendar_event_confirm",
         "calendar_event_discard",
@@ -1444,6 +1577,89 @@ def _task_close_report_task_id(text: str) -> int | None:
 def _task_close_report_file_name(text: str) -> str:
     match = re.search(r"\bAI-close-\d+-(?:ok|partial|unconfirmed|failed)\.txt\b", text, flags=re.IGNORECASE)
     return match.group(0) if match else ""
+
+
+def _common_task_close_control_decision(
+    request: str,
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    available_tools = {str(tool.get("name") or "") for tool in tool_definitions or []}
+    require_declared_tool = tool_definitions is not None
+    clean_request = _strip_command_prefix(request)
+    lowered = clean_request.casefold()
+    if not _looks_like_task_close_control_request(lowered):
+        return None
+
+    update_args = _task_close_control_update_args(clean_request)
+    if update_args is not None:
+        if require_declared_tool and "task_close_control_update" not in available_tools:
+            return None
+        return BitrixLLMDecision(
+            status="completed",
+            answer="",
+            confidence=0.9,
+            tool_calls=[
+                BitrixLLMToolCall(
+                    name="task_close_control_update",
+                    args=update_args,
+                    summary="deterministic task close control update routing",
+                )
+            ],
+        )
+
+    if require_declared_tool and "task_close_control_get" not in available_tools:
+        return None
+    return BitrixLLMDecision(
+        status="completed",
+        answer="",
+        confidence=0.88,
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="task_close_control_get",
+                args={},
+                summary="deterministic task close control settings routing",
+            )
+        ],
+    )
+
+
+def _looks_like_task_close_control_request(lowered: str) -> bool:
+    return (
+        ("контрол" in lowered and "закрыт" in lowered)
+        or "контролируем" in lowered
+        or ("автозакрыт" in lowered and "задач" in lowered)
+        or ("спис" in lowered and ("оператор" in lowered or "контролируем" in lowered))
+        or ("спис" in lowered and "оператор" in lowered and "обычн" in lowered and "пользовател" in lowered)
+        or ("кто" in lowered and ("оператор" in lowered or "контролируем" in lowered))
+        or ("оператор" in lowered and ("задач" in lowered or "закрыт" in lowered or "контрол" in lowered))
+    )
+
+
+def _task_close_control_update_args(request: str) -> dict[str, Any] | None:
+    lowered = request.casefold()
+    time_match = re.search(r"\b([01]?\d|2[0-3])[:.ч]\s*([0-5]\d)\b", request)
+    if "автозакрыт" in lowered and time_match is not None:
+        hour = int(time_match.group(1))
+        minute = int(time_match.group(2))
+        return {"action": "set_auto_close_time", "auto_close_time": f"{hour:02d}:{minute:02d}"}
+
+    user_id = _first_int(request)
+    if user_id is None:
+        return None
+    add = any(marker in lowered for marker in ("добав", "включ", "назнач"))
+    remove = any(marker in lowered for marker in ("убери", "убрать", "удали", "удалить", "исключ", "сними", "снять"))
+    if not add and not remove:
+        return None
+    if "оператор" in lowered:
+        return {"action": "add_operator" if add else "remove_operator", "target_user_id": user_id}
+    if "контрол" in lowered:
+        return {"action": "add_controlled_user" if add else "remove_controlled_user", "target_user_id": user_id}
+    return None
+
+
+def _first_int(text: str) -> int | None:
+    match = re.search(r"\b(\d+)\b", text)
+    return optional_int(match.group(1)) if match else None
 
 
 def _common_calendar_event_draft_decision(

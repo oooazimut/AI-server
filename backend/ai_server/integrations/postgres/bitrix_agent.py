@@ -117,6 +117,27 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
             )
             db.execute(
                 """
+                CREATE TABLE IF NOT EXISTS bitrix24.task_close_control_operators (
+                    user_id INTEGER PRIMARY KEY,
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    updated_by INTEGER,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bitrix24.task_close_control_revisions (
+                    id SERIAL PRIMARY KEY,
+                    actor_user_id INTEGER,
+                    action TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            db.execute(
+                """
                 CREATE TABLE IF NOT EXISTS bitrix24.task_close_processing_state (
                     task_id INTEGER NOT NULL,
                     state_key TEXT NOT NULL,
@@ -316,6 +337,54 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                 """,
                 (key, value, updated_by),
             )
+            self._record_task_close_control_revision(
+                db,
+                actor_user_id=updated_by,
+                action="set_setting",
+                payload={"key": key, "value": value},
+            )
+
+    def task_close_operator_ids(self) -> set[int]:
+        with self._sync_connect() as db:
+            rows = db.execute(
+                """
+                SELECT user_id
+                FROM bitrix24.task_close_control_operators
+                WHERE active IS TRUE
+                ORDER BY user_id
+                """
+            ).fetchall()
+        return {int(row["user_id"]) for row in rows if row.get("user_id") is not None}
+
+    def set_task_close_operators(self, *, operator_user_ids: list[int], actor_user_id: int | None) -> list[int]:
+        cleaned = sorted({int(user_id) for user_id in operator_user_ids if int(user_id) > 0})
+        with self._sync_connect() as db:
+            db.execute(
+                """
+                UPDATE bitrix24.task_close_control_operators
+                SET active = FALSE, updated_by = %s, updated_at = now()
+                """,
+                (actor_user_id,),
+            )
+            for user_id in cleaned:
+                db.execute(
+                    """
+                    INSERT INTO bitrix24.task_close_control_operators (user_id, active, updated_by, updated_at)
+                    VALUES (%s, TRUE, %s, now())
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        active = TRUE,
+                        updated_by = EXCLUDED.updated_by,
+                        updated_at = now()
+                    """,
+                    (user_id, actor_user_id),
+                )
+            self._record_task_close_control_revision(
+                db,
+                actor_user_id=actor_user_id,
+                action="set_operators",
+                payload={"operator_user_ids": cleaned},
+            )
+        return cleaned
 
     def get_task_close_controlled_user(self, user_id: int) -> dict[str, Any] | None:
         with self._sync_connect() as db:
@@ -328,6 +397,18 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                 (user_id,),
             ).fetchone()
         return dict(row) if row else None
+
+    def task_close_controlled_user_ids(self) -> set[int]:
+        with self._sync_connect() as db:
+            rows = db.execute(
+                """
+                SELECT user_id
+                FROM bitrix24.task_close_controlled_users
+                WHERE active IS TRUE
+                ORDER BY user_id
+                """
+            ).fetchall()
+        return {int(row["user_id"]) for row in rows if row.get("user_id") is not None}
 
     def upsert_task_close_controlled_user(
         self,
@@ -348,6 +429,12 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                     updated_at = now()
                 """,
                 (user_id, active, updated_by),
+            )
+            self._record_task_close_control_revision(
+                db,
+                actor_user_id=updated_by,
+                action="set_controlled_user",
+                payload={"user_id": user_id, "active": active},
             )
 
     def get_task_close_processing_state(self, *, task_id: object, state_key: str) -> dict[str, Any] | None:
@@ -458,6 +545,23 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                     json.dumps(payload or {}, ensure_ascii=False),
                 ),
             )
+
+    def _record_task_close_control_revision(
+        self,
+        db: Any,
+        *,
+        actor_user_id: int | None,
+        action: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        db.execute(
+            """
+            INSERT INTO bitrix24.task_close_control_revisions
+                (actor_user_id, action, payload_json, created_at)
+            VALUES (%s, %s, %s, now())
+            """,
+            (actor_user_id, action, json.dumps(payload or {}, ensure_ascii=False, sort_keys=True)),
+        )
 
     # ------------------------------------------------------------------
     # Portal search index

@@ -34,6 +34,8 @@ from ai_server.agents.bitrix24.tools import (
     SaveIncompleteProposalTool,
     SaveResponsibleResponseTool,
     TaskCloseConfirmTool,
+    TaskCloseControlGetTool,
+    TaskCloseControlUpdateTool,
     TaskCloseDiscardTool,
     TaskCloseDraftTool,
     TaskCloseReportIncidentTool,
@@ -73,6 +75,8 @@ _LLM_TOOL_NAMES = frozenset(
         "task_close_confirm",
         "task_close_discard",
         "task_close_report_incident",
+        "task_close_control_get",
+        "task_close_control_update",
         "calendar_event_draft",
         "calendar_event_confirm",
         "calendar_event_discard",
@@ -196,6 +200,8 @@ class Bitrix24Specialist(BaseSpecialist):
                 portal_search=portal_search_index,
                 settings=_settings,
             ),
+            TaskCloseControlGetTool(store=bitrix_store, user_client=bitrix_client),
+            TaskCloseControlUpdateTool(store=bitrix_store, user_client=bitrix_client),
             CalendarEventDraftTool(store=bitrix_store),
             CalendarEventConfirmTool(
                 store=bitrix_store,
@@ -274,6 +280,13 @@ class Bitrix24Specialist(BaseSpecialist):
             )
         elif tool_call.name == "project_create_draft":
             args = _project_create_args_with_actor_context(dict(tool_call.args or {}), task)
+            tool_call = SimpleNamespace(
+                name=tool_call.name,
+                args=args,
+                summary=getattr(tool_call, "summary", ""),
+            )
+        elif tool_call.name in {"task_close_control_get", "task_close_control_update"}:
+            args = _args_with_actor_admin_context(dict(tool_call.args or {}), task)
             tool_call = SimpleNamespace(
                 name=tool_call.name,
                 args=args,
@@ -424,6 +437,11 @@ def _project_create_args_with_actor_context(args: dict[str, Any], task: AgentTas
     actor_name = _current_user_label(task)
     actor_is_admin = bool(profile.get("is_admin"))
     return {**args, "_actor_name": actor_name, "_actor_is_admin": actor_is_admin}
+
+
+def _args_with_actor_admin_context(args: dict[str, Any], task: AgentTask) -> dict[str, Any]:
+    profile = _current_user_profile(task)
+    return {**args, "_actor_is_admin": bool(profile.get("is_admin"))}
 
 
 def _current_user_label(task: AgentTask) -> str:
