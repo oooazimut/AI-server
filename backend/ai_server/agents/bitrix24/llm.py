@@ -916,11 +916,14 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
             lines.append("1.1 Еще работы - ... ???")
     lines.append("")
     lines.append("2. Использовано материалов, оборудование")
-    lines.append("   (перечисли, что использовали, или укажи: не использовалось)")
-    equipment_items = _task_close_display_items(equipment)
-    if equipment_items:
-        lines.extend(f"2.{index} {item}" for index, item in enumerate(equipment_items, start=1))
-        lines.append(f"2.{len(equipment_items) + 1} Еще материалы - ... ???")
+    if _task_close_no_equipment_value(equipment):
+        lines.append("   (перечисли, что использовали, или укажи: [ВЫБРАНО: не использовалось])")
+    else:
+        lines.append("   (перечисли, что использовали, или укажи: не использовалось)")
+        equipment_items = _task_close_display_items(equipment)
+        if equipment_items:
+            lines.extend(f"2.{index} {item}" for index, item in enumerate(equipment_items, start=1))
+            lines.append(f"2.{len(equipment_items) + 1} Еще материалы - ... ???")
     lines.append("")
     lines.append("3. Статус выполнения работ")
     lines.append(f"   {_task_close_status_prompt(overall_status or overall)}")
@@ -941,7 +944,9 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
         lines.extend(f"4.{index} {item}" for index, item in enumerate(additional_items, start=1))
         lines.append(f"4.{len(additional_items) + 1} Еще информация - ... ???")
     lines.append("")
-    lines.append('Действия: допишите данные или напишите "да, закрывай как есть".')
+    lines.append(
+        'Внести изменения (укажите пункт или подпункт и нужную информацию) или напишите: "да, закрывай как есть".'
+    )
     return "\n".join(lines)
 
 
@@ -976,6 +981,28 @@ def _task_close_status_needs_reason(status: str) -> bool:
 def _task_close_absent_value(value: str) -> bool:
     text = compact_text(value).casefold()
     return text in {"отсутствует", "нет", "не было", "нет дополнительной информации"}
+
+
+def _task_close_no_equipment_value(value: str) -> bool:
+    text = compact_text(value).casefold().strip(" .;:-")
+    if not text:
+        return False
+    if text in {
+        "не использовалось",
+        "не использовались",
+        "не использовали",
+        "не применялось",
+        "не применяли",
+        "не было",
+        "нет",
+        "ничего",
+        "без материалов",
+        "без оборудования",
+        "материалы не использовались",
+        "оборудование не использовалось",
+    }:
+        return True
+    return ("не использ" in text or "не примен" in text) and not any(char.isdigit() for char in text)
 
 
 def _task_close_is_placeholder_summary(value: str) -> bool:
@@ -1043,20 +1070,21 @@ def _task_close_point_status(
     point_cf = point.casefold()
     for item in not_done:
         if _task_close_texts_overlap(point_cf, item):
-            return f"не выполнено: {item}"
+            return "не выполнено"
     for item in unconfirmed:
         if _task_close_texts_overlap(point_cf, item):
-            return f"не подтверждено: {item}"
-    if _task_close_point_completed(point, result_text):
-        return "выполнено"
+            return "не подтверждено"
+    completed_label = _task_close_point_completed_label(point, result_text)
+    if completed_label:
+        return completed_label
     if result_text:
-        return "уточнить по этому пункту ... ???"
+        return "... ???"
     return "... ???"
 
 
-def _task_close_point_completed(point: str, result_text: str) -> bool:
+def _task_close_point_completed_label(point: str, result_text: str) -> str:
     if not result_text:
-        return False
+        return ""
     point_cf = point.casefold()
     clauses = re.split(r"(?:\r?\n)+|[.;]+|,(?=\s*\d+\.\d+)", result_text)
     for clause in clauses:
@@ -1066,8 +1094,8 @@ def _task_close_point_completed(point: str, result_text: str) -> bool:
         if ("выполн" in clause_cf or "сделан" in clause_cf or "готов" in clause_cf) and _task_close_texts_overlap(
             point_cf, clause
         ):
-            return True
-    return False
+            return "выполнено полностью" if "полностью" in clause_cf else "выполнено"
+    return ""
 
 
 def _task_close_texts_overlap(point_cf: str, value: str) -> bool:
@@ -1465,6 +1493,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "If permission_context.pending_task_draft._draft_type is task_close and the user adds details for the same task, call task_close_draft with the same task_id and the updated full draft fields; backend will merge without resetting old fields. "
         "If a user starts closing another task while task_close draft is active, call task_close_draft for the requested task so backend returns the active-draft choice instead of overwriting the current draft. "
         "For task closing, missing completion details are not a reason to return needs_clarification after the task is identified: call task_close_draft and put unknown fields into missing_fields/unconfirmed_items so the user always sees the full draft. "
+        "For task closing draft updates, keep the four blocks isolated: block 1/task points only records each work item status (completed/not done/unconfirmed), block 2 only records used materials/equipment, block 3 only records the user's overall status and reasons, and block 4 only records additional information. Ignore extra text inside the wrong block and never move it to another block. "
         "If permission_context.pending_task_draft._draft_type is calendar_event and the current user explicitly confirms calendar creation, call calendar_event_confirm. "
         "If permission_context.pending_task_draft._draft_type is project_create and the current user explicitly confirms project creation, call project_create_confirm. "
         "If the current user explicitly cancels or rejects a task creation draft, call task_draft_discard. "
@@ -1487,6 +1516,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Сначала найди задачу через bitrix_task_search, собери результат выполнения, затем вызови task_close_draft. "
         "В task_close_draft передавай короткий полный черновик: task_points, equipment_consumables, overall_status, "
         "not_done_items для невыполненных пунктов и unconfirmed_items для неизвестного/неподтверждённого результата. "
+        "Не перетаскивай данные между блоками черновика закрытия: в блоке 1 по пунктам задачи сохраняй только статус пункта, без причин; материалы только в блок 2; общий статус и причины только в блок 3; дополнительную информацию только в блок 4. "
         "Если задача уже закрыта в Bitrix, всё равно используй task_close_draft/task_close_confirm, но передай already_closed=true: "
         "backend сохранит AI-отчёт и не будет повторно вызывать tasks.task.complete/tasks.task.approve. "
         "Если описание/чеклист исходной задачи пустые, не выдумывай task_points: передай source_task_description_empty=true, "
@@ -1909,14 +1939,17 @@ def _task_close_active_update_args(request: str, *, draft: dict[str, Any], task_
     work_summary = _task_close_expand_numbered_work_summary(work_summary, task_points=task_points)
     work_lowered = work_summary.casefold()
     status_section = _task_close_section_text(summary, 3)
-    status_text = status_section or (summary if not _task_close_has_section_markers(summary) else "")
+    work_targets_points = _task_close_summary_targets_task_points(work_summary or summary, task_points)
+    status_text = status_section or (
+        summary if not _task_close_has_section_markers(summary) and not work_targets_points else ""
+    )
     status_lowered = status_text.casefold()
     args = {
         "task_id": task_id,
         "task_title": _text(draft.get("task_title")),
         "completion_summary": work_summary,
     }
-    equipment = _task_close_equipment_from_text(summary, lowered)
+    equipment = _task_close_equipment_from_text(summary, lowered, task_points=task_points)
     if equipment:
         args["equipment_consumables"] = equipment
     additional_info = _task_close_additional_info_from_text(summary)
@@ -1973,14 +2006,28 @@ def _task_close_expand_numbered_work_summary(summary: str, *, task_points: list[
         if not value:
             continue
         point = task_points[point_index - 1]
-        items.append(value if _task_close_texts_overlap(point.casefold(), value) else f"{point} {value}")
+        status_label = _task_close_work_status_label(value)
+        if status_label:
+            items.append(f"{point} {status_label}")
+        else:
+            items.append(value if _task_close_texts_overlap(point.casefold(), value) else f"{point} {value}")
     return ". ".join(items) if items else summary
 
 
-def _task_close_equipment_from_text(summary: str, lowered: str) -> str:
+def _task_close_equipment_from_text(summary: str, lowered: str, *, task_points: list[str]) -> str:
     section = _task_close_section_text(summary, 2)
-    if not section and "оборуд" not in lowered and "расход" not in lowered and "материал" not in lowered:
-        return ""
+    if not section:
+        if _task_close_has_section_markers(summary):
+            return ""
+        if _task_close_summary_targets_task_points(summary, task_points):
+            return ""
+        has_equipment_intent = re.search(
+            r"\b(?:использ|примен|израсход|расход|материал|оборудовани[ея]|кабель|камер[ауы])",
+            lowered,
+            flags=re.IGNORECASE,
+        )
+        if not has_equipment_intent:
+            return ""
     section = section or summary
     section_lowered = section.casefold()
     if "не использ" in section_lowered or "не примен" in section_lowered:
@@ -1993,6 +2040,12 @@ def _task_close_equipment_from_text(summary: str, lowered: str) -> str:
     )
     section = re.sub(r"^\s*2\s+", "", section)
     section = re.sub(r"^\s*(?:оборудование|расходники)\s*:?", "", section, flags=re.IGNORECASE)
+    section = re.split(
+        r"\b(?:задач[ауы]?|работ[аы]?)\s+(?:выполн|не\s+выполн|частич)|\bпричин[аы]?\b",
+        section,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
     return _task_close_clean_referenced_text(section)
 
 
@@ -2007,7 +2060,7 @@ def _task_close_additional_info_from_text(summary: str) -> str:
         flags=re.IGNORECASE,
     )
     section = re.sub(r"^\s*4\s+", "", section)
-    return _task_close_clean_referenced_text(section)
+    return _task_close_filter_additional_info_text(_task_close_clean_referenced_text(section))
 
 
 def _task_close_overall_status_from_text(lowered: str) -> str:
@@ -2026,11 +2079,11 @@ def _task_close_not_done_items_from_text(summary: str, lowered: str, *, task_poi
     values = _task_close_status_items_from_text(
         summary,
         task_points=task_points,
-        markers=("не выполн", "не сделан"),
+        markers=("не выполн", "не сделан", "не сделал", "не поставил", "не установил", "не забрал", "не починил"),
     )
     if values:
         return _unique_text_items(values)
-    if "не выполн" in lowered or "не сделан" in lowered:
+    if _task_close_work_status_label(lowered) == "не выполнено":
         return [summary]
     return []
 
@@ -2049,6 +2102,8 @@ def _task_close_unconfirmed_items_from_text(summary: str, lowered: str, *, task_
 
 
 def _task_close_status_reasons_from_text(summary: str) -> list[str]:
+    summary = re.sub(r"^\s*(?:по\s+)?пункт[ау]?\s+3\s*:?", "", summary, flags=re.IGNORECASE)
+    summary = re.sub(r"^\s*3\s+", "", summary)
     text = _task_close_clean_referenced_text(summary)
     if not text:
         return []
@@ -2099,6 +2154,8 @@ def _task_close_section_text(summary: str, section_number: int) -> str:
 
 
 def _task_close_has_section_markers(summary: str) -> bool:
+    if re.search(r"(?<!\d)1\.\d+\s+", summary):
+        return True
     return any(
         re.search(_task_close_section_marker_pattern(number), summary, flags=re.IGNORECASE) for number in range(1, 5)
     )
@@ -2146,6 +2203,105 @@ def _task_close_clean_referenced_text(value: str) -> str:
     text = re.sub(r"^(?:\d+\.\d+|\d+[.)])\s*", "", text)
     text = re.sub(r"^\s*(?:по\s+)?пункт[ау]?\s+\d+(?:\.\d+)?\s*:?", "", text, flags=re.IGNORECASE)
     return compact_text(text).strip(" .;:-")
+
+
+def _task_close_filter_additional_info_text(value: str) -> str:
+    text = compact_text(value)
+    if not text or _task_close_absent_value(text):
+        return text
+    kept: list[str] = []
+    for item in _task_close_display_items(text):
+        if _task_close_additional_info_item_allowed(item):
+            kept.append(item)
+    return ", ".join(kept)
+
+
+def _task_close_additional_info_item_allowed(value: str) -> bool:
+    text = compact_text(value)
+    lowered = text.casefold()
+    if not text:
+        return False
+    future_markers = (
+        "нужно",
+        "надо",
+        "требуется",
+        "следующ",
+        "взять с собой",
+        "вернуться",
+        "потом",
+        "завтра",
+        "на будущее",
+    )
+    if any(marker in lowered for marker in future_markers):
+        return True
+    wrong_block_patterns = (
+        r"\bиспользова",
+        r"\bизрасходова",
+        r"\bприменил",
+        r"\bприменили",
+        r"\bпоставил",
+        r"\bпоставили",
+        r"\bустановил",
+        r"\bустановили",
+        r"\bподключил",
+        r"\bподключили",
+        r"\bсмонтировал",
+        r"\bсмонтировали",
+        r"\bзаменил",
+        r"\bзаменили",
+        r"\bработ[аы]\s+(?:выполн|не\s+выполн|частич)",
+        r"\bзадач[ауы]?\s+(?:выполн|не\s+выполн|частич)",
+        r"\b(?:выполнено|выполнена)\s+(?:полностью|частично)",
+        r"\bне\s+выполнено\b",
+        r"\bне\s+выполнена\b",
+        r"\bпричин[аы]?\b",
+    )
+    return not any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in wrong_block_patterns)
+
+
+def _task_close_summary_targets_task_points(summary: str, task_points: list[str]) -> bool:
+    if not summary or not task_points:
+        return False
+    if re.search(r"(?<!\d)1\.\d+\s+", summary):
+        return True
+    summary_cf = summary.casefold()
+    return any(_task_close_texts_overlap(point.casefold(), summary_cf) for point in task_points)
+
+
+def _task_close_work_status_label(text: str) -> str:
+    lowered = compact_text(text).casefold()
+    if not lowered:
+        return ""
+    if "не подтверж" in lowered or "неизвест" in lowered or "не провер" in lowered:
+        return "не подтверждено"
+    not_done_patterns = (
+        r"\bне\s+выполн",
+        r"\bне\s+сдела",
+        r"\bне\s+постав",
+        r"\bне\s+установ",
+        r"\bне\s+забра",
+        r"\bне\s+почин",
+        r"\bне\s+переда",
+        r"\bне\s+провер",
+    )
+    if any(re.search(pattern, lowered) for pattern in not_done_patterns):
+        return "не выполнено"
+    if "выполнено полностью" in lowered or "выполнена полностью" in lowered:
+        return "выполнено полностью"
+    completed_patterns = (
+        r"\bвыполн",
+        r"\bсдела",
+        r"\bготов",
+        r"\bпостав",
+        r"\bустанов",
+        r"\bзабра",
+        r"\bпочин",
+        r"\bпереда",
+        r"\bпровер",
+    )
+    if any(re.search(pattern, lowered) for pattern in completed_patterns):
+        return "выполнено"
+    return ""
 
 
 def _common_task_close_report_incident_decision(

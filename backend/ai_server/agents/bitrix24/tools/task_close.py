@@ -1050,16 +1050,27 @@ def _merge_task_close_draft_args(
 ) -> dict[str, Any]:
     merged = dict(existing)
     merged["task_id"] = update_payload.get("task_id") or existing.get("task_id")
+    task_points = _string_list(update_payload.get("task_points") or existing.get("task_points"))
+    point_status_updates = _task_close_point_status_updates(update_payload, task_points=task_points)
 
     for payload_field, aliases in _TASK_CLOSE_SCALAR_FIELDS.items():
         if not _has_any_key(raw_args, aliases):
             continue
         value = compact_text(str(update_payload.get(payload_field) or ""))
         if value:
-            merged[payload_field] = value
+            if payload_field == "completion_summary":
+                merged[payload_field] = _merge_task_close_completion_summary(
+                    str(existing.get(payload_field) or ""),
+                    value,
+                    task_points=task_points,
+                )
+            else:
+                merged[payload_field] = value
 
     for payload_field, aliases in _TASK_CLOSE_LIST_FIELDS.items():
         if not _has_any_key(raw_args, aliases):
+            continue
+        if point_status_updates and payload_field in {"not_done_items", "unconfirmed_items"}:
             continue
         merged[payload_field] = _string_list(update_payload.get(payload_field))
 
@@ -1067,6 +1078,21 @@ def _merge_task_close_draft_args(
         if not _has_any_key(raw_args, aliases):
             continue
         merged[payload_field] = bool(update_payload.get(payload_field))
+
+    if point_status_updates:
+        _apply_task_close_point_status_updates(
+            merged,
+            point_status_updates,
+            extra_not_done=_task_close_items_without_task_point(update_payload.get("not_done_items"), task_points),
+            extra_unconfirmed=_task_close_items_without_task_point(
+                update_payload.get("unconfirmed_items"), task_points
+            ),
+        )
+    if (
+        _has_any_key(raw_args, _TASK_CLOSE_SCALAR_FIELDS["overall_status"])
+        and _overall_status(update_payload.get("overall_status")) == "completed"
+    ):
+        merged["status_reasons"] = []
 
     if _task_close_has_user_result(update_payload):
         for field_name in ("unconfirmed_items", "unresolved_items", "missing_fields"):
@@ -1112,6 +1138,133 @@ def _preview_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _has_any_key(values: dict[str, Any], keys: tuple[str, ...]) -> bool:
     return any(key in values for key in keys)
+
+
+def _merge_task_close_completion_summary(existing: str, update: str, *, task_points: list[str]) -> str:
+    existing_text = compact_text(existing)
+    update_text = compact_text(update)
+    if not existing_text or not update_text or not task_points:
+        return update_text or existing_text
+    updated_points = _task_close_points_mentioned(update_text, task_points=task_points)
+    if not updated_points:
+        return update_text
+    kept_existing = [
+        clause
+        for clause in _task_close_summary_clauses(existing_text)
+        if not any(_task_close_text_matches_point(point, clause) for point in updated_points)
+    ]
+    return ". ".join(_unique_strings([*kept_existing, *_task_close_summary_clauses(update_text)]))
+
+
+def _task_close_point_status_updates(update_payload: dict[str, Any], *, task_points: list[str]) -> dict[str, str]:
+    if not task_points:
+        return {}
+    updates: dict[str, str] = {}
+    completion_summary = compact_text(str(update_payload.get("completion_summary") or ""))
+    for clause in _task_close_summary_clauses(completion_summary):
+        status = _task_close_clause_status(clause)
+        if not status:
+            continue
+        for point in _task_close_points_mentioned(clause, task_points=task_points):
+            updates[point] = status
+    for item in _string_list(update_payload.get("not_done_items")):
+        for point in _task_close_points_mentioned(item, task_points=task_points):
+            updates[point] = "not_done"
+    for item in _string_list(update_payload.get("unconfirmed_items")):
+        for point in _task_close_points_mentioned(item, task_points=task_points):
+            updates[point] = "unconfirmed"
+    return updates
+
+
+def _apply_task_close_point_status_updates(
+    merged: dict[str, Any],
+    updates: dict[str, str],
+    *,
+    extra_not_done: list[str],
+    extra_unconfirmed: list[str],
+) -> None:
+    updated_points = list(updates)
+    not_done = [
+        item
+        for item in _string_list(merged.get("not_done_items"))
+        if not any(_task_close_text_matches_point(point, item) for point in updated_points)
+    ]
+    unconfirmed = [
+        item
+        for item in _string_list(merged.get("unconfirmed_items"))
+        if not any(_task_close_text_matches_point(point, item) for point in updated_points)
+    ]
+    for point, status in updates.items():
+        if status == "not_done":
+            not_done.append(point)
+        elif status == "unconfirmed":
+            unconfirmed.append(point)
+    not_done.extend(extra_not_done)
+    unconfirmed.extend(extra_unconfirmed)
+    merged["not_done_items"] = _unique_strings(not_done)
+    merged["unconfirmed_items"] = _unique_strings(unconfirmed)
+
+
+def _task_close_items_without_task_point(value: object, task_points: list[str]) -> list[str]:
+    return [
+        item
+        for item in _string_list(value)
+        if not any(_task_close_text_matches_point(point, item) for point in task_points)
+    ]
+
+
+def _task_close_summary_clauses(value: str) -> list[str]:
+    text = compact_text(value)
+    if not text:
+        return []
+    return _unique_strings([compact_text(part).strip(" .;:-") for part in re.split(r"(?:\r?\n)+|(?<!\d)[.,;]+", text)])
+
+
+def _task_close_points_mentioned(value: str, *, task_points: list[str]) -> list[str]:
+    return [point for point in task_points if _task_close_text_matches_point(point, value)]
+
+
+def _task_close_text_matches_point(point: str, value: str) -> bool:
+    point_norm = _task_close_match_text(point)
+    value_norm = _task_close_match_text(value)
+    if not point_norm or not value_norm:
+        return False
+    if point_norm in value_norm or value_norm in point_norm:
+        return True
+    point_tokens = set(point_norm.split())
+    value_tokens = set(value_norm.split())
+    if not point_tokens or not value_tokens:
+        return False
+    return len(point_tokens & value_tokens) >= min(len(point_tokens), 2)
+
+
+def _task_close_match_text(value: str) -> str:
+    text = compact_text(value).casefold().replace("ё", "е")
+    text = re.sub(r"[^0-9a-zа-я]+", " ", text, flags=re.IGNORECASE)
+    ignored = {"и", "или", "по", "на", "в", "во", "с", "со", "к", "ко", "для", "пункт"}
+    return compact_text(" ".join(token for token in text.split() if token not in ignored))
+
+
+def _task_close_clause_status(value: str) -> str:
+    text = compact_text(value).casefold().replace("ё", "е")
+    if not text:
+        return ""
+    if (
+        "не выполн" in text
+        or "не сдел" in text
+        or "не постав" in text
+        or "не установ" in text
+        or "не забрал" in text
+        or "не почини" in text
+        or "not done" in text
+        or "not completed" in text
+    ):
+        return "not_done"
+    if "не подтверж" in text or "неизвест" in text or "не провер" in text or "unconfirmed" in text:
+        return "unconfirmed"
+    if "выполн" in text or "сделан" in text or "готов" in text or "completed" in text or "done" in text:
+        return "completed"
+    return ""
 
 
 def _remove_initial_unknown_close_placeholders(value: object) -> list[str]:
