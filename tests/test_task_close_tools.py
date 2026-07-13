@@ -15,6 +15,7 @@ from ai_server.agents.bitrix24.tools.task_close import (
     TaskCloseDiscardTool,
     TaskCloseDraftTool,
     TaskCloseReportIncidentTool,
+    format_task_close_draft_message,
 )
 from ai_server.integrations.bitrix.task_close_direct_queue import (
     TASK_CLOSE_DIRECT_STATUS_ACTIVE,
@@ -66,6 +67,28 @@ class _TaskDetailClient:
     async def result(self, method: str, params: dict) -> dict:
         self.calls.append((method, params))
         return {"task": self.task}
+
+
+def test_task_close_file_formatter_hides_unanswered_unconfirmed_task_points():
+    text = format_task_close_draft_message(
+        {
+            "_draft_type": TASK_CLOSE_DRAFT_TYPE,
+            "task_id": 139,
+            "task_title": "Проверить объект",
+            "completion_summary": "Установить камеру не выполнено",
+            "task_points": ["Установить камеру", "Забрать документы", "Проверить архив"],
+            "not_done_items": ["Установить камеру"],
+            "unconfirmed_items": ["Забрать документы", "Проверить архив"],
+            "overall_status": "partial",
+            "status_reasons": ["не было доступа к архиву"],
+        }
+    )
+
+    assert "1.1 Установить камеру - не выполнено" in text
+    assert "1.2 Забрать документы - ... ???" in text
+    assert "1.3 Проверить архив - ... ???" in text
+    assert "1.2 Забрать документы - не подтверждено" not in text
+    assert "1.3 Проверить архив - не подтверждено" not in text
 
 
 def test_ai_close_report_parser_prefers_machine_problem_types_over_human_prompts():
