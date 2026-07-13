@@ -928,6 +928,58 @@ def test_portal_metadata_sync_auto_restores_missing_ai_close_report(monkeypatch)
     assert task.metadata["ai_close_report_files"][0]["attached_object_id"] == 901
 
 
+def test_portal_metadata_sync_does_not_restore_ai_close_report_when_task_disappears(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    monkeypatch.setenv("BITRIX_TASK_CLOSE_REPORT_ADMIN_USER_IDS", "1")
+    monkeypatch.setenv("SEARCH_INDEX_MAX_TASK_ATTACHMENTS", "10")
+    index = FakePortalSearchIndex()
+    index.upsert_item(
+        entity_type="task",
+        entity_id=303,
+        title="Deleted task",
+        body="",
+        metadata={
+            "ai_close_report_files": [
+                {
+                    "attached_object_id": 801,
+                    "disk_object_id": 62357,
+                    "name": "AI-close-303.txt",
+                    "status": "unconfirmed",
+                }
+            ],
+            "ai_close_report_missing": True,
+            "ai_close_report_incident_status": "pending",
+            "ai_close_report_auto_restore_after": "2000-01-01T00:00:00+03:00",
+        },
+    )
+
+    class DeletedTaskBitrix(FakePortalBitrix):
+        def __init__(self) -> None:
+            super().__init__()
+            self.addfile_payloads: list[dict] = []
+            self.messages: list[tuple[str, str]] = []
+
+        async def list_all_tasks(self, **kwargs):
+            return []
+
+        async def result(self, method: str, payload: dict):
+            if method == "task.item.addfile":
+                self.addfile_payloads.append(payload)
+                return {"ATTACHMENT_ID": 901, "FILE_ID": 62357, "NAME": payload["fileParameters"]["NAME"]}
+            return await super().result(method, payload)
+
+        async def send_bot_message(self, dialog_id: str, message: str, *, bot_id=None, keyboard=None):
+            self.messages.append((dialog_id, message))
+            return {"message_id": 1}
+
+    bitrix = DeletedTaskBitrix()
+    anyio_run(sync_portal_index(bitrix, index, settings=get_settings()))
+
+    assert bitrix.addfile_payloads == []
+    assert bitrix.messages == []
+
+
 def test_portal_metadata_sync_deduplicates_disk_roots(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")

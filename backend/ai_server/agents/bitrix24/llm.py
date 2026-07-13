@@ -872,7 +872,11 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
     draft = data.get("draft") if isinstance(data.get("draft"), dict) else {}
     task_id = _text(draft.get("task_id"))
     task_title = _text(preview.get("task_title")) or _text(draft.get("task_title")) or _task_fallback_title(task_id)
-    raw_result_text = _text(preview.get("completion_summary")) or _text(draft.get("completion_summary"))
+    raw_result_text = (
+        _text(preview.get("completion_summary"))
+        or _text(draft.get("completion_summary"))
+        or _text(draft.get("result_text"))
+    )
     result_text = "" if _task_close_is_placeholder_summary(raw_result_text) else raw_result_text
     task_points = _text_items(preview.get("task_points") or draft.get("task_points"))
     source_task_description_empty = bool(
