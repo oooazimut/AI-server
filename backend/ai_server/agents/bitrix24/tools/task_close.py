@@ -1525,8 +1525,7 @@ def _task_close_status_prompt(status: str) -> str:
     ]
     rendered = [f"[ВЫБРАНО: {label}]" if normalized == key else label for key, label in options]
     return (
-        f"({' / '.join(rendered)}; если выполнено частично или не выполнено - "
-        "укажи причину неполного выполнения работ)"
+        f"({' / '.join(rendered)}; если выполнено частично или не выполнено - укажи причину неполного выполнения работ)"
     )
 
 
@@ -1600,11 +1599,7 @@ def _task_close_visible_unconfirmed(
         key = value.casefold()
         if key in {"результат выполнения не указан", "result is not specified"}:
             continue
-        if (
-            ("результат закрытия" in key and "не подтверж" in key)
-            or "ai-черновик" in key
-            or "ai draft" in key
-        ):
+        if ("результат закрытия" in key and "не подтверж" in key) or "ai-черновик" in key or "ai draft" in key:
             continue
         if key in point_keys:
             continue
