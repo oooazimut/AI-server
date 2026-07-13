@@ -24,7 +24,7 @@ sys.path.insert(0, str(BACKEND_DIR))
 from ai_server.integrations.bitrix.chat_parser import make_dialog_key  # noqa: E402
 from ai_server.integrations.postgres.bitrix_agent import PostgresBitrixAgentStore  # noqa: E402
 from ai_server.settings import get_settings  # noqa: E402
-from scripts.create_bitrix_dev_chat import env_file_paths, load_env_files  # noqa: E402
+from scripts.create_bitrix_dev_chat import preload_env_files_from_argv  # noqa: E402
 
 DEFAULT_EVENTS_URL = "http://127.0.0.1:8001/bitrix/events"
 DEFAULT_STATUS_URL = "http://127.0.0.1:8001/bitrix/webhook-events/status"
@@ -851,9 +851,9 @@ def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
+    loaded_env_keys = preload_env_files_from_argv(sys.argv[1:])
     parser = build_parser()
     args = parser.parse_args()
-    loaded_env_keys = load_env_files(env_file_paths(args.env_file))
     settings = get_settings()
 
     args.status_url = args.status_url or resolve_status_url(args.events_url)

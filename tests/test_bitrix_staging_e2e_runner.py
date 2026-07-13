@@ -8,6 +8,7 @@ from scripts.bitrix_staging_e2e_runner import (
 )
 from scripts.bitrix_staging_e2e_runner import (
     acquire_dialog_lock,
+    build_parser,
     cleanup_tests_after_failure,
     default_lock_path,
     evaluate_response_text,
@@ -26,6 +27,43 @@ from scripts.bitrix_staging_e2e_runner import (
 from scripts.bitrix_staging_e2e_runner import (
     tests_for_suite as runner_tests_for_suite,
 )
+from scripts.create_bitrix_dev_chat import preload_env_files_from_argv
+
+
+def test_env_file_preload_updates_runner_argparse_defaults(monkeypatch, tmp_path) -> None:
+    for key in (
+        "BITRIX_E2E_DIALOG_ID",
+        "BITRIX_E2E_CHAT_ID",
+        "BITRIX_E2E_USER_ID",
+        "BITRIX_E2E_TASK_CLOSE_TASK_ID",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    env_file = tmp_path / "staging.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "BITRIX_E2E_DIALOG_ID=chat8745",
+                "BITRIX_E2E_CHAT_ID=8745",
+                "BITRIX_E2E_USER_ID=55",
+                "BITRIX_E2E_TASK_CLOSE_TASK_ID=8981",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = preload_env_files_from_argv(["--env-file", str(env_file)])
+    args = build_parser().parse_args(["--env-file", str(env_file), "--suite", "smoke"])
+
+    assert set(loaded) >= {
+        "BITRIX_E2E_DIALOG_ID",
+        "BITRIX_E2E_CHAT_ID",
+        "BITRIX_E2E_USER_ID",
+        "BITRIX_E2E_TASK_CLOSE_TASK_ID",
+    }
+    assert args.dialog_id == "chat8745"
+    assert args.chat_id == 8745
+    assert args.user_id == 55
+    assert args.task_close_task_id == "8981"
 
 
 def test_matching_response_messages_skips_unmatched_delayed_messages() -> None:
