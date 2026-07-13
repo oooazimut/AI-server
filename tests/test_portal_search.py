@@ -11,6 +11,18 @@ from ai_server.integrations.bitrix.portal_search import (
     sync_portal_content_index,
     sync_portal_index,
 )
+from ai_server.integrations.bitrix.task_close_control import (
+    TASK_CLOSE_DECISION_CONTROLLED,
+    TASK_CLOSE_DECISION_IGNORED_BEFORE_START,
+    TASK_CLOSE_DECISION_IGNORED_USER_NOT_CONTROLLED,
+    task_close_event_key,
+)
+from ai_server.integrations.bitrix.task_close_direct_queue import (
+    TASK_CLOSE_DIRECT_STATUS_ACTIVE,
+    TASK_CLOSE_DIRECT_STATUS_PENDING,
+    direct_close_state_key,
+)
+from ai_server.integrations.bitrix.task_close_reports import task_close_report_state_key
 from ai_server.main import app
 from ai_server.models import AgentTask
 from ai_server.registry import get_agent_manifest
@@ -331,8 +343,17 @@ def test_portal_metadata_sync_indexes_tasks_projects_and_disk(monkeypatch):
     assert task is not None
     assert "понаблюдать" in task.body.casefold()
     assert "вы добавлены наблюдателем" not in task.body.casefold()
+    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" in task.body
     assert task.metadata["comments_indexed"] is True
     assert task.metadata["comments_count"] == 1
+    assert task.metadata["task_results_indexed"] is True
+    assert task.metadata["task_results_count"] == 1
+    assert task.metadata["ai_close_incomplete"] is True
+    assert task.metadata["ai_close_marker"] == "AI_SERVER_TASK_CLOSE_INCOMPLETE"
+    assert task.metadata["ai_close_problem_types"] == ["not_done", "unconfirmed"]
+    assert task.metadata["ai_close_has_not_done"] is True
+    assert task.metadata["ai_close_has_unconfirmed"] is True
+    assert task.metadata["ai_close_marker_source"] == "task_result"
     assert task.metadata["responsible_label"] == "Марат"
     assert index.get_item(entity_type="project", entity_id=17) is not None
     stock = index.get_item(entity_type="catalog_store_stock", entity_id="12:1001")
@@ -345,8 +366,618 @@ def test_portal_metadata_sync_indexes_tasks_projects_and_disk(monkeypatch):
     assert index.get_item(entity_type="disk_file", entity_id=501) is not None
     assert index.search("план склад", entity_types={"disk_file"})
     assert index.search("понаблюдать", entity_types={"task"})
+    assert index.search("AI_SERVER_TASK_CLOSE_INCOMPLETE", entity_types={"task"})
     assert index.search("Borisov Junction", entity_types={"catalog_store_stock"})
     assert any(method == "batch" for method, _payload in bitrix.calls)
+
+
+def test_portal_metadata_sync_queues_controlled_direct_closed_tasks(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    index = FakePortalSearchIndex()
+    index.set_task_close_control_setting(
+        key="control_enabled_from",
+        value="2026-07-12T00:00:00+03:00",
+        updated_by=1,
+    )
+    index.upsert_task_close_controlled_user(user_id=13, active=True, updated_by=1)
+
+    class DirectClosedBitrix(FakePortalBitrix):
+        async def list_all_tasks(self, **kwargs):
+            return [
+                {
+                    "ID": 402,
+                    "TITLE": "Later closed direct task",
+                    "DESCRIPTION": "Second direct close",
+                    "STATUS": 5,
+                    "RESPONSIBLE_ID": 13,
+                    "CREATED_BY": 1,
+                    "CHANGED_DATE": "2026-07-12T12:22:00+03:00",
+                    "CLOSED_DATE": "2026-07-12T12:20:00+03:00",
+                    "CLOSED_BY": 13,
+                    "UF_TASK_WEBDAV_FILES": [],
+                },
+                {
+                    "ID": 401,
+                    "TITLE": "Earlier closed direct task",
+                    "DESCRIPTION": "First direct close",
+                    "STATUS": 5,
+                    "RESPONSIBLE_ID": 13,
+                    "CREATED_BY": 1,
+                    "CHANGED_DATE": "2026-07-12T12:12:00+03:00",
+                    "CLOSED_DATE": "2026-07-12T12:10:00+03:00",
+                    "CLOSED_BY": 13,
+                    "UF_TASK_WEBDAV_FILES": [],
+                },
+            ]
+
+        async def result(self, method: str, payload: dict):
+            self.calls.append((method, payload))
+            if method == "batch":
+                return {"result": {key: [] for key in payload["cmd"]}, "result_error": []}
+            raise AssertionError(method)
+
+    anyio_run(sync_portal_index(DirectClosedBitrix(), index, settings=get_settings()))
+
+    early_key = task_close_event_key(task_id=401, closed_at="2026-07-12T12:10:00+03:00")
+    late_key = task_close_event_key(task_id=402, closed_at="2026-07-12T12:20:00+03:00")
+    early_event = index.get_task_close_control_event(task_id=401, close_event_key=early_key)
+    late_event = index.get_task_close_control_event(task_id=402, close_event_key=late_key)
+    assert early_event is not None
+    assert late_event is not None
+    assert early_event["decision"] == TASK_CLOSE_DECISION_CONTROLLED
+    assert late_event["decision"] == TASK_CLOSE_DECISION_CONTROLLED
+
+    early_state = index.get_task_close_processing_state(task_id=401, state_key=direct_close_state_key(early_key))
+    late_state = index.get_task_close_processing_state(task_id=402, state_key=direct_close_state_key(late_key))
+    assert early_state is not None
+    assert late_state is not None
+    assert early_state["status"] == TASK_CLOSE_DIRECT_STATUS_ACTIVE
+    assert late_state["status"] == TASK_CLOSE_DIRECT_STATUS_PENDING
+
+
+def test_portal_metadata_sync_keeps_uncontrolled_direct_close_ignored_after_user_added(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    index = FakePortalSearchIndex()
+    index.set_task_close_control_setting(
+        key="control_enabled_from",
+        value="2026-07-12T00:00:00+03:00",
+        updated_by=1,
+    )
+
+    class DirectClosedBitrix(FakePortalBitrix):
+        async def list_all_tasks(self, **kwargs):
+            return [
+                {
+                    "ID": 410,
+                    "TITLE": "Direct close by uncontrolled user",
+                    "DESCRIPTION": "Closed before user was added to control",
+                    "STATUS": 5,
+                    "RESPONSIBLE_ID": 99,
+                    "CREATED_BY": 1,
+                    "CHANGED_DATE": "2026-07-12T14:00:00+03:00",
+                    "CLOSED_DATE": "2026-07-12T13:55:00+03:00",
+                    "CLOSED_BY": 99,
+                    "UF_TASK_WEBDAV_FILES": [],
+                }
+            ]
+
+        async def result(self, method: str, payload: dict):
+            self.calls.append((method, payload))
+            if method == "batch":
+                return {"result": {key: [] for key in payload["cmd"]}, "result_error": []}
+            raise AssertionError(method)
+
+    anyio_run(sync_portal_index(DirectClosedBitrix(), index, settings=get_settings()))
+    index.upsert_task_close_controlled_user(user_id=99, active=True, updated_by=1)
+    anyio_run(sync_portal_index(DirectClosedBitrix(), index, settings=get_settings()))
+
+    close_key = task_close_event_key(task_id=410, closed_at="2026-07-12T13:55:00+03:00")
+    event = index.get_task_close_control_event(task_id=410, close_event_key=close_key)
+    state = index.get_task_close_processing_state(task_id=410, state_key=direct_close_state_key(close_key))
+    assert event is not None
+    assert event["decision"] == TASK_CLOSE_DECISION_IGNORED_USER_NOT_CONTROLLED
+    assert state is None
+
+
+def test_portal_metadata_sync_ignores_direct_close_before_control_start(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    index = FakePortalSearchIndex()
+    index.set_task_close_control_setting(
+        key="control_enabled_from",
+        value="2026-07-12T00:00:00+03:00",
+        updated_by=1,
+    )
+    index.upsert_task_close_controlled_user(user_id=13, active=True, updated_by=1)
+
+    class OldDirectClosedBitrix(FakePortalBitrix):
+        async def list_all_tasks(self, **kwargs):
+            return [
+                {
+                    "ID": 411,
+                    "TITLE": "Old direct close",
+                    "DESCRIPTION": "Closed before control launch",
+                    "STATUS": 5,
+                    "RESPONSIBLE_ID": 13,
+                    "CREATED_BY": 1,
+                    "CHANGED_DATE": "2026-07-10T12:05:00+03:00",
+                    "CLOSED_DATE": "2026-07-10T12:00:00+03:00",
+                    "CLOSED_BY": 13,
+                    "UF_TASK_WEBDAV_FILES": [],
+                }
+            ]
+
+        async def result(self, method: str, payload: dict):
+            self.calls.append((method, payload))
+            if method == "batch":
+                return {"result": {key: [] for key in payload["cmd"]}, "result_error": []}
+            raise AssertionError(method)
+
+    anyio_run(sync_portal_index(OldDirectClosedBitrix(), index, settings=get_settings()))
+
+    close_key = task_close_event_key(task_id=411, closed_at="2026-07-10T12:00:00+03:00")
+    event = index.get_task_close_control_event(task_id=411, close_event_key=close_key)
+    state = index.get_task_close_processing_state(task_id=411, state_key=direct_close_state_key(close_key))
+    assert event is not None
+    assert event["decision"] == TASK_CLOSE_DECISION_IGNORED_BEFORE_START
+    assert state is None
+
+
+def test_portal_metadata_sync_does_not_queue_task_with_ai_close_report(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    monkeypatch.setenv("SEARCH_INDEX_MAX_TASK_ATTACHMENTS", "10")
+    index = FakePortalSearchIndex()
+    index.set_task_close_control_setting(
+        key="control_enabled_from",
+        value="2026-07-12T00:00:00+03:00",
+        updated_by=1,
+    )
+    index.upsert_task_close_controlled_user(user_id=13, active=True, updated_by=1)
+
+    class ReportedClosedBitrix(FakePortalBitrix):
+        async def list_all_tasks(self, **kwargs):
+            return [
+                {
+                    "ID": 412,
+                    "TITLE": "Already closed through AI workflow",
+                    "DESCRIPTION": "Has protected report file",
+                    "STATUS": 5,
+                    "RESPONSIBLE_ID": 13,
+                    "CREATED_BY": 1,
+                    "CHANGED_DATE": "2026-07-12T15:00:00+03:00",
+                    "CLOSED_DATE": "2026-07-12T14:55:00+03:00",
+                    "CLOSED_BY": 13,
+                    "UF_TASK_WEBDAV_FILES": ["n812"],
+                }
+            ]
+
+        async def result(self, method: str, payload: dict):
+            self.calls.append((method, payload))
+            if method == "batch":
+                return {"result": {key: [] for key in payload["cmd"]}, "result_error": []}
+            raise AssertionError(method)
+
+        async def get_attached_object(self, attached_object_id: int):
+            return {
+                "ID": attached_object_id,
+                "OBJECT_ID": 62357,
+                "NAME": "AI-close-412.txt",
+                "SIZE": 269,
+                "CREATE_TIME": "2026-07-12T14:56:00+03:00",
+                "DOWNLOAD_URL": "https://example.test/download/812",
+            }
+
+    anyio_run(sync_portal_index(ReportedClosedBitrix(), index, settings=get_settings()))
+
+    close_key = task_close_event_key(task_id=412, closed_at="2026-07-12T14:55:00+03:00")
+    task = index.get_item(entity_type="task", entity_id=412)
+    assert task is not None
+    assert task.metadata["task_close_control_decision"] == "skipped_ai_close_report_present"
+    assert index.get_task_close_control_event(task_id=412, close_event_key=close_key) is None
+    assert index.get_task_close_processing_state(task_id=412, state_key=direct_close_state_key(close_key)) is None
+
+
+def test_portal_metadata_sync_marks_ai_close_report_attachment(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    monkeypatch.setenv("SEARCH_INDEX_MAX_TASK_ATTACHMENTS", "10")
+    index = FakePortalSearchIndex()
+
+    class ReportAttachmentBitrix(FakePortalBitrix):
+        async def list_all_tasks(self, **kwargs):
+            tasks = await super().list_all_tasks(**kwargs)
+            task = dict(tasks[0])
+            task.update(
+                {
+                    "ID": 303,
+                    "TITLE": "Проверить архив",
+                    "STATUS": 5,
+                    "RESPONSIBLE_ID": 13,
+                    "CREATED_BY": 1,
+                    "CLOSED_DATE": "2026-06-02T11:00:00+03:00",
+                    "UF_TASK_WEBDAV_FILES": ["n801"],
+                }
+            )
+            return [task]
+
+        async def result(self, method: str, payload: dict):
+            self.calls.append((method, payload))
+            if method == "batch":
+                if "task_result_0" in payload["cmd"]:
+                    return {"result": {"task_result_0": []}, "result_error": []}
+                return {"result": {"task_0": []}, "result_error": []}
+            raise AssertionError(method)
+
+        async def get_attached_object(self, attached_object_id: int):
+            return {
+                "ID": attached_object_id,
+                "OBJECT_ID": 62357,
+                "NAME": "AI-close-303.txt",
+                "SIZE": 269,
+                "CREATE_TIME": "2026-06-02T11:01:00+03:00",
+                "DOWNLOAD_URL": "https://example.test/download/801",
+            }
+
+        async def download_file_from_url(self, url: str, destination: Path, *, max_bytes: int):
+            data = b"AI task close report\nStatus: unconfirmed\nAI marker: AI_SERVER_TASK_CLOSE_INCOMPLETE\n"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(data)
+            return len(data)
+
+    stats = anyio_run(sync_portal_index(ReportAttachmentBitrix(), index, settings=get_settings()))
+
+    assert stats.tasks == 1
+    assert stats.task_attachments == 1
+    task = index.get_item(entity_type="task", entity_id=303)
+    assert task is not None
+    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" in task.body
+    assert task.metadata["ai_close_incomplete"] is True
+    assert task.metadata["ai_close_marker"] == "AI_SERVER_TASK_CLOSE_INCOMPLETE"
+    assert task.metadata["ai_close_problem_types"] == ["unconfirmed"]
+    assert task.metadata["ai_close_marker_source"] == "task_attachment"
+    attachment = index.get_item(entity_type="task_attachment", entity_id=801)
+    assert attachment is not None
+    assert attachment.metadata["ai_close_report"] is True
+    assert attachment.metadata["ai_close_problem_types"] == ["unconfirmed"]
+    assert index.search("AI_SERVER_TASK_CLOSE_INCOMPLETE", entity_types={"task"})
+
+
+def test_portal_metadata_sync_uses_report_content_status_over_legacy_file_name(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    monkeypatch.setenv("SEARCH_INDEX_MAX_TASK_ATTACHMENTS", "10")
+    index = FakePortalSearchIndex()
+
+    class ReportAttachmentBitrix(FakePortalBitrix):
+        async def list_all_tasks(self, **kwargs):
+            tasks = await super().list_all_tasks(**kwargs)
+            task = dict(tasks[0])
+            task.update(
+                {
+                    "ID": 303,
+                    "TITLE": "Проверить архив",
+                    "STATUS": 5,
+                    "RESPONSIBLE_ID": 13,
+                    "CREATED_BY": 1,
+                    "CLOSED_DATE": "2026-06-02T11:00:00+03:00",
+                    "UF_TASK_WEBDAV_FILES": ["n801"],
+                }
+            )
+            return [task]
+
+        async def result(self, method: str, payload: dict):
+            self.calls.append((method, payload))
+            if method == "batch":
+                if "task_result_0" in payload["cmd"]:
+                    return {"result": {"task_result_0": []}, "result_error": []}
+                return {"result": {"task_0": []}, "result_error": []}
+            raise AssertionError(method)
+
+        async def get_attached_object(self, attached_object_id: int):
+            return {
+                "ID": attached_object_id,
+                "OBJECT_ID": 62357,
+                "NAME": "AI-close-303-unconfirmed.txt",
+                "SIZE": 269,
+                "CREATE_TIME": "2026-06-02T11:01:00+03:00",
+                "DOWNLOAD_URL": "https://example.test/download/801",
+            }
+
+        async def download_file_from_url(self, url: str, destination: Path, *, max_bytes: int):
+            data = b"AI task close report\nStatus: ok\n"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(data)
+            return len(data)
+
+    anyio_run(sync_portal_index(ReportAttachmentBitrix(), index, settings=get_settings()))
+
+    task = index.get_item(entity_type="task", entity_id=303)
+    assert task is not None
+    assert task.metadata["ai_close_report_files"][0]["status"] == "ok"
+    assert task.metadata["ai_close_incomplete"] is False
+    assert task.metadata["ai_close_problem_types"] == []
+    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" not in task.body
+    attachment = index.get_item(entity_type="task_attachment", entity_id=801)
+    assert attachment is not None
+    assert attachment.metadata["ai_close_problem_types"] == []
+
+
+def test_portal_metadata_sync_alerts_when_ai_close_report_attachment_disappears(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    monkeypatch.setenv("BITRIX_TASK_CLOSE_REPORT_ADMIN_USER_IDS", "1")
+    monkeypatch.setenv("SEARCH_INDEX_MAX_TASK_ATTACHMENTS", "10")
+    index = FakePortalSearchIndex()
+
+    class ReportAttachmentBitrix(FakePortalBitrix):
+        def __init__(self, *, with_report: bool = True) -> None:
+            super().__init__()
+            self.with_report = with_report
+            self.messages: list[tuple[str, str]] = []
+
+        async def list_all_tasks(self, **kwargs):
+            tasks = await super().list_all_tasks(**kwargs)
+            task = dict(tasks[0])
+            task.update(
+                {
+                    "ID": 303,
+                    "TITLE": "РџСЂРѕРІРµСЂРёС‚СЊ Р°СЂС…РёРІ",
+                    "STATUS": 5,
+                    "RESPONSIBLE_ID": 13,
+                    "CREATED_BY": 1,
+                    "CLOSED_DATE": "2026-06-02T11:00:00+03:00",
+                    "UF_TASK_WEBDAV_FILES": ["n801"] if self.with_report else [],
+                }
+            )
+            return [task]
+
+        async def result(self, method: str, payload: dict):
+            self.calls.append((method, payload))
+            if method == "batch":
+                if "task_result_0" in payload["cmd"]:
+                    return {"result": {"task_result_0": []}, "result_error": []}
+                return {"result": {"task_0": []}, "result_error": []}
+            raise AssertionError(method)
+
+        async def get_attached_object(self, attached_object_id: int):
+            return {
+                "ID": attached_object_id,
+                "OBJECT_ID": 62357,
+                "NAME": "AI-close-303-unconfirmed.txt",
+                "SIZE": 269,
+                "CREATE_TIME": "2026-06-02T11:01:00+03:00",
+                "DOWNLOAD_URL": "https://example.test/download/801",
+            }
+
+        async def send_bot_message(self, dialog_id: str, message: str, *, bot_id=None, keyboard=None):
+            self.messages.append((dialog_id, message))
+            return {"message_id": 1}
+
+    anyio_run(sync_portal_index(ReportAttachmentBitrix(with_report=True), index, settings=get_settings()))
+    bitrix = ReportAttachmentBitrix(with_report=False)
+    anyio_run(sync_portal_index(bitrix, index, settings=get_settings()))
+
+    task = index.get_item(entity_type="task", entity_id=303)
+    assert task is not None
+    assert task.metadata["ai_close_report_missing"] is True
+    assert task.metadata["ai_close_report_incident_status"] == "pending"
+    assert task.metadata["ai_close_report_missing_files"][0]["name"] == "AI-close-303-unconfirmed.txt"
+    assert task.metadata["ai_close_incomplete"] is True
+    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" in task.body
+    assert bitrix.messages
+    assert bitrix.messages[0][0] == "1"
+    assert "AI-close-303-unconfirmed.txt" in bitrix.messages[0][1]
+    assert "1 " in bitrix.messages[0][1]
+    assert "2 " in bitrix.messages[0][1]
+
+
+def test_portal_metadata_sync_skips_accepted_missing_ai_close_report(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    monkeypatch.setenv("BITRIX_TASK_CLOSE_REPORT_ADMIN_USER_IDS", "1")
+    monkeypatch.setenv("SEARCH_INDEX_MAX_TASK_ATTACHMENTS", "10")
+    index = FakePortalSearchIndex()
+
+    class ReportAttachmentBitrix(FakePortalBitrix):
+        def __init__(self, *, with_report: bool = True) -> None:
+            super().__init__()
+            self.with_report = with_report
+            self.messages: list[tuple[str, str]] = []
+
+        async def list_all_tasks(self, **kwargs):
+            tasks = await super().list_all_tasks(**kwargs)
+            task = dict(tasks[0])
+            task.update(
+                {
+                    "ID": 303,
+                    "TITLE": "Проверить архив",
+                    "STATUS": 5,
+                    "RESPONSIBLE_ID": 13,
+                    "CREATED_BY": 1,
+                    "CLOSED_DATE": "2026-06-02T11:00:00+03:00",
+                    "UF_TASK_WEBDAV_FILES": ["n801"] if self.with_report else [],
+                }
+            )
+            return [task]
+
+        async def result(self, method: str, payload: dict):
+            self.calls.append((method, payload))
+            if method == "batch":
+                if "task_result_0" in payload["cmd"]:
+                    return {"result": {"task_result_0": []}, "result_error": []}
+                return {"result": {"task_0": []}, "result_error": []}
+            raise AssertionError(method)
+
+        async def get_attached_object(self, attached_object_id: int):
+            return {
+                "ID": attached_object_id,
+                "OBJECT_ID": 62357,
+                "NAME": "AI-close-303-unconfirmed.txt",
+                "SIZE": 269,
+                "CREATE_TIME": "2026-06-02T11:01:00+03:00",
+                "DOWNLOAD_URL": "https://example.test/download/801",
+            }
+
+        async def send_bot_message(self, dialog_id: str, message: str, *, bot_id=None, keyboard=None):
+            self.messages.append((dialog_id, message))
+            return {"message_id": 1}
+
+    anyio_run(sync_portal_index(ReportAttachmentBitrix(with_report=True), index, settings=get_settings()))
+    task = index.get_item(entity_type="task", entity_id=303)
+    assert task is not None
+    report_file = task.metadata["ai_close_report_files"][0]
+    index.upsert_task_close_processing_state(
+        task_id=303,
+        state_key=task_close_report_state_key(report_file),
+        status="accepted_missing",
+        payload={"accepted_file": report_file},
+        actor_user_id=1,
+    )
+
+    bitrix = ReportAttachmentBitrix(with_report=False)
+    anyio_run(sync_portal_index(bitrix, index, settings=get_settings()))
+
+    task = index.get_item(entity_type="task", entity_id=303)
+    assert task is not None
+    assert bitrix.messages == []
+    assert "ai_close_report_missing" not in task.metadata
+    assert task.metadata["ai_close_report_files"] == []
+
+
+def test_portal_metadata_sync_auto_restores_missing_ai_close_report(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    monkeypatch.setenv("SEARCH_INDEX_MAX_TASK_ATTACHMENTS", "10")
+    index = FakePortalSearchIndex()
+
+    class ReportAttachmentBitrix(FakePortalBitrix):
+        def __init__(self, *, with_report: bool = True) -> None:
+            super().__init__()
+            self.with_report = with_report
+            self.addfile_payloads: list[dict] = []
+
+        async def list_all_tasks(self, **kwargs):
+            tasks = await super().list_all_tasks(**kwargs)
+            task = dict(tasks[0])
+            task.update(
+                {
+                    "ID": 303,
+                    "TITLE": "РџСЂРѕРІРµСЂРёС‚СЊ Р°СЂС…РёРІ",
+                    "STATUS": 5,
+                    "RESPONSIBLE_ID": 13,
+                    "CREATED_BY": 1,
+                    "CLOSED_DATE": "2026-06-02T11:00:00+03:00",
+                    "UF_TASK_WEBDAV_FILES": ["n801"] if self.with_report else [],
+                }
+            )
+            return [task]
+
+        async def result(self, method: str, payload: dict):
+            self.calls.append((method, payload))
+            if method == "batch":
+                if "task_result_0" in payload["cmd"]:
+                    return {"result": {"task_result_0": []}, "result_error": []}
+                return {"result": {"task_0": []}, "result_error": []}
+            if method == "task.item.addfile":
+                self.addfile_payloads.append(payload)
+                return {"ATTACHMENT_ID": 901, "FILE_ID": 62357, "NAME": payload["fileParameters"]["NAME"]}
+            raise AssertionError(method)
+
+        async def get_attached_object(self, attached_object_id: int):
+            return {
+                "ID": attached_object_id,
+                "OBJECT_ID": 62357,
+                "NAME": "AI-close-303-unconfirmed.txt",
+                "SIZE": 269,
+                "CREATE_TIME": "2026-06-02T11:01:00+03:00",
+                "DOWNLOAD_URL": "https://example.test/download/801",
+            }
+
+        async def send_bot_message(self, dialog_id: str, message: str, *, bot_id=None, keyboard=None):
+            return {"message_id": 1}
+
+        async def get_disk_file_download_url(self, file_id: int) -> str:
+            return f"fake://disk/{file_id}"
+
+        async def download_file_from_url(self, url: str, destination: Path, *, max_bytes: int):
+            data = b"AI task close report\nStatus: unconfirmed\n"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(data)
+            return len(data)
+
+    anyio_run(sync_portal_index(ReportAttachmentBitrix(with_report=True), index, settings=get_settings()))
+    anyio_run(sync_portal_index(ReportAttachmentBitrix(with_report=False), index, settings=get_settings()))
+    task = index.get_item(entity_type="task", entity_id=303)
+    assert task is not None
+    metadata = dict(task.metadata)
+    metadata["ai_close_report_auto_restore_after"] = "2000-01-01T00:00:00+03:00"
+    index.update_item_body_metadata(entity_type="task", entity_id=303, body=task.body, metadata=metadata)
+
+    bitrix = ReportAttachmentBitrix(with_report=False)
+    anyio_run(sync_portal_index(bitrix, index, settings=get_settings()))
+
+    assert bitrix.addfile_payloads
+    assert bitrix.addfile_payloads[0]["fileParameters"]["NAME"] == "AI-close-303-unconfirmed.txt"
+    task = index.get_item(entity_type="task", entity_id=303)
+    assert task is not None
+    assert task.metadata["ai_close_report_missing"] is False
+    assert task.metadata["ai_close_report_incident_status"] == "restored"
+    assert task.metadata["ai_close_report_files"][0]["attached_object_id"] == 901
+
+
+def test_portal_metadata_sync_does_not_restore_ai_close_report_when_task_disappears(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    monkeypatch.setenv("BITRIX_TASK_CLOSE_REPORT_ADMIN_USER_IDS", "1")
+    monkeypatch.setenv("SEARCH_INDEX_MAX_TASK_ATTACHMENTS", "10")
+    index = FakePortalSearchIndex()
+    index.upsert_item(
+        entity_type="task",
+        entity_id=303,
+        title="Deleted task",
+        body="",
+        metadata={
+            "ai_close_report_files": [
+                {
+                    "attached_object_id": 801,
+                    "disk_object_id": 62357,
+                    "name": "AI-close-303.txt",
+                    "status": "unconfirmed",
+                }
+            ],
+            "ai_close_report_missing": True,
+            "ai_close_report_incident_status": "pending",
+            "ai_close_report_auto_restore_after": "2000-01-01T00:00:00+03:00",
+        },
+    )
+
+    class DeletedTaskBitrix(FakePortalBitrix):
+        def __init__(self) -> None:
+            super().__init__()
+            self.addfile_payloads: list[dict] = []
+            self.messages: list[tuple[str, str]] = []
+
+        async def list_all_tasks(self, **kwargs):
+            return []
+
+        async def result(self, method: str, payload: dict):
+            if method == "task.item.addfile":
+                self.addfile_payloads.append(payload)
+                return {"ATTACHMENT_ID": 901, "FILE_ID": 62357, "NAME": payload["fileParameters"]["NAME"]}
+            return await super().result(method, payload)
+
+        async def send_bot_message(self, dialog_id: str, message: str, *, bot_id=None, keyboard=None):
+            self.messages.append((dialog_id, message))
+            return {"message_id": 1}
+
+    bitrix = DeletedTaskBitrix()
+    anyio_run(sync_portal_index(bitrix, index, settings=get_settings()))
+
+    assert bitrix.addfile_payloads == []
+    assert bitrix.messages == []
 
 
 def test_portal_metadata_sync_deduplicates_disk_roots(monkeypatch):
@@ -521,6 +1152,24 @@ class FakePortalBitrix:
     async def result(self, method: str, payload: dict):
         self.calls.append((method, payload))
         if method == "batch":
+            if "task_result_0" in payload["cmd"]:
+                assert "taskId=202" in payload["cmd"]["task_result_0"]
+                return {
+                    "result": {
+                        "task_result_0": [
+                            {
+                                "text": (
+                                    "Метка: AI_SERVER_TASK_CLOSE_INCOMPLETE\n"
+                                    "Невыполненные пункты:\n"
+                                    "- не проверен архив\n"
+                                    "Неподтверждённые пункты:\n"
+                                    "- нет фото результата"
+                                )
+                            }
+                        ]
+                    },
+                    "result_error": [],
+                }
             assert "task_0" in payload["cmd"]
             assert "TASKID=202" in payload["cmd"]["task_0"]
             return {
@@ -536,6 +1185,8 @@ class FakePortalBitrix:
             }
         if method == "task.commentitem.getlist":
             raise AssertionError("comment sync should use batch")
+        if method == "tasks.task.result.list":
+            raise AssertionError("task result sync should use batch")
         raise AssertionError(method)
 
     async def get_attached_object(self, attached_object_id: int):

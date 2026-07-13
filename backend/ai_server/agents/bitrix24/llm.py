@@ -23,7 +23,7 @@ from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
 from ai_server.retrieval import RetrievalHit
 from ai_server.settings import Settings
-from ai_server.utils import MOSCOW_TZ, confidence, optional_int
+from ai_server.utils import MOSCOW_TZ, compact_text, confidence, optional_int
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,9 @@ ALLOWED_TOOL_NAMES = {
     "task_close_draft",
     "task_close_confirm",
     "task_close_discard",
+    "task_close_report_incident",
+    "task_close_control_get",
+    "task_close_control_update",
     "calendar_event_draft",
     "calendar_event_confirm",
     "calendar_event_discard",
@@ -139,6 +142,54 @@ class BitrixLLMService:
                 decision=local_decision,
                 model_usage=_local_model_usage(manifest.id, "draft_confirm_route"),
                 raw={"source": "draft_confirm_route"},
+            )
+
+        local_decision = _common_task_close_draft_conflict_decision(task.request, task.context, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "task_close_draft_conflict_route"),
+                raw={"source": "task_close_draft_conflict_route"},
+            )
+
+        local_decision = _common_task_close_active_update_decision(task.request, task.context, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "task_close_active_update_route"),
+                raw={"source": "task_close_active_update_route"},
+            )
+
+        local_decision = _common_task_close_report_incident_decision(task.request, dialog_history, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "task_close_report_incident_route"),
+                raw={"source": "task_close_report_incident_route"},
+            )
+
+        local_decision = _common_admin_panel_clarification_decision(task.request, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "admin_panel_clarification_route"),
+                raw={"source": "admin_panel_clarification_route"},
+            )
+
+        local_decision = _common_task_close_control_decision(task.request, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "task_close_control_route"),
+                raw={"source": "task_close_control_route"},
+            )
+
+        local_decision = _common_task_close_start_decision(task.request, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "task_close_start_route"),
+                raw={"source": "task_close_start_route"},
             )
 
         local_decision = _common_calendar_event_draft_decision(task.request, tool_definitions)
@@ -349,6 +400,24 @@ def _direct_task_create_response(
                 status="completed",
                 answer="Черновик закрытия задачи удалён.",
                 model_usage=_local_model_usage(agent_id, "task_close_discard_response"),
+            )
+        if result.tool == "task_close_report_incident":
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer=_format_task_close_report_incident_answer(result.data),
+                model_usage=_local_model_usage(agent_id, "task_close_report_incident_response"),
+            )
+        if result.tool == "task_close_control_get":
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer=_format_task_close_control_get_answer(result.data),
+                model_usage=_local_model_usage(agent_id, "task_close_control_get_response"),
+            )
+        if result.tool == "task_close_control_update":
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer=_format_task_close_control_update_answer(result.data),
+                model_usage=_local_model_usage(agent_id, "task_close_control_update_response"),
             )
         if result.tool == "calendar_event_draft":
             return BitrixLLMFinalResult(
@@ -624,6 +693,7 @@ def _task_search_title(data: dict[str, Any]) -> str:
     status = _text(data.get("status")) or "active"
     query = _text(data.get("query"))
     comment_query = _text(data.get("comment_query"))
+    ai_close_problem_type = _text(data.get("ai_close_problem_type"))
     if project_name:
         base = f"Задачи в проекте {project_name}"
     elif status == "overdue":
@@ -634,6 +704,8 @@ def _task_search_title(data: dict[str, Any]) -> str:
         base = scope_label
     else:
         base = f"Активные {scope_label}"
+    if ai_close_problem_type:
+        base = f"{base} {_ai_close_problem_filter_label(ai_close_problem_type)}"
     if query:
         base = f"{base} по запросу «{query}»"
     if comment_query:
@@ -652,6 +724,8 @@ def _task_details(item: dict[str, Any], *, include_roles: bool) -> list[str]:
         details.append(f"исполнитель: {responsible}")
     if creator:
         details.append(f"постановщик: {creator}")
+    if item.get("ai_close_incomplete"):
+        details.append(f"AI-закрытие: {_ai_close_problem_detail_label(item.get('ai_close_problem_types'))}")
     roles = item.get("roles") if isinstance(item.get("roles"), list) else []
     roles_label = ", ".join(_text(role) for role in roles if _text(role))
     if include_roles and roles_label:
@@ -661,6 +735,24 @@ def _task_details(item: dict[str, Any], *, include_roles: bool) -> list[str]:
     if first_snippet:
         details.append(f"комментарий: {first_snippet}")
     return details
+
+
+def _ai_close_problem_filter_label(problem_type: str) -> str:
+    return {
+        "not_done": "с невыполненными пунктами",
+        "unconfirmed": "с неподтверждённым результатом",
+        "any": "с неполным AI-закрытием",
+    }.get(problem_type, "с неполным AI-закрытием")
+
+
+def _ai_close_problem_detail_label(value: object) -> str:
+    problem_types = set(_text_items(value))
+    labels = []
+    if "not_done" in problem_types:
+        labels.append("есть невыполненные пункты")
+    if "unconfirmed" in problem_types:
+        labels.append("результат не подтверждён")
+    return ", ".join(labels) or "неполное/неподтверждённое"
 
 
 def _capitalize_first(value: str) -> str:
@@ -782,28 +874,280 @@ def _format_task_create_confirm_answer(data: dict[str, Any], *, portal_base_url:
 
 
 def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
+    if data.get("status") == "active_draft_conflict":
+        return _format_task_close_draft_conflict_answer(data)
     preview = data.get("preview") if isinstance(data.get("preview"), dict) else {}
     draft = data.get("draft") if isinstance(data.get("draft"), dict) else {}
     task_id = _text(draft.get("task_id"))
     task_title = _text(preview.get("task_title")) or _text(draft.get("task_title")) or _task_fallback_title(task_id)
-    action_label = _text(preview.get("action_label")) or "отметить задачу выполненной"
-    result_text = _text(preview.get("completion_summary")) or _text(draft.get("completion_summary"))
-    unresolved = preview.get("unresolved_items") if isinstance(preview.get("unresolved_items"), list) else []
-    unresolved = [_text(item) for item in unresolved if _text(item)]
-    lines = [
-        "Черновик закрытия задачи:",
-        f"Задача: {task_title}",
-        f"Действие: {action_label}",
-    ]
-    if result_text:
-        lines.append(f"Результат: {result_text}")
-    if unresolved:
-        lines.append("Непроверенные пункты:")
-        lines.extend(f"- {item}" for item in unresolved)
-        lines.append("При подтверждении будет добавлена метка AI_SERVER_TASK_CLOSE_INCOMPLETE.")
+    raw_result_text = (
+        _text(preview.get("completion_summary"))
+        or _text(draft.get("completion_summary"))
+        or _text(draft.get("result_text"))
+    )
+    result_text = "" if _task_close_is_placeholder_summary(raw_result_text) else raw_result_text
+    task_points = _text_items(preview.get("task_points") or draft.get("task_points"))
+    source_task_description_empty = bool(
+        preview.get("source_task_description_empty") or draft.get("source_task_description_empty")
+    )
+    equipment = _text(preview.get("equipment_consumables")) or _text(draft.get("equipment_consumables"))
+    additional_info = _text(preview.get("additional_info")) or _text(draft.get("additional_info"))
+    overall_status = _text(preview.get("overall_status")) or _text(draft.get("overall_status"))
+    overall = _text(preview.get("overall_status_label")) or _text(draft.get("overall_status_label"))
+    if overall.casefold() == "результат не подтверждён" and not result_text:
+        overall = ""
+    not_done = _text_items(preview.get("not_done_items") or draft.get("not_done_items"))
+    unconfirmed = _text_items(preview.get("unconfirmed_items") or draft.get("unconfirmed_items"))
+    status_reasons = _text_items(preview.get("status_reasons") or draft.get("status_reasons"))
+    unresolved = _text_items(preview.get("unresolved_items") or draft.get("unresolved_items"))
+    if not unconfirmed and unresolved:
+        unconfirmed = unresolved
+    unconfirmed = _task_close_visible_unconfirmed(unconfirmed, task_points=task_points, result_text=result_text)
+    lines = [f"Черновик #{task_id or '?'}: {task_title}"]
     lines.append("")
-    lines.append("Если всё верно, напишите: да, закрывай.")
+    lines.append("1. Выполняемые работы")
+    if source_task_description_empty:
+        result_items = _task_close_display_items(result_text)
+        if result_items:
+            lines.extend(f"1.{index} {item}" for index, item in enumerate(result_items, start=1))
+            lines.append(f"1.{len(result_items) + 1} Еще работы - ... ???")
+        else:
+            lines.append("1.1 Еще работы - ... ???")
+    else:
+        if task_points:
+            lines.extend(
+                f"1.{index} {item} - {_task_close_point_status(item, result_text, not_done, unconfirmed)}"
+                for index, item in enumerate(task_points, start=1)
+            )
+            lines.append(f"1.{len(task_points) + 1} Еще работы - ... ???")
+        elif result_text:
+            result_items = _task_close_display_items(result_text)
+            lines.extend(f"1.{index} {item}" for index, item in enumerate(result_items, start=1))
+            lines.append(f"1.{len(result_items) + 1} Еще работы - ... ???")
+        else:
+            lines.append("1.1 Еще работы - ... ???")
+    lines.append("")
+    lines.append("2. Использовано материалов, оборудование")
+    if _task_close_no_equipment_value(equipment):
+        lines.append("   (перечисли, что использовали, или укажи: [ВЫБРАНО: не использовалось])")
+    else:
+        lines.append("   (перечисли, что использовали, или укажи: не использовалось)")
+        equipment_items = _task_close_display_items(equipment)
+        if equipment_items:
+            lines.extend(f"2.{index} {item}" for index, item in enumerate(equipment_items, start=1))
+            lines.append(f"2.{len(equipment_items) + 1} Еще материалы - ... ???")
+    lines.append("")
+    lines.append("3. Статус выполнения работ")
+    lines.append(f"   {_task_close_status_prompt(overall_status or overall)}")
+    if status_reasons:
+        for index, item in enumerate(status_reasons, start=1):
+            lines.append(f"3.{index} причина: {item}")
+        lines.append(f"3.{len(status_reasons) + 1} Еще причины невыполнения - ... ???")
+    elif _task_close_status_needs_reason(overall_status or overall):
+        lines.append("3.1 Еще причины невыполнения - ... ???")
+    lines.append("")
+    lines.append("4. Дополнительная информация")
+    if _task_close_absent_value(additional_info):
+        lines.append("   (если есть — укажи; если нет — укажи: [ВЫБРАНО: отсутствует])")
+    else:
+        lines.append("   (если есть — укажи; если нет — укажи: отсутствует)")
+    additional_items = _task_close_display_items(additional_info)
+    if additional_items and not _task_close_absent_value(additional_info):
+        lines.extend(f"4.{index} {item}" for index, item in enumerate(additional_items, start=1))
+        lines.append(f"4.{len(additional_items) + 1} Еще информация - ... ???")
+    lines.append("")
+    lines.append(
+        'Внести изменения (укажите пункт или подпункт и нужную информацию) или напишите: "да, закрывай как есть".'
+    )
     return "\n".join(lines)
+
+
+def _task_close_status_prompt(status: str) -> str:
+    normalized = _task_close_normalized_status(status)
+    options = [
+        ("completed", "выполнено полностью"),
+        ("partial", "выполнено частично"),
+        ("not_done", "не выполнено"),
+    ]
+    rendered = [f"[ВЫБРАНО: {label}]" if normalized == key else label for key, label in options]
+    return (
+        f"({' / '.join(rendered)}; если выполнено частично или не выполнено — укажи причину неполного выполнения работ)"
+    )
+
+
+def _task_close_normalized_status(status: str) -> str:
+    text = compact_text(status).casefold()
+    if text in {"completed", "complete", "done"} or "полностью" in text:
+        return "completed"
+    if text in {"partial", "partially_done", "partly_done"} or "частич" in text:
+        return "partial"
+    if text in {"not_done", "not_completed", "not done"} or "не выполн" in text or "не сделан" in text:
+        return "not_done"
+    return ""
+
+
+def _task_close_status_needs_reason(status: str) -> bool:
+    return _task_close_normalized_status(status) in {"partial", "not_done"}
+
+
+def _task_close_absent_value(value: str) -> bool:
+    text = compact_text(value).casefold()
+    return text in {"отсутствует", "нет", "не было", "нет дополнительной информации"}
+
+
+def _task_close_no_equipment_value(value: str) -> bool:
+    text = compact_text(value).casefold().strip(" .;:-")
+    if not text:
+        return False
+    if text in {
+        "не использовалось",
+        "не использовались",
+        "не использовали",
+        "не применялось",
+        "не применяли",
+        "не было",
+        "нет",
+        "ничего",
+        "без материалов",
+        "без оборудования",
+        "материалы не использовались",
+        "оборудование не использовалось",
+    }:
+        return True
+    return ("не использ" in text or "не примен" in text) and not any(char.isdigit() for char in text)
+
+
+def _task_close_is_placeholder_summary(value: str) -> bool:
+    text = compact_text(value)
+    if not text:
+        return False
+    lowered = text.casefold()
+    if "статус ai-закрытия" in lowered:
+        return True
+    if "результат выполнения не указан" in lowered:
+        return True
+    return "общий итог: результат не подтвержд" in lowered and (
+        lowered.startswith("пункты задачи:") or "неподтверждённые пункты" in lowered
+    )
+
+
+def _task_close_visible_unconfirmed(
+    values: list[str],
+    *,
+    task_points: list[str],
+    result_text: str,
+) -> list[str]:
+    point_keys = {item.casefold() for item in task_points}
+    visible: list[str] = []
+    for value in values:
+        key = value.casefold()
+        if key in {"результат выполнения не указан", "result is not specified"}:
+            continue
+        if key in point_keys:
+            if result_text and _task_close_result_explicitly_marks_unconfirmed(value, result_text):
+                visible.append(value)
+            continue
+        visible.append(value)
+    return visible
+
+
+def _task_close_result_explicitly_marks_unconfirmed(point: str, result_text: str) -> bool:
+    point_cf = point.casefold()
+    for clause in re.split(r"(?:\r?\n)+|[.;]+|,(?=\s*\d+\.\d+)", result_text):
+        clause_cf = clause.casefold()
+        if not any(marker in clause_cf for marker in ("не подтверж", "неизвест", "не провер", "unconfirmed")):
+            continue
+        if _task_close_texts_overlap(point_cf, clause):
+            return True
+    return False
+
+
+def _task_close_display_items(value: str) -> list[str]:
+    text = compact_text(value)
+    if not text:
+        return []
+    raw_parts = re.split(r"(?:\r?\n)+|(?:^|\s)(?:\d+[.)]|[-*•])\s+|[,;]+", text)
+    parts = _unique_text_items(part.strip(" .;:-") for part in raw_parts)
+    return parts[:12] if len(parts) > 1 else ([text] if text else [])
+
+
+def _unique_text_items(values: Any) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = compact_text(str(value or "")).strip()
+        key = text.casefold()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
+def _task_close_point_status(
+    point: str,
+    result_text: str,
+    not_done: list[str],
+    unconfirmed: list[str],
+) -> str:
+    point_cf = point.casefold()
+    for item in not_done:
+        if _task_close_texts_overlap(point_cf, item):
+            return "не выполнено"
+    for item in unconfirmed:
+        if _task_close_texts_overlap(point_cf, item):
+            return "не подтверждено"
+    completed_label = _task_close_point_completed_label(point, result_text)
+    if completed_label:
+        return completed_label
+    if result_text:
+        return "... ???"
+    return "... ???"
+
+
+def _task_close_point_completed_label(point: str, result_text: str) -> str:
+    if not result_text:
+        return ""
+    point_cf = point.casefold()
+    clauses = re.split(r"(?:\r?\n)+|[.;]+|,(?=\s*\d+\.\d+)", result_text)
+    for clause in clauses:
+        clause_cf = clause.casefold()
+        if "не выполн" in clause_cf or "не подтверж" in clause_cf:
+            continue
+        if ("выполн" in clause_cf or "сделан" in clause_cf or "готов" in clause_cf) and _task_close_texts_overlap(
+            point_cf, clause
+        ):
+            return "выполнено полностью" if "полностью" in clause_cf else "выполнено"
+    return ""
+
+
+def _task_close_texts_overlap(point_cf: str, value: str) -> bool:
+    value_cf = value.casefold()
+    if point_cf and point_cf in value_cf:
+        return True
+    words = [word for word in re.findall(r"[0-9A-Za-zА-Яа-яЁё]+", point_cf) if len(word) >= 5]
+    return bool(words and any(word in value_cf for word in words[:4]))
+
+
+def _format_task_close_draft_conflict_answer(data: dict[str, Any]) -> str:
+    draft = data.get("draft") if isinstance(data.get("draft"), dict) else {}
+    incoming = data.get("incoming_draft") if isinstance(data.get("incoming_draft"), dict) else {}
+    current_task_id = _text(draft.get("task_id"))
+    requested_task_id = _text(incoming.get("task_id"))
+    current_title = _text(draft.get("task_title")) or _task_fallback_title(current_task_id)
+    requested_title = _text(incoming.get("task_title")) or _task_fallback_title(requested_task_id)
+    return "\n".join(
+        [
+            "Уже есть активный черновик закрытия.",
+            f"Текущий: {current_title}",
+            f"Новая задача: {requested_title}",
+            "",
+            "Сначала выберите действие:",
+            "1 — продолжить текущий черновик",
+            "2 — закрыть текущую задачу как есть с пометкой",
+            "3 — отменить текущий черновик и перейти к новой задаче",
+        ]
+    )
 
 
 def _format_task_close_confirm_answer(data: dict[str, Any], *, portal_base_url: str = "") -> str:
@@ -812,11 +1156,141 @@ def _format_task_close_confirm_answer(data: dict[str, Any], *, portal_base_url: 
     task_title = _text(data.get("task_title")) or _text(draft.get("task_title")) or _task_fallback_title(task_id)
     action = _text(data.get("action")) or _text(draft.get("action"))
     label = _task_link(task_title, task_id, portal_base_url=portal_base_url)
-    unresolved = data.get("unresolved_items") if isinstance(data.get("unresolved_items"), list) else []
-    suffix = " С непроверенными пунктами добавлена метка AI_SERVER_TASK_CLOSE_INCOMPLETE." if unresolved else ""
+    not_done = _text_items(data.get("not_done_items") or draft.get("not_done_items"))
+    unconfirmed = _text_items(data.get("unconfirmed_items") or draft.get("unconfirmed_items"))
+    unresolved = _text_items(data.get("unresolved_items") or draft.get("unresolved_items"))
+    if not unconfirmed and unresolved:
+        unconfirmed = unresolved
+    suffix = f" Статус: {_task_close_human_status(not_done, unconfirmed)}." if not_done or unconfirmed else ""
     if action == "approve":
         return f"Задача закрыта: {label}.{suffix}"
     return f"Задача отмечена выполненной: {label}.{suffix}"
+
+
+def _format_task_close_report_incident_answer(data: dict[str, Any]) -> str:
+    task_id = _text(data.get("task_id"))
+    file_name = _text(data.get("file_name")) or "AI-close report"
+    action = _text(data.get("action"))
+    if action == "restore":
+        return f"Файл отчёта AI-закрытия восстановлен в задаче #{task_id}: {file_name}."
+    if action == "accept_missing":
+        return (
+            f"Принято: удаление отчёта AI-закрытия по задаче #{task_id} оставлено как есть, служебные данные очищены."
+        )
+    return f"Инцидент отчёта AI-закрытия по задаче #{task_id} обработан."
+
+
+def _format_task_close_control_get_answer(data: dict[str, Any]) -> str:
+    lines = [
+        "Настройки контроля закрытия задач:",
+        f"- Автозакрытие: {data.get('auto_close_time') or '20:00'}",
+        f"- Запуск контроля: {data.get('control_enabled_from') or 'не задан'}",
+    ]
+    members = _task_close_control_member_lines(data.get("members"))
+    if members:
+        lines.append("- Сейчас включены:")
+        lines.extend(members)
+    else:
+        lines.append("- Сейчас включены: нет")
+
+    available = _task_close_control_available_lines(data)
+    if available:
+        lines.append("- Пользователи Bitrix:")
+        lines.extend(available)
+        if data.get("available_users_truncated"):
+            lines.append(f"  Показаны первые {data.get('available_users_limit') or 100}; можно уточнить по имени.")
+    elif data.get("user_lookup_status") == "not_configured":
+        lines.append("- Пользователи Bitrix: список недоступен, Bitrix user client не настроен.")
+    elif data.get("user_lookup_status") in {"failed", "partial"}:
+        lines.append(f"- Пользователи Bitrix: не удалось получить полный список ({data.get('user_lookup_error')}).")
+    return "\n".join(lines)
+
+
+def _format_task_close_control_update_answer(data: dict[str, Any]) -> str:
+    action = str(data.get("action") or "")
+    action_labels = {
+        "add_operator": "оператор добавлен",
+        "remove_operator": "оператор удалён",
+        "add_controlled_user": "контролируемый пользователь добавлен",
+        "remove_controlled_user": "контролируемый пользователь удалён",
+        "set_auto_close_time": "время автозакрытия обновлено",
+        "set_control_enabled_from": "дата запуска контроля обновлена",
+    }
+    lines = [f"Готово: {action_labels.get(action, 'настройки обновлены')}."]
+    lines.append(f"Сейчас включены: {_task_close_control_members_summary(data)}.")
+    lines.append(f"Автозакрытие: {data.get('auto_close_time') or '20:00'}.")
+    if data.get("control_enabled_from"):
+        lines.append(f"Запуск контроля: {data['control_enabled_from']}.")
+    return " ".join(lines)
+
+
+def _task_close_control_member_lines(value: object, *, limit: int = 50) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    lines = []
+    for item in value[:limit]:
+        if not isinstance(item, dict):
+            continue
+        lines.append(f"  {_task_close_control_user_label(item)}")
+    if len(value) > limit:
+        lines.append(f"  ... ещё {len(value) - limit}")
+    return lines
+
+
+def _task_close_control_available_lines(data: dict[str, Any], *, limit: int = 100) -> list[str]:
+    users = data.get("available_users")
+    if not isinstance(users, list):
+        return []
+    lines = []
+    for item in users[:limit]:
+        if not isinstance(item, dict):
+            continue
+        lines.append(f"  {_task_close_control_user_label(item)}")
+    return lines
+
+
+def _task_close_control_members_summary(data: dict[str, Any]) -> str:
+    members = data.get("members")
+    if isinstance(members, list) and members:
+        labels = [_task_close_control_user_label(item) for item in members[:8] if isinstance(item, dict)]
+        suffix = f"; ещё {len(members) - 8}" if len(members) > 8 else ""
+        return "; ".join(labels) + suffix
+    operator_ids = _ids_label(data.get("operator_user_ids"))
+    controlled_ids = _ids_label(data.get("controlled_user_ids"))
+    return f"операторы: {operator_ids}; контролируемые: {controlled_ids}"
+
+
+def _task_close_control_user_label(item: dict[str, Any]) -> str:
+    user_id = _text(item.get("user_id")) or "?"
+    name = _text(item.get("name")) or f"Bitrix user #{user_id}"
+    role = _task_close_control_role_label(item)
+    return f"ID {user_id} — {name} — {role}"
+
+
+def _task_close_control_role_label(item: dict[str, Any]) -> str:
+    is_operator = bool(item.get("is_operator"))
+    is_controlled = bool(item.get("is_controlled"))
+    if is_operator and is_controlled:
+        return "оператор, контролируемый"
+    if is_operator:
+        return "оператор"
+    if is_controlled:
+        return "контролируемый"
+    return "можно добавить"
+
+
+def _ids_label(value: object) -> str:
+    if not isinstance(value, list) or not value:
+        return "нет"
+    return ", ".join(str(item) for item in value)
+
+
+def _task_close_human_status(not_done_items: list[str], unconfirmed_items: list[str]) -> str:
+    if not_done_items and unconfirmed_items:
+        return "выполнена частично, неподтвержденная"
+    if not_done_items:
+        return "выполнена частично"
+    return "неподтвержденная"
 
 
 def _format_calendar_event_draft_answer(data: dict[str, Any]) -> str:
@@ -938,6 +1412,25 @@ def _text(value: object) -> str:
     return str(value or "").strip()
 
 
+def _text_items(value: object) -> list[str]:
+    if isinstance(value, str):
+        raw_items = [value]
+    elif isinstance(value, list | tuple | set):
+        raw_items = list(value)
+    else:
+        raw_items = []
+    items: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        text = _text(item).strip(" -•")
+        key = text.casefold()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        items.append(text)
+    return items
+
+
 def _int_value(value: object) -> int | None:
     try:
         return int(value)
@@ -976,7 +1469,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
-        '"tool_calls":[{"name":"bitrix_warehouse_search|bitrix_my_tasks|bitrix_task_search|bitrix_project_search|bitrix_api|task_create_draft|task_create_confirm|task_draft_discard|task_close_draft|task_close_confirm|task_close_discard|calendar_event_draft|calendar_event_confirm|calendar_event_discard|project_create_draft|project_create_confirm|project_create_discard|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
+        '"tool_calls":[{"name":"bitrix_warehouse_search|bitrix_my_tasks|bitrix_task_search|bitrix_project_search|bitrix_api|task_create_draft|task_create_confirm|task_draft_discard|task_close_draft|task_close_confirm|task_close_discard|task_close_report_incident|task_close_control_get|task_close_control_update|calendar_event_draft|calendar_event_confirm|calendar_event_discard|project_create_draft|project_create_confirm|project_create_discard|save_incomplete_proposal|delete_incomplete_proposal|save_responsible_response|portal_search|none","args":{},"summary":""}]}. '
         "Перед каждым tool_call сам проверь, хватает ли данных для его корректного вызова. "
         "Нельзя вызывать tool с надеждой, что backend или tool сам разберётся с недостающими данными. "
         'Если данных не хватает, не вызывай tool: верни status=needs_clarification, tool_calls=[{"name":"none"}], '
@@ -991,7 +1484,9 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Для сложного поиска задач по нескольким критериям тоже используй bitrix_task_search: "
         "deadline_from/deadline_to для срока, created_from/created_to для даты создания, "
         "closed_from/closed_to для даты закрытия, comment_query для текста в комментариях, "
-        "include_comments=true если общий query нужно искать и в комментариях. "
+        "include_comments=true если общий query нужно искать и в комментариях, "
+        "ai_close_problem_type=not_done для AI-закрытий с невыполненными пунктами, "
+        "ai_close_problem_type=unconfirmed для AI-закрытий с неизвестным/неподтверждённым результатом. "
         "Если пользователь просит закрытые задачи или дату закрытия, передай status=closed и include_closed=true. "
         "Для поиска сотрудника по имени — bitrix_api с user.search, получи numeric ID. "
         "Для чтения/поиска проекта по названию используй bitrix_project_search. "
@@ -1018,12 +1513,23 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Не вызывай task_create_draft без title и одного из responsible_id/responsible_self. "
         "If permission_context.pending_task_draft._draft_type is absent/task_create and the current user explicitly confirms creation, call task_create_confirm. "
         "If permission_context.pending_task_draft._draft_type is task_close and the current user explicitly confirms closing, call task_close_confirm. "
+        "If permission_context.pending_task_draft._draft_type is task_close and the user adds details for the same task, call task_close_draft with the same task_id and the updated full draft fields; backend will merge without resetting old fields. "
+        "If a user starts closing another task while task_close draft is active, call task_close_draft for the requested task so backend returns the active-draft choice instead of overwriting the current draft. "
+        "For task closing, missing completion details are not a reason to return needs_clarification after the task is identified: call task_close_draft and put unknown fields into missing_fields/unconfirmed_items so the user always sees the full draft. "
+        "For task closing draft updates, keep the four blocks isolated: block 1/task points only records each work item status (completed/not done/unconfirmed), block 2 only records used materials/equipment, block 3 only records the user's overall status and reasons, and block 4 only records additional information. Ignore extra text inside the wrong block and never move it to another block. "
         "If permission_context.pending_task_draft._draft_type is calendar_event and the current user explicitly confirms calendar creation, call calendar_event_confirm. "
         "If permission_context.pending_task_draft._draft_type is project_create and the current user explicitly confirms project creation, call project_create_confirm. "
         "If the current user explicitly cancels or rejects a task creation draft, call task_draft_discard. "
         "If the current user explicitly cancels or rejects a task closing draft, call task_close_discard. "
         "If the current user explicitly cancels or rejects a calendar event draft, call calendar_event_discard. "
         "If the current user explicitly cancels or rejects a project creation draft, call project_create_discard. "
+        "If dialog_history contains an AI-close report missing alert and the admin replies with option 1/restore, call task_close_report_incident with action=restore. "
+        "If the admin replies with option 2/accept/delete for that alert, call task_close_report_incident with action=accept_missing. Do not add Bitrix buttons. "
+        "Для просмотра настроек контроля закрытия задач используй task_close_control_get. "
+        "Для изменения операторов, контролируемых пользователей, времени автозакрытия и даты запуска контроля используй task_close_control_update. "
+        "Не используй bitrix_api для этих настроек. Действия task_close_control_update: add_operator/remove_operator/add_controlled_user/remove_controlled_user/set_auto_close_time/set_control_enabled_from. "
+        "Статус оператора и статус контролируемого пользователя независимы: если оператор должен попадать под правила закрытия задач, отдельно добавь его как controlled user. "
+        "Операторы могут менять только controlled users; операторов, время автозакрытия и дату запуска меняет только Bitrix-админ. "
         "Do not call confirm tools for ambiguous replies; ask a short clarification instead. "
         "Для фраз вида 'напомни мне завтра позвонить Борисову' используй календарь: подготовь calendar_event_draft, а не задачу и не прямой bitrix_api. "
         "Если время напоминания не указано, передай date_iso или start_iso с датой без времени: backend поставит 12:00 МСК. "
@@ -1031,8 +1537,15 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Метод calendar.event.add не вызывай через bitrix_api: для него есть calendar_event_* tools. "
         "Для закрытия задачи не вызывай tasks.task.result.add/tasks.task.complete/tasks.task.approve через bitrix_api напрямую. "
         "Сначала найди задачу через bitrix_task_search, собери результат выполнения, затем вызови task_close_draft. "
-        "Если после уточнений пользователь явно разрешает закрыть с непроверенными пунктами, передай их в unresolved_items: "
-        "backend добавит метку AI_SERVER_TASK_CLOSE_INCOMPLETE для будущей индексации. "
+        "В task_close_draft передавай короткий полный черновик: task_points, equipment_consumables, overall_status, "
+        "not_done_items для невыполненных пунктов и unconfirmed_items для неизвестного/неподтверждённого результата. "
+        "Не перетаскивай данные между блоками черновика закрытия: в блоке 1 по пунктам задачи сохраняй только статус пункта, без причин; материалы только в блок 2; общий статус и причины только в блок 3; дополнительную информацию только в блок 4. "
+        "Если задача уже закрыта в Bitrix, всё равно используй task_close_draft/task_close_confirm, но передай already_closed=true: "
+        "backend сохранит AI-отчёт и не будет повторно вызывать tasks.task.complete/tasks.task.approve. "
+        "Если описание/чеклист исходной задачи пустые, не выдумывай task_points: передай source_task_description_empty=true, "
+        "а результат пользователя положи в completion_summary как свободное описание выполненной работы. "
+        "Если после уточнений пользователь явно разрешает закрыть с такими проблемами, backend сохранит признак неполного AI-закрытия для будущей индексации. "
+        "Не показывай пользователю технический код AI_SERVER_TASK_CLOSE_INCOMPLETE; в видимом тексте пиши коротко: неподтвержденная или выполнена частично. "
         "Для уведомления пользователя используй bitrix_api с im.notify.system.add. "
         "Методы закрытия задач complete/approve/result.add не вызывай через bitrix_api: для них есть task_close_* tools. "
         "Остальные разрешённые Bitrix-методы вызывай через bitrix_api. "
@@ -1062,7 +1575,7 @@ def _compose_system_prompt(portal_base_url: str = "") -> str:
         "Не выдумывай данные, которых нет в tool_results. "
         "Для результата task_create_draft черновик должен быть обычным текстом без ссылок: название, ответственный, проект если указан, срок, описание, запрос подтверждения. "
         "Для результата task_create_confirm дай ссылку только на созданную задачу; ссылки на профиль сотрудника запрещены. "
-        "Для результата task_close_draft покажи обычный текст без ссылок: задача, действие, результат, непроверенные пункты, запрос подтверждения. "
+        "Для результата task_close_draft покажи обычный текст без ссылок: задача, пункты задачи, оборудование/расходники, итог, невыполненное, неподтверждённое, что нужно дописать, действия. "
         "Для результата task_close_confirm дай ссылку только на задачу; ссылки на профиль сотрудника запрещены. "
         "Для результата calendar_event_draft покажи обычный текст без ссылок: название, начало, окончание, участники, описание, запрос подтверждения. "
         "Для результата calendar_event_confirm не выдумывай ссылку на календарь; если готовой ссылки нет, дай обычный текст. "
@@ -1111,6 +1624,8 @@ _WRITE_TOOL_NAMES = frozenset(
         "task_close_draft",
         "task_close_confirm",
         "task_close_discard",
+        "task_close_report_incident",
+        "task_close_control_update",
         "calendar_event_draft",
         "calendar_event_confirm",
         "calendar_event_discard",
@@ -1256,6 +1771,790 @@ def _confirm_decision_tool(name: str, summary: str) -> BitrixLLMDecision:
             )
         ],
     )
+
+
+def _common_task_close_start_decision(
+    request: str,
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    if not _draft_discard_tool_available(tool_definitions, "task_close_draft"):
+        return None
+    clean_request = _strip_command_prefix(request)
+    lowered = clean_request.casefold()
+    if not _is_task_close_start_request(lowered):
+        return None
+    task_id = _extract_task_id(clean_request)
+    if task_id is None:
+        return None
+    return BitrixLLMDecision(
+        status="completed",
+        answer="",
+        confidence=0.92,
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="task_close_draft",
+                args={
+                    "task_id": task_id,
+                    "overall_status": "unconfirmed",
+                    "unconfirmed_items": ["результат выполнения не указан"],
+                    "missing_fields": [
+                        "что сделано по задаче",
+                        "оборудование/расходники, если использовались",
+                        "итог: выполнена полностью, частично или не выполнена",
+                    ],
+                },
+                summary="deterministic task close draft start routing",
+            )
+        ],
+    )
+
+
+def _is_task_close_start_request(lowered_request: str) -> bool:
+    if "задач" not in lowered_request:
+        return False
+    if any(marker in lowered_request for marker in ("найди", "найти", "покажи", "выведи", "список", "какие", "ищи")):
+        return False
+    return any(marker in lowered_request for marker in ("закрой", "закрыть", "закроем", "закрываем", "заверши"))
+
+
+def _common_task_close_draft_conflict_decision(
+    request: str,
+    context: dict[str, Any],
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    draft = context.get("pending_task_draft") if isinstance(context, dict) else None
+    if not isinstance(draft, dict) or draft.get("_draft_type") != "task_close":
+        return None
+    pending = draft.get("_task_close_conflict_pending")
+    if not isinstance(pending, dict) or not pending:
+        return None
+
+    action = _task_close_draft_conflict_action(request)
+    if not action:
+        return None
+    if action == "continue_current":
+        if not _draft_discard_tool_available(tool_definitions, "task_close_draft"):
+            return None
+        return BitrixLLMDecision(
+            status="completed",
+            answer="",
+            confidence=0.92,
+            tool_calls=[
+                BitrixLLMToolCall(
+                    name="task_close_draft",
+                    args=_task_close_draft_replay_args(draft),
+                    summary="deterministic task close active draft continue routing",
+                )
+            ],
+        )
+    if action == "close_current":
+        if not _draft_discard_tool_available(tool_definitions, "task_close_confirm"):
+            return None
+        return _confirm_decision_tool(
+            "task_close_confirm", "deterministic task close active draft close-current routing"
+        )
+
+    if not (
+        _draft_discard_tool_available(tool_definitions, "task_close_discard")
+        and _draft_discard_tool_available(tool_definitions, "task_close_draft")
+    ):
+        return None
+    return BitrixLLMDecision(
+        status="completed",
+        answer="",
+        confidence=0.92,
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="task_close_discard",
+                args={},
+                summary="deterministic task close active draft discard-current routing",
+            ),
+            BitrixLLMToolCall(
+                name="task_close_draft",
+                args=_task_close_draft_replay_args(pending),
+                summary="deterministic task close active draft start-requested routing",
+            ),
+        ],
+    )
+
+
+def _task_close_draft_conflict_action(request: str) -> str:
+    text = _strip_command_prefix(request).strip().casefold()
+    if text in {"1", "1.", "первый", "первый вариант"}:
+        return "continue_current"
+    if text in {"2", "2.", "второй", "второй вариант"}:
+        return "close_current"
+    if text in {"3", "3.", "третий", "третий вариант"}:
+        return "start_requested"
+    if "продолж" in text and "текущ" in text:
+        return "continue_current"
+    if "закр" in text and ("как есть" in text or "помет" in text):
+        return "close_current"
+    if any(marker in text for marker in ("перейти к нов", "к новой задач", "отменить текущ", "отмени текущ")):
+        return "start_requested"
+    return ""
+
+
+def _task_close_draft_replay_args(draft: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "task_id": optional_int(draft.get("task_id")),
+        "task_title": _text(draft.get("task_title")),
+        "action": _text(draft.get("action")) or "complete",
+        "completion_summary": _text(draft.get("completion_summary")),
+        "task_points": _text_items(draft.get("task_points")),
+        "source_task_description_empty": bool(draft.get("source_task_description_empty")),
+        "equipment_consumables": _text(draft.get("equipment_consumables")),
+        "additional_info": _text(draft.get("additional_info")),
+        "overall_status": _text(draft.get("overall_status")),
+        "not_done_items": _text_items(draft.get("not_done_items")),
+        "unconfirmed_items": _text_items(draft.get("unconfirmed_items")),
+        "unresolved_items": _text_items(draft.get("unresolved_items")),
+        "missing_fields": _text_items(draft.get("missing_fields")),
+    }
+
+
+def _common_task_close_active_update_decision(
+    request: str,
+    context: dict[str, Any],
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    if not _draft_discard_tool_available(tool_definitions, "task_close_draft"):
+        return None
+    draft = context.get("pending_task_draft") if isinstance(context, dict) else None
+    if not isinstance(draft, dict) or draft.get("_draft_type") != "task_close":
+        return None
+    if isinstance(draft.get("_task_close_conflict_pending"), dict):
+        return None
+
+    clean_request = _strip_command_prefix(request)
+    lowered = clean_request.casefold()
+    if _is_draft_discard_request(lowered) or _is_draft_confirm_request(lowered):
+        return None
+    if _task_close_report_incident_action(clean_request) and _has_task_close_report_context(clean_request):
+        return None
+
+    current_task_id = optional_int(draft.get("task_id"))
+    requested_task_id = _extract_task_id(clean_request)
+    task_id = requested_task_id or current_task_id
+    if task_id is None:
+        return None
+
+    args = _task_close_active_update_args(clean_request, draft=draft, task_id=task_id)
+    return BitrixLLMDecision(
+        status="completed",
+        answer="",
+        confidence=0.9,
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="task_close_draft",
+                args=args,
+                summary="deterministic task close active draft update routing",
+            )
+        ],
+    )
+
+
+def _task_close_active_update_args(request: str, *, draft: dict[str, Any], task_id: int) -> dict[str, Any]:
+    summary = _task_close_update_summary(request, task_id=task_id)
+    lowered = summary.casefold()
+    task_points = _text_items(draft.get("task_points"))
+    work_summary = _task_close_work_summary_from_text(summary)
+    work_summary = _task_close_expand_numbered_work_summary(work_summary, task_points=task_points)
+    work_lowered = work_summary.casefold()
+    status_section = _task_close_section_text(summary, 3)
+    work_targets_points = _task_close_summary_targets_task_points(work_summary or summary, task_points)
+    status_text = status_section or (
+        summary if not _task_close_has_section_markers(summary) and not work_targets_points else ""
+    )
+    status_lowered = status_text.casefold()
+    args = {
+        "task_id": task_id,
+        "task_title": _text(draft.get("task_title")),
+        "completion_summary": work_summary,
+    }
+    equipment = _task_close_equipment_from_text(summary, lowered, task_points=task_points)
+    if equipment:
+        args["equipment_consumables"] = equipment
+    additional_info = _task_close_additional_info_from_text(summary)
+    if additional_info:
+        args["additional_info"] = additional_info
+    overall_status = _task_close_overall_status_from_text(status_lowered)
+    if overall_status:
+        args["overall_status"] = overall_status
+    status_reasons = (
+        _task_close_status_reasons_from_text(status_text)
+        if status_section or re.search(r"\bпричин[аы]?\b", status_text, flags=re.IGNORECASE)
+        else []
+    )
+    if status_reasons:
+        args["status_reasons"] = status_reasons
+    not_done_items = _task_close_not_done_items_from_text(work_summary, work_lowered, task_points=task_points)
+    if not_done_items:
+        args["not_done_items"] = not_done_items
+    unconfirmed_items = _task_close_unconfirmed_items_from_text(work_summary, work_lowered, task_points=task_points)
+    if unconfirmed_items:
+        args["unconfirmed_items"] = unconfirmed_items
+    if equipment or additional_info or overall_status or status_reasons:
+        args["missing_fields"] = []
+    return args
+
+
+def _task_close_update_summary(request: str, *, task_id: int) -> str:
+    text = re.sub(
+        rf"^\s*(?:по\s+)?задач[аеуы]?\s+#?{task_id}\s*:?\s*",
+        "",
+        request,
+        flags=re.IGNORECASE,
+    )
+    return compact_text(text) or compact_text(request)
+
+
+def _task_close_work_summary_from_text(summary: str) -> str:
+    text = _task_close_section_text(summary, 1) or _task_close_before_any_block(summary, (2, 3, 4))
+    text = re.sub(r"^\s*(?:по\s+)?пункт[ау]?\s+1\s*:?", "", text, flags=re.IGNORECASE)
+    if re.search(r"(?<!\d)1\.\d+\s+", text):
+        return compact_text(text).strip(" .;:-")
+    return _task_close_clean_referenced_text(text)
+
+
+def _task_close_expand_numbered_work_summary(summary: str, *, task_points: list[str]) -> str:
+    if not summary or not task_points:
+        return summary
+    items: list[str] = []
+    for match in re.finditer(r"(?<!\d)1\.(\d+)\s+(.+?)(?=(?:\s+1\.\d+\s+)|$)", summary, flags=re.DOTALL):
+        point_index = optional_int(match.group(1))
+        if point_index is None or point_index < 1 or point_index > len(task_points):
+            continue
+        value = _task_close_clean_referenced_text(match.group(2)).strip(" ,.;:-")
+        if not value:
+            continue
+        point = task_points[point_index - 1]
+        status_label = _task_close_work_status_label(value)
+        if status_label:
+            items.append(f"{point} {status_label}")
+        else:
+            items.append(value if _task_close_texts_overlap(point.casefold(), value) else f"{point} {value}")
+    return ". ".join(items) if items else summary
+
+
+def _task_close_equipment_from_text(summary: str, lowered: str, *, task_points: list[str]) -> str:
+    section = _task_close_section_text(summary, 2)
+    if not section:
+        if _task_close_has_section_markers(summary):
+            return ""
+        if _task_close_summary_targets_task_points(summary, task_points):
+            return ""
+        has_equipment_intent = re.search(
+            r"\b(?:использ|примен|израсход|расход|материал|оборудовани[ея]|кабель|камер[ауы])",
+            lowered,
+            flags=re.IGNORECASE,
+        )
+        if not has_equipment_intent:
+            return ""
+    section = section or summary
+    section_lowered = section.casefold()
+    if "не использ" in section_lowered or "не примен" in section_lowered:
+        return "не использовалось"
+    section = re.sub(
+        r"^\s*(?:по\s+)?пункт[ау]?\s+2\s*(?:оборудование|расходники)?\s*:?",
+        "",
+        section,
+        flags=re.IGNORECASE,
+    )
+    section = re.sub(r"^\s*2\s+", "", section)
+    section = re.sub(r"^\s*(?:оборудование|расходники)\s*:?", "", section, flags=re.IGNORECASE)
+    section = re.split(
+        r"\b(?:задач[ауы]?|работ[аы]?)\s+(?:выполн|не\s+выполн|частич)|\bпричин[аы]?\b",
+        section,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    return _task_close_clean_referenced_text(section)
+
+
+def _task_close_additional_info_from_text(summary: str) -> str:
+    section = _task_close_section_text(summary, 4)
+    if not section:
+        return ""
+    section = re.sub(
+        r"^\s*(?:по\s+)?пункт[ау]?\s+4\s*(?:дополнительно|дополнительная информация)?\s*:?",
+        "",
+        section,
+        flags=re.IGNORECASE,
+    )
+    section = re.sub(r"^\s*4\s+", "", section)
+    return _task_close_filter_additional_info_text(_task_close_clean_referenced_text(section))
+
+
+def _task_close_overall_status_from_text(lowered: str) -> str:
+    if "частич" in lowered or "не все" in lowered:
+        return "partial"
+    if "не выполн" in lowered or "не сделан" in lowered:
+        return "not_done"
+    if "не подтверж" in lowered or "неизвест" in lowered or "не провер" in lowered:
+        return "unconfirmed"
+    if "выполн" in lowered or "готов" in lowered or "сделан" in lowered:
+        return "completed"
+    return ""
+
+
+def _task_close_not_done_items_from_text(summary: str, lowered: str, *, task_points: list[str]) -> list[str]:
+    values = _task_close_status_items_from_text(
+        summary,
+        task_points=task_points,
+        markers=("не выполн", "не сделан", "не сделал", "не поставил", "не установил", "не забрал", "не починил"),
+    )
+    if values:
+        return _unique_text_items(values)
+    if _task_close_work_status_label(lowered) == "не выполнено":
+        return [summary]
+    return []
+
+
+def _task_close_unconfirmed_items_from_text(summary: str, lowered: str, *, task_points: list[str]) -> list[str]:
+    values = _task_close_status_items_from_text(
+        summary,
+        task_points=task_points,
+        markers=("не подтверж", "неизвест", "не провер"),
+    )
+    if values:
+        return values
+    if "не подтверж" in lowered or "неизвест" in lowered or "не провер" in lowered:
+        return [summary]
+    return []
+
+
+def _task_close_status_reasons_from_text(summary: str) -> list[str]:
+    summary = re.sub(r"^\s*(?:по\s+)?пункт[ау]?\s+3\s*:?", "", summary, flags=re.IGNORECASE)
+    summary = re.sub(r"^\s*3\s+", "", summary)
+    text = _task_close_clean_referenced_text(summary)
+    if not text:
+        return []
+    reason = _task_close_reason_from_text(text)
+    if reason:
+        return _task_close_display_items(reason)
+    text = re.sub(
+        r"\b(?:выполнено|выполнена)\s+(?:полностью|частично)\b|\bне\s+выполнено\b|\bне\s+выполнена\b",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"^\s*[,.;:-]*\s*(?:причин[аы]?\s*:?)?", "", text, flags=re.IGNORECASE)
+    return _task_close_display_items(text)
+
+
+def _task_close_status_items_from_text(summary: str, *, task_points: list[str], markers: tuple[str, ...]) -> list[str]:
+    result: list[str] = []
+    clauses = re.split(r"(?:\r?\n)+|[.;]+|,(?=\s*(?:\d+\.\d+|по\s+пункт))", summary)
+    for clause in clauses:
+        cleaned = _task_close_clean_referenced_text(clause)
+        lowered = cleaned.casefold()
+        if not cleaned or not any(marker in lowered for marker in markers):
+            continue
+        matched = [point for point in task_points if _task_close_texts_overlap(point.casefold(), cleaned)]
+        result.extend(matched or [cleaned])
+    return _unique_text_items(result)
+
+
+def _task_close_reason_from_text(summary: str) -> str:
+    match = re.search(
+        r"\bпричин[аы]?\s*:?\s*(.+?)(?=(?:\.\s*(?:(?:по\s+)?пункт[ау]?\s+4\b|4\b))|$)",
+        summary,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return ""
+    return _task_close_clean_referenced_text(match.group(1))
+
+
+def _task_close_section_text(summary: str, section_number: int) -> str:
+    match = re.search(_task_close_section_marker_pattern(section_number), summary, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    next_match = _task_close_next_section_match(summary[match.end() :], section_number)
+    end = match.end() + next_match.start() if next_match else len(summary)
+    return compact_text(summary[match.start() : end]).strip(" .;")
+
+
+def _task_close_has_section_markers(summary: str) -> bool:
+    if re.search(r"(?<!\d)1\.\d+\s+", summary):
+        return True
+    return any(
+        re.search(_task_close_section_marker_pattern(number), summary, flags=re.IGNORECASE) for number in range(1, 5)
+    )
+
+
+def _task_close_before_any_block(summary: str, section_numbers: tuple[int, ...]) -> str:
+    matches = [
+        match
+        for number in section_numbers
+        if (match := re.search(_task_close_section_marker_pattern(number), summary, flags=re.IGNORECASE))
+    ]
+    if not matches:
+        return compact_text(summary).strip(" .;")
+    first = min(matches, key=lambda item: item.start())
+    return compact_text(summary[: first.start()]).strip(" .;")
+
+
+def _task_close_before_block(summary: str, section_number: int) -> str:
+    match = re.search(_task_close_section_marker_pattern(section_number), summary, flags=re.IGNORECASE)
+    return compact_text(summary[: match.start()] if match else summary).strip(" .;")
+
+
+def _task_close_section_marker_pattern(section_number: int) -> str:
+    explicit = rf"(?:по\s+)?пункт[ау]?\s+{section_number}\b"
+    numeric_markers = {
+        2: r"(?<![\d.])2(?![\d.])(?=\s+(?:использ|не\s+использ|примен|не\s+примен|оборуд|материал|расход))",
+        3: r"(?<![\d.])3(?![\d.])(?=\s+(?:статус|выполн|не\s+выполн|частич|причин))",
+        4: r"(?<![\d.])4(?![\d.])(?=\s+(?:отсутств|нет|доп|информац|нужно|надо|требуется|вернуться))",
+    }
+    numeric = numeric_markers.get(section_number)
+    return rf"(?:{explicit}|{numeric})" if numeric else explicit
+
+
+def _task_close_next_section_match(text: str, section_number: int) -> re.Match[str] | None:
+    matches = [
+        match
+        for number in range(section_number + 1, 5)
+        if (match := re.search(_task_close_section_marker_pattern(number), text, flags=re.IGNORECASE))
+    ]
+    return min(matches, key=lambda item: item.start()) if matches else None
+
+
+def _task_close_clean_referenced_text(value: str) -> str:
+    text = compact_text(value).strip(" .;:-")
+    text = re.sub(r"^(?:\d+\.\d+|\d+[.)])\s*", "", text)
+    text = re.sub(r"^\s*(?:по\s+)?пункт[ау]?\s+\d+(?:\.\d+)?\s*:?", "", text, flags=re.IGNORECASE)
+    return compact_text(text).strip(" .;:-")
+
+
+def _task_close_filter_additional_info_text(value: str) -> str:
+    text = compact_text(value)
+    if not text or _task_close_absent_value(text):
+        return text
+    kept: list[str] = []
+    for item in _task_close_display_items(text):
+        if _task_close_additional_info_item_allowed(item):
+            kept.append(item)
+    return ", ".join(kept)
+
+
+def _task_close_additional_info_item_allowed(value: str) -> bool:
+    text = compact_text(value)
+    lowered = text.casefold()
+    if not text:
+        return False
+    future_markers = (
+        "нужно",
+        "надо",
+        "требуется",
+        "следующ",
+        "взять с собой",
+        "вернуться",
+        "потом",
+        "завтра",
+        "на будущее",
+    )
+    if any(marker in lowered for marker in future_markers):
+        return True
+    wrong_block_patterns = (
+        r"\bиспользова",
+        r"\bизрасходова",
+        r"\bприменил",
+        r"\bприменили",
+        r"\bпоставил",
+        r"\bпоставили",
+        r"\bустановил",
+        r"\bустановили",
+        r"\bподключил",
+        r"\bподключили",
+        r"\bсмонтировал",
+        r"\bсмонтировали",
+        r"\bзаменил",
+        r"\bзаменили",
+        r"\bработ[аы]\s+(?:выполн|не\s+выполн|частич)",
+        r"\bзадач[ауы]?\s+(?:выполн|не\s+выполн|частич)",
+        r"\b(?:выполнено|выполнена)\s+(?:полностью|частично)",
+        r"\bне\s+выполнено\b",
+        r"\bне\s+выполнена\b",
+        r"\bпричин[аы]?\b",
+    )
+    return not any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in wrong_block_patterns)
+
+
+def _task_close_summary_targets_task_points(summary: str, task_points: list[str]) -> bool:
+    if not summary or not task_points:
+        return False
+    if re.search(r"(?<!\d)1\.\d+\s+", summary):
+        return True
+    summary_cf = summary.casefold()
+    return any(_task_close_texts_overlap(point.casefold(), summary_cf) for point in task_points)
+
+
+def _task_close_work_status_label(text: str) -> str:
+    lowered = compact_text(text).casefold()
+    if not lowered:
+        return ""
+    if "не подтверж" in lowered or "неизвест" in lowered or "не провер" in lowered:
+        return "не подтверждено"
+    not_done_patterns = (
+        r"\bне\s+выполн",
+        r"\bне\s+сдела",
+        r"\bне\s+постав",
+        r"\bне\s+установ",
+        r"\bне\s+забра",
+        r"\bне\s+почин",
+        r"\bне\s+переда",
+        r"\bне\s+провер",
+    )
+    if any(re.search(pattern, lowered) for pattern in not_done_patterns):
+        return "не выполнено"
+    if "выполнено полностью" in lowered or "выполнена полностью" in lowered:
+        return "выполнено полностью"
+    completed_patterns = (
+        r"\bвыполн",
+        r"\bсдела",
+        r"\bготов",
+        r"\bпостав",
+        r"\bустанов",
+        r"\bзабра",
+        r"\bпочин",
+        r"\bпереда",
+        r"\bпровер",
+    )
+    if any(re.search(pattern, lowered) for pattern in completed_patterns):
+        return "выполнено"
+    return ""
+
+
+def _common_task_close_report_incident_decision(
+    request: str,
+    dialog_history: list[dict[str, str]] | None,
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    if not _draft_discard_tool_available(tool_definitions, "task_close_report_incident"):
+        return None
+    action = _task_close_report_incident_action(request)
+    if not action:
+        return None
+    context_text = _task_close_report_incident_context(request, dialog_history)
+    if not _has_task_close_report_context(context_text):
+        return None
+    task_id = _task_close_report_task_id(context_text)
+    if task_id is None:
+        return None
+    args: dict[str, Any] = {"task_id": task_id, "action": action}
+    file_name = _task_close_report_file_name(context_text)
+    if file_name:
+        args["file_name"] = file_name
+    return BitrixLLMDecision(
+        status="completed",
+        answer="",
+        confidence=0.95,
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="task_close_report_incident",
+                args=args,
+                summary="deterministic task close report incident routing",
+            )
+        ],
+    )
+
+
+def _task_close_report_incident_action(request: str) -> str:
+    text = _strip_command_prefix(request).strip().casefold()
+    if text in {"1", "1.", "первый", "первый вариант"}:
+        return "restore"
+    if text in {"2", "2.", "второй", "второй вариант"}:
+        return "accept_missing"
+    if any(marker in text for marker in ("восстанов", "верни", "вернуть")):
+        return "restore"
+    if any(marker in text for marker in ("удали", "удалить", "все в порядке", "всё в порядке", "оставь как есть")):
+        return "accept_missing"
+    return ""
+
+
+def _task_close_report_incident_context(
+    request: str,
+    dialog_history: list[dict[str, str]] | None,
+) -> str:
+    parts = [request]
+    for item in reversed(dialog_history or []):
+        content = str(item.get("content") or "")
+        if _has_task_close_report_context(content):
+            parts.append(content)
+            break
+    return "\n".join(parts)
+
+
+def _has_task_close_report_context(text: str) -> bool:
+    lowered = text.casefold()
+    return "ai-close-" in lowered or "файл отчёта" in lowered or "отчет ai-закрытия" in lowered
+
+
+def _task_close_report_task_id(text: str) -> int | None:
+    for pattern in (r"задач[аеиу]?\s*#?\s*(\d+)", r"task\s*#?\s*(\d+)", r"#(\d+)"):
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return optional_int(match.group(1))
+    return None
+
+
+def _task_close_report_file_name(text: str) -> str:
+    match = re.search(
+        r"\bAI-close-\d+(?:-(?:ok|partial|unconfirmed|failed))?(?: \(\d+\))?\.txt\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return match.group(0) if match else ""
+
+
+def _common_admin_panel_clarification_decision(
+    request: str,
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    clean_request = _strip_command_prefix(request)
+    lowered = clean_request.casefold()
+    if _looks_like_task_close_control_request(lowered) or _looks_like_vehicle_usage_admin_panel_request(lowered):
+        return None
+    if not _looks_like_ambiguous_admin_panel_request(lowered):
+        return None
+
+    return BitrixLLMDecision(
+        status="needs_clarification",
+        answer="Уточните, какую панель показать: закрытие задач или отчет по машинам и людям.",
+        confidence=0.86,
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="none",
+                args={},
+                summary="ambiguous admin panel clarification",
+            )
+        ],
+    )
+
+
+def _looks_like_ambiguous_admin_panel_request(lowered: str) -> bool:
+    return (
+        ("админ" in lowered and "панел" in lowered)
+        or ("спис" in lowered and ("оператор" in lowered or "пользовател" in lowered))
+        or ("кто" in lowered and "оператор" in lowered)
+    )
+
+
+def _looks_like_vehicle_usage_admin_panel_request(lowered: str) -> bool:
+    vehicle_domain = (
+        "машин" in lowered or "автомоб" in lowered or "люд" in lowered or "сотрудник" in lowered or "логист" in lowered
+    )
+    return vehicle_domain and ("отчет" in lowered or "оператор" in lowered or "пользовател" in lowered)
+
+
+def _common_task_close_control_decision(
+    request: str,
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    available_tools = {str(tool.get("name") or "") for tool in tool_definitions or []}
+    require_declared_tool = tool_definitions is not None
+    clean_request = _strip_command_prefix(request)
+    lowered = clean_request.casefold()
+    if not _looks_like_task_close_control_request(lowered):
+        return None
+
+    update_args = _task_close_control_update_args(clean_request)
+    if update_args is not None:
+        if require_declared_tool and "task_close_control_update" not in available_tools:
+            return None
+        return BitrixLLMDecision(
+            status="completed",
+            answer="",
+            confidence=0.9,
+            tool_calls=[
+                BitrixLLMToolCall(
+                    name="task_close_control_update",
+                    args=update_args,
+                    summary="deterministic task close control update routing",
+                )
+            ],
+        )
+
+    if require_declared_tool and "task_close_control_get" not in available_tools:
+        return None
+    return BitrixLLMDecision(
+        status="completed",
+        answer="",
+        confidence=0.88,
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="task_close_control_get",
+                args={},
+                summary="deterministic task close control settings routing",
+            )
+        ],
+    )
+
+
+def _looks_like_task_close_control_request(lowered: str) -> bool:
+    task_close_domain = (
+        "контролируем" in lowered
+        or ("автозакрыт" in lowered and "задач" in lowered)
+        or ("контрол" in lowered and ("закрыт" in lowered or "задач" in lowered))
+        or ("закрыт" in lowered and "задач" in lowered)
+    )
+    if not task_close_domain:
+        return False
+
+    settings_intent = (
+        "настрой" in lowered
+        or "панел" in lowered
+        or "спис" in lowered
+        or "кто" in lowered
+        or "оператор" in lowered
+        or "пользовател" in lowered
+        or "автозакрыт" in lowered
+        or any(
+            marker in lowered
+            for marker in (
+                "добав",
+                "включ",
+                "назнач",
+                "убери",
+                "убрать",
+                "удали",
+                "удалить",
+                "исключ",
+                "сними",
+                "снять",
+            )
+        )
+    )
+    return settings_intent
+
+
+def _task_close_control_update_args(request: str) -> dict[str, Any] | None:
+    lowered = request.casefold()
+    time_match = re.search(r"\b([01]?\d|2[0-3])[:.ч]\s*([0-5]\d)\b", request)
+    if "автозакрыт" in lowered and time_match is not None:
+        hour = int(time_match.group(1))
+        minute = int(time_match.group(2))
+        return {"action": "set_auto_close_time", "auto_close_time": f"{hour:02d}:{minute:02d}"}
+
+    user_id = _first_int(request)
+    if user_id is None:
+        return None
+    add = any(marker in lowered for marker in ("добав", "включ", "назнач"))
+    remove = any(marker in lowered for marker in ("убери", "убрать", "удали", "удалить", "исключ", "сними", "снять"))
+    if not add and not remove:
+        return None
+    if "оператор" in lowered:
+        return {"action": "add_operator" if add else "remove_operator", "target_user_id": user_id}
+    if "контрол" in lowered:
+        return {"action": "add_controlled_user" if add else "remove_controlled_user", "target_user_id": user_id}
+    return None
+
+
+def _first_int(text: str) -> int | None:
+    match = re.search(r"\b(\d+)\b", text)
+    return optional_int(match.group(1)) if match else None
 
 
 def _common_calendar_event_draft_decision(
@@ -1408,6 +2707,13 @@ def _common_task_read_args(request: str) -> dict[str, Any] | None:
     }
     if status in {"closed", "deferred", "declined", "all"}:
         args["include_closed"] = True
+    ai_close_problem_type = _extract_ai_close_problem_type(lowered)
+    if ai_close_problem_type:
+        args["ai_close_problem_type"] = ai_close_problem_type
+        args["status"] = "closed"
+        args["include_closed"] = True
+        if args["scope"] == "all":
+            args["scope"] = "member"
     project_name = _extract_project_name_from_task_request(request)
     if project_name:
         args["project_name"] = project_name
@@ -1476,6 +2782,22 @@ def _extract_closed_date_range(request: str) -> tuple[str, str]:
     if not match:
         return "", ""
     return _normalize_task_date(match.group(1)), _normalize_task_date(match.group(2))
+
+
+def _extract_ai_close_problem_type(lowered: str) -> str:
+    if "невыполн" in lowered or "не выполн" in lowered or "не сделан" in lowered:
+        return "not_done"
+    if (
+        "неподтверж" in lowered
+        or "не подтверж" in lowered
+        or "неизвест" in lowered
+        or "непровер" in lowered
+        or "не смогли подтверд" in lowered
+    ):
+        return "unconfirmed"
+    if "неполностью" in lowered or "не полностью" in lowered:
+        return "any"
+    return ""
 
 
 def _normalize_task_date(value: str) -> str:

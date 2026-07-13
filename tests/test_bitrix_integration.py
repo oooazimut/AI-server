@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from fastapi.testclient import TestClient
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist
@@ -13,7 +15,7 @@ from ai_server.registry import get_agent_manifest
 from ai_server.settings import get_settings
 from ai_server.tools.bitrix_policy import apply_write_policy
 from ai_server.transcription import TranscriptionResult
-from scripts.create_bitrix_dev_chat import chat_reference, sanitize_result
+from scripts.create_bitrix_dev_chat import chat_reference, create_chat, sanitize_result
 from tests.fakes import FakeBitrixLLM, FakePortalSearchIndex
 
 
@@ -297,6 +299,25 @@ def test_bitrix_api_tool_denies_direct_task_creation():
     assert result.status == ToolStatus.DENIED
     assert result.error == "Use task_create_draft/task_create_confirm for Bitrix task creation."
     assert fake_bitrix.calls == []
+
+
+def test_bitrix_api_tool_denies_direct_task_closing_methods():
+    close_methods = [
+        ("tasks.task.result.add", {"taskId": 139, "fields": {"TEXT": "Готово"}}),
+        ("tasks.task.complete", {"taskId": 139}),
+        ("tasks.task.approve", {"taskId": 139}),
+    ]
+
+    for method, params in close_methods:
+        fake_bitrix = FakeBitrixClient()
+        tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=False)
+
+        result = anyio_run(tool.execute({"method": method, "params": params}))
+
+        assert result.status == ToolStatus.DENIED
+        assert "task_close_draft/task_close_confirm" in result.error
+        assert result.data == {"method": method}
+        assert fake_bitrix.calls == []
 
 
 def test_bitrix_api_tool_denies_direct_calendar_event_creation():
@@ -637,6 +658,36 @@ def test_create_bitrix_dev_chat_helpers_extract_reference_and_redact_tokens():
     assert chat_reference(raw) == {"chat_id": 3955, "dialog_id": "chat3955"}
     assert sanitize_result(raw)["callInfo"]["token"] == "<redacted>"
     assert sanitize_result(raw)["access_token"] == "<redacted>"
+
+
+def test_create_bitrix_dev_chat_passes_settings_to_client(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    constructed = []
+
+    class FakeBitrixClient:
+        def __init__(self, *, settings):
+            constructed.append(settings)
+
+        async def create_bot_chat(self, **kwargs):
+            return {"chat": {"id": 8745, "dialogId": "chat8745"}, "kwargs": kwargs}
+
+    monkeypatch.setattr("scripts.create_bitrix_dev_chat.BitrixClient", FakeBitrixClient)
+    args = SimpleNamespace(
+        title="AI Dev Tester",
+        user_ids=[55],
+        description="test chat",
+        color="mint",
+        message="ready",
+        bot_id=231,
+        owner_id=None,
+    )
+
+    result = anyio_run(create_chat(args))
+
+    assert constructed
+    assert constructed[0].bitrix_bot_auth_mode == get_settings().bitrix_bot_auth_mode
+    assert result["chat"] == {"chat_id": 8745, "dialog_id": "chat8745"}
+    assert result["result"]["kwargs"]["user_ids"] == [55]
 
 
 def test_bitrix_oauth_service_saves_token_from_app_payload(monkeypatch):

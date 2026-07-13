@@ -126,6 +126,47 @@ def test_status_normalization(value, expected):
     assert _status(value) == expected
 
 
+def test_orchestrator_decide_clarifies_ambiguous_admin_panel_without_llm():
+    client = RecordingLLMClient('{"status":"completed","answer":"wrong","tool_calls":[{"name":"none","args":{}}]}')
+    service = OrchestratorLLMService(client)
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("internal_orchestrator"),
+            task=AgentTask(task_id="t1", request="Покажи список операторов"),
+            dialog_history=[
+                {"role": "assistant", "content": "Настройки контроля закрытия задач:\n- Автозакрытие: 20:00"}
+            ],
+            retrieval_hits=[],
+            tool_definitions=_tool_defs("call_specialist"),
+            tool_results=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.decision.status == "needs_clarification"
+    assert result.decision.answer == "Уточните, какую панель показать: закрытие задач или отчет по машинам и людям."
+    assert [call.name for call in result.decision.tool_calls] == ["none"]
+
+
+def test_orchestrator_decide_keeps_explicit_vehicle_admin_panel_for_llm():
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    service = OrchestratorLLMService(client)
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("internal_orchestrator"),
+            task=AgentTask(task_id="t1", request="Покажи список операторов отчета по машинам и людям"),
+            retrieval_hits=[],
+            tool_definitions=_tool_defs("call_specialist"),
+            tool_results=[],
+        )
+    )
+
+    assert client.calls
+    assert [call.name for call in result.decision.tool_calls] == ["none"]
+
+
 def test_orchestrator_compose_passes_through_specialist_answer_without_llm():
     client = RecordingLLMClient(json.dumps({"answer": "wrong rewrite", "status": "completed"}))
     service = OrchestratorLLMService(client)

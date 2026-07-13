@@ -23,6 +23,13 @@ class Settings:
     bitrix_oauth_enabled: bool
     bitrix_oauth_required_for_writes: bool
     bitrix_task_draft_ttl_minutes: int
+    bitrix_task_close_report_admin_user_ids: str
+    bitrix_task_close_report_auto_restore_hours: int
+    bitrix_task_close_control_admin_user_ids: str
+    bitrix_task_close_control_worker_enabled: bool
+    bitrix_task_close_control_interval_seconds: int
+    bitrix_task_close_control_direct_limit: int
+    bitrix_task_close_control_auto_close_limit: int
     bitrix_oauth_app_path: str
     bitrix_oauth_callback_path: str
     bitrix_oauth_token_endpoint: str
@@ -304,6 +311,14 @@ class Settings:
         return _id_list(self.supervisor_admin_user_ids)
 
     @property
+    def resolved_task_close_report_admin_user_ids(self) -> list[int]:
+        return _id_list(self.bitrix_task_close_report_admin_user_ids) or [1]
+
+    @property
+    def resolved_task_close_control_admin_user_ids(self) -> list[int]:
+        return _id_list(self.bitrix_task_close_control_admin_user_ids) or [1]
+
+    @property
     def resolved_agent_private_disk_path_markers(self) -> list[str]:
         return [
             item.strip() for item in self.agent_private_disk_path_markers.replace(";", ",").split(",") if item.strip()
@@ -403,6 +418,17 @@ def get_settings() -> Settings:
         bitrix_oauth_enabled=_env_bool("BITRIX_OAUTH_ENABLED", True),
         bitrix_oauth_required_for_writes=_env_bool("BITRIX_OAUTH_REQUIRED_FOR_WRITES", True),
         bitrix_task_draft_ttl_minutes=_env_int("BITRIX_TASK_DRAFT_TTL_MINUTES", 24 * 60) or (24 * 60),
+        bitrix_task_close_report_admin_user_ids=_env("BITRIX_TASK_CLOSE_REPORT_ADMIN_USER_IDS", "1"),
+        bitrix_task_close_report_auto_restore_hours=_env_int_default("BITRIX_TASK_CLOSE_REPORT_AUTO_RESTORE_HOURS", 24),
+        bitrix_task_close_control_admin_user_ids=_env(
+            "BITRIX_TASK_CLOSE_CONTROL_ADMIN_USER_IDS",
+            _env("BITRIX_TASK_CLOSE_REPORT_ADMIN_USER_IDS", "1"),
+        ),
+        bitrix_task_close_control_worker_enabled=_env_bool("BITRIX_TASK_CLOSE_CONTROL_WORKER_ENABLED", False),
+        bitrix_task_close_control_interval_seconds=_env_int("BITRIX_TASK_CLOSE_CONTROL_INTERVAL_SECONDS", 5 * 60)
+        or (5 * 60),
+        bitrix_task_close_control_direct_limit=_env_int("BITRIX_TASK_CLOSE_CONTROL_DIRECT_LIMIT", 20) or 20,
+        bitrix_task_close_control_auto_close_limit=_env_int("BITRIX_TASK_CLOSE_CONTROL_AUTO_CLOSE_LIMIT", 100) or 100,
         bitrix_oauth_app_path=_env("BITRIX_OAUTH_APP_PATH", "/bitrix/app"),
         bitrix_oauth_callback_path=_env("BITRIX_OAUTH_CALLBACK_PATH", "/bitrix/oauth/callback"),
         bitrix_oauth_token_endpoint=_env("BITRIX_OAUTH_TOKEN_ENDPOINT", "https://oauth.bitrix.info/oauth/token/"),
@@ -635,6 +661,11 @@ def _env_int(name: str, default: int | None = None) -> int | None:
         return int(raw)
     except ValueError:
         return default
+
+
+def _env_int_default(name: str, default: int) -> int:
+    value = _env_int(name, default)
+    return default if value is None else value
 
 
 def _env_float(name: str, default: float | None = None) -> float | None:

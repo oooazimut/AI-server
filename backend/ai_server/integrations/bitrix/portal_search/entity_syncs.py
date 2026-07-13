@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import html
 import re
-from datetime import datetime
+import tempfile
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlsplit
 
@@ -15,6 +17,30 @@ from ai_server.integrations.bitrix.portal_search.text_utils import (
     to_str,
 )
 from ai_server.integrations.bitrix.portal_search.types import PortalSearchResult
+from ai_server.integrations.bitrix.task_close_control import (
+    TASK_CLOSE_DECISION_CONTROLLED,
+    decide_task_close_control,
+    task_close_event_key,
+)
+from ai_server.integrations.bitrix.task_close_direct_queue import (
+    activate_next_direct_close_event,
+    enqueue_direct_close_event,
+)
+from ai_server.integrations.bitrix.task_close_reports import (
+    TASK_CLOSE_INCOMPLETE_MARKER as _TASK_CLOSE_INCOMPLETE_MARKER,
+)
+from ai_server.integrations.bitrix.task_close_reports import (
+    TASK_CLOSE_REPORT_FILE_RE as _TASK_CLOSE_REPORT_FILE_RE,
+)
+from ai_server.integrations.bitrix.task_close_reports import (
+    restore_task_close_report_file,
+    task_close_report_key,
+    task_close_report_problem_types,
+    task_close_report_problem_types_from_text,
+    task_close_report_records,
+    task_close_report_state_key,
+    task_close_report_status_from_text,
+)
 from ai_server.settings import Settings
 from ai_server.utils import MOSCOW_TZ
 
@@ -24,6 +50,12 @@ _BITRIX_PAIRED_TAG_RE = re.compile(
 _BITRIX_SINGLE_TAG_RE = re.compile(r"\[/?[A-Z][A-Z0-9_]*(?:=[^\]]*)?\]", re.IGNORECASE)
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _BITRIX_BATCH_COMMENT_SIZE = 50
+_BITRIX_TASK_RESULT_LIMIT = 10
+_TASK_CLOSE_REPORT_INCIDENT_STATUS_PENDING = "pending"
+_TASK_CLOSE_REPORT_INCIDENT_STATUS_RESTORED = "restored"
+_TASK_CLOSE_REPORT_INCIDENT_STATUS_ACCEPTED_MISSING = "accepted_missing"
+_TASK_CLOSE_CONTROL_ENABLED_FROM_KEY = "control_enabled_from"
+_BITRIX_TASK_STATUS_COMPLETED = 5
 
 
 def _first(data: dict[str, Any], *keys: str) -> object | None:
@@ -88,6 +120,82 @@ async def _task_comments_by_id(
     return comments_by_id
 
 
+async def _task_results_by_id(
+    bitrix: BitrixClient,
+    task_ids: list[object],
+    *,
+    limit: int,
+) -> dict[str, list[str]]:
+    if limit <= 0:
+        return {}
+    unique_ids = list(dict.fromkeys(str(task_id) for task_id in task_ids if task_id is not None))
+    results_by_id: dict[str, list[str]] = {}
+    for offset in range(0, len(unique_ids), _BITRIX_BATCH_COMMENT_SIZE):
+        chunk = unique_ids[offset : offset + _BITRIX_BATCH_COMMENT_SIZE]
+        cmd = {
+            f"task_result_{index}": "tasks.task.result.list?" + urlencode({"taskId": task_id})
+            for index, task_id in enumerate(chunk)
+        }
+        try:
+            batch_result = await bitrix.result("batch", {"halt": 0, "cmd": cmd})
+        except Exception:
+            for task_id in chunk:
+                results_by_id[task_id] = await _task_result_texts(bitrix, task_id, limit=limit)
+            continue
+
+        results = batch_result.get("result") if isinstance(batch_result, dict) else None
+        if not isinstance(results, dict):
+            for task_id in chunk:
+                results_by_id[task_id] = []
+            continue
+        for index, task_id in enumerate(chunk):
+            results_by_id[task_id] = _task_result_texts_from_result(results.get(f"task_result_{index}"), limit=limit)
+    return results_by_id
+
+
+async def _task_result_texts(bitrix: BitrixClient, task_id: object, *, limit: int) -> list[str]:
+    if limit <= 0:
+        return []
+    try:
+        result = await bitrix.result("tasks.task.result.list", {"taskId": task_id})
+    except Exception:
+        return []
+    return _task_result_texts_from_result(result, limit=limit)
+
+
+def _task_result_texts_from_result(result: Any, *, limit: int) -> list[str]:
+    texts: list[str] = []
+    for item in _extract_task_results(result):
+        text = _task_result_text(item)
+        if not text:
+            continue
+        texts.append(text)
+        if len(texts) >= limit:
+            break
+    return texts
+
+
+def _extract_task_results(result: Any) -> list[dict[str, Any]]:
+    if isinstance(result, list):
+        return [item for item in result if isinstance(item, dict)]
+    if isinstance(result, dict):
+        for key in ("results", "RESULTS", "items", "result"):
+            value = result.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                nested = _extract_task_results(value)
+                if nested:
+                    return nested
+    return []
+
+
+def _task_result_text(item: dict[str, Any]) -> str:
+    return _clean_bitrix_comment_text(
+        to_str(_first(item, "TEXT", "text", "POST_MESSAGE", "message", "comment", "COMMENT")) or ""
+    )
+
+
 def _comment_texts_from_result(result: Any, *, limit: int) -> list[str]:
     texts: list[str] = []
     for comment in _extract_comments(result):
@@ -118,6 +226,623 @@ def _extract_comments(result: Any) -> list[dict[str, Any]]:
 def _comment_text(comment: dict[str, Any]) -> str:
     return _clean_bitrix_comment_text(
         to_str(_first(comment, "POST_MESSAGE", "POST_MESSAGE_HTML", "POST_MESSAGE_TEXT", "text", "message")) or ""
+    )
+
+
+def _task_close_marker_metadata(
+    *,
+    task_results: list[str],
+    comments: list[str],
+    attachment_names: list[str] | None = None,
+) -> dict[str, Any]:
+    texts = [*task_results, *comments]
+    marker_texts = [text for text in texts if _TASK_CLOSE_INCOMPLETE_MARKER in text]
+    attachment_problem_types = _task_close_report_problem_types(attachment_names or [])
+    problem_types: list[str] = []
+    marker_blob = "\n".join(marker_texts).casefold()
+    if marker_texts and any(marker in marker_blob for marker in ("невыполн", "не выполн", "not_done", "not done")):
+        problem_types.append("not_done")
+    if marker_texts and (
+        any(marker in marker_blob for marker in ("неподтверж", "не подтверж", "непровер", "unknown", "unconfirmed"))
+        or not problem_types
+    ):
+        problem_types.append("unconfirmed")
+    problem_types = _unique_problem_types([*problem_types, *attachment_problem_types])
+    has_marker = bool(marker_texts) or bool(problem_types)
+    return {
+        "ai_close_incomplete": has_marker,
+        "ai_close_marker": _TASK_CLOSE_INCOMPLETE_MARKER if has_marker else "",
+        "ai_close_problem_types": problem_types,
+        "ai_close_has_not_done": "not_done" in problem_types,
+        "ai_close_has_unconfirmed": "unconfirmed" in problem_types,
+        "ai_close_marker_source": _task_close_marker_source(
+            task_results=task_results,
+            comments=comments,
+            attachment_names=attachment_names or [],
+        ),
+    }
+
+
+def _task_close_marker_source(*, task_results: list[str], comments: list[str], attachment_names: list[str]) -> str:
+    if any(_TASK_CLOSE_INCOMPLETE_MARKER in text for text in task_results):
+        return "task_result"
+    if any(_TASK_CLOSE_INCOMPLETE_MARKER in text for text in comments):
+        return "comment"
+    if _task_close_report_problem_types(attachment_names):
+        return "task_attachment"
+    return ""
+
+
+def _task_close_report_problem_types(attachment_names: list[str]) -> list[str]:
+    return task_close_report_problem_types(attachment_names)
+
+
+async def _task_close_report_records_from_attachments(
+    bitrix: BitrixClient,
+    attachments: list[dict[str, Any]],
+    *,
+    settings: Settings,
+) -> list[dict[str, Any]]:
+    records = task_close_report_records(attachments)
+    if not records:
+        return []
+    by_key = {task_close_report_key(record): record for record in records}
+    for attached in attachments:
+        record = task_close_report_records([attached])
+        if not record:
+            continue
+        target = by_key.get(task_close_report_key(record[0]))
+        if target is None:
+            continue
+        report_text = await _task_close_report_text(bitrix, attached=attached, file_record=target, settings=settings)
+        if not report_text:
+            continue
+        content_problem_types = task_close_report_problem_types_from_text(report_text)
+        status = task_close_report_status_from_text(report_text)
+        has_ai_marker = _TASK_CLOSE_INCOMPLETE_MARKER.casefold() in report_text.casefold()
+        if status or content_problem_types or has_ai_marker:
+            target["problem_types"] = content_problem_types
+        if status:
+            target["status"] = status
+            target["status_source"] = "file_content"
+    return records
+
+
+async def _task_close_report_text(
+    bitrix: BitrixClient,
+    *,
+    attached: dict[str, Any],
+    file_record: dict[str, Any],
+    settings: Settings,
+) -> str:
+    download_url = to_str(_first(attached, "DOWNLOAD_URL", "downloadUrl") or file_record.get("download_url")) or ""
+    if not download_url:
+        disk_object_id = safe_int(file_record.get("disk_object_id"))
+        getter = getattr(bitrix, "get_disk_file_download_url", None)
+        if disk_object_id is not None and callable(getter):
+            try:
+                download_url = await getter(disk_object_id)
+            except Exception:
+                download_url = ""
+    downloader = getattr(bitrix, "download_file_from_url", None)
+    if not download_url or not callable(downloader):
+        return ""
+    with tempfile.TemporaryDirectory(prefix="ai-close-report-index-") as tmp_dir:
+        path = Path(tmp_dir) / "report.txt"
+        try:
+            await downloader(download_url, path, max_bytes=settings.attachment_max_bytes)
+            return path.read_text(encoding="utf-8-sig", errors="replace")
+        except Exception:
+            return ""
+
+
+def _task_close_direct_control_metadata(
+    index: PortalSearchIndex,
+    *,
+    task: dict[str, Any],
+    task_id: object,
+    task_title: str,
+    task_results: list[str],
+    current_report_files: list[dict[str, Any]],
+    close_marker_metadata: dict[str, Any],
+    settings: Settings,
+    now_iso: str,
+) -> tuple[dict[str, Any], tuple[int | None, str] | None]:
+    task_id_int = safe_int(task_id)
+    if task_id_int is None or not _task_is_closed(task):
+        return {}, None
+
+    closed_at = _first(task, "closedDate", "CLOSED_DATE")
+    changed_at = _first(task, "changedDate", "CHANGED_DATE")
+    event_key = task_close_event_key(task_id=task_id_int, closed_at=closed_at, first_seen_at=changed_at)
+    existing_event = _task_close_control_event(index, task_id=task_id_int, close_event_key=event_key)
+    if existing_event:
+        activation_key = (
+            _activation_key_from_payload(existing_event)
+            if str(existing_event.get("decision") or "") == TASK_CLOSE_DECISION_CONTROLLED
+            else None
+        )
+        return _task_close_control_event_metadata(existing_event), activation_key
+
+    if current_report_files or close_marker_metadata.get("ai_close_incomplete"):
+        return {
+            "task_close_control_event_key": event_key,
+            "task_close_control_decision": "skipped_ai_close_report_present",
+            "task_close_control_reason": "ai_close_report_or_marker_present",
+        }, None
+
+    control_enabled_from = _task_close_control_setting(index, _TASK_CLOSE_CONTROL_ENABLED_FROM_KEY)
+    if not control_enabled_from:
+        return {
+            "task_close_control_event_key": event_key,
+            "task_close_control_decision": "disabled",
+            "task_close_control_reason": "control_start_not_configured",
+        }, None
+
+    responsible_id = safe_int(_first(task, "responsibleId", "RESPONSIBLE_ID"))
+    closed_by_user_id = safe_int(_first(task, "closedBy", "CLOSED_BY", "closedByUserId", "CLOSED_BY_USER_ID"))
+    dialog_key = str(responsible_id or "")
+    description = str(_first(task, "description", "DESCRIPTION") or "")
+    controlled_user_ids = _task_close_controlled_user_ids(index)
+    decision = decide_task_close_control(
+        closed_at=closed_at,
+        control_enabled_from=control_enabled_from,
+        user_is_controlled=bool(responsible_id is not None and responsible_id in controlled_user_ids),
+    )
+    payload = {
+        "task_title": task_title,
+        "task_status": _first(task, "status", "STATUS"),
+        "responsible_id": responsible_id,
+        "closed_by_user_id": closed_by_user_id,
+        "dialog_key": dialog_key,
+        "recipient_id": str(responsible_id or ""),
+        "draft_dialog_key": _task_close_private_dialog_key(responsible_id),
+        "closed_at": to_str(closed_at),
+        "changed_at": to_str(changed_at),
+        "control_enabled_from": control_enabled_from,
+        "seen_at": now_iso,
+        "task_description": description,
+        "task_points": _task_points_from_description(description),
+        "task_results": task_results[:5],
+        "source_task_description_empty": not bool(description.strip()),
+        "task_url": _task_url(task_id_int, settings),
+    }
+    _upsert_task_close_control_event(
+        index,
+        task_id=task_id_int,
+        close_event_key=event_key,
+        decision=decision.decision,
+        reason=decision.reason,
+        closed_at=to_str(closed_at) or None,
+        responsible_id=responsible_id,
+        closed_by_user_id=closed_by_user_id,
+        payload=payload,
+    )
+    queue_event = None
+    activation_key = None
+    if decision.decision == TASK_CLOSE_DECISION_CONTROLLED:
+        queue_event = enqueue_direct_close_event(
+            index,
+            task_id=task_id_int,
+            close_event_key=event_key,
+            responsible_id=responsible_id,
+            dialog_key=dialog_key,
+            closed_at=closed_at,
+            task_title=task_title,
+            payload=payload,
+            now_iso=now_iso,
+            actor_user_id=closed_by_user_id,
+        )
+        activation_key = (responsible_id, dialog_key)
+
+    return (
+        _task_close_control_event_metadata(
+            {
+                "close_event_key": event_key,
+                "decision": decision.decision,
+                "reason": decision.reason,
+                "payload": payload,
+            },
+            queue_status=queue_event.status if queue_event else "",
+        ),
+        activation_key,
+    )
+
+
+def _task_is_closed(task: dict[str, Any]) -> bool:
+    status = safe_int(_first(task, "status", "STATUS"))
+    return bool(status == _BITRIX_TASK_STATUS_COMPLETED or _first(task, "closedDate", "CLOSED_DATE"))
+
+
+def _task_close_private_dialog_key(user_id: int | None) -> str:
+    if user_id is None or user_id <= 0:
+        return ""
+    return f"dialog:{user_id}:user:{user_id}"
+
+
+def _task_points_from_description(description: object) -> list[str]:
+    text = str(description or "").strip()
+    if not text:
+        return []
+    lines = [re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip() for line in text.splitlines()]
+    points = [line for line in lines if line]
+    if not points and text:
+        points = [text]
+    return points[:10]
+
+
+def _task_close_control_event(index: PortalSearchIndex, *, task_id: int, close_event_key: str) -> dict[str, Any] | None:
+    getter = getattr(index, "get_task_close_control_event", None)
+    if not callable(getter):
+        return None
+    event = getter(task_id=task_id, close_event_key=close_event_key)
+    return event if isinstance(event, dict) else None
+
+
+def _upsert_task_close_control_event(
+    index: PortalSearchIndex,
+    *,
+    task_id: int,
+    close_event_key: str,
+    decision: str,
+    reason: str,
+    closed_at: str | None,
+    responsible_id: int | None,
+    closed_by_user_id: int | None,
+    payload: dict[str, Any],
+) -> None:
+    upsert = getattr(index, "upsert_task_close_control_event", None)
+    if not callable(upsert):
+        return
+    upsert(
+        task_id=task_id,
+        close_event_key=close_event_key,
+        decision=decision,
+        reason=reason,
+        closed_at=closed_at,
+        responsible_id=responsible_id,
+        closed_by_user_id=closed_by_user_id,
+        payload=payload,
+    )
+
+
+def _task_close_control_setting(index: PortalSearchIndex, key: str) -> str:
+    getter = getattr(index, "get_task_close_control_setting", None)
+    if not callable(getter):
+        return ""
+    setting = getter(key)
+    if not isinstance(setting, dict):
+        return ""
+    return str(setting.get("value") or "").strip()
+
+
+def _task_close_controlled_user_ids(index: PortalSearchIndex) -> set[int]:
+    getter = getattr(index, "task_close_controlled_user_ids", None)
+    if not callable(getter):
+        return set()
+    return {item for item in (safe_int(value) for value in getter()) if item is not None and item > 0}
+
+
+def _task_close_control_event_metadata(
+    event: dict[str, Any],
+    *,
+    queue_status: str = "",
+) -> dict[str, Any]:
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    result = {
+        "task_close_control_event_key": str(event.get("close_event_key") or payload.get("close_event_key") or ""),
+        "task_close_control_decision": str(event.get("decision") or ""),
+        "task_close_control_reason": str(event.get("reason") or ""),
+        "task_close_control_responsible_id": payload.get("responsible_id"),
+        "task_close_control_dialog_key": str(payload.get("dialog_key") or ""),
+    }
+    if queue_status:
+        result["task_close_direct_queue_status"] = queue_status
+    return result
+
+
+def _activation_key_from_payload(event: dict[str, Any]) -> tuple[int | None, str] | None:
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    responsible_id = safe_int(payload.get("responsible_id"))
+    dialog_key = str(payload.get("dialog_key") or "")
+    return (responsible_id, dialog_key) if dialog_key else None
+
+
+def _activate_task_close_direct_queues(
+    index: PortalSearchIndex,
+    activation_keys: set[tuple[int | None, str]],
+    *,
+    now_iso: str,
+) -> None:
+    for responsible_id, dialog_key in sorted(activation_keys, key=lambda item: (item[0] or 0, item[1])):
+        activate_next_direct_close_event(index, responsible_id=responsible_id, dialog_key=dialog_key, now_iso=now_iso)
+
+
+def _unique_problem_types(values: list[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        if value not in {"not_done", "unconfirmed"} or value in result:
+            continue
+        result.append(value)
+    return result
+
+
+def _task_close_report_is_accepted_missing(
+    index: PortalSearchIndex, *, task_id: int, file_record: dict[str, Any]
+) -> bool:
+    state = _task_close_report_state(index, task_id=task_id, file_record=file_record)
+    return str((state or {}).get("status") or "") == _TASK_CLOSE_REPORT_INCIDENT_STATUS_ACCEPTED_MISSING
+
+
+def _task_close_report_state(
+    index: PortalSearchIndex, *, task_id: int, file_record: dict[str, Any]
+) -> dict[str, Any] | None:
+    getter = getattr(index, "get_task_close_processing_state", None)
+    if not callable(getter):
+        return None
+    state = getter(task_id=task_id, state_key=task_close_report_state_key(file_record))
+    return state if isinstance(state, dict) else None
+
+
+def _upsert_task_close_report_state(
+    index: PortalSearchIndex,
+    *,
+    task_id: int,
+    file_record: dict[str, Any],
+    status: str,
+    payload: dict[str, Any] | None = None,
+    actor_user_id: int | None = None,
+) -> None:
+    upsert = getattr(index, "upsert_task_close_processing_state", None)
+    if not callable(upsert):
+        return
+    upsert(
+        task_id=task_id,
+        state_key=task_close_report_state_key(file_record),
+        status=status,
+        payload=payload,
+        actor_user_id=actor_user_id,
+    )
+
+
+async def _task_close_report_integrity_metadata(
+    *,
+    bitrix: BitrixClient,
+    index: PortalSearchIndex,
+    settings: Settings,
+    task_id: object,
+    task_title: str,
+    current_report_files: list[dict[str, Any]],
+) -> dict[str, Any]:
+    task_id_int = safe_int(task_id)
+    if task_id_int is None:
+        return {"ai_close_report_files": current_report_files}
+
+    previous = index.item_snapshot(entity_type="task", entity_id=task_id_int)
+    previous_metadata = previous.get("metadata") if isinstance(previous, dict) else {}
+    if not isinstance(previous_metadata, dict):
+        previous_metadata = {}
+    previous_report_files = _dict_list(previous_metadata.get("ai_close_report_files"))
+    if not previous_report_files:
+        return {"ai_close_report_files": current_report_files}
+
+    previous_report_files = [
+        record
+        for record in previous_report_files
+        if not _task_close_report_is_accepted_missing(index, task_id=task_id_int, file_record=record)
+    ]
+    if not previous_report_files:
+        return {"ai_close_report_files": current_report_files}
+
+    current_keys = {task_close_report_key(record) for record in current_report_files}
+    missing_files = [record for record in previous_report_files if task_close_report_key(record) not in current_keys]
+    if not missing_files:
+        return {"ai_close_report_files": current_report_files}
+
+    now = datetime.now(MOSCOW_TZ)
+    now_iso = now.isoformat(timespec="seconds")
+    detected_at = str(previous_metadata.get("ai_close_report_detected_at") or now_iso)
+    auto_restore_after = str(
+        previous_metadata.get("ai_close_report_auto_restore_after")
+        or _task_close_report_auto_restore_after(detected_at, settings)
+    )
+    incident_key = str(
+        previous_metadata.get("ai_close_report_incident_key")
+        or _task_close_report_incident_key(task_id=task_id_int, missing_files=missing_files)
+    )
+    metadata = {
+        "ai_close_report_files": previous_report_files,
+        "ai_close_report_missing": True,
+        "ai_close_report_missing_files": missing_files,
+        "ai_close_report_incident_status": _TASK_CLOSE_REPORT_INCIDENT_STATUS_PENDING,
+        "ai_close_report_incident_key": incident_key,
+        "ai_close_report_detected_at": detected_at,
+        "ai_close_report_auto_restore_after": auto_restore_after,
+    }
+    for file_record in missing_files:
+        _upsert_task_close_report_state(
+            index,
+            task_id=task_id_int,
+            file_record=file_record,
+            status=_TASK_CLOSE_REPORT_INCIDENT_STATUS_PENDING,
+            payload={
+                "task_title": task_title,
+                "detected_at": detected_at,
+                "auto_restore_after": auto_restore_after,
+                "file": file_record,
+            },
+        )
+
+    if _should_auto_restore_task_close_report(auto_restore_after, now=now):
+        restored_files: list[dict[str, Any]] = []
+        restore_errors: list[str] = []
+        for file_record in missing_files:
+            try:
+                restore_result = await restore_task_close_report_file(
+                    bitrix,
+                    task_id=task_id_int,
+                    file_record=file_record,
+                    max_bytes=settings.attachment_max_bytes,
+                )
+                restored_file = restore_result.get("restored_file")
+                if isinstance(restored_file, dict):
+                    restored_files.append(restored_file)
+                    _upsert_task_close_report_state(
+                        index,
+                        task_id=task_id_int,
+                        file_record=file_record,
+                        status=_TASK_CLOSE_REPORT_INCIDENT_STATUS_RESTORED,
+                        payload={"task_title": task_title, "restored_at": now_iso, "restored_file": restored_file},
+                    )
+            except Exception as exc:
+                restore_errors.append(f"{file_record.get('name')}: {type(exc).__name__}: {exc}")
+        if restored_files and not restore_errors:
+            return {
+                "ai_close_report_files": [*current_report_files, *restored_files],
+                "ai_close_report_missing": False,
+                "ai_close_report_missing_files": [],
+                "ai_close_report_incident_status": _TASK_CLOSE_REPORT_INCIDENT_STATUS_RESTORED,
+                "ai_close_report_incident_key": incident_key,
+                "ai_close_report_detected_at": detected_at,
+                "ai_close_report_restored_at": now_iso,
+            }
+        metadata["ai_close_report_restore_error"] = "; ".join(restore_errors) if restore_errors else "not restored"
+
+    if not previous_metadata.get("ai_close_report_alert_sent_at"):
+        alert_error = await _notify_task_close_report_missing(
+            bitrix,
+            settings=settings,
+            task_id=task_id_int,
+            task_title=task_title,
+            missing_files=missing_files,
+            auto_restore_after=auto_restore_after,
+        )
+        if alert_error:
+            metadata["ai_close_report_alert_error"] = alert_error
+        else:
+            metadata["ai_close_report_alert_sent_at"] = now_iso
+    else:
+        metadata["ai_close_report_alert_sent_at"] = previous_metadata.get("ai_close_report_alert_sent_at")
+    return metadata
+
+
+def _task_close_marker_metadata_from_report_files(report_files: list[dict[str, Any]]) -> dict[str, Any] | None:
+    problem_types = _unique_problem_types(
+        [
+            problem_type
+            for record in report_files
+            for problem_type in _string_list_for_metadata(record.get("problem_types"))
+        ]
+    )
+    if not problem_types:
+        return None
+    return {
+        "ai_close_incomplete": True,
+        "ai_close_marker": _TASK_CLOSE_INCOMPLETE_MARKER,
+        "ai_close_problem_types": problem_types,
+        "ai_close_has_not_done": "not_done" in problem_types,
+        "ai_close_has_unconfirmed": "unconfirmed" in problem_types,
+        "ai_close_marker_source": "task_attachment",
+    }
+
+
+def _dict_list(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)]
+
+
+def _string_list_for_metadata(value: object) -> list[str]:
+    if isinstance(value, list | tuple | set):
+        return [str(item) for item in value if str(item)]
+    if value:
+        return [str(value)]
+    return []
+
+
+def _task_close_report_incident_key(*, task_id: int, missing_files: list[dict[str, Any]]) -> str:
+    keys = ",".join(sorted(task_close_report_key(record) for record in missing_files))
+    return f"task:{task_id}:ai-close-report-missing:{keys}"
+
+
+def _task_close_report_auto_restore_after(detected_at: str, settings: Settings) -> str:
+    detected_dt = _parse_datetime(detected_at) or datetime.now(MOSCOW_TZ)
+    hours = max(int(settings.bitrix_task_close_report_auto_restore_hours), 0)
+    return (detected_dt + timedelta(hours=hours)).isoformat(timespec="seconds")
+
+
+def _should_auto_restore_task_close_report(auto_restore_after: str, *, now: datetime) -> bool:
+    due_at = _parse_datetime(auto_restore_after)
+    return bool(due_at and now >= due_at)
+
+
+def _parse_datetime(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=MOSCOW_TZ)
+    return parsed.astimezone(MOSCOW_TZ)
+
+
+async def _notify_task_close_report_missing(
+    bitrix: BitrixClient,
+    *,
+    settings: Settings,
+    task_id: int,
+    task_title: str,
+    missing_files: list[dict[str, Any]],
+    auto_restore_after: str,
+) -> str:
+    message = _task_close_report_missing_message(
+        task_id=task_id,
+        task_title=task_title,
+        missing_files=missing_files,
+        auto_restore_after=auto_restore_after,
+    )
+    errors: list[str] = []
+    for admin_id in settings.resolved_task_close_report_admin_user_ids:
+        try:
+            await bitrix.send_bot_message(str(admin_id), message)
+            continue
+        except Exception as send_exc:
+            send_error = f"send_bot_message:{admin_id}:{type(send_exc).__name__}: {send_exc}"
+        try:
+            await bitrix.notify_user(
+                user_id=admin_id,
+                message=message,
+                tag="ai_server",
+                sub_tag=f"task_close_report_missing_{task_id}",
+            )
+            continue
+        except Exception as exc:
+            errors.append(f"{send_error}; notify_user:{admin_id}:{type(exc).__name__}: {exc}")
+    return "; ".join(errors)
+
+
+def _task_close_report_missing_message(
+    *,
+    task_id: int,
+    task_title: str,
+    missing_files: list[dict[str, Any]],
+    auto_restore_after: str,
+) -> str:
+    file_names = ", ".join(str(record.get("name") or "") for record in missing_files if record.get("name"))
+    return "\n".join(
+        [
+            "Контроль AI-закрытия: файл отчёта исчез из задачи.",
+            f"Задача #{task_id}: {task_title or 'без названия'}",
+            f"Файл: {file_names or 'AI-close report'}",
+            "",
+            "Выберите текстом:",
+            "1 — восстановить файл в задаче",
+            "2 — всё в порядке, удалить эти данные из индекса",
+            f"Если ответа не будет, файл будет восстановлен автоматически после {auto_restore_after}.",
+        ]
     )
 
 
@@ -372,6 +1097,8 @@ async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: 
             "CREATED_DATE",
             "CHANGED_DATE",
             "CLOSED_DATE",
+            "CLOSED_BY",
+            "CLOSED_BY_USER_ID",
             "ACCOMPLICES",
             "AUDITORS",
             "UF_TASK_WEBDAV_FILES",
@@ -390,12 +1117,77 @@ async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: 
         if settings.search_index_include_task_comments
         else {}
     )
+    results_by_task_id = await _task_results_by_id(
+        bitrix,
+        [_first(task, "id", "ID") for task in tasks],
+        limit=_BITRIX_TASK_RESULT_LIMIT,
+    )
+    now_iso = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
+    task_close_activation_keys: set[tuple[int | None, str]] = set()
     for task in tasks:
         task_id = _first(task, "id", "ID")
         if task_id is None:
             continue
         title = str(_first(task, "title", "TITLE") or "Без названия")
         comments = comments_by_task_id.get(str(task_id), [])
+        task_results = results_by_task_id.get(str(task_id), [])
+        task_attachments: list[dict[str, Any]] = []
+        if (
+            settings.search_index_include_task_attachments
+            and indexed_attachments < settings.search_index_max_task_attachments
+        ):
+            attachment_ids_list = _attachment_ids(_first(task, "ufTaskWebdavFiles", "UF_TASK_WEBDAV_FILES"))
+            for attached_object_id in attachment_ids_list:
+                if indexed_attachments + len(task_attachments) >= settings.search_index_max_task_attachments:
+                    break
+                if attached_object_id in seen_attachments:
+                    continue
+                seen_attachments.add(attached_object_id)
+                try:
+                    attached = await bitrix.get_attached_object(attached_object_id)
+                except Exception:
+                    continue
+                if isinstance(attached, dict):
+                    task_attachments.append(attached)
+        close_marker_metadata = _task_close_marker_metadata(
+            task_results=task_results,
+            comments=comments,
+        )
+        current_report_files = await _task_close_report_records_from_attachments(
+            bitrix,
+            task_attachments,
+            settings=settings,
+        )
+        report_integrity_metadata = await _task_close_report_integrity_metadata(
+            bitrix=bitrix,
+            index=index,
+            settings=settings,
+            task_id=task_id,
+            task_title=title,
+            current_report_files=current_report_files,
+        )
+        effective_report_files = _dict_list(report_integrity_metadata.get("ai_close_report_files"))
+        report_marker_metadata = _task_close_marker_metadata_from_report_files(effective_report_files)
+        if report_marker_metadata:
+            close_marker_metadata = {**close_marker_metadata, **report_marker_metadata}
+        report_files_by_attachment_id = {
+            to_str(record.get("attached_object_id")): record
+            for record in effective_report_files
+            if to_str(record.get("attached_object_id"))
+        }
+        task_close_control_metadata, activation_key = _task_close_direct_control_metadata(
+            index,
+            task=task,
+            task_id=task_id,
+            task_title=title,
+            task_results=task_results,
+            current_report_files=effective_report_files,
+            close_marker_metadata=close_marker_metadata,
+            settings=settings,
+            now_iso=now_iso,
+        )
+        if activation_key is not None:
+            task_close_activation_keys.add(activation_key)
         responsible_label = _person_label(_first(task, "responsible", "RESPONSIBLE"))
         creator_label = _person_label(_first(task, "creator", "CREATOR"))
         responsible = responsible_label or to_str(_first(task, "responsibleId", "RESPONSIBLE_ID"))
@@ -409,7 +1201,12 @@ async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: 
             f"Срок: {_first(task, 'deadline', 'DEADLINE')}",
             f"Дата создания: {_first(task, 'createdDate', 'CREATED_DATE')}",
             f"Дата закрытия: {_first(task, 'closedDate', 'CLOSED_DATE')}",
+            "Результаты:\n" + "\n".join(f"- {result}" for result in task_results) if task_results else "",
             "Комментарии:\n" + "\n".join(f"- {comment}" for comment in comments) if comments else "",
+            f"AI close marker: {_TASK_CLOSE_INCOMPLETE_MARKER}" if close_marker_metadata["ai_close_incomplete"] else "",
+            "AI close problem types: " + ", ".join(close_marker_metadata["ai_close_problem_types"])
+            if close_marker_metadata["ai_close_problem_types"]
+            else "",
         ]
         index.upsert_item(
             entity_type="task",
@@ -432,35 +1229,27 @@ async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: 
                 "auditors": _first(task, "auditors", "AUDITORS"),
                 "comments_indexed": bool(comments),
                 "comments_count": len(comments),
+                "task_results_indexed": bool(task_results),
+                "task_results_count": len(task_results),
+                **report_integrity_metadata,
+                **close_marker_metadata,
+                **task_close_control_metadata,
             },
             source_updated_at=to_str(_first(task, "changedDate", "CHANGED_DATE")),
         )
 
-        if not settings.search_index_include_task_attachments:
-            continue
-        if indexed_attachments >= settings.search_index_max_task_attachments:
-            continue
-        attachment_ids_list = _attachment_ids(_first(task, "ufTaskWebdavFiles", "UF_TASK_WEBDAV_FILES"))
-        for attached_object_id in attachment_ids_list:
-            if attached_object_id in seen_attachments:
-                continue
-            seen_attachments.add(attached_object_id)
-            try:
-                attached = await bitrix.get_attached_object(attached_object_id)
-            except Exception:
-                continue
-            if isinstance(attached, dict):
-                _index_task_attachment(
-                    index,
-                    attached=attached,
-                    task_id=task_id,
-                    task_title=title,
-                    task_updated_at=to_str(_first(task, "changedDate", "CHANGED_DATE")),
-                    settings=settings,
-                )
-                indexed_attachments += 1
-            if indexed_attachments >= settings.search_index_max_task_attachments:
-                break
+        for attached in task_attachments:
+            _index_task_attachment(
+                index,
+                attached=attached,
+                task_id=task_id,
+                task_title=title,
+                task_updated_at=to_str(_first(task, "changedDate", "CHANGED_DATE")),
+                report_file=report_files_by_attachment_id.get(to_str(_first(attached, "ID", "id"))),
+                settings=settings,
+            )
+            indexed_attachments += 1
+    _activate_task_close_direct_queues(index, task_close_activation_keys, now_iso=now_iso)
     return {
         "tasks": len(tasks),
         "attachments": indexed_attachments,
@@ -733,11 +1522,18 @@ def _index_task_attachment(
     task_id: object,
     task_title: str,
     task_updated_at: str | None,
+    report_file: dict[str, Any] | None = None,
     settings: Settings,
 ) -> None:
     attached_id = _first(attached, "ID", "id")
     object_id = _first(attached, "OBJECT_ID", "objectId")
     name = str(_first(attached, "NAME", "name") or f"Вложение #{attached_id}")
+    close_problem_types = (
+        _string_list_for_metadata(report_file.get("problem_types"))
+        if report_file
+        else _task_close_report_problem_types([name])
+    )
+    ai_close_report = bool(report_file) or bool(_TASK_CLOSE_REPORT_FILE_RE.match(name))
     index.upsert_item(
         entity_type="task_attachment",
         entity_id=attached_id,
@@ -762,6 +1558,10 @@ def _index_task_attachment(
             "created_by": _first(attached, "CREATED_BY", "createdBy"),
             "create_time": _first(attached, "CREATE_TIME", "createTime"),
             "download_available": bool(_first(attached, "DOWNLOAD_URL", "downloadUrl")),
+            "ai_close_report": ai_close_report,
+            "ai_close_incomplete": bool(close_problem_types),
+            "ai_close_marker": _TASK_CLOSE_INCOMPLETE_MARKER if close_problem_types else "",
+            "ai_close_problem_types": close_problem_types,
         },
         source_updated_at=to_str(_first(attached, "CREATE_TIME", "createTime")) or task_updated_at,
     )

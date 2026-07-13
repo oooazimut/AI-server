@@ -8,6 +8,8 @@ from ai_server.agents.base import BaseSpecialist
 from ai_server.agents.bitrix24.llm import (
     BitrixAgentLLM,
     BitrixLLMService,
+    _format_task_close_confirm_answer,
+    _format_task_close_draft_answer,
     llm_failure_result,
 )
 from ai_server.agents.bitrix24.ports import ProposalStorePort, TaskDraftStorePort
@@ -32,8 +34,11 @@ from ai_server.agents.bitrix24.tools import (
     SaveIncompleteProposalTool,
     SaveResponsibleResponseTool,
     TaskCloseConfirmTool,
+    TaskCloseControlGetTool,
+    TaskCloseControlUpdateTool,
     TaskCloseDiscardTool,
     TaskCloseDraftTool,
+    TaskCloseReportIncidentTool,
     TaskCreateConfirmTool,
     TaskCreateDraftTool,
     TaskDraftDiscardTool,
@@ -69,6 +74,9 @@ _LLM_TOOL_NAMES = frozenset(
         "task_close_draft",
         "task_close_confirm",
         "task_close_discard",
+        "task_close_report_incident",
+        "task_close_control_get",
+        "task_close_control_update",
         "calendar_event_draft",
         "calendar_event_confirm",
         "calendar_event_discard",
@@ -177,7 +185,7 @@ class Bitrix24Specialist(BaseSpecialist):
                 draft_ttl_minutes=_settings.bitrix_task_draft_ttl_minutes,
             ),
             TaskDraftDiscardTool(store=bitrix_store),
-            TaskCloseDraftTool(store=bitrix_store),
+            TaskCloseDraftTool(store=bitrix_store, read_client=bitrix_client, bitrix_oauth=bitrix_oauth),
             TaskCloseConfirmTool(
                 store=bitrix_store,
                 write_client=bitrix_client,
@@ -187,6 +195,13 @@ class Bitrix24Specialist(BaseSpecialist):
                 draft_ttl_minutes=_settings.bitrix_task_draft_ttl_minutes,
             ),
             TaskCloseDiscardTool(store=bitrix_store),
+            TaskCloseReportIncidentTool(
+                client=bitrix_client,
+                portal_search=portal_search_index,
+                settings=_settings,
+            ),
+            TaskCloseControlGetTool(store=bitrix_store, user_client=bitrix_client),
+            TaskCloseControlUpdateTool(store=bitrix_store, user_client=bitrix_client),
             CalendarEventDraftTool(store=bitrix_store),
             CalendarEventConfirmTool(
                 store=bitrix_store,
@@ -241,7 +256,8 @@ class Bitrix24Specialist(BaseSpecialist):
                 bitrix=self._bitrix_task_client,
                 settings=self._settings_for_qc,
             )
-        return await super().handle(task)
+        result = await super().handle(task)
+        return _enforce_task_close_response(result, settings=self._settings_for_qc)
 
     async def _execute_tool_call(
         self,
@@ -264,6 +280,13 @@ class Bitrix24Specialist(BaseSpecialist):
             )
         elif tool_call.name == "project_create_draft":
             args = _project_create_args_with_actor_context(dict(tool_call.args or {}), task)
+            tool_call = SimpleNamespace(
+                name=tool_call.name,
+                args=args,
+                summary=getattr(tool_call, "summary", ""),
+            )
+        elif tool_call.name in {"task_close_control_get", "task_close_control_update"}:
+            args = _args_with_actor_admin_context(dict(tool_call.args or {}), task, settings=self._settings_for_qc)
             tool_call = SimpleNamespace(
                 name=tool_call.name,
                 args=args,
@@ -416,6 +439,19 @@ def _project_create_args_with_actor_context(args: dict[str, Any], task: AgentTas
     return {**args, "_actor_name": actor_name, "_actor_is_admin": actor_is_admin}
 
 
+def _args_with_actor_admin_context(
+    args: dict[str, Any],
+    task: AgentTask,
+    *,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    profile = _current_user_profile(task)
+    user_id = optional_int(task.user.id)
+    configured_admin_ids = set(settings.resolved_task_close_control_admin_user_ids if settings is not None else [])
+    actor_is_admin = bool(profile.get("is_admin")) or bool(user_id is not None and user_id in configured_admin_ids)
+    return {**args, "_actor_is_admin": actor_is_admin}
+
+
 def _current_user_label(task: AgentTask) -> str:
     display_name = str(task.user.display_name or "").strip()
     if display_name:
@@ -451,3 +487,23 @@ def _truthy(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().casefold() in {"1", "true", "yes", "y", "да", "on"}
     return bool(value)
+
+
+def _enforce_task_close_response(result: AgentResult, *, settings: Settings | None = None) -> AgentResult:
+    for action in reversed(result.actions_taken):
+        if str(action.status) != "ok":
+            continue
+        details = action.details if isinstance(action.details, dict) else {}
+        data = details.get("data") if isinstance(details.get("data"), dict) else {}
+        if action.name == "task_close_draft":
+            answer = _format_task_close_draft_answer(data)
+            return result.model_copy(update={"status": "needs_human", "answer": answer})
+        if action.name == "task_close_confirm":
+            answer = _format_task_close_confirm_answer(
+                data,
+                portal_base_url=settings.bitrix_portal_base_url if settings is not None else "",
+            )
+            return result.model_copy(update={"status": "completed", "answer": answer})
+        if action.name == "task_close_discard":
+            return result.model_copy(update={"status": "completed", "answer": "Черновик закрытия задачи удалён."})
+    return result

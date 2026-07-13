@@ -5,6 +5,8 @@ from datetime import date
 import ai_server.agents.bitrix24.llm as bitrix_llm
 from ai_server.agents.bitrix24 import Bitrix24Specialist, BitrixLLMDecision, BitrixLLMService, BitrixLLMToolCall
 from ai_server.agents.bitrix24.llm import ALLOWED_TOOL_NAMES
+from ai_server.agents.bitrix24.tools.task_close import TaskCloseDraftTool
+from ai_server.agents.bitrix24.tools.task_close_control import TaskCloseControlUpdateTool
 from ai_server.agents.bitrix24.tools.task_create import TaskCreateDraftTool
 from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import AgentTask, ToolDefinition, ToolResult
@@ -16,7 +18,7 @@ from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
 from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, FakeTaskDraftStore, RecordingLLMClient
 
 
-def _bitrix_specialist(*, tools=None, llm=None) -> Bitrix24Specialist:
+def _bitrix_specialist(*, tools=None, llm=None, settings=None) -> Bitrix24Specialist:
     manifest = get_agent_manifest("bitrix24")
     retriever = HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider())
     return Bitrix24Specialist(
@@ -26,6 +28,7 @@ def _bitrix_specialist(*, tools=None, llm=None) -> Bitrix24Specialist:
         agent_tools=tools.agent_tools() if tools is not None else None,
         bitrix_user_client=tools.make_user_client() if tools is not None else None,
         llm=llm or FakeBitrixLLM(),
+        settings=settings,
     )
 
 
@@ -269,6 +272,314 @@ def test_bitrix_llm_decide_routes_advanced_comment_closed_search(monkeypatch):
     }
 
 
+def test_bitrix_llm_decide_routes_ai_close_problem_search(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient(
+        json.dumps(
+            {
+                "status": "completed",
+                "answer": "",
+                "confidence": 0.2,
+                "tool_calls": [{"name": "none", "args": {}}],
+            }
+        )
+    )
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request="Битрикс найди задачи с невыполненными пунктами после AI-закрытия.",
+                user={"id": "13"},
+            ),
+            retrieval_hits=[],
+            tool_definitions=_bitrix_read_tool_definitions(),
+        )
+    )
+
+    assert [call.name for call in result.decision.tool_calls] == ["bitrix_task_search"]
+    assert result.decision.tool_calls[0].args == {
+        "scope": "member",
+        "status": "closed",
+        "limit": 10,
+        "include_closed": True,
+        "ai_close_problem_type": "not_done",
+    }
+
+
+def test_bitrix_llm_decide_routes_task_close_report_incident_reply(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    service = BitrixLLMService(client, settings=get_settings())
+    tool_definitions = [
+        ToolDefinition(name="task_close_report_incident", description="", parameters={}).model_dump(),
+        ToolDefinition(name="none", description="", parameters={}).model_dump(),
+    ]
+    history = [
+        {
+            "role": "assistant",
+            "content": (
+                "Контроль AI-закрытия: файл отчёта исчез из задачи.\n"
+                "Задача #303: Проверить архив\n"
+                "Файл: AI-close-303-unconfirmed.txt\n"
+                "1 — восстановить файл в задаче\n"
+                "2 — всё в порядке, удалить эти данные из индекса"
+            ),
+        }
+    ]
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t1", request="1", user={"id": "1"}),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+            dialog_history=history,
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_report_incident"]
+    assert result.decision.tool_calls[0].args == {
+        "task_id": 303,
+        "action": "restore",
+        "file_name": "AI-close-303-unconfirmed.txt",
+    }
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t2", request="второй вариант", user={"id": "1"}),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+            dialog_history=history,
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_report_incident"]
+    assert result.decision.tool_calls[0].args == {
+        "task_id": 303,
+        "action": "accept_missing",
+        "file_name": "AI-close-303-unconfirmed.txt",
+    }
+
+
+def test_bitrix_llm_decide_routes_task_close_control_get(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    service = BitrixLLMService(client, settings=get_settings())
+    tool_definitions = [
+        ToolDefinition(name="task_close_control_get", description="", parameters={}).model_dump(),
+        ToolDefinition(name="task_close_control_update", description="", parameters={}).model_dump(),
+    ]
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t1", request="Покажи настройки контроля закрытия задач", user={"id": "1"}),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_control_get"]
+    assert result.decision.tool_calls[0].args == {}
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t2", request="Покажи список операторов и контролируемых пользователей", user={"id": "1"}
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_control_get"]
+    assert result.decision.tool_calls[0].args == {}
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t3",
+                request="Покажи список операторов и обычных пользователей закрытия задач",
+                user={"id": "1"},
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_control_get"]
+    assert result.decision.tool_calls[0].args == {}
+
+
+def test_bitrix_llm_does_not_route_ambiguous_operator_panel_request(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    tool_definitions = [
+        ToolDefinition(name="task_close_control_get", description="", parameters={}).model_dump(),
+        ToolDefinition(name="task_close_control_update", description="", parameters={}).model_dump(),
+    ]
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    for request in (
+        "Покажи список операторов",
+        "Покажи список пользователей",
+        "Покажи админ-панель",
+        "Кто операторы",
+    ):
+        result = asyncio.run(
+            service.decide(
+                manifest=get_agent_manifest("bitrix24"),
+                task=AgentTask(task_id="ambiguous", request=request, user={"id": "1"}),
+                retrieval_hits=[],
+                tool_definitions=tool_definitions,
+            )
+        )
+
+        assert client.calls == []
+        assert result.decision.status == "needs_clarification"
+        assert "закрытие задач или отчет по машинам и людям" in result.decision.answer
+        assert [call.name for call in result.decision.tool_calls] == ["none"]
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="vehicle-panel",
+                request="Покажи список операторов и пользователей отчета по машинам и людям",
+                user={"id": "1"},
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls
+    assert [call.name for call in result.decision.tool_calls] == ["none"]
+
+
+def test_bitrix_llm_decide_routes_task_close_control_update(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    service = BitrixLLMService(client, settings=get_settings())
+    tool_definitions = [
+        ToolDefinition(name="task_close_control_get", description="", parameters={}).model_dump(),
+        ToolDefinition(name="task_close_control_update", description="", parameters={}).model_dump(),
+        ToolDefinition(name="none", description="", parameters={}).model_dump(),
+    ]
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t1", request="Добавь пользователя 231 в контролируемые", user={"id": "1"}),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_control_update"]
+    assert result.decision.tool_calls[0].args == {"action": "add_controlled_user", "target_user_id": 231}
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t2", request="Поставь автозакрытие задач на 19:30", user={"id": "1"}),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_control_update"]
+    assert result.decision.tool_calls[0].args == {"action": "set_auto_close_time", "auto_close_time": "19:30"}
+
+
+def test_bitrix_specialist_injects_admin_context_for_task_close_control_tool(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    store = FakeTaskDraftStore()
+
+    class TaskCloseControlTools:
+        def agent_tools(self):
+            return [TaskCloseControlUpdateTool(store=store)]
+
+        def make_user_client(self):
+            class UserClient:
+                async def get_user(self, user_id: int):
+                    return {"ID": user_id, "NAME": "Admin", "LAST_NAME": "User", "IS_ADMIN": True}
+
+            return UserClient()
+
+    llm = FakeBitrixLLM(
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="task_close_control_update",
+                args={"action": "add_operator", "target_user_id": 13},
+            )
+        ]
+    )
+
+    result = asyncio.run(
+        _bitrix_specialist(tools=TaskCloseControlTools(), llm=llm).handle(
+            AgentTask(task_id="t1", request="добавь 13 оператором контроля закрытия задач", user={"id": "1"})
+        )
+    )
+
+    assert result.status == "completed"
+    assert store.task_close_operator_ids() == {13}
+    assert store.task_close_controlled_user_ids() == set()
+
+
+def test_bitrix_specialist_uses_configured_task_close_control_admin_ids(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_TASK_CLOSE_CONTROL_ADMIN_USER_IDS", "1")
+    store = FakeTaskDraftStore()
+
+    class TaskCloseControlTools:
+        def agent_tools(self):
+            return [TaskCloseControlUpdateTool(store=store)]
+
+        def make_user_client(self):
+            class UserClient:
+                async def get_user(self, user_id: int):
+                    return {
+                        "ID": user_id,
+                        "NAME": "Configured",
+                        "LAST_NAME": "Admin",
+                    }
+
+            return UserClient()
+
+    llm = FakeBitrixLLM(
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="task_close_control_update",
+                args={"action": "add_operator", "target_user_id": 13},
+            )
+        ]
+    )
+
+    result = asyncio.run(
+        _bitrix_specialist(tools=TaskCloseControlTools(), llm=llm, settings=get_settings()).handle(
+            AgentTask(task_id="t1", request="добавь 13 оператором контроля закрытия задач", user={"id": "1"})
+        )
+    )
+
+    assert result.status == "completed"
+    assert store.task_close_operator_ids() == {13}
+    assert store.task_close_controlled_user_ids() == set()
+
+
 def test_bitrix_llm_decide_routes_project_search_to_deterministic_tool(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient(
@@ -396,6 +707,63 @@ def test_bitrix_specialist_task_create_draft_saves_to_store():
     assert draft_fields["RESPONSIBLE_ID"] == 9
     assert draft_fields["CREATED_BY"] == 9
     assert draft_fields["DEADLINE"]
+
+
+def test_bitrix_specialist_enforces_structured_task_close_draft_response():
+    store = FakeTaskDraftStore()
+    specialist = Bitrix24Specialist(
+        get_agent_manifest("bitrix24"),
+        retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
+        agent_tools=[TaskCloseDraftTool(store=store)],
+        llm=FakeBitrixLLM(
+            tool_calls=[
+                BitrixLLMToolCall(
+                    name="task_close_draft",
+                    args={
+                        "task_id": 8869,
+                        "task_title": "Проверить камеру",
+                        "completion_summary": "Камеру проверили, архив не проверяли.",
+                        "task_points": ["камера проверена", "архив не проверен"],
+                        "equipment_consumables": "не указано",
+                        "overall_status": "partial",
+                        "not_done_items": ["архив не проверен"],
+                        "unconfirmed_items": ["нет фото результата"],
+                        "status_reasons": ["нет доступа к архиву"],
+                    },
+                )
+            ],
+            final_status="needs_clarification",
+            final_answer="Черновик закрытия уже подготовлен: короткий свободный текст.",
+        ),
+    )
+
+    result = asyncio.run(
+        specialist.handle(
+            AgentTask(
+                task_id="t1",
+                request="закрой задачу 8869",
+                user={"id": "13"},
+                context={"dialog_key": "d:13", "dialog_id": "chat4321"},
+            )
+        )
+    )
+
+    assert result.status == "needs_human"
+    assert "d:13" in store._drafts
+    assert "Черновик #8869: Проверить камеру" in result.answer
+    assert "1. Выполняемые работы" in result.answer
+    assert "1.1 камера проверена - ... ???" in result.answer
+    assert "1.3 Еще работы - ... ???" in result.answer
+    assert "2. Использовано материалов, оборудование" in result.answer
+    assert "2.1 не указано" in result.answer
+    assert "3. Статус выполнения работ" in result.answer
+    assert "[ВЫБРАНО: выполнено частично]" in result.answer
+    assert "3.1 причина: нет доступа к архиву" in result.answer
+    assert "Причина/что не выполнено: архив не проверен" not in result.answer
+    assert "Не подтверждено: нет фото результата" not in result.answer
+    assert "4. Дополнительная информация" in result.answer
+    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" not in result.answer
+    assert "уже подготовлен" not in result.answer
 
 
 def test_bitrix_specialist_task_create_draft_uses_current_user_profile_label():
@@ -667,6 +1035,453 @@ def test_bitrix_llm_routes_task_close_confirmation_without_llm(monkeypatch):
     assert client.calls == []
     assert result.raw == {"source": "draft_confirm_route"}
     assert [call.name for call in result.decision.tool_calls] == ["task_close_confirm"]
+
+
+def test_bitrix_llm_routes_task_close_start_to_draft_without_llm(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_close_draft", "description": "", "parameters": {}},
+        {"name": "task_close_confirm", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request="Битрикс закрой задачу 8899.",
+                user={"id": "15"},
+                context={"dialog_id": "chat4321"},
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_close_start_route"}
+    assert result.decision.status == "completed"
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_draft"]
+    args = result.decision.tool_calls[0].args
+    assert args["task_id"] == 8899
+    assert args["overall_status"] == "unconfirmed"
+    assert args["unconfirmed_items"] == ["результат выполнения не указан"]
+    assert "что сделано по задаче" in args["missing_fields"]
+
+
+def test_bitrix_llm_routes_task_close_followup_to_active_draft_without_llm(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_close_draft", "description": "", "parameters": {}},
+        {"name": "task_close_confirm", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request=(
+                    "По задаче 8899: проверка выполнена частично, не все пункты подтверждены, "
+                    "оборудование не использовалось."
+                ),
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "task_close",
+                        "task_id": 8899,
+                        "task_title": "Проверить камеры",
+                        "task_points": ["Проверить камеру", "Проверить архив"],
+                        "overall_status": "unconfirmed",
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_close_active_update_route"}
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_draft"]
+    args = result.decision.tool_calls[0].args
+    assert args["task_id"] == 8899
+    assert args["task_title"] == "Проверить камеры"
+    assert args["overall_status"] == "partial"
+    assert args["equipment_consumables"] == "не использовалось"
+    assert "unconfirmed_items" not in args
+    assert args["missing_fields"] == []
+
+
+def test_bitrix_llm_routes_task_close_followup_extracts_four_block_fields(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_close_draft", "description": "", "parameters": {}},
+        {"name": "task_close_confirm", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request=(
+                    "По задаче 8899: 1.1 Проверить камеру выполнено, "
+                    "1.2 Забрать документы не выполнено, 1.3 Починить селектор не подтверждено. "
+                    "По пункту 2 оборудование: 3 видеокамеры, 40 метров кабеля. "
+                    "По пункту 3 выполнено частично, причина: не было доступа к архиву. "
+                    "По пункту 4 нужно вернуться завтра с доступом."
+                ),
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "task_close",
+                        "task_id": 8899,
+                        "task_title": "Проверить объект",
+                        "task_points": ["Проверить камеру", "Забрать документы", "Починить селектор"],
+                        "overall_status": "unconfirmed",
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_close_active_update_route"}
+    args = result.decision.tool_calls[0].args
+    assert args["completion_summary"] == (
+        "Проверить камеру выполнено. Забрать документы не выполнено. Починить селектор не подтверждено"
+    )
+    assert args["equipment_consumables"] == "3 видеокамеры, 40 метров кабеля"
+    assert args["additional_info"] == "нужно вернуться завтра с доступом"
+    assert args["overall_status"] == "partial"
+    assert args["not_done_items"] == ["Забрать документы"]
+    assert args["unconfirmed_items"] == ["Починить селектор"]
+    assert args["status_reasons"] == ["не было доступа к архиву"]
+    assert args["missing_fields"] == []
+
+
+def test_bitrix_llm_routes_task_close_followup_extracts_compact_numbered_blocks(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_close_draft", "description": "", "parameters": {}},
+        {"name": "task_close_confirm", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request=(
+                    "По задаче 8899: 1.1 выполнено полностью. "
+                    "1.2 не выполнено. 1.3 не подтверждено. "
+                    "2 использовал 2 камеры, 30 метров кабеля. "
+                    "3 выполнено частично, причина не было доступа к архиву. "
+                    "4 отсутствует."
+                ),
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "task_close",
+                        "task_id": 8899,
+                        "task_title": "Проверить объект",
+                        "task_points": ["Проверить камеру", "Забрать документы", "Починить селектор"],
+                        "overall_status": "unconfirmed",
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_close_active_update_route"}
+    args = result.decision.tool_calls[0].args
+    assert args["completion_summary"] == (
+        "Проверить камеру выполнено полностью. Забрать документы не выполнено. Починить селектор не подтверждено"
+    )
+    assert args["equipment_consumables"] == "использовал 2 камеры, 30 метров кабеля"
+    assert args["additional_info"] == "отсутствует"
+    assert args["overall_status"] == "partial"
+    assert args["not_done_items"] == ["Забрать документы"]
+    assert args["unconfirmed_items"] == ["Починить селектор"]
+    assert args["status_reasons"] == ["не было доступа к архиву"]
+    assert args["missing_fields"] == []
+
+
+def test_bitrix_llm_routes_task_close_followup_keeps_work_block_isolated(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_close_draft", "description": "", "parameters": {}},
+        {"name": "task_close_confirm", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request=(
+                    "По задаче 8899: 1.1 камеру не поставил, потому что не было оборудования "
+                    "и не было доступа к архиву."
+                ),
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "task_close",
+                        "task_id": 8899,
+                        "task_title": "Проверить объект",
+                        "task_points": ["Проверить камеру", "Забрать документы"],
+                        "overall_status": "unconfirmed",
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_close_active_update_route"}
+    args = result.decision.tool_calls[0].args
+    assert args["completion_summary"] == "Проверить камеру не выполнено"
+    assert args["not_done_items"] == ["Проверить камеру"]
+    assert "equipment_consumables" not in args
+    assert "overall_status" not in args
+    assert "status_reasons" not in args
+    assert "additional_info" not in args
+
+
+def test_bitrix_llm_routes_task_close_followup_keeps_status_block_out_of_equipment(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_close_draft", "description": "", "parameters": {}},
+        {"name": "task_close_confirm", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request="По задаче 8899: 3 выполнено частично, причина: не хватило 30 метров кабеля.",
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "task_close",
+                        "task_id": 8899,
+                        "task_title": "Проверить объект",
+                        "task_points": ["Проверить камеру"],
+                        "overall_status": "unconfirmed",
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_close_active_update_route"}
+    args = result.decision.tool_calls[0].args
+    assert args["overall_status"] == "partial"
+    assert args["status_reasons"] == ["не хватило 30 метров кабеля"]
+    assert "equipment_consumables" not in args
+    assert "not_done_items" not in args
+
+
+def test_bitrix_llm_routes_task_close_followup_filters_wrong_extra_info_block_parts(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_close_draft", "description": "", "parameters": {}},
+        {"name": "task_close_confirm", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request=("По задаче 8899: 4 нужно вернуться завтра, использовал 5 датчиков и работа не выполнена."),
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "task_close",
+                        "task_id": 8899,
+                        "task_title": "Проверить объект",
+                        "task_points": ["Проверить камеру"],
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_close_active_update_route"}
+    args = result.decision.tool_calls[0].args
+    assert args["additional_info"] == "нужно вернуться завтра"
+    assert "equipment_consumables" not in args
+    assert "overall_status" not in args
+
+
+def test_bitrix_llm_routes_task_close_followup_keeps_future_extra_info_with_equipment_words(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_close_draft", "description": "", "parameters": {}},
+        {"name": "task_close_confirm", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request="По задаче 8899: 4 нужно взять с собой 5 камер, вернуться завтра.",
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "task_close",
+                        "task_id": 8899,
+                        "task_title": "Проверить объект",
+                        "task_points": ["Проверить камеру"],
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_close_active_update_route"}
+    args = result.decision.tool_calls[0].args
+    assert args["additional_info"] == "нужно взять с собой 5 камер, вернуться завтра"
+    assert "equipment_consumables" not in args
+
+
+def test_bitrix_llm_routes_task_close_followup_completed_status_has_no_fake_reason(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_close_draft", "description": "", "parameters": {}},
+        {"name": "task_close_confirm", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request=(
+                    "По задаче 8899: 1.1 выполнено полностью. "
+                    "2 не использовалось. 3 выполнено полностью. 4 отсутствует."
+                ),
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "task_close",
+                        "task_id": 8899,
+                        "task_title": "Проверить объект",
+                        "task_points": ["Проверить камеру"],
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_close_active_update_route"}
+    args = result.decision.tool_calls[0].args
+    assert args["overall_status"] == "completed"
+    assert "status_reasons" not in args
+
+
+def test_bitrix_llm_routes_task_close_conflict_switch_to_requested_without_llm(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_close_draft", "description": "", "parameters": {}},
+        {"name": "task_close_confirm", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request="3",
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "task_close",
+                        "task_id": 139,
+                        "task_title": "Проверить камеры",
+                        "_task_close_conflict_pending": {
+                            "_draft_type": "task_close",
+                            "task_id": 140,
+                            "task_title": "Проверить регистратор",
+                            "completion_summary": "Регистратор проверен.",
+                            "task_points": ["регистратор проверен"],
+                        },
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_close_draft_conflict_route"}
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_discard", "task_close_draft"]
+    assert result.decision.tool_calls[1].args["task_id"] == 140
+    assert result.decision.tool_calls[1].args["task_title"] == "Проверить регистратор"
+    assert result.decision.tool_calls[1].args["task_points"] == ["регистратор проверен"]
 
 
 def test_bitrix_llm_routes_calendar_confirmation_without_llm(monkeypatch):
@@ -1240,11 +2055,290 @@ def test_bitrix_llm_compose_formats_task_close_draft(monkeypatch):
 
     assert client.calls == []
     assert result.status == "needs_human"
-    assert "Черновик закрытия задачи" in result.answer
+    assert "Черновик #139: Обучение сотрудников" in result.answer
     assert "Обучение сотрудников" in result.answer
-    assert "не приложен акт проверки" in result.answer
-    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" in result.answer
+    assert "1.1 Пользователь подтвердил выполнение" in result.answer
+    assert "Не подтверждено: не приложен акт проверки" not in result.answer
+    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" not in result.answer
     assert "[URL" not in result.answer
+
+
+def test_bitrix_llm_compose_formats_structured_task_close_draft(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="закрой задачу", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="task_close_draft",
+                    data={
+                        "draft": {"_draft_type": "task_close", "task_id": 139, "task_title": "Проверить камеры"},
+                        "preview": {
+                            "task_title": "Проверить камеры",
+                            "action_label": "отметить задачу выполненной",
+                            "completion_summary": "Часть работ выполнена.",
+                            "task_points": ["камеры подключены", "архив не проверен"],
+                            "equipment_consumables": "4 камеры, 30 метров кабеля",
+                            "additional_info": "вернуться завтра, проверить доступ",
+                            "overall_status_label": "выполнена частично",
+                            "not_done_items": ["не проверен архив"],
+                            "unconfirmed_items": ["нет фото результата"],
+                            "status_reasons": ["не было доступа к архиву"],
+                            "missing_fields": ["причина, почему архив не проверен"],
+                            "ai_close_marker": "AI_SERVER_TASK_CLOSE_INCOMPLETE",
+                        },
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert "1. Выполняемые работы" in result.answer
+    assert "1.1 камеры подключены - ... ???" in result.answer
+    assert "1.3 Еще работы - ... ???" in result.answer
+    assert "2. Использовано материалов, оборудование" in result.answer
+    assert "2.1 4 камеры" in result.answer
+    assert "2.2 30 метров кабеля" in result.answer
+    assert "[ВЫБРАНО: выполнено частично]" in result.answer
+    assert "3.1 причина: не было доступа к архиву" in result.answer
+    assert "Причина/что не выполнено: не проверен архив" not in result.answer
+    assert "1.2 архив не проверен - не выполнено" in result.answer
+    assert "Не подтверждено: нет фото результата" not in result.answer
+    assert "4. Дополнительная информация" in result.answer
+    assert "4.1 вернуться завтра" in result.answer
+    assert "4.2 проверить доступ" in result.answer
+    assert "да, закрывай как есть" in result.answer
+    assert "[URL" not in result.answer
+
+
+def test_bitrix_llm_compose_formats_task_close_point_status_labels(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="закрой задачу", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="task_close_draft",
+                    data={
+                        "draft": {"_draft_type": "task_close", "task_id": 139, "task_title": "Проверить объект"},
+                        "preview": {
+                            "task_title": "Проверить объект",
+                            "completion_summary": (
+                                "Проверить камеру выполнено полностью. "
+                                "Забрать документы не выполнено. "
+                                "Починить селектор не подтверждено"
+                            ),
+                            "task_points": ["Проверить камеру", "Забрать документы", "Починить селектор"],
+                            "not_done_items": ["Забрать документы"],
+                            "unconfirmed_items": ["Починить селектор"],
+                        },
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert "1.1 Проверить камеру - выполнено полностью" in result.answer
+    assert "1.2 Забрать документы - не выполнено" in result.answer
+    assert "1.3 Починить селектор - не подтверждено" in result.answer
+    assert "1.2 Забрать документы - не выполнено: Забрать документы" not in result.answer
+    assert "1.3 Починить селектор - не подтверждено: Починить селектор" not in result.answer
+    assert "2.1 выполнено" not in result.answer
+    assert "3.1 причина: Забрать документы" not in result.answer
+
+
+def test_bitrix_llm_compose_hides_unanswered_unconfirmed_task_points(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="закрой задачу", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="task_close_draft",
+                    data={
+                        "draft": {
+                            "_draft_type": "task_close",
+                            "task_id": 139,
+                            "task_title": "Проверить объект",
+                        },
+                        "preview": {
+                            "task_title": "Проверить объект",
+                            "completion_summary": "Установить камеру не выполнено",
+                            "task_points": ["Установить камеру", "Забрать документы", "Проверить архив"],
+                            "not_done_items": ["Установить камеру"],
+                            "unconfirmed_items": ["Забрать документы", "Проверить архив"],
+                            "overall_status": "partial",
+                            "status_reasons": ["не было доступа к архиву"],
+                        },
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert "1.1 Установить камеру - не выполнено" in result.answer
+    assert "1.2 Забрать документы - ... ???" in result.answer
+    assert "1.3 Проверить архив - ... ???" in result.answer
+    assert "1.2 Забрать документы - не подтверждено" not in result.answer
+    assert "1.3 Проверить архив - не подтверждено" not in result.answer
+
+
+def test_bitrix_llm_compose_formats_empty_description_task_close_draft(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="закрой задачу", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="task_close_draft",
+                    data={
+                        "draft": {
+                            "_draft_type": "task_close",
+                            "task_id": 139,
+                            "task_title": "Пустая задача",
+                            "source_task_description_empty": True,
+                        },
+                        "preview": {
+                            "task_title": "Пустая задача",
+                            "action_label": "отметить задачу выполненной",
+                            "source_task_description_empty": True,
+                            "completion_summary": "Проверил объект, устранил замечания.",
+                            "equipment_consumables": "не использовались",
+                            "overall_status_label": "выполнена полностью",
+                        },
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert "1. Выполняемые работы" in result.answer
+    assert "1.1 Проверил объект" in result.answer
+    assert "1.2 устранил замечания" in result.answer
+    assert "1. Пункты задачи" not in result.answer
+    assert "[ВЫБРАНО: не использовалось]" in result.answer
+    assert "2.1 не использовались" not in result.answer
+    assert "[ВЫБРАНО: выполнено полностью]" in result.answer
+
+
+def test_bitrix_llm_compose_hides_initial_task_close_placeholder_summary(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="закрой задачу", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="task_close_draft",
+                    data={
+                        "draft": {
+                            "_draft_type": "task_close",
+                            "task_id": 139,
+                            "task_title": "Пустая задача",
+                            "source_task_description_empty": True,
+                        },
+                        "preview": {
+                            "task_title": "Пустая задача",
+                            "source_task_description_empty": True,
+                            "completion_summary": (
+                                "Общий итог: результат не подтверждён "
+                                "Статус AI-закрытия: неподтвержденная "
+                                "Неподтверждённые пункты: - результат выполнения не указан"
+                            ),
+                            "overall_status_label": "результат не подтверждён",
+                            "unconfirmed_items": ["результат выполнения не указан"],
+                        },
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert "1. Выполняемые работы" in result.answer
+    assert "1.1 Еще работы - ... ???" in result.answer
+    assert "2. Использовано материалов, оборудование" in result.answer
+    assert "2.1" not in result.answer
+    assert "3. Статус выполнения работ" in result.answer
+    assert "[ВЫБРАНО:" not in result.answer
+    assert "результат не подтверждён" not in result.answer
+    assert "результат выполнения не указан" not in result.answer
+    assert "Статус AI-закрытия" not in result.answer
+
+
+def test_bitrix_llm_compose_formats_task_close_active_draft_conflict(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="закрой задачу 140", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="task_close_draft",
+                    data={
+                        "status": "active_draft_conflict",
+                        "draft": {"_draft_type": "task_close", "task_id": 139, "task_title": "Проверить камеры"},
+                        "incoming_draft": {
+                            "_draft_type": "task_close",
+                            "task_id": 140,
+                            "task_title": "Проверить регистратор",
+                        },
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert "Уже есть активный черновик закрытия." in result.answer
+    assert "Текущий: Проверить камеры" in result.answer
+    assert "Новая задача: Проверить регистратор" in result.answer
+    assert "1 — продолжить текущий черновик" in result.answer
+    assert "3 — отменить текущий черновик и перейти к новой задаче" in result.answer
 
 
 def test_bitrix_llm_compose_formats_task_close_draft_with_id_fallback(monkeypatch):
@@ -1284,7 +2378,7 @@ def test_bitrix_llm_compose_formats_task_close_draft_with_id_fallback(monkeypatc
 
     assert client.calls == []
     assert result.status == "needs_human"
-    assert "Задача: задача #139" in result.answer
+    assert "Черновик #139: задача #139" in result.answer
     assert "Задача: указанная задача" not in result.answer
 
 
@@ -1320,8 +2414,7 @@ def test_bitrix_llm_compose_formats_task_close_confirm_with_task_link(monkeypatc
     assert result.answer == (
         "Задача отмечена выполненной: "
         "[URL=https://asutp-expert.bitrix24.ru/company/personal/user/0/tasks/task/view/139/]"
-        "Обучение сотрудников[/URL]. С непроверенными пунктами добавлена метка "
-        "AI_SERVER_TASK_CLOSE_INCOMPLETE."
+        "Обучение сотрудников[/URL]. Статус: неподтвержденная."
     )
     assert "/company/personal/user/13/" not in result.answer
 
@@ -1533,6 +2626,50 @@ def test_bitrix_llm_compose_formats_task_search_comment_snippet(monkeypatch):
         "[URL=https://asutp-expert.bitrix24.ru/company/personal/user/0/tasks/task/view/101/]Проверить документы[/URL]"
         in result.answer
     )
+
+
+def test_bitrix_llm_compose_formats_ai_close_problem_task_search(monkeypatch):
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    service = BitrixLLMService(client=RecordingLLMClient("{}"), settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="найди задачи с невыполненными пунктами", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="bitrix_task_search",
+                    data={
+                        "mode": "list",
+                        "scope": "member",
+                        "scope_label": "мои задачи",
+                        "status": "closed",
+                        "ai_close_problem_type": "not_done",
+                        "items": [
+                            {
+                                "id": "101",
+                                "title": "Проверить камеры",
+                                "deadline_label": "10.07.2026 19:00",
+                                "status_label": "завершена",
+                                "ai_close_incomplete": True,
+                                "ai_close_problem_types": ["not_done", "unconfirmed"],
+                            }
+                        ],
+                        "total": 1,
+                        "limit": 10,
+                        "offset": 0,
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert result.status == "completed"
+    assert "Завершённые мои задачи с невыполненными пунктами:" in result.answer
+    assert "AI-закрытие: есть невыполненные пункты, результат не подтверждён" in result.answer
+    assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" not in result.answer
 
 
 def test_bitrix_llm_compose_formats_task_search_list_without_duplicate_detail_or_ids(monkeypatch):

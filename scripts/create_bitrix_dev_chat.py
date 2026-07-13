@@ -13,9 +13,9 @@ BACKEND_DIR = PROJECT_ROOT / "backend"
 DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
 sys.path.insert(0, str(BACKEND_DIR))
 
-from ai_server.integrations.bitrix.client import BitrixApiError, BitrixClient, BitrixConfigError
-from ai_server.integrations.bitrix.oauth import BitrixOAuthError
-from ai_server.settings import get_settings
+from ai_server.integrations.bitrix.client import BitrixApiError, BitrixClient, BitrixConfigError  # noqa: E402
+from ai_server.integrations.bitrix.oauth import BitrixOAuthError  # noqa: E402
+from ai_server.settings import get_settings  # noqa: E402
 
 DEFAULT_TITLE = "AI dev"
 DEFAULT_USERS = "1,9"
@@ -59,7 +59,9 @@ def chat_reference(result: Any) -> dict[str, Any]:
         if chat_id is not None:
             return {"chat_id": chat_id, "dialog_id": f"chat{chat_id}"}
 
-    chat_id = result.get("chatId") or result.get("CHAT_ID") or result.get("chat_id") or result.get("id") or result.get("ID")
+    chat_id = (
+        result.get("chatId") or result.get("CHAT_ID") or result.get("chat_id") or result.get("id") or result.get("ID")
+    )
     dialog_id = result.get("dialogId") or result.get("DIALOG_ID") or result.get("dialog_id")
     reference: dict[str, Any] = {}
     if chat_id is not None:
@@ -94,6 +96,13 @@ def env_file_paths(raw_values: list[str] | None) -> list[Path]:
             if value:
                 paths.append(Path(value))
     return paths
+
+
+def preload_env_files_from_argv(argv: list[str]) -> list[str]:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--env-file", action="append", default=None)
+    args, _ = parser.parse_known_args(argv)
+    return load_env_files(env_file_paths(args.env_file))
 
 
 def load_env_files(paths: list[Path]) -> list[str]:
@@ -176,7 +185,8 @@ def dry_run_plan(
 
 
 async def create_chat(args: argparse.Namespace) -> dict[str, Any]:
-    client = BitrixClient()
+    settings = get_settings()
+    client = BitrixClient(settings=settings)
     result = await client.create_bot_chat(
         title=args.title,
         user_ids=args.user_ids,
@@ -228,9 +238,9 @@ def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
+    loaded_env_keys = preload_env_files_from_argv(sys.argv[1:])
     parser = build_parser()
     args = parser.parse_args()
-    loaded_env_keys = load_env_files(env_file_paths(args.env_file))
     if args.oauth_db_path:
         os.environ["BITRIX_OAUTH_DB_PATH"] = str(args.oauth_db_path)
         loaded_env_keys.append("BITRIX_OAUTH_DB_PATH")

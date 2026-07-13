@@ -24,7 +24,7 @@ sys.path.insert(0, str(BACKEND_DIR))
 from ai_server.integrations.bitrix.chat_parser import make_dialog_key  # noqa: E402
 from ai_server.integrations.postgres.bitrix_agent import PostgresBitrixAgentStore  # noqa: E402
 from ai_server.settings import get_settings  # noqa: E402
-from scripts.create_bitrix_dev_chat import env_file_paths, load_env_files  # noqa: E402
+from scripts.create_bitrix_dev_chat import preload_env_files_from_argv  # noqa: E402
 
 DEFAULT_EVENTS_URL = "http://127.0.0.1:8001/bitrix/events"
 DEFAULT_STATUS_URL = "http://127.0.0.1:8001/bitrix/webhook-events/status"
@@ -39,6 +39,7 @@ class TestCase:
     expect_all: tuple[str, ...] = ()
     reject_any: tuple[str, ...] = ()
     kind: str = "read"
+    required_task_id_arg: str = ""
 
 
 SAFE_TESTS: dict[str, list[TestCase]] = {
@@ -160,6 +161,53 @@ STATEFUL_TESTS: dict[str, list[TestCase]] = {
             kind="draft_cleanup",
         ),
     ],
+    "task_close": [
+        TestCase(
+            test_id="BITRIX-TASK-CLOSE-INITIAL-DRAFT-01",
+            text="Битрикс закрой задачу {task_close_task_id}.",
+            timeout_seconds=300,
+            expect_all=(
+                "Черновик #",
+                "Выполняемые работы",
+                "1.1",
+                "Использовано материалов, оборудование",
+                "Статус выполнения работ",
+                "Дополнительная информация",
+                "Внести изменения",
+            ),
+            reject_any=("Задача закрыта", "Задача отмечена выполненной"),
+            kind="task_close_draft",
+            required_task_id_arg="task_close_task_id",
+        ),
+        TestCase(
+            test_id="BITRIX-TASK-CLOSE-DRAFT-01",
+            text=(
+                "По задаче {task_close_task_id}: проверка выполнена частично, "
+                "не все пункты подтверждены, оборудование не использовалось."
+            ),
+            timeout_seconds=300,
+            expect_all=(
+                "Черновик #",
+                "Выполняемые работы",
+                "1.1",
+                "Использовано материалов, оборудование",
+                "Статус выполнения работ",
+                "Дополнительная информация",
+                "Внести изменения",
+            ),
+            reject_any=("Задача закрыта", "Задача отмечена выполненной"),
+            kind="task_close_draft",
+            required_task_id_arg="task_close_task_id",
+        ),
+        TestCase(
+            test_id="BITRIX-TASK-CLOSE-DISCARD-01",
+            text="Битрикс отмени черновик закрытия задачи.",
+            timeout_seconds=180,
+            expect_all=("Черновик закрытия задачи", "удал"),
+            kind="task_close_cleanup",
+            required_task_id_arg="task_close_task_id",
+        ),
+    ],
 }
 STATEFUL_TESTS["draft"] = STATEFUL_TESTS["drafts"]
 
@@ -203,6 +251,102 @@ def bitrix_rest(rest_webhook_url: str, method: str, payload: dict[str, Any]) -> 
     return post_json(url, payload)
 
 
+def create_task_close_test_task(args: argparse.Namespace, *, run_id: str) -> dict[str, Any]:
+    title = f"AI Dev task close E2E {run_id}"
+    description = (
+        "1. Проверить тестовый сценарий закрытия задачи.\n"
+        "2. Зафиксировать, что бот не закрывает задачу без результата работ."
+    )
+    response = bitrix_rest(
+        args.rest_webhook_url,
+        "tasks.task.add",
+        {
+            "fields": {
+                "TITLE": title,
+                "DESCRIPTION": description,
+                "RESPONSIBLE_ID": args.user_id,
+            }
+        },
+    )
+    task_id = extract_task_id(response)
+    return {
+        "ok": task_id is not None,
+        "task_id": task_id,
+        "title": title,
+        "response": compact_rest_response(response),
+    }
+
+
+def delete_task_close_test_task(args: argparse.Namespace) -> dict[str, Any]:
+    task_id = optional_int(getattr(args, "created_task_close_task_id", None))
+    if task_id is None:
+        return {"ok": True, "skipped": True}
+    response = bitrix_rest(args.rest_webhook_url, "tasks.task.delete", {"taskId": task_id})
+    return {
+        "ok": bool(response.get("result") is not None or response.get("ok") is not False),
+        "task_id": task_id,
+        "response": compact_rest_response(response),
+    }
+
+
+def get_task_status(args: argparse.Namespace, task_id: object) -> dict[str, Any]:
+    task_id_int = optional_int(task_id)
+    if task_id_int is None:
+        return {"ok": False, "error": "missing_task_id"}
+    response = bitrix_rest(
+        args.rest_webhook_url,
+        "tasks.task.get",
+        {"taskId": task_id_int, "select": ["ID", "TITLE", "STATUS", "CLOSED_DATE"]},
+    )
+    task = extract_task(response)
+    status = optional_int((task or {}).get("status") or (task or {}).get("STATUS"))
+    return {
+        "ok": task is not None,
+        "task_id": task_id_int,
+        "status": status,
+        "is_closed": status == 5 or bool((task or {}).get("closedDate") or (task or {}).get("CLOSED_DATE")),
+        "response": compact_rest_response(response),
+    }
+
+
+def extract_task_id(response: dict[str, Any]) -> int | None:
+    task = extract_task(response)
+    if task:
+        return optional_int(task.get("id") or task.get("ID"))
+    result = response.get("result")
+    if isinstance(result, dict):
+        return optional_int(result.get("taskId") or result.get("TASK_ID") or result.get("id") or result.get("ID"))
+    return optional_int(result)
+
+
+def extract_task(response: dict[str, Any]) -> dict[str, Any] | None:
+    result = response.get("result")
+    if isinstance(result, dict):
+        for key in ("task", "TASK", "item", "ITEM"):
+            value = result.get(key)
+            if isinstance(value, dict):
+                return value
+        if "id" in result or "ID" in result:
+            return result
+    return None
+
+
+def optional_int(value: object) -> int | None:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def compact_rest_response(response: dict[str, Any]) -> dict[str, Any]:
+    if response.get("ok") is False:
+        return {key: response.get(key) for key in ("ok", "error", "status", "details", "body")}
+    result = response.get("result")
+    if isinstance(result, dict):
+        return {"result_keys": sorted(str(key) for key in result)[:20]}
+    return {"has_result": "result" in response, "result_type": type(result).__name__}
+
+
 def get_messages(rest_webhook_url: str, dialog_id: str) -> list[dict[str, Any]]:
     response = bitrix_rest(rest_webhook_url, "im.dialog.messages.get", {"DIALOG_ID": dialog_id, "LIMIT": 40})
     result = response.get("result")
@@ -239,6 +383,7 @@ def send_event(
     secret: str,
     run_id: str,
     test: TestCase,
+    text: str,
     bot_id: int,
     chat_id: int,
     dialog_id: str,
@@ -253,7 +398,7 @@ def send_event(
             "message": {
                 "id": synthetic_message_id,
                 "authorId": user_id,
-                "text": f"[{run_id} {test.test_id}] {test.text}",
+                "text": f"[{run_id} {test.test_id}] {text}",
             },
             "user": {"id": user_id},
         },
@@ -262,6 +407,10 @@ def send_event(
 
 
 def run_test(args: argparse.Namespace, *, run_id: str, test: TestCase) -> dict[str, Any]:
+    missing_arg = missing_required_test_arg(args, test)
+    if missing_arg:
+        return {"test_id": test.test_id, "kind": test.kind, "ok": False, "stage": "missing_arg", "missing": missing_arg}
+
     preflight_status = wait_queue_idle(args.status_url, timeout_seconds=args.preflight_idle_timeout)
     if not preflight_status.get("ok"):
         return {
@@ -274,11 +423,13 @@ def run_test(args: argparse.Namespace, *, run_id: str, test: TestCase) -> dict[s
 
     before_messages = get_messages(args.rest_webhook_url, args.dialog_id)
     before_ids = {item for item in (message_id(message) for message in before_messages) if item is not None}
+    text = render_test_text(test, args=args)
     enqueue = send_event(
         events_url=args.events_url,
         secret=args.secret,
         run_id=run_id,
         test=test,
+        text=text,
         bot_id=args.bot_id,
         chat_id=args.chat_id,
         dialog_id=args.dialog_id,
@@ -315,7 +466,13 @@ def run_test(args: argparse.Namespace, *, run_id: str, test: TestCase) -> dict[s
         joined = "\n".join(message_text(message) for message in response_messages)
         evaluation = evaluate_response_text(joined, test)
         draft_state = verify_draft_state(args, test)
-        ok = evaluation["matched"] and not evaluation["rejected"] and draft_state.get("ok", True)
+        task_state = verify_task_state(args, test)
+        ok = (
+            evaluation["matched"]
+            and not evaluation["rejected"]
+            and draft_state.get("ok", True)
+            and task_state.get("ok", True)
+        )
         return {
             "test_id": test.test_id,
             "kind": test.kind,
@@ -331,6 +488,7 @@ def run_test(args: argparse.Namespace, *, run_id: str, test: TestCase) -> dict[s
             "reject_any": list(test.reject_any),
             **evaluation,
             "draft_state": draft_state,
+            "task_state": task_state,
             "response_preview": joined[:1200],
             "worker_latest": compact_status(last_status),
         }
@@ -400,12 +558,37 @@ def evaluate_response_text(text: str, test: TestCase) -> dict[str, bool]:
     }
 
 
+def render_test_text(test: TestCase, *, args: argparse.Namespace) -> str:
+    values = {
+        "task_close_task_id": getattr(args, "task_close_task_id", ""),
+    }
+    try:
+        return test.text.format(**values)
+    except KeyError:
+        return test.text
+
+
+def missing_required_test_arg(args: argparse.Namespace, test: TestCase) -> str:
+    if not test.required_task_id_arg:
+        return ""
+    value = getattr(args, test.required_task_id_arg, "")
+    return "" if optional_int(value) is not None else test.required_task_id_arg
+
+
 def expected_pending_draft(test: TestCase) -> bool | None:
-    if test.kind == "draft":
+    if test.kind in {"draft", "task_close_draft"}:
         return True
-    if test.kind == "draft_cleanup":
+    if test.kind in {"draft_cleanup", "task_close_cleanup", "task_close_prompt"}:
         return False
     return None
+
+
+def expected_draft_type(test: TestCase) -> str:
+    if test.kind in {"task_close_draft", "task_close_cleanup"}:
+        return "task_close"
+    if test.kind in {"draft", "draft_cleanup"}:
+        return ""
+    return ""
 
 
 def verify_draft_state(args: argparse.Namespace, test: TestCase) -> dict[str, Any]:
@@ -429,14 +612,39 @@ def verify_draft_state(args: argparse.Namespace, test: TestCase) -> dict[str, An
             "dialog_key": dialog_key,
         }
     present = bool(draft)
+    expected_type = expected_draft_type(test)
+    draft_type = draft.get("_draft_type") if isinstance(draft, dict) else None
+    draft_task_id = optional_int(draft.get("task_id")) if isinstance(draft, dict) else None
+    expected_task_id = (
+        optional_int(getattr(args, "task_close_task_id", None)) if expected_type == "task_close" else None
+    )
+    type_ok = not expected or not expected_type or draft_type == expected_type
+    task_ok = not expected or expected_task_id is None or draft_task_id == expected_task_id
     return {
         "checked": True,
-        "ok": present is expected,
+        "ok": present is expected and type_ok and task_ok,
         "expected_present": expected,
         "present": present,
         "dialog_key": dialog_key,
-        "draft_type": draft.get("_draft_type") if isinstance(draft, dict) else None,
+        "expected_type": expected_type,
+        "draft_type": draft_type,
+        "expected_task_id": expected_task_id,
+        "draft_task_id": draft_task_id,
         "has_fields": isinstance(draft, dict) and isinstance(draft.get("fields"), dict),
+    }
+
+
+def verify_task_state(args: argparse.Namespace, test: TestCase) -> dict[str, Any]:
+    if test.kind not in {"task_close_prompt", "task_close_draft"}:
+        return {"checked": False, "ok": True}
+    status = get_task_status(args, getattr(args, "task_close_task_id", ""))
+    if not status.get("ok"):
+        return {"checked": True, "ok": False, **status}
+    return {
+        "checked": True,
+        "ok": not status.get("is_closed"),
+        "expected_open": True,
+        **status,
     }
 
 
@@ -569,6 +777,10 @@ def tests_for_suite(suite: str, *, include_draft: bool) -> list[TestCase]:
     return selected
 
 
+def suite_needs_task_close_task(tests: list[TestCase]) -> bool:
+    return any(test.required_task_id_arg == "task_close_task_id" for test in tests)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run synthetic Bitrix staging E2E checks through AI Dev.")
     parser.add_argument("--env-file", action="append", default=None)
@@ -611,6 +823,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="For stateful draft suites, verify pending draft presence in PostgreSQL.",
     )
     parser.add_argument(
+        "--task-close-task-id",
+        default=os.getenv("BITRIX_E2E_TASK_CLOSE_TASK_ID", ""),
+        help="Existing staging task id for --suite task_close. If omitted, a temporary task is created and deleted.",
+    )
+    parser.add_argument(
+        "--keep-created-task",
+        action="store_true",
+        help="Do not delete the temporary task created for --suite task_close.",
+    )
+    parser.add_argument(
         "--lock-path",
         default=os.getenv("BITRIX_E2E_LOCK_PATH", ""),
         help="Dialog-level lock path. Defaults to a temp file derived from dialog-id.",
@@ -629,9 +851,9 @@ def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
+    loaded_env_keys = preload_env_files_from_argv(sys.argv[1:])
     parser = build_parser()
     args = parser.parse_args()
-    loaded_env_keys = load_env_files(env_file_paths(args.env_file))
     settings = get_settings()
 
     args.status_url = args.status_url or resolve_status_url(args.events_url)
@@ -672,6 +894,32 @@ def main() -> int:
 
     run_id = make_run_id()
     tests = tests_for_suite(args.suite, include_draft=args.include_draft)
+    setup: dict[str, Any] = {"task_close_test_task": {"ok": True, "skipped": True}}
+    cleanup: dict[str, Any] = {"task_close_test_task": {"ok": True, "skipped": True}}
+    if suite_needs_task_close_task(tests) and optional_int(args.task_close_task_id) is None:
+        created = create_task_close_test_task(args, run_id=run_id)
+        setup["task_close_test_task"] = created
+        if not created.get("ok"):
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "suite": args.suite,
+                        "run_id": run_id,
+                        "stage": "create_task_close_test_task",
+                        "setup": setup,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            release_dialog_lock(lock)
+            return 2
+        args.task_close_task_id = str(created["task_id"])
+        args.created_task_close_task_id = created["task_id"]
+    else:
+        args.created_task_close_task_id = None
+
     results = []
     stopped_after_failure = False
     try:
@@ -685,9 +933,11 @@ def main() -> int:
                 stopped_after_failure = True
                 break
     finally:
+        if not args.keep_created_task:
+            cleanup["task_close_test_task"] = delete_task_close_test_task(args)
         release_dialog_lock(lock)
     payload = {
-        "ok": all(item.get("ok") for item in results),
+        "ok": all(item.get("ok") for item in results) and cleanup["task_close_test_task"].get("ok", True),
         "suite": args.suite,
         "include_draft": args.include_draft,
         "continue_on_failure": args.continue_on_failure,
@@ -701,6 +951,8 @@ def main() -> int:
         "dialog_key": args.dialog_key,
         "user_id": args.user_id,
         "bot_id": args.bot_id,
+        "setup": setup,
+        "cleanup": cleanup,
         "loaded_env_keys": sorted({key for key in loaded_env_keys if key.startswith(("BITRIX_", "WEBHOOK_"))}),
         "results": results,
     }
@@ -709,11 +961,11 @@ def main() -> int:
 
 
 def cleanup_tests_after_failure(tests: list[TestCase], failed_index: int) -> list[TestCase]:
-    if tests[failed_index].kind != "draft":
+    if tests[failed_index].kind not in {"draft", "task_close_draft"}:
         return []
     cleanup_tests: list[TestCase] = []
     for test in tests[failed_index + 1 :]:
-        if test.kind != "draft_cleanup":
+        if test.kind not in {"draft_cleanup", "task_close_cleanup"}:
             break
         cleanup_tests.append(test)
     return cleanup_tests

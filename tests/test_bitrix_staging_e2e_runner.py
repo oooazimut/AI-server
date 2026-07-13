@@ -8,20 +8,62 @@ from scripts.bitrix_staging_e2e_runner import (
 )
 from scripts.bitrix_staging_e2e_runner import (
     acquire_dialog_lock,
+    build_parser,
     cleanup_tests_after_failure,
     default_lock_path,
     evaluate_response_text,
     event_processed,
+    expected_draft_type,
     expected_pending_draft,
     make_run_id,
     matching_response_messages,
+    missing_required_test_arg,
     queue_is_idle,
     release_dialog_lock,
+    render_test_text,
+    suite_needs_task_close_task,
     verify_draft_state,
 )
 from scripts.bitrix_staging_e2e_runner import (
     tests_for_suite as runner_tests_for_suite,
 )
+from scripts.create_bitrix_dev_chat import preload_env_files_from_argv
+
+
+def test_env_file_preload_updates_runner_argparse_defaults(monkeypatch, tmp_path) -> None:
+    for key in (
+        "BITRIX_E2E_DIALOG_ID",
+        "BITRIX_E2E_CHAT_ID",
+        "BITRIX_E2E_USER_ID",
+        "BITRIX_E2E_TASK_CLOSE_TASK_ID",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    env_file = tmp_path / "staging.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "BITRIX_E2E_DIALOG_ID=chat8745",
+                "BITRIX_E2E_CHAT_ID=8745",
+                "BITRIX_E2E_USER_ID=55",
+                "BITRIX_E2E_TASK_CLOSE_TASK_ID=8981",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = preload_env_files_from_argv(["--env-file", str(env_file)])
+    args = build_parser().parse_args(["--env-file", str(env_file), "--suite", "smoke"])
+
+    assert set(loaded) >= {
+        "BITRIX_E2E_DIALOG_ID",
+        "BITRIX_E2E_CHAT_ID",
+        "BITRIX_E2E_USER_ID",
+        "BITRIX_E2E_TASK_CLOSE_TASK_ID",
+    }
+    assert args.dialog_id == "chat8745"
+    assert args.chat_id == 8745
+    assert args.user_id == 55
+    assert args.task_close_task_id == "8981"
 
 
 def test_matching_response_messages_skips_unmatched_delayed_messages() -> None:
@@ -239,3 +281,48 @@ def test_cleanup_tests_after_failure_ignores_read_failures() -> None:
     ]
 
     assert cleanup_tests_after_failure(tests, 0) == []
+
+
+def test_cleanup_tests_after_failure_handles_task_close_cleanup() -> None:
+    tests = [
+        RunnerTestCase(test_id="task-close", text="", kind="task_close_draft"),
+        RunnerTestCase(test_id="task-close-cleanup", text="", kind="task_close_cleanup"),
+        RunnerTestCase(test_id="read", text="", kind="read"),
+    ]
+
+    cleanup = cleanup_tests_after_failure(tests, 0)
+
+    assert [test.test_id for test in cleanup] == ["task-close-cleanup"]
+
+
+def test_tests_for_suite_task_close_creates_three_stateful_steps() -> None:
+    tests = runner_tests_for_suite("task_close", include_draft=False)
+
+    assert [test.test_id for test in tests] == [
+        "BITRIX-TASK-CLOSE-INITIAL-DRAFT-01",
+        "BITRIX-TASK-CLOSE-DRAFT-01",
+        "BITRIX-TASK-CLOSE-DISCARD-01",
+    ]
+    assert suite_needs_task_close_task(tests)
+    assert expected_pending_draft(tests[0]) is True
+    assert expected_draft_type(tests[0]) == "task_close"
+    assert expected_pending_draft(tests[1]) is True
+    assert expected_draft_type(tests[1]) == "task_close"
+    assert expected_pending_draft(tests[2]) is False
+    assert expected_draft_type(tests[2]) == "task_close"
+
+
+def test_task_close_suite_formats_task_id_and_requires_numeric_id() -> None:
+    test = runner_tests_for_suite("task_close", include_draft=False)[0]
+
+    assert missing_required_test_arg(SimpleNamespace(task_close_task_id=""), test) == "task_close_task_id"
+    assert missing_required_test_arg(SimpleNamespace(task_close_task_id="abc"), test) == "task_close_task_id"
+    assert missing_required_test_arg(SimpleNamespace(task_close_task_id="8875"), test) == ""
+    assert render_test_text(test, args=SimpleNamespace(task_close_task_id="8875")) == "Битрикс закрой задачу 8875."
+
+
+def test_tests_for_suite_release_does_not_include_task_close_writes() -> None:
+    tests = runner_tests_for_suite("release", include_draft=False)
+
+    assert not suite_needs_task_close_task(tests)
+    assert all(test.kind not in {"task_close_draft", "task_close_cleanup"} for test in tests)
