@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
+import logging
 from dataclasses import dataclass, field
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from typing import Any
 
 from ai_server.agents.bitrix24.tools.task_close import (
@@ -24,6 +26,8 @@ from ai_server.integrations.bitrix.task_close_direct_queue import (
 )
 from ai_server.settings import Settings
 from ai_server.utils import MOSCOW_TZ
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -74,6 +78,91 @@ class DirectTaskCloseAutoCloseStats:
             "skipped": self.skipped,
             "errors": list(self.errors),
         }
+
+
+async def run_task_close_direct_control_worker(
+    *,
+    bitrix: Any,
+    bitrix_oauth: Any | None = None,
+    store: Any,
+    settings: Settings,
+    status: dict[str, Any],
+) -> None:
+    interval_seconds = max(int(settings.bitrix_task_close_control_interval_seconds), 30)
+    status.update(
+        {
+            "enabled": settings.bitrix_task_close_control_worker_enabled,
+            "running": True,
+            "interval_seconds": interval_seconds,
+            "direct_limit": settings.bitrix_task_close_control_direct_limit,
+            "auto_close_limit": settings.bitrix_task_close_control_auto_close_limit,
+            "last_check_at": None,
+            "last_success_at": None,
+            "last_error": None,
+            "next_check_at": None,
+            "runs": int(status.get("runs") or 0),
+            "errors": int(status.get("errors") or 0),
+        }
+    )
+    while True:
+        try:
+            result = await run_task_close_direct_control_once(
+                bitrix=bitrix,
+                bitrix_oauth=bitrix_oauth,
+                store=store,
+                settings=settings,
+                status=status,
+            )
+            status["last_success_at"] = _now().isoformat()
+            status["last_error"] = None
+            status["runs"] = int(status.get("runs") or 0) + 1
+            status["last_result"] = result
+            await _sleep_until_next(status, interval_seconds)
+        except asyncio.CancelledError:
+            status["running"] = False
+            raise
+        except Exception as exc:
+            logger.exception("Task close direct control tick failed")
+            status["last_error"] = f"{type(exc).__name__}: {exc}"
+            status["errors"] = int(status.get("errors") or 0) + 1
+            await _sleep_until_next(status, min(interval_seconds, 300))
+
+
+async def run_task_close_direct_control_once(
+    *,
+    bitrix: Any,
+    bitrix_oauth: Any | None = None,
+    store: Any,
+    settings: Settings,
+    status: dict[str, Any] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    now_dt = now or _now()
+    if status is not None:
+        status["last_check_at"] = now_dt.isoformat()
+    dispatch_stats = await dispatch_direct_task_close_drafts(
+        bitrix=bitrix,
+        store=store,
+        settings=settings,
+        limit=max(int(settings.bitrix_task_close_control_direct_limit), 1),
+        now=now_dt,
+    )
+    auto_close_stats = await auto_close_direct_task_close_reports(
+        bitrix=bitrix,
+        bitrix_oauth=bitrix_oauth,
+        store=store,
+        settings=settings,
+        limit=max(int(settings.bitrix_task_close_control_auto_close_limit), 1),
+        now=now_dt,
+    )
+    result = {
+        "checked_at": now_dt.isoformat(),
+        "dispatch": dispatch_stats.as_dict(),
+        "auto_close": auto_close_stats.as_dict(),
+    }
+    if status is not None:
+        status.update(result)
+    return result
 
 
 async def dispatch_direct_task_close_drafts(
@@ -334,6 +423,16 @@ def _parse_hhmm(value: str) -> time | None:
     if hour < 0 or hour > 23 or minute < 0 or minute > 59:
         return None
     return time(hour=hour, minute=minute)
+
+
+def _now() -> datetime:
+    return datetime.now(MOSCOW_TZ)
+
+
+async def _sleep_until_next(status: dict[str, Any], seconds: int) -> None:
+    next_check_at = _now() + timedelta(seconds=seconds)
+    status["next_check_at"] = next_check_at.isoformat()
+    await asyncio.sleep(seconds)
 
 
 def _auto_close_draft_from_state(

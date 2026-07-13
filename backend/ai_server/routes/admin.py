@@ -53,6 +53,7 @@ def health(request: Request) -> dict[str, Any]:
         "bitrix_quality_control_enabled": settings.quality_control_webhook_enabled,
         "bitrix_quality_control_dry_run": settings.quality_control_dry_run,
         "bitrix_task_supervisor_enabled": settings.supervisor_enabled,
+        "bitrix_task_close_control_worker_enabled": settings.bitrix_task_close_control_worker_enabled,
         "bitrix_reconciler_enabled": settings.reconcile_enabled,
         "logistics_vehicle_usage_enabled": settings.vehicle_usage_enabled,
     }

@@ -25,6 +25,10 @@ class Settings:
     bitrix_task_draft_ttl_minutes: int
     bitrix_task_close_report_admin_user_ids: str
     bitrix_task_close_report_auto_restore_hours: int
+    bitrix_task_close_control_worker_enabled: bool
+    bitrix_task_close_control_interval_seconds: int
+    bitrix_task_close_control_direct_limit: int
+    bitrix_task_close_control_auto_close_limit: int
     bitrix_oauth_app_path: str
     bitrix_oauth_callback_path: str
     bitrix_oauth_token_endpoint: str
@@ -411,6 +415,11 @@ def get_settings() -> Settings:
         bitrix_task_draft_ttl_minutes=_env_int("BITRIX_TASK_DRAFT_TTL_MINUTES", 24 * 60) or (24 * 60),
         bitrix_task_close_report_admin_user_ids=_env("BITRIX_TASK_CLOSE_REPORT_ADMIN_USER_IDS", "1"),
         bitrix_task_close_report_auto_restore_hours=_env_int_default("BITRIX_TASK_CLOSE_REPORT_AUTO_RESTORE_HOURS", 24),
+        bitrix_task_close_control_worker_enabled=_env_bool("BITRIX_TASK_CLOSE_CONTROL_WORKER_ENABLED", False),
+        bitrix_task_close_control_interval_seconds=_env_int("BITRIX_TASK_CLOSE_CONTROL_INTERVAL_SECONDS", 5 * 60)
+        or (5 * 60),
+        bitrix_task_close_control_direct_limit=_env_int("BITRIX_TASK_CLOSE_CONTROL_DIRECT_LIMIT", 20) or 20,
+        bitrix_task_close_control_auto_close_limit=_env_int("BITRIX_TASK_CLOSE_CONTROL_AUTO_CLOSE_LIMIT", 100) or 100,
         bitrix_oauth_app_path=_env("BITRIX_OAUTH_APP_PATH", "/bitrix/app"),
         bitrix_oauth_callback_path=_env("BITRIX_OAUTH_CALLBACK_PATH", "/bitrix/oauth/callback"),
         bitrix_oauth_token_endpoint=_env("BITRIX_OAUTH_TOKEN_ENDPOINT", "https://oauth.bitrix.info/oauth/token/"),

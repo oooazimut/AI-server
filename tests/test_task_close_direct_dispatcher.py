@@ -20,6 +20,7 @@ from ai_server.utils import MOSCOW_TZ
 from ai_server.workers.bitrix.task_close_direct_dispatcher import (
     auto_close_direct_task_close_reports,
     dispatch_direct_task_close_drafts,
+    run_task_close_direct_control_once,
 )
 from tests.fakes import FakePortalSearchIndex
 
@@ -201,6 +202,38 @@ def test_dispatcher_ignores_pending_queue_item(monkeypatch):
     state = store.get_task_close_processing_state(task_id=8875, state_key=direct_close_state_key("event-a"))
     assert state is not None
     assert state["status"] == TASK_CLOSE_DIRECT_STATUS_PENDING
+
+
+def test_control_worker_once_dispatches_and_records_status(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    store = DraftQueueStore()
+    bitrix = RecordingBitrix()
+    enqueue_direct_close_event(
+        store,
+        task_id=8875,
+        close_event_key="event-a",
+        responsible_id=231,
+        dialog_key="231",
+        payload={"recipient_id": "231", "draft_dialog_key": "dialog:231:user:231"},
+    )
+    activate_next_direct_close_event(store, responsible_id=231, dialog_key="231")
+    status: dict = {}
+
+    result = anyio.run(
+        lambda: run_task_close_direct_control_once(
+            bitrix=bitrix,
+            store=store,
+            settings=get_settings(),
+            status=status,
+            now=datetime(2026, 7, 12, 19, 0, tzinfo=MOSCOW_TZ),
+        )
+    )
+
+    assert result["dispatch"]["drafts_created"] == 1
+    assert result["auto_close"]["due"] is False
+    assert status["last_check_at"] == "2026-07-12T19:00:00+03:00"
+    assert status["dispatch"]["messages_sent"] == 1
+    assert bitrix.messages
 
 
 def test_auto_close_direct_queue_writes_unknown_report_when_no_draft(monkeypatch):

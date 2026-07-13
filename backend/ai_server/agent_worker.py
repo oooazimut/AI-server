@@ -52,6 +52,7 @@ from ai_server.workers.bitrix.reconciler import run_reconciler
 from ai_server.workers.bitrix.search_indexer import PortalSearchIndexerWorker
 from ai_server.workers.bitrix.staff_roster_publisher import publish_staff_roster
 from ai_server.workers.bitrix.supervisor import run_task_supervisor
+from ai_server.workers.bitrix.task_close_direct_dispatcher import run_task_close_direct_control_worker
 from ai_server.workers.bitrix.webhook_event_queue import run_webhook_event_worker
 from ai_server.workers.diagnost.event_worker import run_diagnost_event_worker
 from ai_server.workers.diagnost.feedback_receiver import FeedbackReceiverAdapter
@@ -398,6 +399,29 @@ async def main() -> None:
         agent_tasks.append(asyncio.create_task(run_staff_sync(vehicle_usage_store, settings.redis_url)))
     if settings.search_background_periodic_enabled:
         agent_tasks.append(asyncio.create_task(portal_search_indexer.run_periodic()))
+    if settings.bitrix_task_close_control_worker_enabled:
+        _task_close_direct_status: dict = {
+            "enabled": settings.bitrix_task_close_control_worker_enabled,
+            "running": False,
+            "interval_seconds": settings.bitrix_task_close_control_interval_seconds,
+            "last_check_at": None,
+            "last_success_at": None,
+            "last_error": None,
+            "next_check_at": None,
+            "runs": 0,
+            "errors": 0,
+        }
+        agent_tasks.append(
+            asyncio.create_task(
+                run_task_close_direct_control_worker(
+                    bitrix=bitrix,
+                    bitrix_oauth=bitrix_oauth,
+                    store=portal_search,
+                    settings=settings,
+                    status=_task_close_direct_status,
+                )
+            )
+        )
     if settings.supervisor_enabled:
         _supervisor_status: dict = {
             "enabled": settings.supervisor_enabled,
