@@ -22,7 +22,10 @@ from ai_server.integrations.bitrix.task_close_direct_queue import (
     TASK_CLOSE_DIRECT_STATUS_DISCARDED,
     direct_close_state_key,
 )
-from ai_server.integrations.bitrix.task_close_reports import task_close_report_state_key
+from ai_server.integrations.bitrix.task_close_reports import (
+    task_close_report_problem_types_from_text,
+    task_close_report_state_key,
+)
 from ai_server.models import ToolStatus
 from ai_server.settings import get_settings
 from tests.fakes import FakePortalSearchIndex, FakeTaskDraftStore
@@ -63,6 +66,25 @@ class _TaskDetailClient:
     async def result(self, method: str, params: dict) -> dict:
         self.calls.append((method, params))
         return {"task": self.task}
+
+
+def test_ai_close_report_parser_prefers_machine_problem_types_over_human_prompts():
+    text = """AI-close report
+Задача #8993: Проверка
+
+3. Статус выполнения работ
+   (выполнено полностью / [ВЫБРАНО: выполнено частично] / не выполнено; если выполнено частично или не выполнено - укажи причину неполного выполнения работ)
+3.1 причина: машинный блок будет проверен после индексации
+3.2 Еще причины невыполнения - ... ???
+
+---
+Machine metadata
+Status: unconfirmed
+Problem types: unconfirmed
+AI marker: AI_SERVER_TASK_CLOSE_INCOMPLETE
+"""
+
+    assert task_close_report_problem_types_from_text(text) == ["unconfirmed"]
 
 
 def _exec(tool, args, *, user_id=None, dialog_key=None, dialog_id=None):
