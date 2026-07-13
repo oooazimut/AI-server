@@ -1904,7 +1904,9 @@ def _common_task_close_active_update_decision(
 def _task_close_active_update_args(request: str, *, draft: dict[str, Any], task_id: int) -> dict[str, Any]:
     summary = _task_close_update_summary(request, task_id=task_id)
     lowered = summary.casefold()
+    task_points = _text_items(draft.get("task_points"))
     work_summary = _task_close_work_summary_from_text(summary)
+    work_summary = _task_close_expand_numbered_work_summary(work_summary, task_points=task_points)
     work_lowered = work_summary.casefold()
     status_section = _task_close_section_text(summary, 3)
     status_text = status_section or (summary if not _task_close_has_section_markers(summary) else "")
@@ -1930,7 +1932,6 @@ def _task_close_active_update_args(request: str, *, draft: dict[str, Any], task_
     )
     if status_reasons:
         args["status_reasons"] = status_reasons
-    task_points = _text_items(draft.get("task_points"))
     not_done_items = _task_close_not_done_items_from_text(work_summary, work_lowered, task_points=task_points)
     if not_done_items:
         args["not_done_items"] = not_done_items
@@ -1955,7 +1956,25 @@ def _task_close_update_summary(request: str, *, task_id: int) -> str:
 def _task_close_work_summary_from_text(summary: str) -> str:
     text = _task_close_section_text(summary, 1) or _task_close_before_any_block(summary, (2, 3, 4))
     text = re.sub(r"^\s*(?:по\s+)?пункт[ау]?\s+1\s*:?", "", text, flags=re.IGNORECASE)
+    if re.search(r"(?<!\d)1\.\d+\s+", text):
+        return compact_text(text).strip(" .;:-")
     return _task_close_clean_referenced_text(text)
+
+
+def _task_close_expand_numbered_work_summary(summary: str, *, task_points: list[str]) -> str:
+    if not summary or not task_points:
+        return summary
+    items: list[str] = []
+    for match in re.finditer(r"(?<!\d)1\.(\d+)\s+(.+?)(?=(?:\s+1\.\d+\s+)|$)", summary, flags=re.DOTALL):
+        point_index = optional_int(match.group(1))
+        if point_index is None or point_index < 1 or point_index > len(task_points):
+            continue
+        value = _task_close_clean_referenced_text(match.group(2)).strip(" ,.;:-")
+        if not value:
+            continue
+        point = task_points[point_index - 1]
+        items.append(value if _task_close_texts_overlap(point.casefold(), value) else f"{point} {value}")
+    return ". ".join(items) if items else summary
 
 
 def _task_close_equipment_from_text(summary: str, lowered: str) -> str:
@@ -1972,6 +1991,7 @@ def _task_close_equipment_from_text(summary: str, lowered: str) -> str:
         section,
         flags=re.IGNORECASE,
     )
+    section = re.sub(r"^\s*2\s+", "", section)
     section = re.sub(r"^\s*(?:оборудование|расходники)\s*:?", "", section, flags=re.IGNORECASE)
     return _task_close_clean_referenced_text(section)
 
@@ -1986,6 +2006,7 @@ def _task_close_additional_info_from_text(summary: str) -> str:
         section,
         flags=re.IGNORECASE,
     )
+    section = re.sub(r"^\s*4\s+", "", section)
     return _task_close_clean_referenced_text(section)
 
 
@@ -2059,7 +2080,7 @@ def _task_close_status_items_from_text(summary: str, *, task_points: list[str], 
 
 def _task_close_reason_from_text(summary: str) -> str:
     match = re.search(
-        r"\bпричин[аы]?\s*:\s*(.+?)(?=(?:\.\s*(?:по\s+)?пункт[ау]?\s+4\b)|$)",
+        r"\bпричин[аы]?\s*:?\s*(.+?)(?=(?:\.\s*(?:(?:по\s+)?пункт[ау]?\s+4\b|4\b))|$)",
         summary,
         flags=re.IGNORECASE | re.DOTALL,
     )
@@ -2069,28 +2090,25 @@ def _task_close_reason_from_text(summary: str) -> str:
 
 
 def _task_close_section_text(summary: str, section_number: int) -> str:
-    pattern = rf"(?:по\s+)?пункт[ау]?\s+{section_number}\b"
-    match = re.search(pattern, summary, flags=re.IGNORECASE)
+    match = re.search(_task_close_section_marker_pattern(section_number), summary, flags=re.IGNORECASE)
     if not match:
         return ""
-    next_match = re.search(
-        rf"(?:по\s+)?пункт[ау]?\s+(?:{section_number + 1}|[1-4])\b",
-        summary[match.end() :],
-        flags=re.IGNORECASE,
-    )
+    next_match = _task_close_next_section_match(summary[match.end() :], section_number)
     end = match.end() + next_match.start() if next_match else len(summary)
     return compact_text(summary[match.start() : end]).strip(" .;")
 
 
 def _task_close_has_section_markers(summary: str) -> bool:
-    return bool(re.search(r"(?:по\s+)?пункт[ау]?\s+[1-4]\b", summary, flags=re.IGNORECASE))
+    return any(
+        re.search(_task_close_section_marker_pattern(number), summary, flags=re.IGNORECASE) for number in range(1, 5)
+    )
 
 
 def _task_close_before_any_block(summary: str, section_numbers: tuple[int, ...]) -> str:
     matches = [
         match
         for number in section_numbers
-        if (match := re.search(rf"(?:по\s+)?пункт[ау]?\s+{number}\b", summary, flags=re.IGNORECASE))
+        if (match := re.search(_task_close_section_marker_pattern(number), summary, flags=re.IGNORECASE))
     ]
     if not matches:
         return compact_text(summary).strip(" .;")
@@ -2099,8 +2117,28 @@ def _task_close_before_any_block(summary: str, section_numbers: tuple[int, ...])
 
 
 def _task_close_before_block(summary: str, section_number: int) -> str:
-    match = re.search(rf"(?:по\s+)?пункт[ау]?\s+{section_number}\b", summary, flags=re.IGNORECASE)
+    match = re.search(_task_close_section_marker_pattern(section_number), summary, flags=re.IGNORECASE)
     return compact_text(summary[: match.start()] if match else summary).strip(" .;")
+
+
+def _task_close_section_marker_pattern(section_number: int) -> str:
+    explicit = rf"(?:по\s+)?пункт[ау]?\s+{section_number}\b"
+    numeric_markers = {
+        2: r"(?<![\d.])2(?![\d.])(?=\s+(?:использ|не\s+использ|примен|не\s+примен|оборуд|материал|расход))",
+        3: r"(?<![\d.])3(?![\d.])(?=\s+(?:статус|выполн|не\s+выполн|частич|причин))",
+        4: r"(?<![\d.])4(?![\d.])(?=\s+(?:отсутств|нет|доп|информац|нужно|надо|требуется|вернуться))",
+    }
+    numeric = numeric_markers.get(section_number)
+    return rf"(?:{explicit}|{numeric})" if numeric else explicit
+
+
+def _task_close_next_section_match(text: str, section_number: int) -> re.Match[str] | None:
+    matches = [
+        match
+        for number in range(section_number + 1, 5)
+        if (match := re.search(_task_close_section_marker_pattern(number), text, flags=re.IGNORECASE))
+    ]
+    return min(matches, key=lambda item: item.start()) if matches else None
 
 
 def _task_close_clean_referenced_text(value: str) -> str:
