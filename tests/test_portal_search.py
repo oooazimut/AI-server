@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist, BitrixLLMToolCall
 from ai_server.agents.bitrix24.tools import PortalSearchTool
+from ai_server.integrations.bitrix.client import BitrixApiError
 from ai_server.integrations.bitrix.portal_search import (
     sync_disk_delta_index,
     sync_portal_content_index,
@@ -1019,6 +1020,47 @@ def test_portal_metadata_sync_deduplicates_disk_roots(monkeypatch):
     assert index.get_item(entity_type="disk_storage", entity_id=11) is not None
     assert index.get_item(entity_type="disk_file", entity_id=501) is not None
     assert index.get_item(entity_type="disk_folder", entity_id=502) is not None
+
+
+def test_portal_metadata_sync_continues_after_disk_folder_502(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    monkeypatch.setenv("SEARCH_INDEX_MAX_TASK_ATTACHMENTS", "10")
+    monkeypatch.setenv("SEARCH_INDEX_MAX_DISK_ITEMS", "20")
+
+    class OneBrokenDiskBitrix(FakePortalBitrix):
+        async def list_disk_storages(self, *, limit: int | None = None):
+            storages = [
+                {"ID": 20, "ROOT_OBJECT_ID": 600, "NAME": "Broken Disk"},
+                {"ID": 10, "ROOT_OBJECT_ID": 500, "NAME": "Shared Disk"},
+            ]
+            return storages[:limit] if limit else storages
+
+        async def list_disk_folder_children_all(
+            self,
+            *,
+            folder_id: int,
+            filter_: dict | None = None,
+            limit: int | None = None,
+        ):
+            if folder_id == 600:
+                raise BitrixApiError("disk.folder.getchildren", "HTTP_502", "Bad Gateway")
+            return await super().list_disk_folder_children_all(folder_id=folder_id, filter_=filter_, limit=limit)
+
+    index = FakePortalSearchIndex()
+    index.upsert_item(entity_type="disk_file", entity_id=999, title="Old file", metadata={"parent_id": 600})
+
+    stats = anyio_run(sync_portal_index(OneBrokenDiskBitrix(), index, settings=get_settings()))
+
+    assert stats.disk_items == 4
+    assert stats.errors == [
+        "disk: storage 20 root folder 600: Bitrix REST error in disk.folder.getchildren: HTTP_502 Bad Gateway"
+    ]
+    assert stats.prune_skipped == ["disk: incomplete after API errors"]
+    assert index.get_item(entity_type="disk_storage", entity_id=20) is not None
+    assert index.get_item(entity_type="disk_storage", entity_id=10) is not None
+    assert index.get_item(entity_type="disk_file", entity_id=501) is not None
+    assert index.get_item(entity_type="disk_file", entity_id=999) is not None
 
 
 def test_portal_delta_sync_updates_folder_and_deletes_missing_children(monkeypatch):
