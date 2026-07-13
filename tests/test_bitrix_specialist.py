@@ -662,7 +662,7 @@ def test_bitrix_specialist_enforces_structured_task_close_draft_response():
     assert "d:13" in store._drafts
     assert "Черновик #8869: Проверить камеру" in result.answer
     assert "1. Выполняемые работы" in result.answer
-    assert "1.1 камера проверена - уточнить по этому пункту ... ???" in result.answer
+    assert "1.1 камера проверена - ... ???" in result.answer
     assert "1.3 Еще работы - ... ???" in result.answer
     assert "2. Использовано материалов, оборудование" in result.answer
     assert "2.1 не указано" in result.answer
@@ -1225,6 +1225,85 @@ def test_bitrix_llm_routes_task_close_followup_keeps_status_block_out_of_equipme
     assert args["status_reasons"] == ["не хватило 30 метров кабеля"]
     assert "equipment_consumables" not in args
     assert "not_done_items" not in args
+
+
+def test_bitrix_llm_routes_task_close_followup_filters_wrong_extra_info_block_parts(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_close_draft", "description": "", "parameters": {}},
+        {"name": "task_close_confirm", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request=("По задаче 8899: 4 нужно вернуться завтра, использовал 5 датчиков и работа не выполнена."),
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "task_close",
+                        "task_id": 8899,
+                        "task_title": "Проверить объект",
+                        "task_points": ["Проверить камеру"],
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_close_active_update_route"}
+    args = result.decision.tool_calls[0].args
+    assert args["additional_info"] == "нужно вернуться завтра"
+    assert "equipment_consumables" not in args
+    assert "overall_status" not in args
+
+
+def test_bitrix_llm_routes_task_close_followup_keeps_future_extra_info_with_equipment_words(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_close_draft", "description": "", "parameters": {}},
+        {"name": "task_close_confirm", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request="По задаче 8899: 4 нужно взять с собой 5 камер, вернуться завтра.",
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "task_close",
+                        "task_id": 8899,
+                        "task_title": "Проверить объект",
+                        "task_points": ["Проверить камеру"],
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_close_active_update_route"}
+    args = result.decision.tool_calls[0].args
+    assert args["additional_info"] == "нужно взять с собой 5 камер, вернуться завтра"
+    assert "equipment_consumables" not in args
 
 
 def test_bitrix_llm_routes_task_close_conflict_switch_to_requested_without_llm(monkeypatch):
@@ -1891,7 +1970,7 @@ def test_bitrix_llm_compose_formats_structured_task_close_draft(monkeypatch):
     assert client.calls == []
     assert result.status == "needs_human"
     assert "1. Выполняемые работы" in result.answer
-    assert "1.1 камеры подключены - уточнить по этому пункту ... ???" in result.answer
+    assert "1.1 камеры подключены - ... ???" in result.answer
     assert "1.3 Еще работы - ... ???" in result.answer
     assert "2. Использовано материалов, оборудование" in result.answer
     assert "2.1 4 камеры" in result.answer

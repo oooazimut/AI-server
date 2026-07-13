@@ -941,7 +941,9 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
         lines.extend(f"4.{index} {item}" for index, item in enumerate(additional_items, start=1))
         lines.append(f"4.{len(additional_items) + 1} Еще информация - ... ???")
     lines.append("")
-    lines.append('Действия: допишите данные или напишите "да, закрывай как есть".')
+    lines.append(
+        'Внести изменения (укажите пункт или подпункт и нужную информацию) или напишите: "да, закрывай как есть".'
+    )
     return "\n".join(lines)
 
 
@@ -1051,7 +1053,7 @@ def _task_close_point_status(
     if completed_label:
         return completed_label
     if result_text:
-        return "уточнить по этому пункту ... ???"
+        return "... ???"
     return "... ???"
 
 
@@ -2033,7 +2035,7 @@ def _task_close_additional_info_from_text(summary: str) -> str:
         flags=re.IGNORECASE,
     )
     section = re.sub(r"^\s*4\s+", "", section)
-    return _task_close_clean_referenced_text(section)
+    return _task_close_filter_additional_info_text(_task_close_clean_referenced_text(section))
 
 
 def _task_close_overall_status_from_text(lowered: str) -> str:
@@ -2174,6 +2176,60 @@ def _task_close_clean_referenced_text(value: str) -> str:
     text = re.sub(r"^(?:\d+\.\d+|\d+[.)])\s*", "", text)
     text = re.sub(r"^\s*(?:по\s+)?пункт[ау]?\s+\d+(?:\.\d+)?\s*:?", "", text, flags=re.IGNORECASE)
     return compact_text(text).strip(" .;:-")
+
+
+def _task_close_filter_additional_info_text(value: str) -> str:
+    text = compact_text(value)
+    if not text or _task_close_absent_value(text):
+        return text
+    kept: list[str] = []
+    for item in _task_close_display_items(text):
+        if _task_close_additional_info_item_allowed(item):
+            kept.append(item)
+    return ", ".join(kept)
+
+
+def _task_close_additional_info_item_allowed(value: str) -> bool:
+    text = compact_text(value)
+    lowered = text.casefold()
+    if not text:
+        return False
+    future_markers = (
+        "нужно",
+        "надо",
+        "требуется",
+        "следующ",
+        "взять с собой",
+        "вернуться",
+        "потом",
+        "завтра",
+        "на будущее",
+    )
+    if any(marker in lowered for marker in future_markers):
+        return True
+    wrong_block_patterns = (
+        r"\bиспользова",
+        r"\bизрасходова",
+        r"\bприменил",
+        r"\bприменили",
+        r"\bпоставил",
+        r"\bпоставили",
+        r"\bустановил",
+        r"\bустановили",
+        r"\bподключил",
+        r"\bподключили",
+        r"\bсмонтировал",
+        r"\bсмонтировали",
+        r"\bзаменил",
+        r"\bзаменили",
+        r"\bработ[аы]\s+(?:выполн|не\s+выполн|частич)",
+        r"\bзадач[ауы]?\s+(?:выполн|не\s+выполн|частич)",
+        r"\b(?:выполнено|выполнена)\s+(?:полностью|частично)",
+        r"\bне\s+выполнено\b",
+        r"\bне\s+выполнена\b",
+        r"\bпричин[аы]?\b",
+    )
+    return not any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in wrong_block_patterns)
 
 
 def _task_close_summary_targets_task_points(summary: str, task_points: list[str]) -> bool:
