@@ -127,7 +127,16 @@ def test_dispatcher_creates_direct_close_draft_and_sends_message(monkeypatch):
     assert draft["_direct_close_close_event_key"] == "closed_at:2026-07-12T12:00:00+03:00"
     assert draft["completion_summary"] == "Камеры проверены"
     assert bitrix.messages[0][0] == "231"
-    assert "Задача закрыта напрямую в Bitrix" in bitrix.messages[0][1]
+    message = bitrix.messages[0][1]
+    assert "Задача закрыта напрямую в Bitrix" in message
+    assert "Черновик #8875" in message
+    assert "1. Выполняемые работы" in message
+    assert "1.1 Проверить камеры" in message
+    assert "1.3 Еще работы - ... ???" in message
+    assert "2. Использовано материалов, оборудование" in message
+    assert "3. Статус выполнения работ" in message
+    assert "4. Дополнительная информация" in message
+    assert "Пункты задачи:" not in message
     state = store.get_task_close_processing_state(
         task_id=8875,
         state_key=direct_close_state_key("closed_at:2026-07-12T12:00:00+03:00"),
@@ -135,6 +144,37 @@ def test_dispatcher_creates_direct_close_draft_and_sends_message(monkeypatch):
     assert state is not None
     assert state["status"] == TASK_CLOSE_DIRECT_STATUS_ACTIVE
     assert state["payload"]["direct_close_draft_sent_at"]
+
+
+def test_dispatcher_keeps_direct_close_points_unknown_without_specific_result(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    store = DraftQueueStore()
+    bitrix = RecordingBitrix()
+    enqueue_direct_close_event(
+        store,
+        task_id=8876,
+        close_event_key="closed_at:2026-07-12T12:00:00+03:00",
+        responsible_id=231,
+        dialog_key="231",
+        closed_at="2026-07-12T12:00:00+03:00",
+        task_title="Проверить прямое закрытие",
+        payload={
+            "recipient_id": "231",
+            "draft_dialog_key": "dialog:231:user:231",
+            "task_points": ["Проверить прямое закрытие задачи", "Проверить новый черновик"],
+            "source_task_description_empty": False,
+        },
+    )
+    activate_next_direct_close_event(store, responsible_id=231, dialog_key="231")
+
+    stats = anyio.run(lambda: dispatch_direct_task_close_drafts(bitrix=bitrix, store=store, settings=get_settings()))
+
+    assert stats.drafts_created == 1
+    message = bitrix.messages[0][1]
+    assert "1.1 Проверить прямое закрытие задачи - ... ???" in message
+    assert "1.2 Проверить новый черновик - ... ???" in message
+    assert "1.3 Еще работы - ... ???" in message
+    assert "1.1 Проверить прямое закрытие задачи - не подтверждено" not in message
 
 
 def test_dispatcher_does_not_send_duplicate_message(monkeypatch):

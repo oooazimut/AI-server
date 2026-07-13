@@ -11,6 +11,7 @@ from ai_server.agents.bitrix24.tools.task_close import (
     TASK_CLOSE_DRAFT_TYPE,
     _execute_task_close,
     build_task_close_draft_from_args,
+    format_task_close_draft_message,
 )
 from ai_server.agents.bitrix24.tools.task_close_control import (
     TASK_CLOSE_AUTO_CLOSE_TIME_KEY,
@@ -681,43 +682,13 @@ def _build_direct_close_draft(*, state: dict[str, Any], payload: dict[str, Any])
 
 
 def _direct_close_draft_message(draft: dict[str, Any]) -> str:
-    task_id = str(draft.get("task_id") or "")
-    title = str(draft.get("task_title") or f"#{task_id}").strip()
-    result = str(draft.get("completion_summary") or "").strip()
-    task_points = _string_list(draft.get("task_points"))
-    missing = _string_list(draft.get("missing_fields"))
-    unconfirmed = _string_list(draft.get("unconfirmed_items"))
-    lines = [
-        "Задача закрыта напрямую в Bitrix.",
-        "Нужно подтвердить результат для AI-контроля.",
-        "",
-        "Черновик закрытия задачи:",
-        f"Задача: {title}",
-        "Действие: сохранить AI-отчёт по закрытию",
-    ]
-    if task_points:
-        lines.append("Пункты задачи:")
-        lines.extend(f"{index}. {item}" for index, item in enumerate(task_points, start=1))
-    else:
-        lines.append("Описание выполненной работы:")
-        lines.append(f"- {result or '? кратко напишите, что было сделано'}")
-    lines.append("Оборудование, расходники: ? что использовано")
-    if result and task_points:
-        lines.append(f"Результат: {result}")
-    lines.append("Итог: не подтверждено")
-    if unconfirmed:
-        lines.append("Не подтверждено:")
-        lines.extend(f"- {item}" for item in unconfirmed)
-    if missing:
-        lines.append("Нужно дописать:")
-        lines.extend(f"- {item}" for item in missing)
-    lines.extend(
-        [
-            "",
-            'Внести изменения (укажите пункт или подпункт и нужную информацию) или напишите: "да, закрывай как есть".',
-        ]
+    return format_task_close_draft_message(
+        draft,
+        intro_lines=[
+            "Задача закрыта напрямую в Bitrix.",
+            "Нужно подтвердить результат для AI-контроля.",
+        ],
     )
-    return "\n".join(lines)
 
 
 def _update_state(store: Any, *, state: dict[str, Any], payload: dict[str, Any]) -> None:

@@ -1406,6 +1406,253 @@ def _report_file_content(*, task_id: int, action: str, draft: dict[str, Any]) ->
     return "\n".join(lines).strip() + "\n"
 
 
+def format_task_close_draft_message(
+    draft: dict[str, Any],
+    *,
+    preview: dict[str, Any] | None = None,
+    intro_lines: list[str] | None = None,
+) -> str:
+    preview = preview if isinstance(preview, dict) else {}
+    task_id = _draft_text(draft.get("task_id"))
+    task_title = _draft_text(preview.get("task_title")) or _draft_text(draft.get("task_title")) or f"задача #{task_id}"
+    raw_result_text = _draft_text(preview.get("completion_summary")) or _draft_text(draft.get("completion_summary"))
+    result_text = "" if _task_close_is_placeholder_summary(raw_result_text) else raw_result_text
+    task_points = _string_list(preview.get("task_points") or draft.get("task_points"))
+    source_task_description_empty = bool(
+        preview.get("source_task_description_empty") or draft.get("source_task_description_empty")
+    )
+    equipment = _draft_text(preview.get("equipment_consumables")) or _draft_text(draft.get("equipment_consumables"))
+    additional_info = _draft_text(preview.get("additional_info")) or _draft_text(draft.get("additional_info"))
+    overall_status = _draft_text(preview.get("overall_status")) or _draft_text(draft.get("overall_status"))
+    overall = _draft_text(preview.get("overall_status_label")) or _draft_text(draft.get("overall_status_label"))
+    if overall.casefold() == "результат не подтверждён" and not result_text:
+        overall = ""
+    not_done = _string_list(preview.get("not_done_items") or draft.get("not_done_items"))
+    unconfirmed = _string_list(preview.get("unconfirmed_items") or draft.get("unconfirmed_items"))
+    status_reasons = _string_list(preview.get("status_reasons") or draft.get("status_reasons"))
+    unresolved = _string_list(preview.get("unresolved_items") or draft.get("unresolved_items"))
+    if not unconfirmed and unresolved:
+        unconfirmed = unresolved
+    unconfirmed = _task_close_visible_unconfirmed(unconfirmed, task_points=task_points, result_text=result_text)
+
+    lines: list[str] = [line for line in (intro_lines or []) if str(line).strip()]
+    if lines:
+        lines.append("")
+    lines.extend([f"Черновик #{task_id or '?'}: {task_title}", ""])
+    lines.append("1. Выполняемые работы")
+    if source_task_description_empty:
+        result_items = _task_close_display_items(result_text)
+        if result_items:
+            lines.extend(f"1.{index} {item}" for index, item in enumerate(result_items, start=1))
+            lines.append(f"1.{len(result_items) + 1} Еще работы - ... ???")
+        else:
+            lines.append("1.1 Еще работы - ... ???")
+    elif task_points:
+        lines.extend(
+            f"1.{index} {item} - {_task_close_point_status(item, result_text, not_done, unconfirmed)}"
+            for index, item in enumerate(task_points, start=1)
+        )
+        lines.append(f"1.{len(task_points) + 1} Еще работы - ... ???")
+    elif result_text:
+        result_items = _task_close_display_items(result_text)
+        lines.extend(f"1.{index} {item}" for index, item in enumerate(result_items, start=1))
+        lines.append(f"1.{len(result_items) + 1} Еще работы - ... ???")
+    else:
+        lines.append("1.1 Еще работы - ... ???")
+
+    lines.append("")
+    lines.append("2. Использовано материалов, оборудование")
+    if _task_close_no_equipment_value(equipment):
+        lines.append("   (перечисли, что использовали, или укажи: [ВЫБРАНО: не использовалось])")
+    else:
+        lines.append("   (перечисли, что использовали, или укажи: не использовалось)")
+        equipment_items = _task_close_display_items(equipment)
+        if equipment_items:
+            lines.extend(f"2.{index} {item}" for index, item in enumerate(equipment_items, start=1))
+            lines.append(f"2.{len(equipment_items) + 1} Еще материалы - ... ???")
+
+    lines.append("")
+    lines.append("3. Статус выполнения работ")
+    lines.append(f"   {_task_close_status_prompt(overall_status or overall)}")
+    if status_reasons:
+        for index, item in enumerate(status_reasons, start=1):
+            lines.append(f"3.{index} причина: {item}")
+        lines.append(f"3.{len(status_reasons) + 1} Еще причины невыполнения - ... ???")
+    elif _task_close_status_needs_reason(overall_status or overall):
+        lines.append("3.1 Еще причины невыполнения - ... ???")
+
+    lines.append("")
+    lines.append("4. Дополнительная информация")
+    if _task_close_absent_value(additional_info):
+        lines.append("   (если есть - укажи; если нет - укажи: [ВЫБРАНО: отсутствует])")
+    else:
+        lines.append("   (если есть - укажи; если нет - укажи: отсутствует)")
+    additional_items = _task_close_display_items(additional_info)
+    if additional_items and not _task_close_absent_value(additional_info):
+        lines.extend(f"4.{index} {item}" for index, item in enumerate(additional_items, start=1))
+        lines.append(f"4.{len(additional_items) + 1} Еще информация - ... ???")
+
+    lines.extend(
+        [
+            "",
+            'Внести изменения (укажите пункт или подпункт и нужную информацию) или напишите: "да, закрывай как есть".',
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _draft_text(value: object) -> str:
+    return compact_text(str(value or ""))
+
+
+def _task_close_status_prompt(status: str) -> str:
+    normalized = _task_close_normalized_status(status)
+    options = [
+        ("completed", "выполнено полностью"),
+        ("partial", "выполнено частично"),
+        ("not_done", "не выполнено"),
+    ]
+    rendered = [f"[ВЫБРАНО: {label}]" if normalized == key else label for key, label in options]
+    return (
+        f"({' / '.join(rendered)}; если выполнено частично или не выполнено - "
+        "укажи причину неполного выполнения работ)"
+    )
+
+
+def _task_close_normalized_status(status: str) -> str:
+    text = compact_text(status).casefold()
+    if text in {"completed", "complete", "done"} or "полностью" in text:
+        return "completed"
+    if text in {"partial", "partially_done", "partly_done"} or "частич" in text:
+        return "partial"
+    if text in {"not_done", "not_completed", "not done"} or "не выполн" in text or "не сделан" in text:
+        return "not_done"
+    return ""
+
+
+def _task_close_status_needs_reason(status: str) -> bool:
+    return _task_close_normalized_status(status) in {"partial", "not_done"}
+
+
+def _task_close_absent_value(value: str) -> bool:
+    text = compact_text(value).casefold()
+    return text in {"отсутствует", "нет", "не было", "нет дополнительной информации"}
+
+
+def _task_close_no_equipment_value(value: str) -> bool:
+    text = compact_text(value).casefold().strip(" .;:-")
+    if not text:
+        return False
+    if text in {
+        "не использовалось",
+        "не использовались",
+        "не использовали",
+        "не применялось",
+        "не применяли",
+        "не было",
+        "нет",
+        "ничего",
+        "без материалов",
+        "без оборудования",
+        "материалы не использовались",
+        "оборудование не использовалось",
+    }:
+        return True
+    return ("не использ" in text or "не примен" in text) and not any(char.isdigit() for char in text)
+
+
+def _task_close_is_placeholder_summary(value: str) -> bool:
+    text = compact_text(value)
+    if not text:
+        return False
+    lowered = text.casefold()
+    if "статус ai-закрытия" in lowered:
+        return True
+    if "результат выполнения не указан" in lowered:
+        return True
+    return "общий итог: результат не подтвержд" in lowered and (
+        lowered.startswith("пункты задачи:") or "неподтверждённые пункты" in lowered
+    )
+
+
+def _task_close_visible_unconfirmed(
+    values: list[str],
+    *,
+    task_points: list[str],
+    result_text: str,
+) -> list[str]:
+    if result_text:
+        return values
+    point_keys = {item.casefold() for item in task_points}
+    visible: list[str] = []
+    for value in values:
+        key = value.casefold()
+        if key in {"результат выполнения не указан", "result is not specified"}:
+            continue
+        if (
+            ("результат закрытия" in key and "не подтверж" in key)
+            or "ai-черновик" in key
+            or "ai draft" in key
+        ):
+            continue
+        if key in point_keys:
+            continue
+        visible.append(value)
+    return visible
+
+
+def _task_close_display_items(value: str) -> list[str]:
+    text = compact_text(value)
+    if not text:
+        return []
+    raw_parts = re.split(r"(?:\r?\n)+|(?:^|\s)(?:\d+[.)]|[-*•])\s+|[,;]+", text)
+    parts = _unique_strings([part.strip(" .;:-") for part in raw_parts])
+    return parts[:12] if len(parts) > 1 else ([text] if text else [])
+
+
+def _task_close_point_status(
+    point: str,
+    result_text: str,
+    not_done: list[str],
+    unconfirmed: list[str],
+) -> str:
+    point_cf = point.casefold()
+    for item in not_done:
+        if _task_close_texts_overlap(point_cf, item):
+            return "не выполнено"
+    for item in unconfirmed:
+        if _task_close_texts_overlap(point_cf, item):
+            return "не подтверждено"
+    completed_label = _task_close_point_completed_label(point, result_text)
+    if completed_label:
+        return completed_label
+    return "... ???"
+
+
+def _task_close_point_completed_label(point: str, result_text: str) -> str:
+    if not result_text:
+        return ""
+    point_cf = point.casefold()
+    clauses = re.split(r"(?:\r?\n)+|[.;]+|,(?=\s*\d+\.\d+)", result_text)
+    for clause in clauses:
+        clause_cf = clause.casefold()
+        if "не выполн" in clause_cf or "не подтверж" in clause_cf:
+            continue
+        if ("выполн" in clause_cf or "сделан" in clause_cf or "готов" in clause_cf) and _task_close_texts_overlap(
+            point_cf, clause
+        ):
+            return "выполнено полностью" if "полностью" in clause_cf else "выполнено"
+    return ""
+
+
+def _task_close_texts_overlap(point_cf: str, value: str) -> bool:
+    value_cf = value.casefold()
+    if point_cf and point_cf in value_cf:
+        return True
+    words = [word for word in re.findall(r"[0-9A-Za-zА-Яа-яЁё]+", point_cf) if len(word) >= 5]
+    return bool(words and any(word in value_cf for word in words[:4]))
+
+
 def _ai_close_human_status(not_done_items: list[str], unconfirmed_items: list[str]) -> str:
     if not_done_items and unconfirmed_items:
         return "выполнена частично, неподтвержденная"
