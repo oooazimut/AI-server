@@ -59,6 +59,8 @@ def task_close_report_problem_types_from_text(text: object) -> list[str]:
         problem_types.append("not_done")
     if status in {"unconfirmed", "unknown"}:
         problem_types.append("unconfirmed")
+    if explicit_problem_types or status:
+        return _unique_problem_types(problem_types)
     if "not done:" in lowered or "невыполн" in lowered:
         problem_types.append("not_done")
     if "unconfirmed:" in lowered or "неподтверж" in lowered or "не подтверж" in lowered:
