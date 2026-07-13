@@ -284,6 +284,95 @@ def test_close_draft_merges_same_task_update_without_resetting_known_fields():
     assert draft["missing_fields"] == []
 
 
+def test_close_draft_update_rewrites_named_work_point_status():
+    store = FakeTaskDraftStore()
+    tool = TaskCloseDraftTool(store=store)
+
+    first = _exec(
+        tool,
+        {
+            "task_id": 139,
+            "task_title": "Проверить объект",
+            "task_points": ["Проверить камеру", "Забрать документы", "Починить селектор"],
+            "completion_summary": (
+                "Проверить камеру выполнено полностью. "
+                "Забрать документы не выполнено. "
+                "Починить селектор не подтверждено"
+            ),
+            "overall_status": "partial",
+            "not_done_items": ["Забрать документы"],
+            "unconfirmed_items": ["Починить селектор"],
+            "missing_fields": [],
+        },
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+    second = _exec(
+        tool,
+        {
+            "task_id": 139,
+            "completion_summary": "Забрать документы выполнено полностью",
+        },
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+
+    assert first.status == ToolStatus.OK
+    assert second.status == ToolStatus.OK
+    draft = store._drafts["d:13"]
+    assert draft["not_done_items"] == []
+    assert draft["unconfirmed_items"] == ["Починить селектор"]
+    assert "Проверить камеру выполнено полностью" in draft["completion_summary"]
+    assert "Забрать документы выполнено полностью" in draft["completion_summary"]
+    assert "Забрать документы не выполнено" not in draft["completion_summary"]
+    assert "Починить селектор не подтверждено" in draft["completion_summary"]
+
+
+def test_close_draft_update_completed_status_clears_previous_reasons():
+    store = FakeTaskDraftStore()
+    tool = TaskCloseDraftTool(store=store)
+
+    first = _exec(
+        tool,
+        {
+            "task_id": 139,
+            "task_title": "Проверить объект",
+            "task_points": ["Проверить камеру"],
+            "completion_summary": "Проверить камеру не выполнено",
+            "overall_status": "partial",
+            "not_done_items": ["Проверить камеру"],
+            "status_reasons": ["не было доступа к архиву"],
+            "missing_fields": [],
+        },
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+    second = _exec(
+        tool,
+        {
+            "task_id": 139,
+            "completion_summary": "Проверить камеру выполнено полностью",
+            "overall_status": "completed",
+            "missing_fields": [],
+        },
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+
+    assert first.status == ToolStatus.OK
+    assert second.status == ToolStatus.OK
+    draft = store._drafts["d:13"]
+    assert draft["overall_status"] == "completed"
+    assert draft["not_done_items"] == []
+    assert draft["status_reasons"] == []
+    assert "Еще причины" not in draft["result_text"]
+    assert "не было доступа к архиву" not in draft["result_text"]
+
+
 def test_close_draft_update_removes_initial_unknown_result_placeholder():
     store = FakeTaskDraftStore()
     tool = TaskCloseDraftTool(store=store)
