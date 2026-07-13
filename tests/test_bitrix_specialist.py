@@ -1810,13 +1810,57 @@ def test_bitrix_llm_compose_formats_structured_task_close_draft(monkeypatch):
     assert "[ВЫБРАНО: выполнено частично]" in result.answer
     assert "3.1 причина: не было доступа к архиву" in result.answer
     assert "Причина/что не выполнено: не проверен архив" not in result.answer
-    assert "не проверен архив" in result.answer
+    assert "1.2 архив не проверен - не выполнено" in result.answer
     assert "Не подтверждено: нет фото результата" not in result.answer
     assert "4. Дополнительная информация" in result.answer
     assert "4.1 вернуться завтра" in result.answer
     assert "4.2 проверить доступ" in result.answer
     assert "да, закрывай как есть" in result.answer
     assert "[URL" not in result.answer
+
+
+def test_bitrix_llm_compose_formats_task_close_point_status_labels(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="закрой задачу", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="task_close_draft",
+                    data={
+                        "draft": {"_draft_type": "task_close", "task_id": 139, "task_title": "Проверить объект"},
+                        "preview": {
+                            "task_title": "Проверить объект",
+                            "completion_summary": (
+                                "Проверить камеру выполнено полностью. "
+                                "Забрать документы не выполнено. "
+                                "Починить селектор не подтверждено"
+                            ),
+                            "task_points": ["Проверить камеру", "Забрать документы", "Починить селектор"],
+                            "not_done_items": ["Забрать документы"],
+                            "unconfirmed_items": ["Починить селектор"],
+                        },
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert "1.1 Проверить камеру - выполнено полностью" in result.answer
+    assert "1.2 Забрать документы - не выполнено" in result.answer
+    assert "1.3 Починить селектор - не подтверждено" in result.answer
+    assert "1.2 Забрать документы - не выполнено: Забрать документы" not in result.answer
+    assert "1.3 Починить селектор - не подтверждено: Починить селектор" not in result.answer
+    assert "2.1 выполнено" not in result.answer
+    assert "3.1 причина: Забрать документы" not in result.answer
 
 
 def test_bitrix_llm_compose_formats_empty_description_task_close_draft(monkeypatch):

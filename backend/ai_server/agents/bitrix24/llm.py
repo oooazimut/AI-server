@@ -1043,20 +1043,21 @@ def _task_close_point_status(
     point_cf = point.casefold()
     for item in not_done:
         if _task_close_texts_overlap(point_cf, item):
-            return f"не выполнено: {item}"
+            return "не выполнено"
     for item in unconfirmed:
         if _task_close_texts_overlap(point_cf, item):
-            return f"не подтверждено: {item}"
-    if _task_close_point_completed(point, result_text):
-        return "выполнено"
+            return "не подтверждено"
+    completed_label = _task_close_point_completed_label(point, result_text)
+    if completed_label:
+        return completed_label
     if result_text:
         return "уточнить по этому пункту ... ???"
     return "... ???"
 
 
-def _task_close_point_completed(point: str, result_text: str) -> bool:
+def _task_close_point_completed_label(point: str, result_text: str) -> str:
     if not result_text:
-        return False
+        return ""
     point_cf = point.casefold()
     clauses = re.split(r"(?:\r?\n)+|[.;]+|,(?=\s*\d+\.\d+)", result_text)
     for clause in clauses:
@@ -1066,8 +1067,8 @@ def _task_close_point_completed(point: str, result_text: str) -> bool:
         if ("выполн" in clause_cf or "сделан" in clause_cf or "готов" in clause_cf) and _task_close_texts_overlap(
             point_cf, clause
         ):
-            return True
-    return False
+            return "выполнено полностью" if "полностью" in clause_cf else "выполнено"
+    return ""
 
 
 def _task_close_texts_overlap(point_cf: str, value: str) -> bool:
