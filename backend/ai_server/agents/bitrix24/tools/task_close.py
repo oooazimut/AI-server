@@ -1591,8 +1591,6 @@ def _task_close_visible_unconfirmed(
     task_points: list[str],
     result_text: str,
 ) -> list[str]:
-    if result_text:
-        return values
     point_keys = {item.casefold() for item in task_points}
     visible: list[str] = []
     for value in values:
@@ -1602,9 +1600,22 @@ def _task_close_visible_unconfirmed(
         if ("результат закрытия" in key and "не подтверж" in key) or "ai-черновик" in key or "ai draft" in key:
             continue
         if key in point_keys:
+            if result_text and _task_close_result_explicitly_marks_unconfirmed(value, result_text):
+                visible.append(value)
             continue
         visible.append(value)
     return visible
+
+
+def _task_close_result_explicitly_marks_unconfirmed(point: str, result_text: str) -> bool:
+    point_cf = point.casefold()
+    for clause in re.split(r"(?:\r?\n)+|[.;]+|,(?=\s*\d+\.\d+)", result_text):
+        clause_cf = clause.casefold()
+        if not any(marker in clause_cf for marker in ("не подтверж", "неизвест", "не провер", "unconfirmed")):
+            continue
+        if _task_close_texts_overlap(point_cf, clause):
+            return True
+    return False
 
 
 def _task_close_display_items(value: str) -> list[str]:

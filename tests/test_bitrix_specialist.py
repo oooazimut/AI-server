@@ -2163,6 +2163,50 @@ def test_bitrix_llm_compose_formats_task_close_point_status_labels(monkeypatch):
     assert "3.1 причина: Забрать документы" not in result.answer
 
 
+def test_bitrix_llm_compose_hides_unanswered_unconfirmed_task_points(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="закрой задачу", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="task_close_draft",
+                    data={
+                        "draft": {
+                            "_draft_type": "task_close",
+                            "task_id": 139,
+                            "task_title": "Проверить объект",
+                        },
+                        "preview": {
+                            "task_title": "Проверить объект",
+                            "completion_summary": "Установить камеру не выполнено",
+                            "task_points": ["Установить камеру", "Забрать документы", "Проверить архив"],
+                            "not_done_items": ["Установить камеру"],
+                            "unconfirmed_items": ["Забрать документы", "Проверить архив"],
+                            "overall_status": "partial",
+                            "status_reasons": ["не было доступа к архиву"],
+                        },
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert "1.1 Установить камеру - не выполнено" in result.answer
+    assert "1.2 Забрать документы - ... ???" in result.answer
+    assert "1.3 Проверить архив - ... ???" in result.answer
+    assert "1.2 Забрать документы - не подтверждено" not in result.answer
+    assert "1.3 Проверить архив - не подтверждено" not in result.answer
+
+
 def test_bitrix_llm_compose_formats_empty_description_task_close_draft(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
