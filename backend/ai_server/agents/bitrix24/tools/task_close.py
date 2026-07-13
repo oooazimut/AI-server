@@ -97,6 +97,8 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
     completion_summary = compact_text(
         str(args.get("completion_summary") or args.get("result_text") or args.get("summary") or "")
     )
+    if _task_close_is_close_command_summary(completion_summary, task_id):
+        completion_summary = ""
     unresolved_items = _string_list(args.get("unresolved_items") or args.get("missing_parts"))
     task_points = _string_list(args.get("task_points") or args.get("task_items") or args.get("checklist_items"))
     source_task_description_empty = _truthy(
@@ -944,7 +946,11 @@ def _clean_task_description(description: object) -> str:
 
 
 def _task_close_has_user_result(args: dict[str, Any]) -> bool:
-    if compact_text(str(args.get("completion_summary") or args.get("result_text") or args.get("summary") or "")):
+    task_id = optional_int(args.get("task_id") or args.get("id") or args.get("ID"))
+    completion_summary = compact_text(
+        str(args.get("completion_summary") or args.get("result_text") or args.get("summary") or "")
+    )
+    if completion_summary and not _task_close_is_close_command_summary(completion_summary, task_id):
         return True
     if compact_text(str(args.get("equipment_consumables") or args.get("equipment") or args.get("consumables") or "")):
         return True
@@ -957,6 +963,41 @@ def _task_close_has_user_result(args: dict[str, Any]) -> bool:
     return bool(
         _string_list(args.get("not_done_items") or args.get("unfinished_items") or args.get("incomplete_items"))
     )
+
+
+_TASK_CLOSE_COMMAND_SUMMARIES = frozenset(
+    {
+        "закрой",
+        "закрой задачу",
+        "закрой эту задачу",
+        "закройте задачу",
+        "закрыть",
+        "закрыть задачу",
+        "задачу закрыть",
+        "закрываем задачу",
+        "отметь задачу выполненной",
+        "отметить задачу выполненной",
+        "пометь задачу выполненной",
+        "пометить задачу выполненной",
+        "close",
+        "close task",
+        "complete task",
+        "mark task complete",
+        "mark task completed",
+    }
+)
+
+
+def _task_close_is_close_command_summary(value: str, task_id: int | None) -> bool:
+    text = compact_text(str(value or "")).casefold().replace("ё", "е")
+    if not text:
+        return False
+    if task_id is not None:
+        text = re.sub(rf"(?<!\d)#?{re.escape(str(task_id))}(?!\d)", " ", text)
+    text = re.sub(r"[\"'`«»“”№#.,;:!?()\[\]\-]+", " ", text)
+    ignored_tokens = {"bitrix", "битрикс", "пожалуйста"}
+    text = compact_text(" ".join(token for token in text.split() if token not in ignored_tokens))
+    return text in _TASK_CLOSE_COMMAND_SUMMARIES
 
 
 def _result_text(

@@ -100,6 +100,37 @@ def test_close_draft_with_only_task_id_loads_task_points_and_missing_fields():
     assert result.data["preview"]["task_points"] == ["Проверить камеру на входе", "Проверить архив"]
 
 
+def test_close_draft_ignores_plain_close_command_summary_for_empty_task():
+    store = FakeTaskDraftStore()
+    client = _TaskDetailClient(
+        {
+            "ID": "139",
+            "TITLE": "Пустая задача",
+            "DESCRIPTION": "",
+            "STATUS": "3",
+        }
+    )
+    tool = TaskCloseDraftTool(store=store, read_client=client)
+
+    result = _exec(
+        tool,
+        {"task_id": 139, "completion_summary": "закрой задачу 139"},
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+
+    assert result.status == ToolStatus.OK
+    draft = store._drafts["d:13"]
+    assert draft["completion_summary"] == ""
+    assert draft["task_points"] == []
+    assert draft["source_task_description_empty"] is True
+    assert draft["overall_status"] == "unconfirmed"
+    assert draft["unconfirmed_items"]
+    assert "закрой" not in " ".join(draft["unconfirmed_items"]).casefold()
+    assert result.data["preview"]["completion_summary"] == ""
+
+
 def test_close_draft_splits_plain_comma_description_into_task_points():
     store = FakeTaskDraftStore()
     client = _TaskDetailClient(
