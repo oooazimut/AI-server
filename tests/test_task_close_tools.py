@@ -577,10 +577,15 @@ def test_close_confirm_uses_oauth_close_then_system_report_file():
     assert addfile_payload["taskId"] == 139
     assert addfile_payload["fileParameters"]["NAME"] == "AI-close-139.txt"
     report_text = base64.b64decode(addfile_payload["fileParameters"]["CONTENT"]).decode("utf-8")
-    assert "AI task close report" in report_text
+    assert "AI-close report" in report_text
+    assert "Machine metadata" in report_text
+    assert "AI task close report" not in report_text
     assert "Task ID: 139" in report_text
     assert "Status: ok" in report_text
     assert "Выполнено" in report_text
+    assert "\n2.1 " not in report_text
+    assert "\n4.1 " not in report_text
+    assert "Внести изменения" not in report_text
     assert result.data["report_file_name"] == "AI-close-139.txt"
     assert result.data["report_file_owner"] == "system_bitrix_client"
     assert "d:13" not in store._drafts

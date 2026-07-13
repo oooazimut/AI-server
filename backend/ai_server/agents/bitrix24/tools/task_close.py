@@ -1353,7 +1353,6 @@ def _report_file_status(draft: dict[str, Any]) -> str:
 def _report_file_content(*, task_id: int, action: str, draft: dict[str, Any]) -> str:
     task_title = compact_text(str(draft.get("task_title") or ""))
     completion_summary = compact_text(str(draft.get("completion_summary") or draft.get("result_text") or ""))
-    task_points = _string_list(draft.get("task_points"))
     equipment_consumables = compact_text(str(draft.get("equipment_consumables") or ""))
     additional_info = compact_text(str(draft.get("additional_info") or ""))
     overall_status_label = compact_text(str(draft.get("overall_status_label") or ""))
@@ -1361,8 +1360,23 @@ def _report_file_content(*, task_id: int, action: str, draft: dict[str, Any]) ->
     unconfirmed_items = _string_list(draft.get("unconfirmed_items") or draft.get("unresolved_items"))
     missing_fields = _string_list(draft.get("missing_fields"))
     status = _report_file_status(draft)
+    problem_types = _string_list(draft.get("problem_types"))
+    if not problem_types:
+        if not_done_items:
+            problem_types.append("not_done")
+        if unconfirmed_items:
+            problem_types.append("unconfirmed")
+    human_report = format_task_close_draft_message(
+        draft,
+        heading=f"Задача #{task_id}: {task_title or f'#{task_id}'}",
+        include_instruction=False,
+    )
     lines = [
-        "AI task close report",
+        "AI-close report",
+        human_report,
+        "",
+        "---",
+        "Machine metadata",
         f"Task ID: {task_id}",
         f"Task: {task_title or f'#{task_id}'}",
         f"Action: {action}",
@@ -1370,21 +1384,11 @@ def _report_file_content(*, task_id: int, action: str, draft: dict[str, Any]) ->
         f"Created at: {datetime.now(MOSCOW_TZ).isoformat(timespec='seconds')}",
         "Source: AI-server task_close_confirm",
     ]
-    problem_types = _string_list(draft.get("problem_types"))
-    if not problem_types:
-        if not_done_items:
-            problem_types.append("not_done")
-        if unconfirmed_items:
-            problem_types.append("unconfirmed")
     if problem_types:
         lines.append(f"Problem types: {', '.join(_unique_strings(problem_types))}")
         lines.append(f"AI marker: {INCOMPLETE_CLOSE_MARKER}")
     if completion_summary:
         lines.extend(["", "Summary:", completion_summary])
-    if task_points:
-        lines.append("")
-        lines.append("Task points:")
-        lines.extend(f"{index}. {item}" for index, item in enumerate(task_points, start=1))
     if equipment_consumables:
         lines.extend(["", "Equipment and consumables:", equipment_consumables])
     if additional_info:
@@ -1411,11 +1415,17 @@ def format_task_close_draft_message(
     *,
     preview: dict[str, Any] | None = None,
     intro_lines: list[str] | None = None,
+    heading: str | None = None,
+    include_instruction: bool = True,
 ) -> str:
     preview = preview if isinstance(preview, dict) else {}
     task_id = _draft_text(draft.get("task_id"))
     task_title = _draft_text(preview.get("task_title")) or _draft_text(draft.get("task_title")) or f"задача #{task_id}"
-    raw_result_text = _draft_text(preview.get("completion_summary")) or _draft_text(draft.get("completion_summary"))
+    raw_result_text = (
+        _draft_text(preview.get("completion_summary"))
+        or _draft_text(draft.get("completion_summary"))
+        or _draft_text(draft.get("result_text"))
+    )
     result_text = "" if _task_close_is_placeholder_summary(raw_result_text) else raw_result_text
     task_points = _string_list(preview.get("task_points") or draft.get("task_points"))
     source_task_description_empty = bool(
@@ -1438,7 +1448,7 @@ def format_task_close_draft_message(
     lines: list[str] = [line for line in (intro_lines or []) if str(line).strip()]
     if lines:
         lines.append("")
-    lines.extend([f"Черновик #{task_id or '?'}: {task_title}", ""])
+    lines.extend([heading or f"Черновик #{task_id or '?'}: {task_title}", ""])
     lines.append("1. Выполняемые работы")
     if source_task_description_empty:
         result_items = _task_close_display_items(result_text)
@@ -1492,12 +1502,13 @@ def format_task_close_draft_message(
         lines.extend(f"4.{index} {item}" for index, item in enumerate(additional_items, start=1))
         lines.append(f"4.{len(additional_items) + 1} Еще информация - ... ???")
 
-    lines.extend(
-        [
-            "",
-            'Внести изменения (укажите пункт или подпункт и нужную информацию) или напишите: "да, закрывай как есть".',
-        ]
-    )
+    if include_instruction:
+        lines.extend(
+            [
+                "",
+                'Внести изменения (укажите пункт или подпункт и нужную информацию) или напишите: "да, закрывай как есть".',
+            ]
+        )
     return "\n".join(lines)
 
 
