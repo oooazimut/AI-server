@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlsplit
 
-from ai_server.integrations.bitrix.client import BitrixClient
+from ai_server.integrations.bitrix.client import BitrixApiError, BitrixClient
 from ai_server.integrations.bitrix.portal_search.file_cache import delete_portal_file_cache_path, portal_file_cache_path
 from ai_server.integrations.bitrix.portal_search.search_index import PortalSearchIndex
 from ai_server.integrations.bitrix.portal_search.text_utils import (
@@ -1297,6 +1297,7 @@ async def _sync_projects(bitrix: BitrixClient, index: PortalSearchIndex, setting
 async def _sync_disk(bitrix: BitrixClient, index: PortalSearchIndex, settings: Settings) -> dict[str, object]:
     storages = await bitrix.list_disk_storages(limit=settings.search_index_max_storages)
     indexed_items = 0
+    errors: list[str] = []
     visited_folder_ids: set[int] = set()
     seen_disk_object_ids: set[int] = set()
     for storage in storages:
@@ -1327,26 +1328,34 @@ async def _sync_disk(bitrix: BitrixClient, index: PortalSearchIndex, settings: S
         if root_folder_id in visited_folder_ids:
             continue
         visited_folder_ids.add(root_folder_id)
-        indexed_items += await _sync_disk_folder(
-            bitrix,
-            index,
-            folder_id=root_folder_id,
-            storage_name=name,
-            path=name,
-            depth=0,
-            remaining=settings.search_index_max_disk_items - indexed_items,
-            settings=settings,
-            visited_folder_ids=visited_folder_ids,
-            seen_disk_object_ids=seen_disk_object_ids,
-        )
+        try:
+            indexed_items += await _sync_disk_folder(
+                bitrix,
+                index,
+                folder_id=root_folder_id,
+                storage_name=name,
+                path=name,
+                depth=0,
+                remaining=settings.search_index_max_disk_items - indexed_items,
+                settings=settings,
+                visited_folder_ids=visited_folder_ids,
+                seen_disk_object_ids=seen_disk_object_ids,
+            )
+        except BitrixApiError as exc:
+            errors.append(f"storage {storage_id} root folder {root_folder_id}: {exc}")
+        except Exception as exc:
+            errors.append(f"storage {storage_id} root folder {root_folder_id}: {type(exc).__name__}: {exc}")
         if indexed_items >= settings.search_index_max_disk_items:
             break
     return {
         "storages": len(storages),
         "items": indexed_items,
         "complete": (
-            len(storages) < settings.search_index_max_storages and indexed_items < settings.search_index_max_disk_items
+            len(storages) < settings.search_index_max_storages
+            and indexed_items < settings.search_index_max_disk_items
+            and not errors
         ),
+        "errors": errors,
     }
 
 

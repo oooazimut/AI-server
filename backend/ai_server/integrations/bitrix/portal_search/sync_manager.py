@@ -84,11 +84,15 @@ async def sync_portal_index(
             disk_stats = await _sync_disk(bitrix, index, settings)
             stats.storages = int(disk_stats["storages"])
             stats.disk_items = int(disk_stats["items"])
+            for error in disk_stats.get("errors") or []:
+                stats.errors.append(f"disk: {error}")
             if bool(disk_stats["complete"]):
                 stats.stale_deleted += index.delete_stale_items(
                     entity_types={"disk_storage", "disk_folder", "disk_file"},
                     seen_before=sync_started_at,
                 )
+            elif disk_stats.get("errors"):
+                stats.prune_skipped.append("disk: incomplete after API errors")
             else:
                 stats.prune_skipped.append("disk: reached configured limit")
         except Exception as exc:
