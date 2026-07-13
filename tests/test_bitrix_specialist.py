@@ -1138,6 +1138,95 @@ def test_bitrix_llm_routes_task_close_followup_extracts_compact_numbered_blocks(
     assert args["missing_fields"] == []
 
 
+def test_bitrix_llm_routes_task_close_followup_keeps_work_block_isolated(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_close_draft", "description": "", "parameters": {}},
+        {"name": "task_close_confirm", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request=(
+                    "По задаче 8899: 1.1 камеру не поставил, потому что не было оборудования "
+                    "и не было доступа к архиву."
+                ),
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "task_close",
+                        "task_id": 8899,
+                        "task_title": "Проверить объект",
+                        "task_points": ["Проверить камеру", "Забрать документы"],
+                        "overall_status": "unconfirmed",
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_close_active_update_route"}
+    args = result.decision.tool_calls[0].args
+    assert args["completion_summary"] == "Проверить камеру не выполнено"
+    assert args["not_done_items"] == ["Проверить камеру"]
+    assert "equipment_consumables" not in args
+    assert "overall_status" not in args
+    assert "status_reasons" not in args
+    assert "additional_info" not in args
+
+
+def test_bitrix_llm_routes_task_close_followup_keeps_status_block_out_of_equipment(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_close_draft", "description": "", "parameters": {}},
+        {"name": "task_close_confirm", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request="По задаче 8899: 3 выполнено частично, причина: не хватило 30 метров кабеля.",
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "task_close",
+                        "task_id": 8899,
+                        "task_title": "Проверить объект",
+                        "task_points": ["Проверить камеру"],
+                        "overall_status": "unconfirmed",
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_close_active_update_route"}
+    args = result.decision.tool_calls[0].args
+    assert args["overall_status"] == "partial"
+    assert args["status_reasons"] == ["не хватило 30 метров кабеля"]
+    assert "equipment_consumables" not in args
+    assert "not_done_items" not in args
+
+
 def test_bitrix_llm_routes_task_close_conflict_switch_to_requested_without_llm(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
