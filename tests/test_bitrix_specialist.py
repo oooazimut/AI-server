@@ -18,7 +18,7 @@ from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
 from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, FakeTaskDraftStore, RecordingLLMClient
 
 
-def _bitrix_specialist(*, tools=None, llm=None) -> Bitrix24Specialist:
+def _bitrix_specialist(*, tools=None, llm=None, settings=None) -> Bitrix24Specialist:
     manifest = get_agent_manifest("bitrix24")
     retriever = HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider())
     return Bitrix24Specialist(
@@ -28,6 +28,7 @@ def _bitrix_specialist(*, tools=None, llm=None) -> Bitrix24Specialist:
         agent_tools=tools.agent_tools() if tools is not None else None,
         bitrix_user_client=tools.make_user_client() if tools is not None else None,
         llm=llm or FakeBitrixLLM(),
+        settings=settings,
     )
 
 
@@ -373,7 +374,6 @@ def test_bitrix_llm_decide_routes_task_close_control_get(monkeypatch):
     tool_definitions = [
         ToolDefinition(name="task_close_control_get", description="", parameters={}).model_dump(),
         ToolDefinition(name="task_close_control_update", description="", parameters={}).model_dump(),
-        ToolDefinition(name="none", description="", parameters={}).model_dump(),
     ]
 
     result = asyncio.run(
@@ -407,7 +407,11 @@ def test_bitrix_llm_decide_routes_task_close_control_get(monkeypatch):
     result = asyncio.run(
         service.decide(
             manifest=get_agent_manifest("bitrix24"),
-            task=AgentTask(task_id="t3", request="Покажи список операторов и обычных пользователей", user={"id": "1"}),
+            task=AgentTask(
+                task_id="t3",
+                request="Покажи список операторов и обычных пользователей закрытия задач",
+                user={"id": "1"},
+            ),
             retrieval_hits=[],
             tool_definitions=tool_definitions,
         )
@@ -416,6 +420,52 @@ def test_bitrix_llm_decide_routes_task_close_control_get(monkeypatch):
     assert client.calls == []
     assert [call.name for call in result.decision.tool_calls] == ["task_close_control_get"]
     assert result.decision.tool_calls[0].args == {}
+
+
+def test_bitrix_llm_does_not_route_ambiguous_operator_panel_request(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    tool_definitions = [
+        ToolDefinition(name="task_close_control_get", description="", parameters={}).model_dump(),
+        ToolDefinition(name="task_close_control_update", description="", parameters={}).model_dump(),
+    ]
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    for request in (
+        "Покажи список операторов",
+        "Покажи список пользователей",
+        "Покажи админ-панель",
+        "Кто операторы",
+    ):
+        result = asyncio.run(
+            service.decide(
+                manifest=get_agent_manifest("bitrix24"),
+                task=AgentTask(task_id="ambiguous", request=request, user={"id": "1"}),
+                retrieval_hits=[],
+                tool_definitions=tool_definitions,
+            )
+        )
+
+        assert client.calls == []
+        assert result.decision.status == "needs_clarification"
+        assert "закрытие задач или отчет по машинам и людям" in result.decision.answer
+        assert [call.name for call in result.decision.tool_calls] == ["none"]
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="vehicle-panel",
+                request="Покажи список операторов и пользователей отчета по машинам и людям",
+                user={"id": "1"},
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls
+    assert [call.name for call in result.decision.tool_calls] == ["none"]
 
 
 def test_bitrix_llm_decide_routes_task_close_control_update(monkeypatch):
@@ -481,6 +531,46 @@ def test_bitrix_specialist_injects_admin_context_for_task_close_control_tool(mon
 
     result = asyncio.run(
         _bitrix_specialist(tools=TaskCloseControlTools(), llm=llm).handle(
+            AgentTask(task_id="t1", request="добавь 13 оператором контроля закрытия задач", user={"id": "1"})
+        )
+    )
+
+    assert result.status == "completed"
+    assert store.task_close_operator_ids() == {13}
+    assert store.task_close_controlled_user_ids() == set()
+
+
+def test_bitrix_specialist_uses_configured_task_close_control_admin_ids(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_TASK_CLOSE_CONTROL_ADMIN_USER_IDS", "1")
+    store = FakeTaskDraftStore()
+
+    class TaskCloseControlTools:
+        def agent_tools(self):
+            return [TaskCloseControlUpdateTool(store=store)]
+
+        def make_user_client(self):
+            class UserClient:
+                async def get_user(self, user_id: int):
+                    return {
+                        "ID": user_id,
+                        "NAME": "Configured",
+                        "LAST_NAME": "Admin",
+                    }
+
+            return UserClient()
+
+    llm = FakeBitrixLLM(
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="task_close_control_update",
+                args={"action": "add_operator", "target_user_id": 13},
+            )
+        ]
+    )
+
+    result = asyncio.run(
+        _bitrix_specialist(tools=TaskCloseControlTools(), llm=llm, settings=get_settings()).handle(
             AgentTask(task_id="t1", request="добавь 13 оператором контроля закрытия задач", user={"id": "1"})
         )
     )

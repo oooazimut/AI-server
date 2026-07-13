@@ -8,6 +8,7 @@ from ai_server.agents.logistics import (
     LogisticsLLMToolCall,
     LogisticsSpecialist,
 )
+from ai_server.agents.logistics.llm import _decision_system_prompt
 from ai_server.agents.logistics.specialist import VehicleUsageSettings
 from ai_server.agents.logistics.tools import (
     VehicleCancelReportTool,
@@ -674,6 +675,13 @@ def test_logistics_llm_compose_formats_get_operators_without_saving(monkeypatch)
     assert "Операторы отчета по машинам" in result.answer
     assert "Абдураимова Галина (Bitrix ID 1)" in result.answer
     assert "Коверга Дмитрий (Bitrix ID 13)" in result.answer
+
+
+def test_logistics_prompt_scopes_operator_list_to_vehicle_report_panel():
+    prompt = _decision_system_prompt()
+
+    assert "список операторов отчета по машинам/людям" in prompt
+    assert "просит список операторов, вызови vehicle_usage_get_operators" not in prompt
 
 
 def test_vehicle_usage_non_admin_cannot_replace_operators(monkeypatch):

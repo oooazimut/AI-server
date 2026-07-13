@@ -68,6 +68,7 @@ def test_bitrix_oauth_bot_settings_can_be_loaded(monkeypatch):
 def test_task_close_control_worker_settings(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.delenv("BITRIX_TASK_CLOSE_CONTROL_WORKER_ENABLED", raising=False)
+    monkeypatch.delenv("BITRIX_TASK_CLOSE_CONTROL_ADMIN_USER_IDS", raising=False)
     monkeypatch.delenv("BITRIX_TASK_CLOSE_CONTROL_INTERVAL_SECONDS", raising=False)
     monkeypatch.delenv("BITRIX_TASK_CLOSE_CONTROL_DIRECT_LIMIT", raising=False)
     monkeypatch.delenv("BITRIX_TASK_CLOSE_CONTROL_AUTO_CLOSE_LIMIT", raising=False)
@@ -75,11 +76,13 @@ def test_task_close_control_worker_settings(monkeypatch):
     defaults = get_settings()
 
     assert defaults.bitrix_task_close_control_worker_enabled is False
+    assert defaults.resolved_task_close_control_admin_user_ids == [1]
     assert defaults.bitrix_task_close_control_interval_seconds == 300
     assert defaults.bitrix_task_close_control_direct_limit == 20
     assert defaults.bitrix_task_close_control_auto_close_limit == 100
 
     monkeypatch.setenv("BITRIX_TASK_CLOSE_CONTROL_WORKER_ENABLED", "true")
+    monkeypatch.setenv("BITRIX_TASK_CLOSE_CONTROL_ADMIN_USER_IDS", "1,9")
     monkeypatch.setenv("BITRIX_TASK_CLOSE_CONTROL_INTERVAL_SECONDS", "60")
     monkeypatch.setenv("BITRIX_TASK_CLOSE_CONTROL_DIRECT_LIMIT", "7")
     monkeypatch.setenv("BITRIX_TASK_CLOSE_CONTROL_AUTO_CLOSE_LIMIT", "9")
@@ -87,6 +90,7 @@ def test_task_close_control_worker_settings(monkeypatch):
     overridden = get_settings()
 
     assert overridden.bitrix_task_close_control_worker_enabled is True
+    assert overridden.resolved_task_close_control_admin_user_ids == [1, 9]
     assert overridden.bitrix_task_close_control_interval_seconds == 60
     assert overridden.bitrix_task_close_control_direct_limit == 7
     assert overridden.bitrix_task_close_control_auto_close_limit == 9

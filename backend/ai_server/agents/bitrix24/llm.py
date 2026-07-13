@@ -168,6 +168,14 @@ class BitrixLLMService:
                 raw={"source": "task_close_report_incident_route"},
             )
 
+        local_decision = _common_admin_panel_clarification_decision(task.request, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "admin_panel_clarification_route"),
+                raw={"source": "admin_panel_clarification_route"},
+            )
+
         local_decision = _common_task_close_control_decision(task.request, tool_definitions)
         if local_decision is not None:
             return BitrixLLMDecisionResult(
@@ -2390,6 +2398,46 @@ def _task_close_report_file_name(text: str) -> str:
     return match.group(0) if match else ""
 
 
+def _common_admin_panel_clarification_decision(
+    request: str,
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    clean_request = _strip_command_prefix(request)
+    lowered = clean_request.casefold()
+    if _looks_like_task_close_control_request(lowered) or _looks_like_vehicle_usage_admin_panel_request(lowered):
+        return None
+    if not _looks_like_ambiguous_admin_panel_request(lowered):
+        return None
+
+    return BitrixLLMDecision(
+        status="needs_clarification",
+        answer="Уточните, какую панель показать: закрытие задач или отчет по машинам и людям.",
+        confidence=0.86,
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="none",
+                args={},
+                summary="ambiguous admin panel clarification",
+            )
+        ],
+    )
+
+
+def _looks_like_ambiguous_admin_panel_request(lowered: str) -> bool:
+    return (
+        ("админ" in lowered and "панел" in lowered)
+        or ("спис" in lowered and ("оператор" in lowered or "пользовател" in lowered))
+        or ("кто" in lowered and "оператор" in lowered)
+    )
+
+
+def _looks_like_vehicle_usage_admin_panel_request(lowered: str) -> bool:
+    vehicle_domain = (
+        "машин" in lowered or "автомоб" in lowered or "люд" in lowered or "сотрудник" in lowered or "логист" in lowered
+    )
+    return vehicle_domain and ("отчет" in lowered or "оператор" in lowered or "пользовател" in lowered)
+
+
 def _common_task_close_control_decision(
     request: str,
     tool_definitions: list[dict[str, Any]] | None,
@@ -2435,15 +2483,40 @@ def _common_task_close_control_decision(
 
 
 def _looks_like_task_close_control_request(lowered: str) -> bool:
-    return (
-        ("контрол" in lowered and "закрыт" in lowered)
-        or "контролируем" in lowered
+    task_close_domain = (
+        "контролируем" in lowered
         or ("автозакрыт" in lowered and "задач" in lowered)
-        or ("спис" in lowered and ("оператор" in lowered or "контролируем" in lowered))
-        or ("спис" in lowered and "оператор" in lowered and "обычн" in lowered and "пользовател" in lowered)
-        or ("кто" in lowered and ("оператор" in lowered or "контролируем" in lowered))
-        or ("оператор" in lowered and ("задач" in lowered or "закрыт" in lowered or "контрол" in lowered))
+        or ("контрол" in lowered and ("закрыт" in lowered or "задач" in lowered))
+        or ("закрыт" in lowered and "задач" in lowered)
     )
+    if not task_close_domain:
+        return False
+
+    settings_intent = (
+        "настрой" in lowered
+        or "панел" in lowered
+        or "спис" in lowered
+        or "кто" in lowered
+        or "оператор" in lowered
+        or "пользовател" in lowered
+        or "автозакрыт" in lowered
+        or any(
+            marker in lowered
+            for marker in (
+                "добав",
+                "включ",
+                "назнач",
+                "убери",
+                "убрать",
+                "удали",
+                "удалить",
+                "исключ",
+                "сними",
+                "снять",
+            )
+        )
+    )
+    return settings_intent
 
 
 def _task_close_control_update_args(request: str) -> dict[str, Any] | None:
