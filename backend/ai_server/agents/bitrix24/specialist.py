@@ -286,7 +286,7 @@ class Bitrix24Specialist(BaseSpecialist):
                 summary=getattr(tool_call, "summary", ""),
             )
         elif tool_call.name in {"task_close_control_get", "task_close_control_update"}:
-            args = _args_with_actor_admin_context(dict(tool_call.args or {}), task)
+            args = _args_with_actor_admin_context(dict(tool_call.args or {}), task, settings=self._settings_for_qc)
             tool_call = SimpleNamespace(
                 name=tool_call.name,
                 args=args,
@@ -439,9 +439,17 @@ def _project_create_args_with_actor_context(args: dict[str, Any], task: AgentTas
     return {**args, "_actor_name": actor_name, "_actor_is_admin": actor_is_admin}
 
 
-def _args_with_actor_admin_context(args: dict[str, Any], task: AgentTask) -> dict[str, Any]:
+def _args_with_actor_admin_context(
+    args: dict[str, Any],
+    task: AgentTask,
+    *,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
     profile = _current_user_profile(task)
-    return {**args, "_actor_is_admin": bool(profile.get("is_admin"))}
+    user_id = optional_int(task.user.id)
+    configured_admin_ids = set(settings.resolved_task_close_control_admin_user_ids if settings is not None else [])
+    actor_is_admin = bool(profile.get("is_admin")) or bool(user_id is not None and user_id in configured_admin_ids)
+    return {**args, "_actor_is_admin": actor_is_admin}
 
 
 def _current_user_label(task: AgentTask) -> str:

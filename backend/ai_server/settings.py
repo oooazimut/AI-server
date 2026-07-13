@@ -25,6 +25,7 @@ class Settings:
     bitrix_task_draft_ttl_minutes: int
     bitrix_task_close_report_admin_user_ids: str
     bitrix_task_close_report_auto_restore_hours: int
+    bitrix_task_close_control_admin_user_ids: str
     bitrix_task_close_control_worker_enabled: bool
     bitrix_task_close_control_interval_seconds: int
     bitrix_task_close_control_direct_limit: int
@@ -314,6 +315,10 @@ class Settings:
         return _id_list(self.bitrix_task_close_report_admin_user_ids) or [1]
 
     @property
+    def resolved_task_close_control_admin_user_ids(self) -> list[int]:
+        return _id_list(self.bitrix_task_close_control_admin_user_ids) or [1]
+
+    @property
     def resolved_agent_private_disk_path_markers(self) -> list[str]:
         return [
             item.strip() for item in self.agent_private_disk_path_markers.replace(";", ",").split(",") if item.strip()
@@ -415,6 +420,10 @@ def get_settings() -> Settings:
         bitrix_task_draft_ttl_minutes=_env_int("BITRIX_TASK_DRAFT_TTL_MINUTES", 24 * 60) or (24 * 60),
         bitrix_task_close_report_admin_user_ids=_env("BITRIX_TASK_CLOSE_REPORT_ADMIN_USER_IDS", "1"),
         bitrix_task_close_report_auto_restore_hours=_env_int_default("BITRIX_TASK_CLOSE_REPORT_AUTO_RESTORE_HOURS", 24),
+        bitrix_task_close_control_admin_user_ids=_env(
+            "BITRIX_TASK_CLOSE_CONTROL_ADMIN_USER_IDS",
+            _env("BITRIX_TASK_CLOSE_REPORT_ADMIN_USER_IDS", "1"),
+        ),
         bitrix_task_close_control_worker_enabled=_env_bool("BITRIX_TASK_CLOSE_CONTROL_WORKER_ENABLED", False),
         bitrix_task_close_control_interval_seconds=_env_int("BITRIX_TASK_CLOSE_CONTROL_INTERVAL_SECONDS", 5 * 60)
         or (5 * 60),

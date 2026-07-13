@@ -108,6 +108,20 @@ class OrchestratorLLMService:
         available_skills: list | None = None,
         **kwargs: Any,
     ) -> OrchestratorDecisionResult:
+        local_decision = _admin_panel_clarification_decision(task.request, tool_definitions)
+        if local_decision is not None:
+            return OrchestratorDecisionResult(
+                decision=local_decision,
+                model_usage=ModelUsageRecord(
+                    agent_id=manifest.id,
+                    provider="",
+                    model="",
+                    status="skipped",
+                    notes=["admin_panel_clarification_route"],
+                ),
+                raw={"source": "admin_panel_clarification_route"},
+            )
+
         instructions = load_instructions(manifest)
         completion = await self.client.complete(
             agent_id=manifest.id,
@@ -191,6 +205,60 @@ def orchestrator_llm_failure_result(message: str) -> OrchestratorFinalResult:
             notes=[message],
         ),
     )
+
+
+def _admin_panel_clarification_decision(
+    request: str,
+    tool_definitions: list[dict[str, Any]],
+) -> OrchestratorDecision | None:
+    text = _strip_synthetic_prefix(request).casefold()
+    if _looks_like_task_close_admin_panel_request(text) or _looks_like_vehicle_usage_admin_panel_request(text):
+        return None
+    if not _looks_like_ambiguous_admin_panel_request(text):
+        return None
+    return OrchestratorDecision(
+        status="needs_clarification",
+        answer="Уточните, какую панель показать: закрытие задач или отчет по машинам и людям.",
+        tool_calls=[OrchestratorToolCall(name="none", args={}, summary="ambiguous admin panel clarification")],
+        confidence=0.86,
+    )
+
+
+def _strip_synthetic_prefix(request: str) -> str:
+    return str(request or "").removeprefix("\ufeff").strip()
+
+
+def _looks_like_ambiguous_admin_panel_request(lowered: str) -> bool:
+    return (
+        ("админ" in lowered and "панел" in lowered)
+        or ("спис" in lowered and ("оператор" in lowered or "пользовател" in lowered))
+        or ("кто" in lowered and "оператор" in lowered)
+    )
+
+
+def _looks_like_task_close_admin_panel_request(lowered: str) -> bool:
+    task_close_domain = (
+        "контролируем" in lowered
+        or ("автозакрыт" in lowered and "задач" in lowered)
+        or ("контрол" in lowered and ("закрыт" in lowered or "задач" in lowered))
+        or ("закрыт" in lowered and "задач" in lowered)
+    )
+    return task_close_domain and (
+        "настрой" in lowered
+        or "панел" in lowered
+        or "спис" in lowered
+        or "кто" in lowered
+        or "оператор" in lowered
+        or "пользовател" in lowered
+        or "автозакрыт" in lowered
+    )
+
+
+def _looks_like_vehicle_usage_admin_panel_request(lowered: str) -> bool:
+    vehicle_domain = (
+        "машин" in lowered or "автомоб" in lowered or "люд" in lowered or "сотрудник" in lowered or "логист" in lowered
+    )
+    return vehicle_domain and ("отчет" in lowered or "оператор" in lowered or "пользовател" in lowered)
 
 
 def _direct_specialist_answer(tool_results: list[ToolResult]) -> OrchestratorFinalResult | None:
