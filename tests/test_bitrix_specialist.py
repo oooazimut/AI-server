@@ -1306,6 +1306,48 @@ def test_bitrix_llm_routes_task_close_followup_keeps_future_extra_info_with_equi
     assert "equipment_consumables" not in args
 
 
+def test_bitrix_llm_routes_task_close_followup_completed_status_has_no_fake_reason(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    manifest = get_agent_manifest("bitrix24")
+    tool_definitions = [
+        {"name": "task_close_draft", "description": "", "parameters": {}},
+        {"name": "task_close_confirm", "description": "", "parameters": {}},
+        {"name": "task_close_discard", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=manifest,
+            task=AgentTask(
+                task_id="t1",
+                request=(
+                    "По задаче 8899: 1.1 выполнено полностью. "
+                    "2 не использовалось. 3 выполнено полностью. 4 отсутствует."
+                ),
+                user={"id": "15"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {
+                        "_draft_type": "task_close",
+                        "task_id": 8899,
+                        "task_title": "Проверить объект",
+                        "task_points": ["Проверить камеру"],
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_close_active_update_route"}
+    args = result.decision.tool_calls[0].args
+    assert args["overall_status"] == "completed"
+    assert "status_reasons" not in args
+
+
 def test_bitrix_llm_routes_task_close_conflict_switch_to_requested_without_llm(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
@@ -2072,7 +2114,8 @@ def test_bitrix_llm_compose_formats_empty_description_task_close_draft(monkeypat
     assert "1.1 Проверил объект" in result.answer
     assert "1.2 устранил замечания" in result.answer
     assert "1. Пункты задачи" not in result.answer
-    assert "2.1 не использовались" in result.answer
+    assert "[ВЫБРАНО: не использовалось]" in result.answer
+    assert "2.1 не использовались" not in result.answer
     assert "[ВЫБРАНО: выполнено полностью]" in result.answer
 
 

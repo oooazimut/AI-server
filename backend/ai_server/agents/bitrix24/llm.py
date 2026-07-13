@@ -916,11 +916,14 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
             lines.append("1.1 Еще работы - ... ???")
     lines.append("")
     lines.append("2. Использовано материалов, оборудование")
-    lines.append("   (перечисли, что использовали, или укажи: не использовалось)")
-    equipment_items = _task_close_display_items(equipment)
-    if equipment_items:
-        lines.extend(f"2.{index} {item}" for index, item in enumerate(equipment_items, start=1))
-        lines.append(f"2.{len(equipment_items) + 1} Еще материалы - ... ???")
+    if _task_close_no_equipment_value(equipment):
+        lines.append("   (перечисли, что использовали, или укажи: [ВЫБРАНО: не использовалось])")
+    else:
+        lines.append("   (перечисли, что использовали, или укажи: не использовалось)")
+        equipment_items = _task_close_display_items(equipment)
+        if equipment_items:
+            lines.extend(f"2.{index} {item}" for index, item in enumerate(equipment_items, start=1))
+            lines.append(f"2.{len(equipment_items) + 1} Еще материалы - ... ???")
     lines.append("")
     lines.append("3. Статус выполнения работ")
     lines.append(f"   {_task_close_status_prompt(overall_status or overall)}")
@@ -978,6 +981,28 @@ def _task_close_status_needs_reason(status: str) -> bool:
 def _task_close_absent_value(value: str) -> bool:
     text = compact_text(value).casefold()
     return text in {"отсутствует", "нет", "не было", "нет дополнительной информации"}
+
+
+def _task_close_no_equipment_value(value: str) -> bool:
+    text = compact_text(value).casefold().strip(" .;:-")
+    if not text:
+        return False
+    if text in {
+        "не использовалось",
+        "не использовались",
+        "не использовали",
+        "не применялось",
+        "не применяли",
+        "не было",
+        "нет",
+        "ничего",
+        "без материалов",
+        "без оборудования",
+        "материалы не использовались",
+        "оборудование не использовалось",
+    }:
+        return True
+    return ("не использ" in text or "не примен" in text) and not any(char.isdigit() for char in text)
 
 
 def _task_close_is_placeholder_summary(value: str) -> bool:
@@ -2077,6 +2102,8 @@ def _task_close_unconfirmed_items_from_text(summary: str, lowered: str, *, task_
 
 
 def _task_close_status_reasons_from_text(summary: str) -> list[str]:
+    summary = re.sub(r"^\s*(?:по\s+)?пункт[ау]?\s+3\s*:?", "", summary, flags=re.IGNORECASE)
+    summary = re.sub(r"^\s*3\s+", "", summary)
     text = _task_close_clean_referenced_text(summary)
     if not text:
         return []
