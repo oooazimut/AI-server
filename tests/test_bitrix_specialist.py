@@ -169,6 +169,37 @@ def test_bitrix_specialist_searches_my_open_tasks():
     assert "Проверить камеру" in result.answer
 
 
+def test_bitrix_specialist_treats_show_warehouse_as_stock_request():
+    tools = FakeResolverTools(
+        warehouse_result=ToolResult(
+            status="ok",
+            tool="bitrix_warehouse_search",
+            data={
+                "matches": [{"id": "12", "title": "Борисов А.А.", "address": "Российская,8"}],
+                "products": {"items": [], "total": 0, "limit": 10, "offset": 0},
+            },
+        )
+    )
+
+    result = asyncio.run(
+        _bitrix_specialist(
+            tools=tools,
+            llm=FakeBitrixLLM(
+                tool_calls=[
+                    BitrixLLMToolCall(
+                        name="bitrix_warehouse_search",
+                        args={"query": "Борисов"},
+                    )
+                ],
+                final_answer="Остатки проверены.",
+            ),
+        ).handle(AgentTask(task_id="t1", request="Битрикс покажи склад Борисов", user={"id": "1"}))
+    )
+
+    assert result.status == "completed"
+    assert tools.warehouse_calls == [{"query": "Борисов", "include_products": True, "product_limit": 10}]
+
+
 def test_bitrix_llm_decide_routes_created_by_task_read_to_deterministic_tool(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient(
@@ -3033,22 +3064,43 @@ class _FakeMyTasksTool:
         return self._result
 
 
+class _FakeWarehouseTool:
+    name = "bitrix_warehouse_search"
+
+    def __init__(self, result: ToolResult, calls: list):
+        self._result = result
+        self._calls = calls
+
+    def definition(self):
+        return ToolDefinition(name="bitrix_warehouse_search", description="", parameters={})
+
+    async def execute(self, args, *, user_id=None, dialog_key=None, dialog_id=None):
+        self._calls.append(args)
+        return self._result
+
+
 class FakeResolverTools:
     def __init__(
         self,
         *,
         bitrix_api_result: ToolResult | None = None,
         my_tasks_result: ToolResult | None = None,
+        warehouse_result: ToolResult | None = None,
         raw_user: dict | None = None,
     ) -> None:
         self.bitrix_api_calls: list = []
         self.my_tasks_calls: list = []
+        self.warehouse_calls: list = []
         self._raw_user = raw_user
         self._tools = [
             _FakePortalSearchTool(),
             _FakeMyTasksTool(
                 my_tasks_result or ToolResult(status="not_configured", tool="bitrix_my_tasks"),
                 self.my_tasks_calls,
+            ),
+            _FakeWarehouseTool(
+                warehouse_result or ToolResult(status="not_configured", tool="bitrix_warehouse_search"),
+                self.warehouse_calls,
             ),
             _FakeBitrixApiTool(
                 bitrix_api_result or ToolResult(status="not_configured", tool="bitrix_api"),

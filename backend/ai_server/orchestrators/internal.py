@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime
 from typing import Any
 
 from pydantic import ValidationError
@@ -26,6 +27,7 @@ from ai_server.orchestrators.tools import CallSpecialistTool, ManageSuspendedToo
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.specialists import Specialist, build_specialist_registry
 from ai_server.technical_footer import TechnicalFooterService, append_footer
+from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,7 @@ class InternalOrchestrator(BaseSpecialist):
             store=store,
             scheduler=scheduler,
             retriever=retriever,
+            conversation_trace=conversation_trace,
         )
         self._channels: dict[str, ChannelPort] = channels or {}
         self._footer_svc = footer_service
@@ -96,29 +99,49 @@ class InternalOrchestrator(BaseSpecialist):
 
     async def handle(self, task: AgentTask) -> AgentResult:
         t_start = time.monotonic()
+        started_at = _trace_now_iso()
         dialog_key = task.context.get("dialog_key", "")
         logger.info("Orchestrator.handle: start task_id=%s dialog_key=%s", task.task_id, dialog_key)
-        result = await super().handle(task)
-        # Extract specialist IDs called during this turn for handoff_to
-        specialist_ids = [
-            a.details.get("data", {}).get("specialist")
-            for a in result.actions_taken
-            if a.name == "call_specialist" and a.status == "ok"
-        ]
-        specialist_ids = [s for s in specialist_ids if s]
-        if specialist_ids:
-            result = result.model_copy(update={"handoff_to": specialist_ids})
-        elapsed_ms = {"total_ms": round((time.monotonic() - t_start) * 1000, 1)}
-        logger.info(
-            "Orchestrator.handle: done task_id=%s dialog_key=%s elapsed_ms=%.0f status=%s",
-            task.task_id,
-            dialog_key,
-            elapsed_ms["total_ms"],
-            result.status,
-        )
-        await self._send_to_channel(task, result)
-        await self._publish_result(task, result)
-        return result
+        try:
+            result = await super().handle(task)
+            # Extract specialist IDs called during this turn for handoff_to
+            specialist_ids = [
+                a.details.get("data", {}).get("specialist")
+                for a in result.actions_taken
+                if a.name == "call_specialist" and a.status == "ok"
+            ]
+            specialist_ids = [s for s in specialist_ids if s]
+            if specialist_ids:
+                result = result.model_copy(update={"handoff_to": specialist_ids})
+            elapsed_ms = {"total_ms": round((time.monotonic() - t_start) * 1000, 1)}
+            logger.info(
+                "Orchestrator.handle: done task_id=%s dialog_key=%s elapsed_ms=%.0f status=%s",
+                task.task_id,
+                dialog_key,
+                elapsed_ms["total_ms"],
+                result.status,
+            )
+            await self._send_to_channel(task, result)
+            await self._publish_result(task, result)
+            await self._record_timing(
+                task,
+                stage="handle_total",
+                started_at=started_at,
+                elapsed_ms=(time.monotonic() - t_start) * 1000,
+                status=result.status,
+                details={"handoff_to": specialist_ids},
+            )
+            return result
+        except Exception as exc:
+            await self._record_timing(
+                task,
+                stage="handle_total",
+                started_at=started_at,
+                elapsed_ms=(time.monotonic() - t_start) * 1000,
+                status="error",
+                details={"error": f"{type(exc).__name__}: {exc}"},
+            )
+            raise
 
     async def run(self, queue: AgentQueuePort) -> None:
         """Queue consumer loop.
@@ -269,18 +292,47 @@ class InternalOrchestrator(BaseSpecialist):
         if self._footer_svc and result.answer:
             user_id_raw = task.user.id if task.user else None
             user_id = int(user_id_raw) if user_id_raw and str(user_id_raw).isdigit() else None
+            footer_started_at = _trace_now_iso()
+            footer_t0 = time.monotonic()
             try:
                 footer = await self._footer_svc.build_for_agent_result(
                     result, user_id=user_id, channel=f"{channel_id}_chat"
                 )
             except Exception:
                 logger.exception("Footer build failed")
+                await self._record_timing(
+                    task,
+                    stage="footer_build",
+                    started_at=footer_started_at,
+                    elapsed_ms=(time.monotonic() - footer_t0) * 1000,
+                    status="error",
+                    details={"user_id": user_id},
+                )
+            else:
+                await self._record_timing(
+                    task,
+                    stage="footer_build",
+                    started_at=footer_started_at,
+                    elapsed_ms=(time.monotonic() - footer_t0) * 1000,
+                    status="completed",
+                    details={"user_id": user_id, "footer_chars": len(footer)},
+                )
         body = append_footer(result.answer, footer) if result.answer else ""
         if body:
+            send_started_at = _trace_now_iso()
+            send_t0 = time.monotonic()
             try:
                 await channel.send(recipient_id, body)
             except Exception:
                 logger.exception("Channel send failed for channel=%s recipient=%s", channel_id, recipient_id)
+                await self._record_timing(
+                    task,
+                    stage="channel_send",
+                    started_at=send_started_at,
+                    elapsed_ms=(time.monotonic() - send_t0) * 1000,
+                    status="error",
+                    details={"channel_id": channel_id, "recipient_id": recipient_id, "body_chars": len(body)},
+                )
                 if self._conversation_trace is not None:
                     await self._conversation_trace.record_outbound(
                         task=task,
@@ -291,6 +343,14 @@ class InternalOrchestrator(BaseSpecialist):
                         error="channel_send_failed",
                     )
             else:
+                await self._record_timing(
+                    task,
+                    stage="channel_send",
+                    started_at=send_started_at,
+                    elapsed_ms=(time.monotonic() - send_t0) * 1000,
+                    status="sent",
+                    details={"channel_id": channel_id, "recipient_id": recipient_id, "body_chars": len(body)},
+                )
                 if self._conversation_trace is not None:
                     await self._conversation_trace.record_outbound(
                         task=task,
@@ -303,10 +363,27 @@ class InternalOrchestrator(BaseSpecialist):
     async def _publish_result(self, task: AgentTask, result: AgentResult) -> None:
         if self._result_publisher is None:
             return
+        started_at = _trace_now_iso()
+        t0 = time.monotonic()
         try:
             await self._result_publisher.publish(task, result)
         except Exception:
             logger.exception("Result publishing failed")
+            await self._record_timing(
+                task,
+                stage="result_publish",
+                started_at=started_at,
+                elapsed_ms=(time.monotonic() - t0) * 1000,
+                status="error",
+            )
+        else:
+            await self._record_timing(
+                task,
+                stage="result_publish",
+                started_at=started_at,
+                elapsed_ms=(time.monotonic() - t0) * 1000,
+                status="completed",
+            )
 
     # ------------------------------------------------------------------
     # Backward-compat: expose specialists dict for startup.py run() calls
@@ -327,3 +404,7 @@ def _dummy_manifest() -> AgentManifest:
         kind="orchestrator",
         description="Старший AI-агент. Посредник между людьми и специалистами.",
     )
+
+
+def _trace_now_iso() -> str:
+    return datetime.now(MOSCOW_TZ).isoformat()

@@ -136,3 +136,50 @@ class CallSpecialistTool:
                 "actions_requiring_approval": [a.model_dump() for a in sr.actions_requiring_approval],
             },
         )
+
+    async def execute_with_task(self, args: dict[str, Any], *, task: AgentTask) -> ToolResult:
+        specialist_id = str(args.get("specialist_id") or "").strip()
+        request = str(args.get("request") or "").strip()
+
+        specialist = self._specialists.get(specialist_id)
+        if specialist is None:
+            return ToolResult(
+                status=ToolStatus.ERROR,
+                tool=self.name,
+                error=f"unknown specialist: {specialist_id}",
+            )
+
+        dialog_key = str(task.context.get("dialog_key") or "") or None
+        sub_task = task.model_copy(update={"request": request})
+        try:
+            sr = await specialist.handle(sub_task)
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            logger.exception("CallSpecialistTool: specialist %s failed", specialist_id)
+            return ToolResult(status=ToolStatus.ERROR, tool=self.name, error=err)
+
+        if self.schedule_fn and sr.scheduled_tasks:
+            try:
+                self.schedule_fn(sr.scheduled_tasks)
+            except Exception:
+                logger.exception("CallSpecialistTool: schedule_fn failed for %s", specialist_id)
+
+        if self._store and dialog_key:
+            try:
+                if sr.status in ("needs_clarification", "needs_human"):
+                    await self._store.set_kv(dialog_key, "pending_specialist", specialist_id)
+                else:
+                    await self._store.delete_kv(dialog_key, "pending_specialist")
+            except Exception:
+                logger.exception("CallSpecialistTool: KV update failed for dialog_key=%s", dialog_key)
+
+        return ToolResult(
+            status=ToolStatus.OK,
+            tool=self.name,
+            data={
+                "specialist": specialist_id,
+                "answer": sr.answer,
+                "status": sr.status,
+                "actions_requiring_approval": [a.model_dump() for a in sr.actions_requiring_approval],
+            },
+        )
