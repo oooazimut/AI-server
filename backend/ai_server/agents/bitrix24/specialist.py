@@ -90,6 +90,15 @@ _LLM_TOOL_NAMES = frozenset(
     }
 )
 
+_FAST_RETURN_READ_TOOLS = frozenset(
+    {
+        "bitrix_warehouse_search",
+        "bitrix_my_tasks",
+        "bitrix_task_search",
+        "bitrix_project_search",
+    }
+)
+
 
 class Bitrix24Specialist(BaseSpecialist):
     max_steps = 7
@@ -306,6 +315,35 @@ class Bitrix24Specialist(BaseSpecialist):
             )
         return await super()._execute_tool_call(tool_call, task)
 
+    def _terminal_response_metadata(
+        self,
+        *,
+        tool_call: Any,
+        result: ToolResult | None,
+        action: Any | None,
+        approvals: list[Any],
+        task: AgentTask,
+    ) -> dict[str, Any] | None:
+        if result is None or approvals:
+            return None
+        if tool_call.name not in _FAST_RETURN_READ_TOOLS:
+            return None
+        if _is_ambiguous_read_result(tool_call.name, result):
+            return None
+        if result.status == ToolStatus.OK:
+            return {
+                "fast_return_reason": "read_only_tool_success",
+                "terminal_tool": tool_call.name,
+                "tool_status": str(result.status),
+            }
+        if result.status == ToolStatus.DENIED and _is_oauth_authorization_result(result):
+            return {
+                "fast_return_reason": "read_only_oauth_authorization_required",
+                "terminal_tool": tool_call.name,
+                "tool_status": str(result.status),
+            }
+        return None
+
     def tool_definitions(self) -> list[dict]:
         return [t.definition().model_dump() for t in self._tool_registry.values() if t.name in _LLM_TOOL_NAMES]
 
@@ -514,6 +552,24 @@ def _truthy(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().casefold() in {"1", "true", "yes", "y", "да", "on"}
     return bool(value)
+
+
+def _is_oauth_authorization_result(result: ToolResult) -> bool:
+    data = result.data if isinstance(result.data, dict) else {}
+    return bool(data.get("oauth_required") or isinstance(data.get("authorization"), dict))
+
+
+def _is_ambiguous_read_result(tool_name: str, result: ToolResult) -> bool:
+    if result.status != ToolStatus.OK:
+        return False
+    data = result.data if isinstance(result.data, dict) else {}
+    if tool_name == "bitrix_warehouse_search":
+        matches = data.get("matches")
+        return isinstance(matches, list) and len(matches) > 1
+    if tool_name == "bitrix_project_search":
+        items = data.get("items")
+        return isinstance(items, list) and len(items) > 1
+    return False
 
 
 def _enforce_task_close_response(result: AgentResult, *, settings: Settings | None = None) -> AgentResult:

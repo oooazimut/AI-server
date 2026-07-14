@@ -315,6 +315,17 @@ def _direct_task_create_response(
     portal_base_url: str = "",
 ) -> BitrixLLMFinalResult | None:
     for result in reversed(tool_results):
+        if result.status == "denied" and result.tool in {
+            "bitrix_warehouse_search",
+            "bitrix_my_tasks",
+            "bitrix_task_search",
+            "bitrix_project_search",
+        }:
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer=_format_read_denied_answer(result.data, result.error),
+                model_usage=_local_model_usage(agent_id, "read_authorization_response"),
+            )
         if result.status != "ok":
             continue
         if result.tool == "bitrix_warehouse_search":
@@ -438,6 +449,14 @@ def _direct_task_create_response(
                 model_usage=_local_model_usage(agent_id, "calendar_event_discard_response"),
             )
     return None
+
+
+def _format_read_denied_answer(data: dict[str, Any], error: str | None) -> str:
+    authorization = data.get("authorization") if isinstance(data.get("authorization"), dict) else {}
+    message = _text(authorization.get("message")) if authorization else ""
+    if message:
+        return message
+    return _text(error) or "Для чтения данных Bitrix24 требуется авторизация."
 
 
 def _format_warehouse_answer(data: dict[str, Any], *, portal_base_url: str = "") -> str:

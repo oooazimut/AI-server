@@ -134,6 +134,8 @@ class CallSpecialistTool:
                 "answer": sr.answer,
                 "status": sr.status,
                 "actions_requiring_approval": [a.model_dump() for a in sr.actions_requiring_approval],
+                "metadata": sr.metadata,
+                **_terminal_contract_data(sr.metadata),
             },
         )
 
@@ -181,5 +183,20 @@ class CallSpecialistTool:
                 "answer": sr.answer,
                 "status": sr.status,
                 "actions_requiring_approval": [a.model_dump() for a in sr.actions_requiring_approval],
+                "metadata": sr.metadata,
+                **_terminal_contract_data(sr.metadata),
             },
         )
+
+
+def _terminal_contract_data(metadata: dict[str, Any]) -> dict[str, Any]:
+    if not metadata.get("terminal"):
+        return {}
+    return {
+        "terminal": bool(metadata.get("terminal")),
+        "answer_is_final": bool(metadata.get("answer_is_final")),
+        "safe_to_send": bool(metadata.get("safe_to_send")),
+        "fast_return": bool(metadata.get("fast_return")),
+        "fast_return_reason": str(metadata.get("fast_return_reason") or ""),
+        "terminal_tool": str(metadata.get("terminal_tool") or ""),
+    }

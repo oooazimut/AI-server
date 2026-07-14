@@ -106,6 +106,18 @@ class BaseSpecialist:
         action = ActionRecord(name=tool_call.name, status=result.status, details=result.model_dump())
         return result, action, []
 
+    def _terminal_response_metadata(
+        self,
+        *,
+        tool_call: Any,
+        result: ToolResult | None,
+        action: ActionRecord | None,
+        approvals: list[ActionRecord],
+        task: AgentTask,
+    ) -> dict[str, Any] | None:
+        """Return terminal-response metadata when the loop can skip the next decide step."""
+        return None
+
     # ------------------------------------------------------------------
     # Lifecycle hooks (subclasses override as needed)
     # ------------------------------------------------------------------
@@ -249,6 +261,7 @@ class BaseSpecialist:
         tool_results: list[ToolResult] = []
         approval_actions: list[ActionRecord] = []
         decision_results: list[Any] = []
+        terminal_response_metadata: dict[str, Any] = {}
         decision = None
 
         for step in range(1, self.max_steps + 1):
@@ -325,6 +338,7 @@ class BaseSpecialist:
             executable_calls = [call for call in decision.tool_calls if call.name != "none"]
             if not executable_calls:
                 break
+            stop_after_step = False
             for tool_call in executable_calls:
                 tool_started_at = _trace_now_iso()
                 tool_t0 = time.monotonic()
@@ -360,6 +374,40 @@ class BaseSpecialist:
                 if action is not None:
                     actions_taken.append(action)
                 approval_actions.extend(approvals)
+                if len(executable_calls) == 1:
+                    terminal_metadata = self._terminal_response_metadata(
+                        tool_call=tool_call,
+                        result=result,
+                        action=action,
+                        approvals=approvals,
+                        task=task,
+                    )
+                    if terminal_metadata:
+                        terminal_response_metadata = {
+                            "terminal": True,
+                            "answer_is_final": True,
+                            "safe_to_send": True,
+                            "fast_return": True,
+                            **terminal_metadata,
+                        }
+                        actions_taken.append(
+                            ActionRecord(
+                                name=f"{self.action_prefix}_fast_return",
+                                status="completed",
+                                details=terminal_response_metadata,
+                            )
+                        )
+                        await self._record_timing(
+                            task,
+                            stage="fast_return",
+                            started_at=_trace_now_iso(),
+                            elapsed_ms=0.0,
+                            status="completed",
+                            step=step,
+                            tool=tool_call.name,
+                            details=terminal_response_metadata,
+                        )
+                        stop_after_step = True
             if step == self.max_steps and self.max_steps > 1:
                 actions_taken.append(
                     ActionRecord(
@@ -368,6 +416,8 @@ class BaseSpecialist:
                         details={"max_steps": self.max_steps},
                     )
                 )
+            if stop_after_step:
+                break
 
         if decision is None:
             failure = self._llm_failure_result(f"empty {self.action_prefix} LLM decision loop")
@@ -429,6 +479,8 @@ class BaseSpecialist:
             details={
                 "tool_results_count": len(tool_results),
                 "approval_actions_count": len(approval_actions),
+                "fast_return": bool(terminal_response_metadata.get("fast_return")),
+                "fast_return_reason": str(terminal_response_metadata.get("fast_return_reason") or ""),
             },
         )
         actions_taken.append(
@@ -472,6 +524,7 @@ class BaseSpecialist:
             model_usage=[*[item.model_usage for item in decision_results], final_result.model_usage],
             confidence=decision.confidence,
             logs=self._logs(),
+            metadata=terminal_response_metadata,
         )
 
     async def run(self, queue: AgentQueuePort) -> None:
