@@ -4,6 +4,8 @@ import asyncio
 from typing import Any
 from uuid import uuid4
 
+from ai_server.agent_queue_utils import agent_queue_partition_key
+
 
 class InMemoryAgentQueue:
     """In-process agent queue — asyncio.Queue per agent_id. Fallback when Redis is not configured."""
@@ -23,12 +25,32 @@ class InMemoryAgentQueue:
         msg = {**message, "id": message.get("id") or uuid4().hex}
         await self._queue(agent_id).put(msg)
 
-    async def claim_next(self, agent_id: str) -> dict[str, Any] | None:
+    async def claim_next(
+        self,
+        agent_id: str,
+        *,
+        blocked_partition_keys: set[str] | None = None,
+    ) -> dict[str, Any] | None:
         q = self._queue(agent_id)
-        try:
-            return q.get_nowait()
-        except asyncio.QueueEmpty:
-            return None
+        blocked = set(blocked_partition_keys or ())
+        deferred: list[dict[str, Any]] = []
+        selected: dict[str, Any] | None = None
+        while True:
+            try:
+                message = q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            partition_key = agent_queue_partition_key(message)
+            if partition_key and partition_key in blocked:
+                deferred.append(message)
+                continue
+            if partition_key:
+                message["_partition_key"] = partition_key
+            selected = message
+            break
+        for message in deferred:
+            await q.put(message)
+        return selected
 
     async def ack(self, message_id: str) -> None:
         pass  # in-memory: no persistence, nothing to ack

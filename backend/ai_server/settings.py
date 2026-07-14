@@ -73,6 +73,10 @@ class Settings:
     webhook_event_queue_retry_base_seconds: int
     webhook_event_queue_retry_max_seconds: int
     webhook_event_queue_stale_processing_seconds: int
+    agent_orchestrator_worker_count: int
+    agent_bitrix_worker_count: int
+    agent_task_timeout_seconds: float
+    agent_queue_processing_ttl_seconds: int
     scheduler_enabled: bool
     search_index_max_tasks: int
     search_index_max_projects: int
@@ -477,6 +481,10 @@ def get_settings() -> Settings:
         webhook_event_queue_retry_max_seconds=_env_int("WEBHOOK_EVENT_QUEUE_RETRY_MAX_SECONDS", 300) or 300,
         webhook_event_queue_stale_processing_seconds=_env_int("WEBHOOK_EVENT_QUEUE_STALE_PROCESSING_SECONDS", 300)
         or 300,
+        agent_orchestrator_worker_count=_env_int("AGENT_ORCHESTRATOR_WORKER_COUNT", 1) or 1,
+        agent_bitrix_worker_count=_env_int("AGENT_BITRIX_WORKER_COUNT", 1) or 1,
+        agent_task_timeout_seconds=_env_float("AGENT_TASK_TIMEOUT_SECONDS", 300.0) or 300.0,
+        agent_queue_processing_ttl_seconds=_env_int("AGENT_QUEUE_PROCESSING_TTL_SECONDS", 600) or 600,
         scheduler_enabled=_env_bool("AI_SERVER_SCHEDULER_ENABLED", True),
         search_index_max_tasks=_env_int("SEARCH_INDEX_MAX_TASKS", 5000) or 5000,
         search_index_max_projects=_env_int("SEARCH_INDEX_MAX_PROJECTS", 200) or 200,

@@ -8,6 +8,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from ai_server.agent_queue_utils import agent_queue_partition_key
 from ai_server.agents.ports import AgentQueuePort, AgentStorePort, ResultPublisherPort, SchedulerPort
 from ai_server.agents.tool import AgentTool
 from ai_server.knowledge import MarkdownKnowledgeBase
@@ -58,6 +59,8 @@ class BaseSpecialist:
         self.store = store
         self._result_publisher = result_publisher
         self._conversation_trace = conversation_trace
+        self._active_queue_partitions: set[str] = set()
+        self._queue_partition_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Hooks subclasses implement/override
@@ -535,7 +538,38 @@ class BaseSpecialist:
             metadata=terminal_response_metadata,
         )
 
-    async def run(self, queue: AgentQueuePort) -> None:
+    async def _claim_queue_message(
+        self,
+        queue: AgentQueuePort,
+        agent_id: str,
+    ) -> tuple[dict[str, Any] | None, str]:
+        async with self._queue_partition_lock:
+            message = await queue.claim_next(agent_id, blocked_partition_keys=self._active_queue_partitions)
+            if message is None:
+                return None, ""
+            partition_key = str(message.get("_partition_key") or agent_queue_partition_key(message))
+            if partition_key:
+                self._active_queue_partitions.add(partition_key)
+            return message, partition_key
+
+    async def _release_queue_partition(self, partition_key: str) -> None:
+        if not partition_key:
+            return
+        async with self._queue_partition_lock:
+            self._active_queue_partitions.discard(partition_key)
+
+    async def _await_message_task(self, coro: Any, *, timeout_seconds: float | None) -> Any:
+        if timeout_seconds is None or timeout_seconds <= 0:
+            return await coro
+        return await asyncio.wait_for(coro, timeout=timeout_seconds)
+
+    async def run(
+        self,
+        queue: AgentQueuePort,
+        *,
+        worker_name: str = "",
+        task_timeout_seconds: float | None = None,
+    ) -> None:
         """Queue consumer loop: claim → handle → publish result → ack/nack.
 
         Specialists never call queue.publish() directly inside handle().
@@ -543,7 +577,7 @@ class BaseSpecialist:
         """
         agent_id = self.manifest.id
         while True:
-            message = await queue.claim_next(agent_id)
+            message, partition_key = await self._claim_queue_message(queue, agent_id)
             if message is None:
                 await asyncio.sleep(self._queue_poll_interval)
                 continue
@@ -555,7 +589,7 @@ class BaseSpecialist:
                     logger.warning("Agent %s: invalid message %s: %s", agent_id, msg_id, exc)
                     await queue.nack(msg_id, error=f"invalid message: {exc}")
                     continue
-                result = await self.handle(task)
+                result = await self._await_message_task(self.handle(task), timeout_seconds=task_timeout_seconds)
                 if self._result_publisher is not None:
                     try:
                         await self._result_publisher.publish(task, result)
@@ -578,11 +612,16 @@ class BaseSpecialist:
                         }
                     )
                 await queue.ack(msg_id)
+            except TimeoutError:
+                logger.exception("Agent %s worker %s timed out processing message %s", agent_id, worker_name, msg_id)
+                await queue.nack(msg_id, error=f"TimeoutError: task exceeded {task_timeout_seconds}s")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.exception("Agent %s failed processing message %s", agent_id, msg_id)
                 await queue.nack(msg_id, error=f"{type(exc).__name__}: {exc}")
+            finally:
+                await self._release_queue_partition(partition_key)
 
 
 def _trace_now_iso() -> str:
