@@ -352,7 +352,8 @@ class InternalOrchestrator(BaseSpecialist):
                     status="completed",
                     details={"user_id": user_id, "footer_chars": len(footer)},
                 )
-        body = append_footer(result.answer, footer) if result.answer else ""
+        answer = _label_line_answer(result.answer or "", task.context)
+        body = append_footer(answer, footer) if answer else ""
         if body:
             send_started_at = _trace_now_iso()
             send_t0 = time.monotonic()
@@ -439,6 +440,16 @@ def _dummy_manifest() -> AgentManifest:
         kind="orchestrator",
         description="Старший AI-агент. Посредник между людьми и специалистами.",
     )
+
+
+def _label_line_answer(answer: str, context: dict[str, Any]) -> str:
+    line_label = str(context.get("dialog_line_label") or "").strip()
+    if not line_label or not answer:
+        return answer
+    stripped = answer.lstrip()
+    if stripped.casefold().startswith(line_label.casefold()):
+        return answer
+    return f"{line_label}: {answer}"
 
 
 def _trace_now_iso() -> str:

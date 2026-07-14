@@ -8,6 +8,7 @@ lives here so the channel can be a pure transport adapter.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -26,6 +27,38 @@ def make_dialog_key(*, chat_id: int | None = None, dialog_id: str = "", user_id:
     if dialog_id:
         return f"dialog:{dialog_id}:user:{resolved}"
     return f"user:{resolved}"
+
+
+def make_line_dialog_key(base_dialog_key: str, line_id: str) -> str:
+    clean_line_id = str(line_id or "").strip()
+    if not base_dialog_key or not clean_line_id:
+        return base_dialog_key
+    return f"{base_dialog_key}:line:{clean_line_id}"
+
+
+def extract_dialog_line(text: str) -> tuple[str, dict[str, str]]:
+    """Extract an explicit Bitrix conversation line prefix.
+
+    Supported forms:
+    - "Линия 1 Битрикс найди проект ..."
+    - "Линия 2: покажи склад ..."
+    - "line 3 ..."
+    - "л4 ..."
+    """
+    source = str(text or "")
+    match = re.match(
+        r"^\s*(?:линия|line|л|l)\s*#?([0-9]{1,2})\s*[:.\-–—,]?\s+(.+)$",
+        source,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return source, {}
+    line_id = str(int(match.group(1)))
+    stripped = match.group(2).strip()
+    return stripped or source, {
+        "dialog_line_id": line_id,
+        "dialog_line_label": f"Линия {line_id}",
+    }
 
 
 async def build_agent_task_from_bitrix_chat(
@@ -48,11 +81,15 @@ async def build_agent_task_from_bitrix_chat(
         incoming = incoming.model_copy(
             update={"text": _merge_text_and_transcription(incoming.text, attachment_context["transcription_text"])}
         )
-    dialog_key = make_dialog_key(
+    base_dialog_key = make_dialog_key(
         chat_id=incoming.chat_id,
         dialog_id=incoming.dialog_id,
         user_id=incoming.user_id,
     )
+    request_text, line_context = extract_dialog_line(incoming.text)
+    dialog_key = base_dialog_key
+    if line_context:
+        dialog_key = make_line_dialog_key(base_dialog_key, line_context["dialog_line_id"])
     return AgentTask(
         task_id=str(uuid4()),
         source="bitrix24_chat",
@@ -66,7 +103,7 @@ async def build_agent_task_from_bitrix_chat(
                 "bot_id": incoming.bot_id,
             },
         ),
-        request=incoming.text,
+        request=request_text,
         files=[
             *[file.model_dump() for file in incoming.files],
             *attachment_context["stored_files"],
@@ -74,9 +111,11 @@ async def build_agent_task_from_bitrix_chat(
         context={
             "bitrix_event_type": incoming.event_type,
             "dialog_key": dialog_key,
+            "base_dialog_key": base_dialog_key,
             "dialog_id": incoming.dialog_id or "",
             "channel_id": "bitrix24",
             "recipient_id": incoming.dialog_id or "",
+            **line_context,
             "dialog_history": [],
             "transcriptions": attachment_context["transcriptions"],
             "attachment_errors": attachment_context["errors"],

@@ -2839,7 +2839,7 @@ def _common_project_query(request: str) -> str:
     match = re.search(r"\bпроект[а-яё]*\s+(.+?)(?:[.?!]|$)", request, flags=re.IGNORECASE)
     if not match:
         return ""
-    return _clean_read_query(match.group(1))
+    return _clean_project_query(match.group(1))
 
 
 def _task_scope_from_text(lowered: str) -> str:
@@ -2917,6 +2917,23 @@ def _clean_read_query(value: str) -> str:
     text = str(value or "").strip(" \t\r\n\"'«».,!?")
     text = re.split(r"\s+(?:со|с)\s+(?:статусом|сроком)\b", text, maxsplit=1, flags=re.IGNORECASE)[0]
     text = re.split(r"\s+в\s+проекте\b", text, maxsplit=1, flags=re.IGNORECASE)[0]
+    return text.strip(" \t\r\n\"'«».,!?")
+
+
+def _clean_project_query(value: str) -> str:
+    text = _clean_read_query(value)
+    text = re.split(
+        r"\s+(?:ответь|покажи|дай|напиши|выведи)\b",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    text = re.split(
+        r"\s+(?:кратко|ссылку|ссылкой|название|id)\b",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
     return text.strip(" \t\r\n\"'«».,!?")
 
 
