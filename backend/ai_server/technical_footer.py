@@ -213,12 +213,12 @@ class TechnicalFooterService:
         if not self._is_footer_allowed(user_id=user_id, channel=channel):
             return ""
 
-        lines = [_format_model_usage(result.model_usage)]
+        lines = [_format_model_usage(result)]
         if self._settings.tech_footer_balance_enabled:
             providers = {usage.provider.casefold() for usage in result.model_usage if usage.provider}
             balance_lines = await self._collect_balance_lines(providers)
             lines.extend(balance_lines)
-        return "\n".join(line for line in lines if line)
+        return ", ".join(line for line in lines if line)
 
     async def build_for_pending_action(
         self,
@@ -234,12 +234,12 @@ class TechnicalFooterService:
         if not usages:
             return f"LLM: не использовалась; Bitrix action: {status}."
 
-        lines = [_format_model_usage(usages), f"Bitrix action: {status}."]
+        lines = [_format_model_usage_records(usages), f"Bitrix action: {status}."]
         if self._settings.tech_footer_balance_enabled:
             providers = {usage.provider.casefold() for usage in usages if usage.provider}
             balance_lines = await self._collect_balance_lines(providers)
             lines.extend(balance_lines)
-        return "\n".join(line for line in lines if line)
+        return ", ".join(line for line in lines if line)
 
     def _is_footer_allowed(self, *, user_id: int | None, channel: str) -> bool:
         if not self._settings.tech_footer_enabled:
@@ -260,7 +260,7 @@ class TechnicalFooterService:
         lines: list[str] = []
         for snapshot in snapshots:
             if isinstance(snapshot, ProviderBalanceSnapshot):
-                lines.extend(snapshot.lines)
+                lines.extend(_format_balance_snapshot_compact(snapshot))
         return lines
 
 
@@ -270,21 +270,86 @@ def append_footer(message: str, footer: str) -> str:
     return f"{message}\n\n---\nТех: {footer}"
 
 
-def _format_model_usage(usages: list[ModelUsageRecord]) -> str:
-    if not usages:
-        return "LLM: не использовалась; выполнено системное действие/API."
+def _format_model_usage(result: AgentResult) -> str:
+    return _format_model_usage_records(result.model_usage, result=result)
 
-    parts: list[str] = []
+
+def _format_model_usage_records(usages: list[ModelUsageRecord], *, result: AgentResult | None = None) -> str:
+    if not usages:
+        return "LLM не использовалась"
+
+    visible_usages = [usage for usage in usages if usage.status != "skipped"]
+    if not visible_usages:
+        visible_usages = usages
+
+    input_tokens = sum(usage.input_tokens or 0 for usage in visible_usages)
+    output_tokens = sum(usage.output_tokens or 0 for usage in visible_usages)
+    total_cost = sum(usage.cost_usd or 0 for usage in visible_usages)
+
+    parts = [_format_model_route(result=result, usages=visible_usages)]
+    if any(usage.input_tokens is not None or usage.output_tokens is not None for usage in visible_usages):
+        parts.append(f"{input_tokens}/{output_tokens} ток.")
+    if total_cost:
+        parts.append(f"${total_cost:.4f}")
+    return ", ".join(part for part in parts if part)
+
+
+def _format_model_route(*, result: AgentResult | None, usages: list[ModelUsageRecord]) -> str:
+    if result is not None:
+        source = _agent_label(result.agent_id)
+        handoffs = [_agent_label(agent_id) for agent_id in result.handoff_to if agent_id]
+        handoffs = [label for label in handoffs if label and label != source]
+        if handoffs:
+            return f"{source} → {', '.join(handoffs)}"
+        if result.agent_id:
+            return source
+
+    agent_ids: list[str] = []
     for usage in usages:
-        label = " ".join(part for part in (usage.agent_id, usage.provider, usage.model) if part)
-        if usage.status and usage.status != "used":
-            label += f" ({usage.status})"
-        if usage.input_tokens is not None or usage.output_tokens is not None:
-            label += f" tokens {usage.input_tokens or 0}/{usage.output_tokens or 0}"
-        if usage.cost_usd is not None:
-            label += f" cost ${usage.cost_usd:.4f}"
-        parts.append(label)
-    return "LLM: " + "; ".join(parts) + "."
+        if usage.agent_id and usage.agent_id not in agent_ids:
+            agent_ids.append(usage.agent_id)
+    if not agent_ids:
+        return "LLM"
+    labels = [_agent_label(agent_id) for agent_id in agent_ids]
+    return " → ".join(label for label in labels if label)
+
+
+def _agent_label(agent_id: str) -> str:
+    labels = {
+        "internal_orchestrator": "оркестр",
+        "bitrix24": "Bitrix",
+        "diagnost": "диагност",
+        "kartoteka": "картотека",
+        "logistics": "логистика",
+        "pto": "ПТО",
+    }
+    return labels.get(agent_id, agent_id)
+
+
+def _format_balance_snapshot_compact(snapshot: ProviderBalanceSnapshot) -> list[str]:
+    if snapshot.provider.casefold() != "deepseek":
+        return [line.rstrip(".") for line in snapshot.lines]
+
+    if snapshot.status == "ok":
+        status = "OK" if snapshot.available is not False else "недоступен"
+        balance = _extract_balance_text(snapshot.lines)
+        suffix = f", {balance}" if balance else ""
+        return [f"DeepSeek {status}{suffix}"]
+    if snapshot.status == "not_configured":
+        return ["DeepSeek не настроен"]
+    return ["DeepSeek ошибка"]
+
+
+def _extract_balance_text(lines: list[str]) -> str:
+    for line in lines:
+        marker = "баланс "
+        if marker not in line:
+            continue
+        value = line.split(marker, 1)[1].strip().rstrip(".")
+        if not value or value.startswith("не "):
+            return ""
+        return value
+    return ""
 
 
 def _coerce_model_usage_list(value: Any) -> list[ModelUsageRecord]:
