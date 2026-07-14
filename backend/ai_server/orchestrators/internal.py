@@ -53,6 +53,7 @@ class InternalOrchestrator(BaseSpecialist):
         channels: dict[str, ChannelPort] | None = None,
         footer_service: TechnicalFooterService | None = None,
         result_publisher: ResultPublisherPort | None = None,
+        conversation_trace: Any = None,
     ) -> None:
         super().__init__(
             manifest,
@@ -65,6 +66,7 @@ class InternalOrchestrator(BaseSpecialist):
         self._channels: dict[str, ChannelPort] = channels or {}
         self._footer_svc = footer_service
         self._result_publisher = result_publisher
+        self._conversation_trace = conversation_trace
 
     # ------------------------------------------------------------------
     # BaseSpecialist hooks
@@ -219,6 +221,7 @@ class InternalOrchestrator(BaseSpecialist):
             channels=channels,
             footer_service=footer_service,
             result_publisher=result_publisher,
+            conversation_trace=specialist_deps.get("conversation_trace"),
         )
         # Break circular dep: CallSpecialistTool needs orch to schedule specialist tasks
         call_tool.schedule_fn = orch._apply_scheduled_tasks_from_specialist
@@ -278,6 +281,24 @@ class InternalOrchestrator(BaseSpecialist):
                 await channel.send(recipient_id, body)
             except Exception:
                 logger.exception("Channel send failed for channel=%s recipient=%s", channel_id, recipient_id)
+                if self._conversation_trace is not None:
+                    await self._conversation_trace.record_outbound(
+                        task=task,
+                        result=result,
+                        recipient_id=recipient_id,
+                        body=body,
+                        status="error",
+                        error="channel_send_failed",
+                    )
+            else:
+                if self._conversation_trace is not None:
+                    await self._conversation_trace.record_outbound(
+                        task=task,
+                        result=result,
+                        recipient_id=recipient_id,
+                        body=body,
+                        status="sent",
+                    )
 
     async def _publish_result(self, task: AgentTask, result: AgentResult) -> None:
         if self._result_publisher is None:

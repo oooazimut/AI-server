@@ -150,6 +150,39 @@ async def bitrix_webhook_events_status(request: Request) -> dict[str, Any]:
     }
 
 
+@router.get("/admin/conversation-trace/recent")
+async def conversation_trace_recent(
+    request: Request,
+    x_trace_secret: Annotated[str | None, Header(alias="X-Trace-Secret")] = None,
+    secret: str = "",
+    hours: int = Query(default=24, ge=1, le=48),
+    limit: int = Query(default=100, ge=1, le=500),
+    user_id: str = "",
+    dialog_key: str = "",
+    message_id: str = "",
+    task_id: str = "",
+) -> dict[str, Any]:
+    _validate_trace_secret(request, provided=x_trace_secret or secret)
+    trace = request.app.state.conversation_trace
+    if message_id:
+        events = await trace.by_message(message_id, limit=limit, hours=hours)
+    elif task_id:
+        events = await trace.by_task(task_id, limit=limit, hours=hours)
+    elif dialog_key:
+        events = await trace.by_dialog(dialog_key, limit=limit, hours=hours)
+    elif user_id:
+        events = await trace.by_user(user_id, limit=limit, hours=hours)
+    else:
+        events = await trace.recent(limit=limit, hours=hours)
+    return {
+        "enabled": trace.enabled,
+        "hours": hours,
+        "limit": limit,
+        "count": len(events),
+        "events": events,
+    }
+
+
 @router.get("/agent/webhook-events/status")
 async def legacy_webhook_events_status(request: Request) -> dict[str, Any]:
     return await bitrix_webhook_events_status(request)
@@ -193,6 +226,12 @@ async def bitrix_events(
             payload,
             event_type=event_type,
         )
+        await request.app.state.conversation_trace.record_inbound(
+            event_id=event_id,
+            event_type=event_type,
+            payload=payload,
+            inserted=inserted,
+        )
         queue_status = request.app.state.webhook_event_queue_status
         queue_status["last_enqueued_at"] = now_ts()
         queue_status["last_enqueued_event_id"] = event_id
@@ -210,6 +249,14 @@ async def bitrix_events(
         }
 
     return {"ok": True, "skipped": True, "reason": "webhook_queue_disabled"}
+
+
+def _validate_trace_secret(request: Request, *, provided: str | None) -> None:
+    settings = request.app.state.settings
+    if not settings.conversation_trace_secret:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation trace is not configured")
+    if provided != settings.conversation_trace_secret:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid conversation trace secret")
 
 
 # ---------------------------------------------------------------------------

@@ -39,6 +39,7 @@ async def run_webhook_event_worker(
     status: dict[str, Any],
     settings: Settings,
     feedback_receiver: Any = None,
+    conversation_trace: Any = None,
 ) -> None:
     worker_count = settings.webhook_event_queue_worker_count
     active_partition_keys: set[str] = set()
@@ -71,6 +72,7 @@ async def run_webhook_event_worker(
                 active_lock=active_lock,
                 settings=settings,
                 feedback_receiver=feedback_receiver,
+                conversation_trace=conversation_trace,
             )
         )
         for index in range(worker_count)
@@ -118,6 +120,7 @@ async def _run_webhook_event_worker_loop(
     active_lock: asyncio.Lock,
     settings: Settings,
     feedback_receiver: Any = None,
+    conversation_trace: Any = None,
 ) -> None:
     while True:
         event_id: int | None = None
@@ -139,13 +142,16 @@ async def _run_webhook_event_worker_loop(
             status["last_event"] = event_type
             status["last_worker_id"] = worker_id
             result = await _route_event(
+                event_id=event_id,
                 event_type=event_type,
                 payload=dict(event.get("payload") or {}),
+                partition_key=partition_key,
                 agent_queue=agent_queue,
                 attachment_service=attachment_service,
                 transcriber=transcriber,
                 settings=settings,
                 feedback_receiver=feedback_receiver,
+                conversation_trace=conversation_trace,
             )
             await queue.mark_done(event_id, result)
             status["last_error"] = None
@@ -169,13 +175,16 @@ async def _run_webhook_event_worker_loop(
 
 async def _route_event(
     *,
+    event_id: int | None = None,
     event_type: str,
     payload: dict[str, Any],
+    partition_key: str = "",
     agent_queue: AgentQueuePort,
     attachment_service: AttachmentService,
     transcriber: Any,
     settings: Settings,
     feedback_receiver: Any = None,
+    conversation_trace: Any = None,
 ) -> dict[str, Any]:
     """Route a Bitrix webhook event to the appropriate agent queue."""
     if event_type in MESSAGE_EVENTS:
@@ -192,6 +201,15 @@ async def _route_event(
                 logger.exception("_route_event: feedback_receiver.handle failed")
                 intercepted = False
             if intercepted:
+                await _trace_route(
+                    conversation_trace,
+                    event_id=event_id,
+                    event_type=event_type,
+                    routed_to="feedback_receiver",
+                    task=task,
+                    partition_key=partition_key,
+                    result={"handled": True, "routed_to": "feedback_receiver", "event": event_type},
+                )
                 return {"handled": True, "routed_to": "feedback_receiver", "event": event_type}
         await agent_queue.publish(
             {
@@ -200,6 +218,15 @@ async def _route_event(
                 "type": "bitrix_chat",
                 "payload": task.model_dump(),
             }
+        )
+        await _trace_route(
+            conversation_trace,
+            event_id=event_id,
+            event_type=event_type,
+            routed_to="orchestrator",
+            task=task,
+            partition_key=partition_key,
+            result={"handled": True, "routed_to": "orchestrator", "event": event_type},
         )
         return {"handled": True, "routed_to": "orchestrator", "event": event_type}
 
@@ -213,6 +240,15 @@ async def _route_event(
                 "payload": task.model_dump(),
             }
         )
+        await _trace_route(
+            conversation_trace,
+            event_id=event_id,
+            event_type=event_type,
+            routed_to="bitrix24",
+            task=task,
+            partition_key=partition_key,
+            result={"handled": True, "routed_to": "bitrix24", "event": event_type},
+        )
         return {"handled": True, "routed_to": "bitrix24", "event": event_type}
 
     if _is_disk_event(event_type):
@@ -224,9 +260,47 @@ async def _route_event(
                 "payload": payload,
             }
         )
+        await _trace_route(
+            conversation_trace,
+            event_id=event_id,
+            event_type=event_type,
+            routed_to="index_refresher",
+            partition_key=partition_key,
+            result={"handled": True, "routed_to": "index_refresher", "event": event_type},
+        )
         return {"handled": True, "routed_to": "index_refresher", "event": event_type}
 
+    await _trace_route(
+        conversation_trace,
+        event_id=event_id,
+        event_type=event_type,
+        routed_to="unsupported",
+        partition_key=partition_key,
+        result={"handled": False, "reason": "unsupported_event", "event": event_type},
+    )
     return {"handled": False, "reason": "unsupported_event", "event": event_type}
+
+
+async def _trace_route(
+    conversation_trace: Any,
+    *,
+    event_id: int | None,
+    event_type: str,
+    routed_to: str,
+    task: Any = None,
+    partition_key: str = "",
+    result: dict[str, Any] | None = None,
+) -> None:
+    if conversation_trace is None:
+        return
+    await conversation_trace.record_route(
+        event_id=event_id,
+        event_type=event_type,
+        routed_to=routed_to,
+        task=task,
+        partition_key=partition_key,
+        result=result,
+    )
 
 
 def _update_active_status(status: dict[str, Any], active_partition_keys: set[str]) -> None:

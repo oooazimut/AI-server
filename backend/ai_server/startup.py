@@ -20,6 +20,7 @@ from .integrations.postgres.orchestrator_agent import PostgresOrchestratorStore
 from .integrations.postgres.pto_agent import PostgresPtoAgentStore
 from .integrations.postgres.vehicle_usage import PostgresVehicleUsageStore
 from .integrations.redis.agent_queue import RedisAgentQueue
+from .integrations.redis.conversation_trace import RedisConversationTrace
 from .integrations.redis.event_queue import RedisEventQueue
 from .llm import build_orchestrator_llm_client
 from .orchestrators.internal import InternalOrchestrator
@@ -42,6 +43,10 @@ def _make_event_queue(settings: Settings) -> RedisEventQueue:
 
 def _make_agent_queue(settings: Settings) -> RedisAgentQueue:
     return RedisAgentQueue(settings.redis_url)
+
+
+def _make_conversation_trace(settings: Settings) -> RedisConversationTrace:
+    return RedisConversationTrace(settings.redis_url, settings=settings)
 
 
 async def _make_vehicle_store(settings: Settings) -> PostgresVehicleUsageStore:
@@ -99,6 +104,7 @@ async def lifespan(app: FastAPI):
         bitrix_oauth=bitrix_oauth,
     )
     webhook_event_queue = _make_event_queue(settings)
+    conversation_trace = _make_conversation_trace(settings)
     pto_store = await _make_pto_store(settings)
     orchestrator_store = await _make_orchestrator_store(settings)
     kartoteka_store = await _make_kartoteka_store(settings)
@@ -110,6 +116,7 @@ async def lifespan(app: FastAPI):
     app.state.portal_search = portal_search
     app.state.portal_search_indexer = portal_search_indexer
     app.state.webhook_event_queue = webhook_event_queue
+    app.state.conversation_trace = conversation_trace
     app.state.webhook_event_status = {
         "enabled": True,
         "mode": "webhook",
@@ -265,6 +272,7 @@ async def lifespan(app: FastAPI):
             kartoteka_llm=KartotekaLLMService(),
             channels={"bitrix24": bitrix_channel},
             footer_service=TechnicalFooterService(settings=settings),
+            conversation_trace=conversation_trace,
         )
         orch_manifest = next((m for m in manifests if m.kind == "orchestrator"), None)
         orchestrator = InternalOrchestrator.build(
