@@ -4,7 +4,7 @@ from ai_server.agents.bitrix24 import Bitrix24Specialist
 from ai_server.agents.logistics import LogisticsSpecialist
 from ai_server.agents.pto import PtoSpecialist
 from ai_server.models import AgentManifest, AgentResult, AgentTask
-from ai_server.orchestrators.internal import InternalOrchestrator, _label_line_answer
+from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.orchestrators.tools import CallSpecialistTool
 from ai_server.registry import load_agent_manifests
 from ai_server.retrieval import HybridKnowledgeRetriever
@@ -39,12 +39,6 @@ def _make_orch(specialists: dict, llm, *, store=None) -> InternalOrchestrator:
     )
     call_tool.schedule_fn = orch._apply_scheduled_tasks_from_specialist
     return orch
-
-
-def test_label_line_answer_prefixes_line_label_once():
-    assert _label_line_answer("Ответ", {"dialog_line_label": "Линия 2"}) == "Линия 2: Ответ"
-    assert _label_line_answer("Линия 2: Ответ", {"dialog_line_label": "Линия 2"}) == "Линия 2: Ответ"
-    assert _label_line_answer("Ответ", {}) == "Ответ"
 
 
 def test_internal_orchestrator_delegates_bitrix_request():

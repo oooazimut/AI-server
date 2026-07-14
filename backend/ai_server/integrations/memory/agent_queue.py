@@ -66,3 +66,20 @@ class InMemoryAgentQueue:
             if partition_key:
                 partitions.add(partition_key)
         return partitions
+
+    async def remove_pending_by_partition(self, agent_id: str, partition_key: str) -> int:
+        q = self._queue(agent_id)
+        kept: list[dict[str, Any]] = []
+        removed = 0
+        while True:
+            try:
+                message = q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if agent_queue_partition_key(message) == partition_key:
+                removed += 1
+            else:
+                kept.append(message)
+        for message in kept:
+            await q.put(message)
+        return removed

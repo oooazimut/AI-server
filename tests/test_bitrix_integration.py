@@ -102,35 +102,6 @@ def test_build_agent_task_from_bitrix_chat_builds_correct_task():
     assert task.context["recipient_id"] == "chat99"
 
 
-def test_build_agent_task_from_bitrix_chat_extracts_dialog_line():
-    class FakeAttachmentService:
-        async def download_message_files(self, message):
-            return []
-
-    class FakeTranscriber:
-        async def transcribe(self, attachment):
-            raise AssertionError("no voice files expected")
-
-    payload = _bitrix_v2_message_payload()
-    payload["data"]["message"]["text"] = "Линия 2: Битрикс покажи склад Борисов"
-
-    task = anyio_run(
-        build_agent_task_from_bitrix_chat(
-            payload,
-            attachment_service=FakeAttachmentService(),
-            transcriber=FakeTranscriber(),
-            settings=None,
-        )
-    )
-
-    assert task.request == "Битрикс покажи склад Борисов"
-    assert task.context["base_dialog_key"] == "chat:77:user:9"
-    assert task.context["dialog_key"] == "chat:77:user:9:line:2"
-    assert task.context["dialog_line_id"] == "2"
-    assert task.context["dialog_line_label"] == "Линия 2"
-    assert task.context["recipient_id"] == "chat99"
-
-
 def test_build_agent_task_from_bitrix_chat_transcribes_voice(tmp_path):
     audio = StoredAttachment(
         file_id=501,

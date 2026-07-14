@@ -10,18 +10,10 @@ from ai_server.attachments import AttachmentService
 from ai_server.integrations.bitrix.chat_parser import (
     build_agent_task_from_bitrix_chat,
     build_agent_task_from_task_event,
-    make_line_dialog_key,
 )
 from ai_server.integrations.bitrix.events import MESSAGE_EVENTS
-from ai_server.models import AgentTask
 from ai_server.settings import Settings
 from ai_server.utils import MOSCOW_TZ
-from ai_server.workers.bitrix.dialog_lines import (
-    DEFAULT_AUTO_LINE_MAX,
-    choose_auto_line_id,
-    dialog_line_label,
-    is_auto_line_candidate,
-)
 from ai_server.workers.bitrix.search_webhook_indexer import DISK_FILE_EVENT_MARKERS
 from ai_server.workers.ports import WebhookConsumePort
 
@@ -48,6 +40,8 @@ async def run_webhook_event_worker(
     settings: Settings,
     feedback_receiver: Any = None,
     conversation_trace: Any = None,
+    dialog_guard: Any = None,
+    bitrix_sender: Any = None,
 ) -> None:
     worker_count = settings.webhook_event_queue_worker_count
     active_partition_keys: set[str] = set()
@@ -81,6 +75,8 @@ async def run_webhook_event_worker(
                 settings=settings,
                 feedback_receiver=feedback_receiver,
                 conversation_trace=conversation_trace,
+                dialog_guard=dialog_guard,
+                bitrix_sender=bitrix_sender,
             )
         )
         for index in range(worker_count)
@@ -129,6 +125,8 @@ async def _run_webhook_event_worker_loop(
     settings: Settings,
     feedback_receiver: Any = None,
     conversation_trace: Any = None,
+    dialog_guard: Any = None,
+    bitrix_sender: Any = None,
 ) -> None:
     while True:
         event_id: int | None = None
@@ -160,6 +158,8 @@ async def _run_webhook_event_worker_loop(
                 settings=settings,
                 feedback_receiver=feedback_receiver,
                 conversation_trace=conversation_trace,
+                dialog_guard=dialog_guard,
+                bitrix_sender=bitrix_sender,
             )
             await queue.mark_done(event_id, result)
             status["last_error"] = None
@@ -193,6 +193,8 @@ async def _route_event(
     settings: Settings,
     feedback_receiver: Any = None,
     conversation_trace: Any = None,
+    dialog_guard: Any = None,
+    bitrix_sender: Any = None,
 ) -> dict[str, Any]:
     """Route a Bitrix webhook event to the appropriate agent queue."""
     if event_type in MESSAGE_EVENTS:
@@ -202,7 +204,19 @@ async def _route_event(
             transcriber=transcriber,
             settings=settings,
         )
-        task = await _maybe_assign_auto_dialog_line(task, agent_queue=agent_queue, settings=settings)
+        guard_result = await _handle_dialog_guard(
+            task,
+            agent_queue=agent_queue,
+            settings=settings,
+            dialog_guard=dialog_guard,
+            bitrix_sender=bitrix_sender,
+            conversation_trace=conversation_trace,
+            event_id=event_id,
+            event_type=event_type,
+            partition_key=partition_key,
+        )
+        if guard_result is not None:
+            return guard_result
         if feedback_receiver is not None:
             try:
                 intercepted = await feedback_receiver.handle(task)
@@ -290,50 +304,173 @@ async def _route_event(
     return {"handled": False, "reason": "unsupported_event", "event": event_type}
 
 
-async def _maybe_assign_auto_dialog_line(
-    task: AgentTask,
+async def _handle_dialog_guard(
+    task: Any,
     *,
     agent_queue: AgentQueuePort,
     settings: Settings,
-) -> AgentTask:
-    if not getattr(settings, "bitrix_auto_lines_enabled", False):
-        return task
-    context = dict(task.context or {})
-    if context.get("dialog_line_id"):
-        return task
-    if not is_auto_line_candidate(task.request):
-        return task
-    base_dialog_key = str(context.get("base_dialog_key") or context.get("dialog_key") or "").strip()
-    if not base_dialog_key:
-        return task
-    active_partitions_fn = getattr(agent_queue, "active_partition_keys", None)
-    if active_partitions_fn is None:
-        return task
+    dialog_guard: Any,
+    bitrix_sender: Any,
+    conversation_trace: Any,
+    event_id: int | None,
+    event_type: str,
+    partition_key: str,
+) -> dict[str, Any] | None:
+    if dialog_guard is None or not getattr(settings, "bitrix_dialog_guard_enabled", True):
+        return None
+    context = task.context or {}
+    dialog_key = str(context.get("dialog_key") or "").strip()
+    recipient_id = str(context.get("recipient_id") or "").strip()
+    if not dialog_key or not recipient_id:
+        return None
+
+    decision = _parse_stuck_dialog_decision(task.request)
+    pending = await dialog_guard.get_pending(dialog_key)
+    if pending is not None:
+        if decision == "reset":
+            pending_task = await dialog_guard.pop_pending(dialog_key)
+            generation = await dialog_guard.increment_generation(dialog_key)
+            deleted = 0
+            remove_pending = getattr(agent_queue, "remove_pending_by_partition", None)
+            if remove_pending is not None:
+                deleted += int(await remove_pending("orchestrator", f"dialog:{dialog_key}") or 0)
+                deleted += int(await remove_pending("bitrix24", f"dialog:{dialog_key}") or 0)
+            if pending_task is not None:
+                _set_task_generation(pending_task, generation)
+                await _publish_orchestrator_task(agent_queue, pending_task)
+            await _send_guard_message(
+                bitrix_sender,
+                recipient_id,
+                "Сбросил предыдущий запрос и выполняю новый.",
+                settings=settings,
+            )
+            await _trace_route(
+                conversation_trace,
+                event_id=event_id,
+                event_type=event_type,
+                routed_to="dialog_guard",
+                task=task,
+                partition_key=partition_key,
+                result={
+                    "handled": True,
+                    "routed_to": "dialog_guard",
+                    "event": event_type,
+                    "action": "reset_previous",
+                    "deleted_pending": deleted,
+                },
+            )
+            return {"handled": True, "routed_to": "dialog_guard", "event": event_type, "action": "reset_previous"}
+        if decision == "wait":
+            pending_task = await dialog_guard.pop_pending(dialog_key)
+            if pending_task is not None:
+                _set_task_generation(pending_task, await dialog_guard.current_generation(dialog_key))
+                await _publish_orchestrator_task(agent_queue, pending_task)
+            await _send_guard_message(
+                bitrix_sender,
+                recipient_id,
+                "Хорошо, выполню новый запрос после предыдущего.",
+                settings=settings,
+            )
+            await _trace_route(
+                conversation_trace,
+                event_id=event_id,
+                event_type=event_type,
+                routed_to="dialog_guard",
+                task=task,
+                partition_key=partition_key,
+                result={"handled": True, "routed_to": "dialog_guard", "event": event_type, "action": "wait_previous"},
+            )
+            return {"handled": True, "routed_to": "dialog_guard", "event": event_type, "action": "wait_previous"}
+        await _send_guard_message(bitrix_sender, recipient_id, _guard_choice_message(), settings=settings)
+        await _trace_route(
+            conversation_trace,
+            event_id=event_id,
+            event_type=event_type,
+            routed_to="dialog_guard",
+            task=task,
+            partition_key=partition_key,
+            result={"handled": True, "routed_to": "dialog_guard", "event": event_type, "action": "clarify_choice"},
+        )
+        return {"handled": True, "routed_to": "dialog_guard", "event": event_type, "action": "clarify_choice"}
+
+    active = await dialog_guard.get_active(dialog_key)
+    if active is None:
+        _set_task_generation(task, await dialog_guard.current_generation(dialog_key))
+        return None
+    active_age_seconds = float(active.get("age_seconds") or 0)
+    if active_age_seconds < float(settings.bitrix_dialog_stuck_seconds):
+        _set_task_generation(task, await dialog_guard.current_generation(dialog_key))
+        return None
+
     try:
-        active_partitions = await active_partitions_fn("orchestrator")
+        await dialog_guard.save_pending(task, ttl_seconds=settings.bitrix_dialog_pending_ttl_seconds)
     except Exception:
-        logger.exception("_maybe_assign_auto_dialog_line: failed to inspect active orchestrator partitions")
-        return task
-    line_id = choose_auto_line_id(
-        set(active_partitions),
-        base_dialog_key,
-        max_lines=getattr(settings, "bitrix_auto_line_max", DEFAULT_AUTO_LINE_MAX),
+        logger.exception("_handle_dialog_guard: failed to save pending task")
+        _set_task_generation(task, await dialog_guard.current_generation(dialog_key))
+        return None
+    await _send_guard_message(bitrix_sender, recipient_id, _stuck_dialog_message(), settings=settings)
+    await _trace_route(
+        conversation_trace,
+        event_id=event_id,
+        event_type=event_type,
+        routed_to="dialog_guard",
+        task=task,
+        partition_key=partition_key,
+        result={
+            "handled": True,
+            "routed_to": "dialog_guard",
+            "event": event_type,
+            "action": "stuck_prompt",
+            "active_age_seconds": round(active_age_seconds, 1),
+        },
     )
-    if line_id is None:
-        return task
-    line_id_text = str(line_id)
-    return task.model_copy(
-        update={
-            "context": {
-                **context,
-                "dialog_key": make_line_dialog_key(base_dialog_key, line_id_text),
-                "base_dialog_key": base_dialog_key,
-                "dialog_line_id": line_id_text,
-                "dialog_line_label": dialog_line_label(line_id),
-                "dialog_auto_line": True,
-            }
+    return {"handled": True, "routed_to": "dialog_guard", "event": event_type, "action": "stuck_prompt"}
+
+
+async def _publish_orchestrator_task(agent_queue: AgentQueuePort, task: Any) -> None:
+    await agent_queue.publish(
+        {
+            "to": "orchestrator",
+            "from": "webhook_worker",
+            "type": "bitrix_chat",
+            "payload": task.model_dump(),
         }
     )
+
+
+async def _send_guard_message(bitrix_sender: Any, recipient_id: str, message: str, *, settings: Settings) -> None:
+    if bitrix_sender is None or settings.agent_dry_run:
+        return
+    sender = getattr(bitrix_sender, "send_bot_message", None)
+    if sender is None:
+        return
+    await sender(recipient_id, message, bot_id=settings.bitrix_bot_id)
+
+
+def _set_task_generation(task: Any, generation: int) -> None:
+    task.context["dialog_cancel_generation"] = int(generation)
+
+
+def _parse_stuck_dialog_decision(text: str) -> str:
+    normalized = " ".join(str(text or "").casefold().strip().split())
+    if normalized in {"сбросить предыдущий запрос", "отменить предыдущий запрос", "сбросить предыдущий"}:
+        return "reset"
+    if normalized in {"выполнить после предыдущего", "дождаться предыдущего ответа", "дождаться ответа"}:
+        return "wait"
+    return ""
+
+
+def _stuck_dialog_message() -> str:
+    return (
+        "Предыдущий запрос в этом диалоге обрабатывается дольше обычного.\n\n"
+        "Ответьте одной из фраз:\n"
+        '"сбросить предыдущий запрос" — остановлю старую обработку и выполню новый запрос;\n'
+        '"выполнить после предыдущего" — дождусь старого ответа и выполню новый запрос после него.'
+    )
+
+
+def _guard_choice_message() -> str:
+    return 'Ответьте одной из фраз: "сбросить предыдущий запрос" или "выполнить после предыдущего".'
 
 
 async def _trace_route(

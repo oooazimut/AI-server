@@ -161,3 +161,26 @@ class RedisAgentQueue:
             if partition_key:
                 partitions.add(partition_key)
         return partitions
+
+    async def remove_pending_by_partition(self, agent_id: str, partition_key: str) -> int:
+        if not partition_key:
+            return 0
+        r = await self._get_client()
+        pending_ids = await r.zrange(_pending_key(agent_id), 0, -1)
+        removed = 0
+        for raw_msg_id in pending_ids:
+            msg_id = str(raw_msg_id)
+            raw = await r.get(_data_key(msg_id))
+            if raw is None:
+                await r.zrem(_pending_key(agent_id), msg_id)
+                continue
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if agent_queue_partition_key(message) != partition_key:
+                continue
+            if await r.zrem(_pending_key(agent_id), msg_id):
+                await r.delete(_data_key(msg_id))
+                removed += 1
+        return removed

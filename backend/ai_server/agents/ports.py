@@ -25,6 +25,8 @@ class AgentQueuePort(Protocol):
 
     async def active_partition_keys(self, agent_id: str) -> set[str]: ...
 
+    async def remove_pending_by_partition(self, agent_id: str, partition_key: str) -> int: ...
+
 
 class ChannelPort(Protocol):
     """Outbound port for delivering messages to a communication channel."""
