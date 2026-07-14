@@ -34,6 +34,7 @@ from ai_server.integrations.postgres.orchestrator_agent import PostgresOrchestra
 from ai_server.integrations.postgres.pto_agent import PostgresPtoAgentStore
 from ai_server.integrations.postgres.vehicle_usage import PostgresVehicleUsageStore
 from ai_server.integrations.redis.agent_queue import RedisAgentQueue
+from ai_server.integrations.redis.conversation_trace import RedisConversationTrace
 from ai_server.integrations.redis.diagnost_queue import RedisDiagnostQueue
 from ai_server.integrations.redis.event_queue import RedisEventQueue
 from ai_server.llm import build_orchestrator_llm_client
@@ -118,8 +119,9 @@ async def main() -> None:
         bitrix_oauth=bitrix_oauth,
     )
     diagnost_queue = RedisDiagnostQueue(settings.redis_url)
-    result_publisher = OrchestratorResultPublisher(diagnost_queue)
-    specialist_result_publisher = SpecialistResultPublisher(diagnost_queue)
+    conversation_trace = RedisConversationTrace(settings.redis_url, settings=settings)
+    result_publisher = OrchestratorResultPublisher(diagnost_queue, conversation_trace=conversation_trace)
+    specialist_result_publisher = SpecialistResultPublisher(diagnost_queue, conversation_trace=conversation_trace)
     webhook_event_queue = RedisEventQueue(settings.redis_url)
 
     vehicle_usage_store = None
@@ -179,6 +181,7 @@ async def main() -> None:
             logistics_vu_settings=vu_settings,
             channels={"bitrix24": bitrix_channel},
             footer_service=TechnicalFooterService(settings=settings),
+            conversation_trace=conversation_trace,
             result_publisher=result_publisher,
         )
         orch_manifest = next((m for m in manifests if m.kind == "orchestrator"), None)
@@ -366,6 +369,7 @@ async def main() -> None:
                     status=_webhook_status,
                     settings=settings,
                     feedback_receiver=feedback_receiver,
+                    conversation_trace=conversation_trace,
                 )
             )
         )

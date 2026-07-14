@@ -57,6 +57,10 @@ class Settings:
     tech_footer_balance_enabled: bool
     tech_footer_balance_cache_seconds: int
     diagnost_enabled: bool
+    conversation_trace_enabled: bool
+    conversation_trace_secret: str
+    conversation_trace_ttl_hours: int
+    conversation_trace_max_text_chars: int
     learning_events_enabled: bool
     learning_events_capture_text: bool
     learning_events_max_text_chars: int
@@ -456,6 +460,10 @@ def get_settings() -> Settings:
         tech_footer_balance_enabled=_env_bool("AI_SERVER_TECH_FOOTER_BALANCE_ENABLED", True),
         tech_footer_balance_cache_seconds=_env_int("AI_SERVER_TECH_FOOTER_BALANCE_CACHE_SECONDS", 300) or 300,
         diagnost_enabled=_env_bool("DIAGNOST_ENABLED", True),
+        conversation_trace_enabled=_env_bool("CONVERSATION_TRACE_ENABLED", False),
+        conversation_trace_secret=_env("CONVERSATION_TRACE_SECRET"),
+        conversation_trace_ttl_hours=_env_int("CONVERSATION_TRACE_TTL_HOURS", 48) or 48,
+        conversation_trace_max_text_chars=_env_int("CONVERSATION_TRACE_MAX_TEXT_CHARS", 8000) or 8000,
         learning_events_enabled=_env_bool("LEARNING_EVENTS_ENABLED", True),
         learning_events_capture_text=_env_bool("LEARNING_EVENTS_CAPTURE_TEXT", True),
         learning_events_max_text_chars=_env_int("LEARNING_EVENTS_MAX_TEXT_CHARS", 8000) or 8000,

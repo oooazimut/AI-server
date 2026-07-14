@@ -12,12 +12,38 @@ import hashlib
 import json
 from typing import Any
 
+_SENSITIVE_WEBHOOK_KEYS = {
+    "auth",
+    "authorization",
+    "access_token",
+    "refresh_token",
+    "application_token",
+    "client_secret",
+    "secret",
+    "agent_secret",
+    "token",
+    "webhook_secret",
+    "auth_id",
+    "refresh_id",
+}
+
 
 def sanitize_webhook_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    result = dict(payload)
-    for key in ("auth", "AUTH", "secret", "agent_secret", "token", "WEBHOOK_SECRET"):
-        result.pop(key, None)
-    return result
+    sanitized = _sanitize_value(payload)
+    return sanitized if isinstance(sanitized, dict) else {}
+
+
+def _sanitize_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if str(key).lower() in _SENSITIVE_WEBHOOK_KEYS:
+                continue
+            result[key] = _sanitize_value(item)
+        return result
+    if isinstance(value, list):
+        return [_sanitize_value(item) for item in value]
+    return value
 
 
 def webhook_event_partition_key(payload: dict[str, Any], *, event_type: str) -> str:
