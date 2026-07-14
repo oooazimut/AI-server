@@ -81,13 +81,14 @@ def test_internal_orchestrator_fast_returns_terminal_specialist_answer():
                 },
             )
 
-    fake_llm = FakeInternalOrchestratorLLM(call_specialists=["bitrix24"])
+    fake_llm = FakeInternalOrchestratorLLM(call_specialists=["bitrix24"], status="needs_clarification")
     result = asyncio.run(
         _make_orch({"bitrix24": _TerminalSpecialist()}, fake_llm).handle(
             AgentTask(task_id="t1", request="Bitrix show my tasks")
         )
     )
 
+    assert result.status == "completed"
     assert result.answer == "terminal answer"
     assert len(fake_llm.decide_calls) == 1
     assert result.metadata["fast_return"] is True
