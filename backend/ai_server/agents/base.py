@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime
 from typing import Any
 
@@ -13,7 +14,7 @@ from ai_server.knowledge import MarkdownKnowledgeBase
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult, ToolStatus
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
-from ai_server.utils import optional_int, unique
+from ai_server.utils import MOSCOW_TZ, optional_int, unique
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ class BaseSpecialist:
         scheduler: SchedulerPort | None = None,
         store: AgentStorePort | None = None,
         result_publisher: ResultPublisherPort | None = None,
+        conversation_trace: Any = None,
     ) -> None:
         self.manifest = manifest
         self.knowledge_base = knowledge_base
@@ -55,6 +57,7 @@ class BaseSpecialist:
         self._scheduler = scheduler
         self.store = store
         self._result_publisher = result_publisher
+        self._conversation_trace = conversation_trace
 
     # ------------------------------------------------------------------
     # Hooks subclasses implement/override
@@ -95,7 +98,11 @@ class BaseSpecialist:
         user_id = optional_int(task.user.id) if task.user.id else None
         dialog_key = str(task.context.get("dialog_key") or "") or None
         dialog_id = str(task.context.get("dialog_id") or (task.user.raw or {}).get("dialog_id") or "") or None
-        result = await tool.execute(tool_call.args, user_id=user_id, dialog_key=dialog_key, dialog_id=dialog_id)
+        execute_with_task = getattr(tool, "execute_with_task", None)
+        if execute_with_task is not None:
+            result = await execute_with_task(tool_call.args, task=task)
+        else:
+            result = await tool.execute(tool_call.args, user_id=user_id, dialog_key=dialog_key, dialog_id=dialog_id)
         action = ActionRecord(name=tool_call.name, status=result.status, details=result.model_dump())
         return result, action, []
 
@@ -108,6 +115,35 @@ class BaseSpecialist:
 
     def stop(self) -> None:
         pass
+
+    async def _record_timing(
+        self,
+        task: AgentTask,
+        *,
+        stage: str,
+        started_at: str,
+        elapsed_ms: float,
+        status: str = "",
+        step: int | None = None,
+        tool: str = "",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if self._conversation_trace is None:
+            return
+        try:
+            await self._conversation_trace.record_timing(
+                task=task,
+                component=self.manifest.id,
+                stage=stage,
+                started_at=started_at,
+                elapsed_ms=elapsed_ms,
+                status=status,
+                step=step,
+                tool=tool,
+                details=details,
+            )
+        except Exception:
+            logger.debug("ConversationTrace timing failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Scheduler helpers (scheduler may be None — all methods are safe)
@@ -156,6 +192,8 @@ class BaseSpecialist:
                 logs=self._logs(),
             )
 
+        context_started_at = _trace_now_iso()
+        context_t0 = time.monotonic()
         # Load per-specialist dialog history from agent's own PG schema (if configured),
         # otherwise fall back to the shared history passed via task.context.
         dialog_key: str = task.context.get("dialog_key") or ""
@@ -195,6 +233,18 @@ class BaseSpecialist:
                 },
             )
         ]
+        await self._record_timing(
+            task,
+            stage="context_load",
+            started_at=context_started_at,
+            elapsed_ms=(time.monotonic() - context_t0) * 1000,
+            status="completed",
+            details={
+                "dialog_history_count": len(dialog_history),
+                "available_skills_count": len(available_skills),
+                "retrieval_hits_count": len(retrieval_hits),
+            },
+        )
 
         tool_results: list[ToolResult] = []
         approval_actions: list[ActionRecord] = []
@@ -202,6 +252,8 @@ class BaseSpecialist:
         decision = None
 
         for step in range(1, self.max_steps + 1):
+            decision_started_at = _trace_now_iso()
+            decision_t0 = time.monotonic()
             try:
                 decision_result = await self.llm.decide(
                     manifest=self.manifest,
@@ -213,6 +265,15 @@ class BaseSpecialist:
                     available_skills=available_skills,
                 )
             except Exception as exc:
+                await self._record_timing(
+                    task,
+                    stage="llm_decide",
+                    started_at=decision_started_at,
+                    elapsed_ms=(time.monotonic() - decision_t0) * 1000,
+                    status="error",
+                    step=step,
+                    details={"error": f"{type(exc).__name__}: {exc}"},
+                )
                 failure = self._llm_failure_result(f"{type(exc).__name__}: {exc}")
                 return AgentResult(
                     status="failed",
@@ -234,6 +295,18 @@ class BaseSpecialist:
 
             decision_results.append(decision_result)
             decision = decision_result.decision
+            await self._record_timing(
+                task,
+                stage="llm_decide",
+                started_at=decision_started_at,
+                elapsed_ms=(time.monotonic() - decision_t0) * 1000,
+                status=decision.status,
+                step=step,
+                details={
+                    "tool_calls": [{"name": call.name, "summary": call.summary} for call in decision.tool_calls],
+                    "confidence": decision.confidence,
+                },
+            )
             actions_taken.append(
                 ActionRecord(
                     name=f"{self.action_prefix}_llm_decision",
@@ -253,7 +326,35 @@ class BaseSpecialist:
             if not executable_calls:
                 break
             for tool_call in executable_calls:
-                result, action, approvals = await self._execute_tool_call(tool_call, task)
+                tool_started_at = _trace_now_iso()
+                tool_t0 = time.monotonic()
+                try:
+                    result, action, approvals = await self._execute_tool_call(tool_call, task)
+                except Exception as exc:
+                    await self._record_timing(
+                        task,
+                        stage="tool_execute",
+                        started_at=tool_started_at,
+                        elapsed_ms=(time.monotonic() - tool_t0) * 1000,
+                        status="error",
+                        step=step,
+                        tool=tool_call.name,
+                        details={"error": f"{type(exc).__name__}: {exc}"},
+                    )
+                    raise
+                await self._record_timing(
+                    task,
+                    stage="tool_execute",
+                    started_at=tool_started_at,
+                    elapsed_ms=(time.monotonic() - tool_t0) * 1000,
+                    status=str(result.status) if result is not None else "completed",
+                    step=step,
+                    tool=tool_call.name,
+                    details={
+                        "approvals_count": len(approvals),
+                        "has_result": result is not None,
+                    },
+                )
                 if result is not None:
                     tool_results.append(result)
                 if action is not None:
@@ -281,6 +382,8 @@ class BaseSpecialist:
                 logs=self._logs(),
             )
 
+        compose_started_at = _trace_now_iso()
+        compose_t0 = time.monotonic()
         try:
             final_result = await self.llm.compose(
                 manifest=self.manifest,
@@ -290,6 +393,14 @@ class BaseSpecialist:
                 approval_actions=[action.model_dump() for action in approval_actions],
             )
         except Exception as exc:
+            await self._record_timing(
+                task,
+                stage="llm_compose",
+                started_at=compose_started_at,
+                elapsed_ms=(time.monotonic() - compose_t0) * 1000,
+                status="error",
+                details={"error": f"{type(exc).__name__}: {exc}"},
+            )
             failure = self._llm_failure_result(f"{type(exc).__name__}: {exc}")
             return AgentResult(
                 status="failed",
@@ -309,6 +420,17 @@ class BaseSpecialist:
                 logs=self._logs(),
             )
 
+        await self._record_timing(
+            task,
+            stage="llm_compose",
+            started_at=compose_started_at,
+            elapsed_ms=(time.monotonic() - compose_t0) * 1000,
+            status=final_result.status,
+            details={
+                "tool_results_count": len(tool_results),
+                "approval_actions_count": len(approval_actions),
+            },
+        )
         actions_taken.append(
             ActionRecord(
                 name=f"{self.action_prefix}_llm_final_answer",
@@ -330,7 +452,16 @@ class BaseSpecialist:
         status = "needs_human" if approval_actions else effective_status
 
         if self.store is not None and dialog_key and final_result.answer:
+            store_started_at = _trace_now_iso()
+            store_t0 = time.monotonic()
             await self.store.append_turn(dialog_key, task.request, final_result.answer)
+            await self._record_timing(
+                task,
+                stage="store_append_turn",
+                started_at=store_started_at,
+                elapsed_ms=(time.monotonic() - store_t0) * 1000,
+                status="completed",
+            )
 
         return AgentResult(
             status=status,
@@ -391,3 +522,7 @@ class BaseSpecialist:
             except Exception as exc:
                 logger.exception("Agent %s failed processing message %s", agent_id, msg_id)
                 await queue.nack(msg_id, error=f"{type(exc).__name__}: {exc}")
+
+
+def _trace_now_iso() -> str:
+    return datetime.now(MOSCOW_TZ).isoformat()

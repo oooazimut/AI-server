@@ -131,6 +131,36 @@ class RedisConversationTrace:
             }
         )
 
+    async def record_timing(
+        self,
+        *,
+        task: AgentTask,
+        component: str,
+        stage: str,
+        elapsed_ms: float,
+        started_at: str = "",
+        status: str = "",
+        step: int | None = None,
+        tool: str = "",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        event: dict[str, Any] = {
+            "trace_type": "timing_step",
+            **_task_trace_fields(task),
+            "component": component,
+            "stage": stage,
+            "elapsed_ms": round(float(elapsed_ms), 1),
+            "started_at": started_at,
+            "status": status,
+            "tool": tool,
+            "details": details or {},
+        }
+        if step is not None:
+            event["step"] = step
+        await self.record(event)
+
     async def record(self, event: dict[str, Any]) -> None:
         if not self.enabled:
             return
