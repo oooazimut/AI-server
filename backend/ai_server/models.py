@@ -197,6 +197,7 @@ class AgentResult(BaseModel):
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     logs: list[str] = Field(default_factory=list)
     scheduled_tasks: list[ScheduledTask] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentTestRequest(BaseModel):

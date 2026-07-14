@@ -200,6 +200,132 @@ def test_bitrix_specialist_treats_show_warehouse_as_stock_request():
     assert tools.warehouse_calls == [{"query": "Борисов", "include_products": True, "product_limit": 10}]
 
 
+def test_bitrix_specialist_fast_returns_read_only_tools():
+    cases = [
+        (
+            "bitrix_my_tasks",
+            {"status": "open", "limit": 10},
+            "my_tasks_result",
+            "my_tasks_calls",
+            ToolResult(status="ok", tool="bitrix_my_tasks", data={"items": [], "total": 0}),
+        ),
+        (
+            "bitrix_task_search",
+            {"scope": "responsible", "status": "active", "limit": 10},
+            "task_search_result",
+            "task_search_calls",
+            ToolResult(status="ok", tool="bitrix_task_search", data={"items": [], "total": 0}),
+        ),
+        (
+            "bitrix_project_search",
+            {"query": "Garage", "limit": 10},
+            "project_search_result",
+            "project_search_calls",
+            ToolResult(status="ok", tool="bitrix_project_search", data={"query": "Garage", "items": []}),
+        ),
+    ]
+
+    for tool_name, args, result_kw, calls_attr, tool_result in cases:
+        llm = FakeBitrixLLM(
+            tool_calls=[BitrixLLMToolCall(name=tool_name, args=args)],
+            final_answer="done",
+        )
+        tools = FakeResolverTools(**{result_kw: tool_result})
+
+        result = asyncio.run(
+            _bitrix_specialist(tools=tools, llm=llm).handle(
+                AgentTask(task_id="t1", request=f"Bitrix read via {tool_name}", user={"id": "9"})
+            )
+        )
+
+        assert result.status == "completed"
+        assert getattr(tools, calls_attr)[0] == args
+        assert len(llm.decide_calls) == 1
+        assert result.metadata["fast_return"] is True
+        assert result.metadata["terminal_tool"] == tool_name
+        assert any(action.name == "bitrix_fast_return" for action in result.actions_taken)
+
+
+def test_bitrix_specialist_fast_returns_read_oauth_authorization():
+    llm = FakeBitrixLLM(
+        tool_calls=[BitrixLLMToolCall(name="bitrix_my_tasks", args={"status": "open", "limit": 10})],
+        final_answer="auth required",
+    )
+    tools = FakeResolverTools(
+        my_tasks_result=ToolResult(
+            status="denied",
+            tool="bitrix_my_tasks",
+            error="oauth required",
+            data={"oauth_required": True, "authorization": {"message": "Authorize Bitrix24."}},
+        )
+    )
+
+    result = asyncio.run(
+        _bitrix_specialist(tools=tools, llm=llm).handle(
+            AgentTask(task_id="t1", request="Bitrix show my tasks", user={"id": "27"})
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.answer == "auth required"
+    assert len(llm.decide_calls) == 1
+    assert result.metadata["fast_return_reason"] == "read_only_oauth_authorization_required"
+
+
+def test_bitrix_specialist_does_not_fast_return_ambiguous_project_search():
+    llm = FakeBitrixLLM(
+        tool_calls=[BitrixLLMToolCall(name="bitrix_project_search", args={"query": "Garage", "limit": 10})],
+        final_answer="Choose a project.",
+    )
+    tools = FakeResolverTools(
+        project_search_result=ToolResult(
+            status="ok",
+            tool="bitrix_project_search",
+            data={
+                "query": "Garage",
+                "items": [{"id": "5", "name": "Garage A"}, {"id": "6", "name": "Garage B"}],
+            },
+        )
+    )
+
+    result = asyncio.run(
+        _bitrix_specialist(tools=tools, llm=llm).handle(
+            AgentTask(task_id="t1", request="Bitrix show project Garage", user={"id": "9"})
+        )
+    )
+
+    assert result.answer == "Choose a project."
+    assert len(llm.decide_calls) == 2
+    assert result.metadata == {}
+
+
+def test_bitrix_llm_compose_formats_read_oauth_authorization_without_llm(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient(json.dumps({"answer": "should not be used", "status": "completed"}))
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t1", request="Bitrix show my tasks", user={"id": "27"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[]),
+            tool_results=[
+                ToolResult(
+                    status="denied",
+                    tool="bitrix_my_tasks",
+                    error="oauth required",
+                    data={"authorization": {"message": "Authorize Bitrix24."}, "oauth_required": True},
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.answer == "Authorize Bitrix24."
+    assert client.calls == []
+
+
 def test_bitrix_llm_decide_routes_created_by_task_read_to_deterministic_tool(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient(
@@ -3079,17 +3205,35 @@ class _FakeWarehouseTool:
         return self._result
 
 
+class _FakeNamedTool:
+    def __init__(self, name: str, result: ToolResult, calls: list):
+        self.name = name
+        self._result = result
+        self._calls = calls
+
+    def definition(self):
+        return ToolDefinition(name=self.name, description="", parameters={})
+
+    async def execute(self, args, *, user_id=None, dialog_key=None, dialog_id=None):
+        self._calls.append(args)
+        return self._result
+
+
 class FakeResolverTools:
     def __init__(
         self,
         *,
         bitrix_api_result: ToolResult | None = None,
         my_tasks_result: ToolResult | None = None,
+        task_search_result: ToolResult | None = None,
+        project_search_result: ToolResult | None = None,
         warehouse_result: ToolResult | None = None,
         raw_user: dict | None = None,
     ) -> None:
         self.bitrix_api_calls: list = []
         self.my_tasks_calls: list = []
+        self.task_search_calls: list = []
+        self.project_search_calls: list = []
         self.warehouse_calls: list = []
         self._raw_user = raw_user
         self._tools = [
@@ -3101,6 +3245,16 @@ class FakeResolverTools:
             _FakeWarehouseTool(
                 warehouse_result or ToolResult(status="not_configured", tool="bitrix_warehouse_search"),
                 self.warehouse_calls,
+            ),
+            _FakeNamedTool(
+                "bitrix_task_search",
+                task_search_result or ToolResult(status="not_configured", tool="bitrix_task_search"),
+                self.task_search_calls,
+            ),
+            _FakeNamedTool(
+                "bitrix_project_search",
+                project_search_result or ToolResult(status="not_configured", tool="bitrix_project_search"),
+                self.project_search_calls,
             ),
             _FakeBitrixApiTool(
                 bitrix_api_result or ToolResult(status="not_configured", tool="bitrix_api"),

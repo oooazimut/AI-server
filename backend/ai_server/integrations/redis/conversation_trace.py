@@ -103,6 +103,7 @@ class RedisConversationTrace:
             "actions": [action.model_dump() for action in result.actions_taken],
             "actions_requiring_approval": [action.model_dump() for action in result.actions_requiring_approval],
             "model_usage": [usage.model_dump() for usage in result.model_usage],
+            "metadata": result.metadata,
         }
         await self.record(event)
 

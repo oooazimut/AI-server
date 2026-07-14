@@ -16,7 +16,7 @@ from ai_server.agents.ports import (
     ResultPublisherPort,
     SchedulerPort,
 )
-from ai_server.models import AgentManifest, AgentResult, AgentTask, ScheduledTask
+from ai_server.models import AgentManifest, AgentResult, AgentTask, ScheduledTask, ToolResult, ToolStatus
 from ai_server.orchestrators.orchestrator_llm import (
     OrchestratorFinalResult,
     OrchestratorLLM,
@@ -92,6 +92,27 @@ class InternalOrchestrator(BaseSpecialist):
             except Exception:
                 logger.exception("_load_extra_context: failed to load pending_specialist")
         return task, {}
+
+    def _terminal_response_metadata(
+        self,
+        *,
+        tool_call: Any,
+        result: ToolResult | None,
+        action: Any | None,
+        approvals: list[Any],
+        task: AgentTask,
+    ) -> dict[str, Any] | None:
+        if tool_call.name != "call_specialist" or result is None or result.status != ToolStatus.OK or approvals:
+            return None
+        data = result.data if isinstance(result.data, dict) else {}
+        if not (data.get("terminal") and data.get("answer_is_final") and data.get("safe_to_send")):
+            return None
+        return {
+            "fast_return_reason": str(data.get("fast_return_reason") or "specialist_terminal_response"),
+            "terminal_tool": "call_specialist",
+            "terminal_specialist": str(data.get("specialist") or ""),
+            "specialist_terminal_tool": str(data.get("terminal_tool") or ""),
+        }
 
     # ------------------------------------------------------------------
     # Lifecycle overrides
