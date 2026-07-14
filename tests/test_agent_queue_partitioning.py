@@ -99,6 +99,44 @@ def test_redis_agent_queue_returns_none_when_all_candidates_blocked():
     client.zadd.assert_not_awaited()
 
 
+def test_redis_agent_queue_reports_active_partition_keys():
+    queue = RedisAgentQueue("redis://localhost/0")
+    client = MagicMock()
+    client.zrange = AsyncMock(side_effect=[["m1"], ["m2"]])
+    client.get = AsyncMock(
+        side_effect=[
+            json.dumps(_message("m1", "chat:1:user:1"), ensure_ascii=False),
+            json.dumps(_message("m2", "chat:2:user:2"), ensure_ascii=False),
+        ]
+    )
+    queue._client = client
+
+    result = _run(queue.active_partition_keys("orchestrator"))
+
+    assert result == {"dialog:chat:1:user:1", "dialog:chat:2:user:2"}
+
+
+def test_redis_agent_queue_removes_pending_by_partition():
+    queue = RedisAgentQueue("redis://localhost/0")
+    client = MagicMock()
+    client.zrange = AsyncMock(return_value=["m1", "m2"])
+    client.get = AsyncMock(
+        side_effect=[
+            json.dumps(_message("m1", "chat:1:user:1"), ensure_ascii=False),
+            json.dumps(_message("m2", "chat:2:user:2"), ensure_ascii=False),
+        ]
+    )
+    client.zrem = AsyncMock(return_value=1)
+    client.delete = AsyncMock()
+    queue._client = client
+
+    result = _run(queue.remove_pending_by_partition("orchestrator", "dialog:chat:1:user:1"))
+
+    assert result == 1
+    client.zrem.assert_awaited_once_with("ai_server:aq:orchestrator:pending", "m1")
+    client.delete.assert_awaited_once_with("ai_server:aq:data:m1")
+
+
 def test_memory_agent_queue_skips_blocked_dialog_partition():
     async def _impl() -> dict | None:
         queue = InMemoryAgentQueue()
@@ -111,3 +149,31 @@ def test_memory_agent_queue_skips_blocked_dialog_partition():
     assert result is not None
     assert result["id"] == "m2"
     assert result["_partition_key"] == "dialog:chat:2:user:2"
+
+
+def test_memory_agent_queue_reports_active_partition_keys():
+    async def _impl() -> set[str]:
+        queue = InMemoryAgentQueue()
+        await queue.publish(_message("m1", "chat:1:user:1"))
+        await queue.publish(_message("m2", "chat:2:user:2"))
+        return await queue.active_partition_keys("orchestrator")
+
+    result = anyio.run(_impl)
+
+    assert result == {"dialog:chat:1:user:1", "dialog:chat:2:user:2"}
+
+
+def test_memory_agent_queue_removes_pending_by_partition():
+    async def _impl() -> tuple[int, dict | None]:
+        queue = InMemoryAgentQueue()
+        await queue.publish(_message("m1", "chat:1:user:1"))
+        await queue.publish(_message("m2", "chat:2:user:2"))
+        removed = await queue.remove_pending_by_partition("orchestrator", "dialog:chat:1:user:1")
+        remaining = await queue.claim_next("orchestrator")
+        return removed, remaining
+
+    removed, remaining = anyio.run(_impl)
+
+    assert removed == 1
+    assert remaining is not None
+    assert remaining["id"] == "m2"

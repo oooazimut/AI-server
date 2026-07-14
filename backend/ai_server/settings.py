@@ -30,6 +30,9 @@ class Settings:
     bitrix_task_close_control_interval_seconds: int
     bitrix_task_close_control_direct_limit: int
     bitrix_task_close_control_auto_close_limit: int
+    bitrix_dialog_guard_enabled: bool
+    bitrix_dialog_stuck_seconds: int
+    bitrix_dialog_pending_ttl_seconds: int
     bitrix_oauth_app_path: str
     bitrix_oauth_callback_path: str
     bitrix_oauth_token_endpoint: str
@@ -437,6 +440,9 @@ def get_settings() -> Settings:
         or (5 * 60),
         bitrix_task_close_control_direct_limit=_env_int("BITRIX_TASK_CLOSE_CONTROL_DIRECT_LIMIT", 20) or 20,
         bitrix_task_close_control_auto_close_limit=_env_int("BITRIX_TASK_CLOSE_CONTROL_AUTO_CLOSE_LIMIT", 100) or 100,
+        bitrix_dialog_guard_enabled=_env_bool("BITRIX_DIALOG_GUARD_ENABLED", True),
+        bitrix_dialog_stuck_seconds=_env_int("BITRIX_DIALOG_STUCK_SECONDS", 120) or 120,
+        bitrix_dialog_pending_ttl_seconds=_env_int("BITRIX_DIALOG_PENDING_TTL_SECONDS", 600) or 600,
         bitrix_oauth_app_path=_env("BITRIX_OAUTH_APP_PATH", "/bitrix/app"),
         bitrix_oauth_callback_path=_env("BITRIX_OAUTH_CALLBACK_PATH", "/bitrix/oauth/callback"),
         bitrix_oauth_token_endpoint=_env("BITRIX_OAUTH_TOKEN_ENDPOINT", "https://oauth.bitrix.info/oauth/token/"),

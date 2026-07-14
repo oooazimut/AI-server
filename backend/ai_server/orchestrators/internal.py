@@ -56,6 +56,7 @@ class InternalOrchestrator(BaseSpecialist):
         footer_service: TechnicalFooterService | None = None,
         result_publisher: ResultPublisherPort | None = None,
         conversation_trace: Any = None,
+        dialog_guard: Any = None,
     ) -> None:
         super().__init__(
             manifest,
@@ -70,6 +71,7 @@ class InternalOrchestrator(BaseSpecialist):
         self._footer_svc = footer_service
         self._result_publisher = result_publisher
         self._conversation_trace = conversation_trace
+        self._dialog_guard = dialog_guard
 
     # ------------------------------------------------------------------
     # BaseSpecialist hooks
@@ -123,7 +125,14 @@ class InternalOrchestrator(BaseSpecialist):
         started_at = _trace_now_iso()
         dialog_key = task.context.get("dialog_key", "")
         logger.info("Orchestrator.handle: start task_id=%s dialog_key=%s", task.task_id, dialog_key)
+        active_marked = False
         try:
+            if self._dialog_guard is not None and dialog_key:
+                generation = await self._dialog_guard.mark_active(task, ttl_seconds=3600)
+                task = task.model_copy(
+                    update={"context": {**task.context, "dialog_cancel_generation": int(generation)}}
+                )
+                active_marked = True
             result = await super().handle(task)
             # Extract specialist IDs called during this turn for handoff_to
             specialist_ids = [
@@ -163,6 +172,9 @@ class InternalOrchestrator(BaseSpecialist):
                 details={"error": f"{type(exc).__name__}: {exc}"},
             )
             raise
+        finally:
+            if active_marked and self._dialog_guard is not None:
+                await self._dialog_guard.clear_active(task)
 
     async def run(
         self,
@@ -280,6 +292,7 @@ class InternalOrchestrator(BaseSpecialist):
             footer_service=footer_service,
             result_publisher=result_publisher,
             conversation_trace=specialist_deps.get("conversation_trace"),
+            dialog_guard=specialist_deps.get("dialog_guard"),
         )
         # Break circular dep: CallSpecialistTool needs orch to schedule specialist tasks
         call_tool.schedule_fn = orch._apply_scheduled_tasks_from_specialist
@@ -352,8 +365,25 @@ class InternalOrchestrator(BaseSpecialist):
                     status="completed",
                     details={"user_id": user_id, "footer_chars": len(footer)},
                 )
-        body = append_footer(result.answer, footer) if result.answer else ""
+        answer = result.answer or ""
+        body = append_footer(answer, footer) if answer else ""
         if body:
+            if self._dialog_guard is not None and await self._dialog_guard.task_is_stale(task):
+                logger.info(
+                    "Suppressing stale channel send task_id=%s dialog_key=%s",
+                    task.task_id,
+                    task.context.get("dialog_key"),
+                )
+                if self._conversation_trace is not None:
+                    await self._conversation_trace.record_outbound(
+                        task=task,
+                        result=result,
+                        recipient_id=recipient_id,
+                        body=body,
+                        status="suppressed",
+                        error="dialog_cancelled",
+                    )
+                return
             send_started_at = _trace_now_iso()
             send_t0 = time.monotonic()
             try:

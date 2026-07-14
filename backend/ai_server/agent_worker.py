@@ -36,6 +36,7 @@ from ai_server.integrations.postgres.vehicle_usage import PostgresVehicleUsageSt
 from ai_server.integrations.redis.agent_queue import RedisAgentQueue
 from ai_server.integrations.redis.conversation_trace import RedisConversationTrace
 from ai_server.integrations.redis.diagnost_queue import RedisDiagnostQueue
+from ai_server.integrations.redis.dialog_guard import RedisDialogGuard
 from ai_server.integrations.redis.event_queue import RedisEventQueue
 from ai_server.llm import build_orchestrator_llm_client
 from ai_server.models import AgentTask, UserContext
@@ -120,6 +121,7 @@ async def main() -> None:
     )
     diagnost_queue = RedisDiagnostQueue(settings.redis_url)
     conversation_trace = RedisConversationTrace(settings.redis_url, settings=settings)
+    dialog_guard = RedisDialogGuard(settings.redis_url, settings=settings)
     result_publisher = OrchestratorResultPublisher(diagnost_queue, conversation_trace=conversation_trace)
     specialist_result_publisher = SpecialistResultPublisher(diagnost_queue, conversation_trace=conversation_trace)
     webhook_event_queue = RedisEventQueue(settings.redis_url)
@@ -182,6 +184,7 @@ async def main() -> None:
             channels={"bitrix24": bitrix_channel},
             footer_service=TechnicalFooterService(settings=settings),
             conversation_trace=conversation_trace,
+            dialog_guard=dialog_guard,
             result_publisher=result_publisher,
         )
         orch_manifest = next((m for m in manifests if m.kind == "orchestrator"), None)
@@ -373,6 +376,8 @@ async def main() -> None:
                     settings=settings,
                     feedback_receiver=feedback_receiver,
                     conversation_trace=conversation_trace,
+                    dialog_guard=dialog_guard,
+                    bitrix_sender=bitrix,
                 )
             )
         )

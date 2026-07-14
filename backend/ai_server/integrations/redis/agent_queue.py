@@ -141,3 +141,46 @@ class RedisAgentQueue:
         else:
             logger.warning("RedisAgentQueue: message %s exceeded max retries, dropping. error=%s", message_id, error)
             await r.delete(_data_key(message_id))
+
+    async def active_partition_keys(self, agent_id: str) -> set[str]:
+        r = await self._get_client()
+        pending_ids = await r.zrange(_pending_key(agent_id), 0, -1)
+        processing_ids = await r.zrange(_processing_key(agent_id), 0, -1)
+        msg_ids = list(dict.fromkeys([*pending_ids, *processing_ids]))
+        partitions: set[str] = set()
+        for raw_msg_id in msg_ids:
+            msg_id = str(raw_msg_id)
+            raw = await r.get(_data_key(msg_id))
+            if raw is None:
+                continue
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            partition_key = agent_queue_partition_key(message)
+            if partition_key:
+                partitions.add(partition_key)
+        return partitions
+
+    async def remove_pending_by_partition(self, agent_id: str, partition_key: str) -> int:
+        if not partition_key:
+            return 0
+        r = await self._get_client()
+        pending_ids = await r.zrange(_pending_key(agent_id), 0, -1)
+        removed = 0
+        for raw_msg_id in pending_ids:
+            msg_id = str(raw_msg_id)
+            raw = await r.get(_data_key(msg_id))
+            if raw is None:
+                await r.zrem(_pending_key(agent_id), msg_id)
+                continue
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if agent_queue_partition_key(message) != partition_key:
+                continue
+            if await r.zrem(_pending_key(agent_id), msg_id):
+                await r.delete(_data_key(msg_id))
+                removed += 1
+        return removed
