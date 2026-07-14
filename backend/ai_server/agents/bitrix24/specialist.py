@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from types import SimpleNamespace
 from typing import Any
 
@@ -285,6 +286,13 @@ class Bitrix24Specialist(BaseSpecialist):
                 args=args,
                 summary=getattr(tool_call, "summary", ""),
             )
+        elif tool_call.name == "bitrix_warehouse_search":
+            args = _warehouse_args_with_default_products(dict(tool_call.args or {}), task)
+            tool_call = SimpleNamespace(
+                name=tool_call.name,
+                args=args,
+                summary=getattr(tool_call, "summary", ""),
+            )
         elif tool_call.name in {"task_close_control_get", "task_close_control_update"}:
             args = _args_with_actor_admin_context(dict(tool_call.args or {}), task, settings=self._settings_for_qc)
             tool_call = SimpleNamespace(
@@ -437,6 +445,21 @@ def _project_create_args_with_actor_context(args: dict[str, Any], task: AgentTas
     actor_name = _current_user_label(task)
     actor_is_admin = bool(profile.get("is_admin"))
     return {**args, "_actor_name": actor_name, "_actor_is_admin": actor_is_admin}
+
+
+def _warehouse_args_with_default_products(args: dict[str, Any], task: AgentTask) -> dict[str, Any]:
+    if args.get("include_products") is True:
+        return args
+    if _warehouse_request_implies_stock(str(task.request or "")):
+        return {**args, "include_products": True, "product_limit": int(args.get("product_limit") or 10)}
+    return args
+
+
+def _warehouse_request_implies_stock(request: str) -> bool:
+    normalized = request.casefold().replace("ё", "е")
+    if any(marker in normalized for marker in ("остат", "налич", "что есть", "что находится")):
+        return True
+    return bool(re.search(r"\b(?:битрикс\s+)?покажи(?:те)?\s+(?:мне\s+)?склад\b", normalized))
 
 
 def _args_with_actor_admin_context(
