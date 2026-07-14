@@ -37,13 +37,18 @@ def _sanitize_value(value: Any) -> Any:
     if isinstance(value, dict):
         result: dict[str, Any] = {}
         for key, item in value.items():
-            if str(key).lower() in _SENSITIVE_WEBHOOK_KEYS:
+            if _is_sensitive_key(str(key)):
                 continue
             result[key] = _sanitize_value(item)
         return result
     if isinstance(value, list):
         return [_sanitize_value(item) for item in value]
     return value
+
+
+def _is_sensitive_key(key: str) -> bool:
+    normalized = key.strip().lower()
+    return normalized in _SENSITIVE_WEBHOOK_KEYS
 
 
 def webhook_event_partition_key(payload: dict[str, Any], *, event_type: str) -> str:

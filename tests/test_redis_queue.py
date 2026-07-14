@@ -11,6 +11,7 @@ from ai_server.integrations.redis.event_queue import (
     _iso_from_ms,
     _iso_now,
 )
+from ai_server.integrations.webhook_utils import sanitize_webhook_payload
 
 
 def anyio_run(coro):
@@ -59,6 +60,30 @@ def test_decode_json_invalid():
 
 def test_decode_json_non_dict():
     assert _decode_json("[1, 2, 3]") == {}
+
+
+def test_sanitize_webhook_payload_removes_nested_bitrix_auth_tokens():
+    payload = {
+        "event": "ONIMBOTV2MESSAGEADD",
+        "auth": {"access_token": "top-level"},
+        "data": {
+            "bot": {
+                "auth": {
+                    "access_token": "nested-access",
+                    "refresh_token": "nested-refresh",
+                    "application_token": "nested-app",
+                    "client_endpoint": "https://example.bitrix24.ru/rest/",
+                }
+            },
+            "message": {"text": "Битрикс покажи склад Борисов"},
+        },
+    }
+
+    sanitized = sanitize_webhook_payload(payload)
+
+    assert "auth" not in sanitized
+    assert "auth" not in sanitized["data"]["bot"]
+    assert sanitized["data"]["message"]["text"] == "Битрикс покажи склад Борисов"
 
 
 def test_iso_now_has_timezone():
