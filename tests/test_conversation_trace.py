@@ -144,6 +144,46 @@ def test_record_agent_result_and_outbound_are_indexed_by_task_and_user():
     assert any("ai_server:conversation_trace:task:" in str(call) for call in pipe.zadd.mock_calls)
 
 
+def test_record_timing_step_is_indexed_by_message_task_and_dialog():
+    trace, client = _make_trace()
+    pipe = _make_pipe(client)
+    task = AgentTask(
+        task_id="task-1",
+        request="Покажи склад Борисов",
+        user=UserContext(id="27", channel="bitrix24", raw={"message_id": 127203, "chat_id": 3669}),
+        context={"dialog_key": "chat:3669:user:27", "dialog_id": "chat3669", "recipient_id": "chat3669"},
+    )
+
+    anyio_run(
+        trace.record_timing(
+            task=task,
+            component="bitrix24",
+            stage="tool_execute",
+            started_at="2026-07-14T14:43:46.000000+03:00",
+            elapsed_ms=1234.56,
+            status="ok",
+            step=2,
+            tool="bitrix_warehouse_search",
+            details={"rows": 10},
+        )
+    )
+
+    pipe.set.assert_called_once()
+    stored = json.loads(pipe.set.call_args.args[1])
+    assert stored["trace_type"] == "timing_step"
+    assert stored["component"] == "bitrix24"
+    assert stored["stage"] == "tool_execute"
+    assert stored["elapsed_ms"] == 1234.6
+    assert stored["started_at"] == "2026-07-14T14:43:46.000000+03:00"
+    assert stored["status"] == "ok"
+    assert stored["step"] == 2
+    assert stored["tool"] == "bitrix_warehouse_search"
+    assert stored["message_id"] == 127203
+    assert stored["task_id"] == "task-1"
+    assert any("ai_server:conversation_trace:message:127203" in str(call) for call in pipe.zadd.mock_calls)
+    assert any("ai_server:conversation_trace:task:" in str(call) for call in pipe.zadd.mock_calls)
+
+
 def test_recent_returns_events_from_redis_zset():
     trace, client = _make_trace()
     client.zrevrangebyscore = AsyncMock(return_value=["2", "1"])

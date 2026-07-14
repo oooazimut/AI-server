@@ -112,6 +112,7 @@ class Bitrix24Specialist(BaseSpecialist):
         bitrix_user_client: BitrixToolClientPort | None = None,
         settings: Settings | None = None,
         result_publisher: Any | None = None,
+        conversation_trace: Any | None = None,
     ) -> None:
         self._proposal_store = proposal_store
         self._draft_store = draft_store
@@ -128,6 +129,7 @@ class Bitrix24Specialist(BaseSpecialist):
             scheduler=scheduler,
             store=store,
             result_publisher=result_publisher,
+            conversation_trace=conversation_trace,
         )
 
     @classmethod
@@ -144,6 +146,7 @@ class Bitrix24Specialist(BaseSpecialist):
         bitrix_store: Any | None = None,
         settings: Settings | None = None,
         specialist_result_publisher: Any | None = None,
+        conversation_trace: Any | None = None,
         **_: object,
     ) -> Bitrix24Specialist:
         _settings = settings or get_settings()
@@ -240,6 +243,7 @@ class Bitrix24Specialist(BaseSpecialist):
             bitrix_user_client=bitrix_client,
             settings=_settings,
             result_publisher=specialist_result_publisher,
+            conversation_trace=conversation_trace,
         )
 
     async def handle(self, task: AgentTask) -> AgentResult:
