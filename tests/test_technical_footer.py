@@ -14,13 +14,22 @@ def test_technical_footer_shows_model_usage_and_provider_balance_for_allowed_use
         status="completed",
         agent_id="internal_orchestrator",
         answer="Готово",
+        handoff_to=["bitrix24"],
         model_usage=[
             ModelUsageRecord(
                 agent_id="internal_orchestrator",
                 provider="deepseek",
                 model="deepseek-v4-flash",
                 status="used",
-            )
+                input_tokens=5177,
+                output_tokens=299,
+            ),
+            ModelUsageRecord(
+                agent_id="internal_orchestrator",
+                provider="local",
+                model="specialist_answer_passthrough",
+                status="skipped",
+            ),
         ],
     )
     service = TechnicalFooterService(balance_registry={"deepseek": FakeDeepSeekBalance()})
@@ -30,8 +39,8 @@ def test_technical_footer_shows_model_usage_and_provider_balance_for_allowed_use
 
     footer = anyio.run(build_footer)
 
-    assert "internal_orchestrator deepseek deepseek-v4-flash" in footer
-    assert "DeepSeek: доступен; баланс $12.34." in footer
+    assert footer == "оркестр → Bitrix, 5177/299 ток., DeepSeek OK, $12.34"
+    assert "specialist_answer_passthrough" not in footer
 
 
 def test_technical_footer_is_hidden_for_non_allowed_user(monkeypatch):
@@ -51,9 +60,12 @@ def test_technical_footer_is_hidden_for_non_allowed_user(monkeypatch):
 
 
 def test_append_footer_keeps_user_answer_readable():
-    message = append_footer("Готово", "LLM: не использовалась.")
+    message = append_footer(
+        "Готово",
+        "оркестр → Bitrix, 5177/299 ток., DeepSeek OK, $12.34",
+    )
 
-    assert message == "Готово\n\n---\nТех: LLM: не использовалась."
+    assert message == "Готово\n\n---\nТех: оркестр → Bitrix, 5177/299 ток., DeepSeek OK, $12.34"
 
 
 class FakeDeepSeekBalance:
