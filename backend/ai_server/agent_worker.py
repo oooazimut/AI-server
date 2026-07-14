@@ -36,6 +36,7 @@ from ai_server.integrations.postgres.vehicle_usage import PostgresVehicleUsageSt
 from ai_server.integrations.redis.agent_queue import RedisAgentQueue
 from ai_server.integrations.redis.conversation_trace import RedisConversationTrace
 from ai_server.integrations.redis.diagnost_queue import RedisDiagnostQueue
+from ai_server.integrations.redis.dialog_guard import RedisDialogGuard
 from ai_server.integrations.redis.event_queue import RedisEventQueue
 from ai_server.llm import build_orchestrator_llm_client
 from ai_server.models import AgentTask, UserContext
@@ -120,6 +121,7 @@ async def main() -> None:
     )
     diagnost_queue = RedisDiagnostQueue(settings.redis_url)
     conversation_trace = RedisConversationTrace(settings.redis_url, settings=settings)
+    dialog_guard = RedisDialogGuard(settings.redis_url, settings=settings)
     result_publisher = OrchestratorResultPublisher(diagnost_queue, conversation_trace=conversation_trace)
     specialist_result_publisher = SpecialistResultPublisher(diagnost_queue, conversation_trace=conversation_trace)
     webhook_event_queue = RedisEventQueue(settings.redis_url)
@@ -182,6 +184,7 @@ async def main() -> None:
             channels={"bitrix24": bitrix_channel},
             footer_service=TechnicalFooterService(settings=settings),
             conversation_trace=conversation_trace,
+            dialog_guard=dialog_guard,
             result_publisher=result_publisher,
         )
         orch_manifest = next((m for m in manifests if m.kind == "orchestrator"), None)
@@ -190,7 +193,10 @@ async def main() -> None:
             **specialist_deps.as_build_kwargs(),
         )
 
-        agent_queue = RedisAgentQueue(settings.redis_url)
+        agent_queue = RedisAgentQueue(
+            settings.redis_url,
+            processing_ttl_seconds=settings.agent_queue_processing_ttl_seconds,
+        )
 
         if settings.scheduler_enabled and settings.vehicle_usage_enabled:
             _vu_store_ref = vehicle_usage_store
@@ -370,12 +376,37 @@ async def main() -> None:
                     settings=settings,
                     feedback_receiver=feedback_receiver,
                     conversation_trace=conversation_trace,
+                    dialog_guard=dialog_guard,
+                    bitrix_sender=bitrix,
                 )
             )
         )
-        agent_tasks.append(asyncio.create_task(orchestrator.run(agent_queue)))
+        agent_task_timeout = settings.agent_task_timeout_seconds
+        orchestrator_worker_count = max(1, settings.agent_orchestrator_worker_count)
+        bitrix_worker_count = max(1, settings.agent_bitrix_worker_count)
+        for index in range(orchestrator_worker_count):
+            agent_tasks.append(
+                asyncio.create_task(
+                    orchestrator.run(
+                        agent_queue,
+                        worker_name=f"orchestrator-{index + 1}",
+                        task_timeout_seconds=agent_task_timeout,
+                    )
+                )
+            )
         for sp in orchestrator.specialists.values():
-            agent_tasks.append(asyncio.create_task(sp.run(agent_queue)))  # type: ignore[union-attr]
+            specialist_id = str(getattr(getattr(sp, "manifest", None), "id", ""))
+            worker_count = bitrix_worker_count if specialist_id == "bitrix24" else 1
+            for index in range(worker_count):
+                agent_tasks.append(
+                    asyncio.create_task(
+                        sp.run(  # type: ignore[union-attr]
+                            agent_queue,
+                            worker_name=f"{specialist_id or 'specialist'}-{index + 1}",
+                            task_timeout_seconds=agent_task_timeout,
+                        )
+                    )
+                )
         agent_tasks.append(asyncio.create_task(portal_search_indexer.run(agent_queue)))
         if settings.diagnost_enabled:
             agent_tasks.append(asyncio.create_task(run_diagnost_event_worker(diagnost_queue, diagnost_store)))

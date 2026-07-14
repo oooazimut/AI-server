@@ -8,6 +8,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from ai_server.agent_queue_utils import agent_queue_partition_key
 from ai_server.agents.ports import AgentQueuePort, AgentStorePort, ResultPublisherPort, SchedulerPort
 from ai_server.agents.tool import AgentTool
 from ai_server.knowledge import MarkdownKnowledgeBase
@@ -58,6 +59,8 @@ class BaseSpecialist:
         self.store = store
         self._result_publisher = result_publisher
         self._conversation_trace = conversation_trace
+        self._active_queue_partitions: set[str] = set()
+        self._queue_partition_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Hooks subclasses implement/override
@@ -105,6 +108,18 @@ class BaseSpecialist:
             result = await tool.execute(tool_call.args, user_id=user_id, dialog_key=dialog_key, dialog_id=dialog_id)
         action = ActionRecord(name=tool_call.name, status=result.status, details=result.model_dump())
         return result, action, []
+
+    def _terminal_response_metadata(
+        self,
+        *,
+        tool_call: Any,
+        result: ToolResult | None,
+        action: ActionRecord | None,
+        approvals: list[ActionRecord],
+        task: AgentTask,
+    ) -> dict[str, Any] | None:
+        """Return terminal-response metadata when the loop can skip the next decide step."""
+        return None
 
     # ------------------------------------------------------------------
     # Lifecycle hooks (subclasses override as needed)
@@ -249,6 +264,7 @@ class BaseSpecialist:
         tool_results: list[ToolResult] = []
         approval_actions: list[ActionRecord] = []
         decision_results: list[Any] = []
+        terminal_response_metadata: dict[str, Any] = {}
         decision = None
 
         for step in range(1, self.max_steps + 1):
@@ -325,6 +341,7 @@ class BaseSpecialist:
             executable_calls = [call for call in decision.tool_calls if call.name != "none"]
             if not executable_calls:
                 break
+            stop_after_step = False
             for tool_call in executable_calls:
                 tool_started_at = _trace_now_iso()
                 tool_t0 = time.monotonic()
@@ -360,6 +377,40 @@ class BaseSpecialist:
                 if action is not None:
                     actions_taken.append(action)
                 approval_actions.extend(approvals)
+                if len(executable_calls) == 1:
+                    terminal_metadata = self._terminal_response_metadata(
+                        tool_call=tool_call,
+                        result=result,
+                        action=action,
+                        approvals=approvals,
+                        task=task,
+                    )
+                    if terminal_metadata:
+                        terminal_response_metadata = {
+                            "terminal": True,
+                            "answer_is_final": True,
+                            "safe_to_send": True,
+                            "fast_return": True,
+                            **terminal_metadata,
+                        }
+                        actions_taken.append(
+                            ActionRecord(
+                                name=f"{self.action_prefix}_fast_return",
+                                status="completed",
+                                details=terminal_response_metadata,
+                            )
+                        )
+                        await self._record_timing(
+                            task,
+                            stage="fast_return",
+                            started_at=_trace_now_iso(),
+                            elapsed_ms=0.0,
+                            status="completed",
+                            step=step,
+                            tool=tool_call.name,
+                            details=terminal_response_metadata,
+                        )
+                        stop_after_step = True
             if step == self.max_steps and self.max_steps > 1:
                 actions_taken.append(
                     ActionRecord(
@@ -368,6 +419,8 @@ class BaseSpecialist:
                         details={"max_steps": self.max_steps},
                     )
                 )
+            if stop_after_step:
+                break
 
         if decision is None:
             failure = self._llm_failure_result(f"empty {self.action_prefix} LLM decision loop")
@@ -429,6 +482,8 @@ class BaseSpecialist:
             details={
                 "tool_results_count": len(tool_results),
                 "approval_actions_count": len(approval_actions),
+                "fast_return": bool(terminal_response_metadata.get("fast_return")),
+                "fast_return_reason": str(terminal_response_metadata.get("fast_return_reason") or ""),
             },
         )
         actions_taken.append(
@@ -438,10 +493,18 @@ class BaseSpecialist:
                 details={},
             )
         )
+        terminal_answer_ready = bool(
+            terminal_response_metadata.get("terminal")
+            and terminal_response_metadata.get("answer_is_final")
+            and terminal_response_metadata.get("safe_to_send")
+        )
         # Decide status is authoritative for needs_clarification/needs_human:
         # compose only formats the answer text, not the conversational state.
-        # If decide said needs_clarification but compose returned completed, trust decide.
-        if (
+        # A terminal fast-return is the exception: the tool already produced a final,
+        # safe answer, so keep diagnostics aligned with what was actually sent.
+        if terminal_answer_ready:
+            effective_status = "completed"
+        elif (
             decision is not None
             and decision.status in ("needs_clarification", "needs_human")
             and final_result.status == "completed"
@@ -472,9 +535,41 @@ class BaseSpecialist:
             model_usage=[*[item.model_usage for item in decision_results], final_result.model_usage],
             confidence=decision.confidence,
             logs=self._logs(),
+            metadata=terminal_response_metadata,
         )
 
-    async def run(self, queue: AgentQueuePort) -> None:
+    async def _claim_queue_message(
+        self,
+        queue: AgentQueuePort,
+        agent_id: str,
+    ) -> tuple[dict[str, Any] | None, str]:
+        async with self._queue_partition_lock:
+            message = await queue.claim_next(agent_id, blocked_partition_keys=self._active_queue_partitions)
+            if message is None:
+                return None, ""
+            partition_key = str(message.get("_partition_key") or agent_queue_partition_key(message))
+            if partition_key:
+                self._active_queue_partitions.add(partition_key)
+            return message, partition_key
+
+    async def _release_queue_partition(self, partition_key: str) -> None:
+        if not partition_key:
+            return
+        async with self._queue_partition_lock:
+            self._active_queue_partitions.discard(partition_key)
+
+    async def _await_message_task(self, coro: Any, *, timeout_seconds: float | None) -> Any:
+        if timeout_seconds is None or timeout_seconds <= 0:
+            return await coro
+        return await asyncio.wait_for(coro, timeout=timeout_seconds)
+
+    async def run(
+        self,
+        queue: AgentQueuePort,
+        *,
+        worker_name: str = "",
+        task_timeout_seconds: float | None = None,
+    ) -> None:
         """Queue consumer loop: claim → handle → publish result → ack/nack.
 
         Specialists never call queue.publish() directly inside handle().
@@ -482,7 +577,7 @@ class BaseSpecialist:
         """
         agent_id = self.manifest.id
         while True:
-            message = await queue.claim_next(agent_id)
+            message, partition_key = await self._claim_queue_message(queue, agent_id)
             if message is None:
                 await asyncio.sleep(self._queue_poll_interval)
                 continue
@@ -494,7 +589,7 @@ class BaseSpecialist:
                     logger.warning("Agent %s: invalid message %s: %s", agent_id, msg_id, exc)
                     await queue.nack(msg_id, error=f"invalid message: {exc}")
                     continue
-                result = await self.handle(task)
+                result = await self._await_message_task(self.handle(task), timeout_seconds=task_timeout_seconds)
                 if self._result_publisher is not None:
                     try:
                         await self._result_publisher.publish(task, result)
@@ -517,11 +612,16 @@ class BaseSpecialist:
                         }
                     )
                 await queue.ack(msg_id)
+            except TimeoutError:
+                logger.exception("Agent %s worker %s timed out processing message %s", agent_id, worker_name, msg_id)
+                await queue.nack(msg_id, error=f"TimeoutError: task exceeded {task_timeout_seconds}s")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.exception("Agent %s failed processing message %s", agent_id, msg_id)
                 await queue.nack(msg_id, error=f"{type(exc).__name__}: {exc}")
+            finally:
+                await self._release_queue_partition(partition_key)
 
 
 def _trace_now_iso() -> str:

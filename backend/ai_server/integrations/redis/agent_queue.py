@@ -8,10 +8,13 @@ from uuid import uuid4
 
 import redis.asyncio as aioredis
 
+from ai_server.agent_queue_utils import agent_queue_partition_key
+
 logger = logging.getLogger(__name__)
 
 _PREFIX = "ai_server:aq"
 _PROCESSING_TTL = 360  # seconds before a claimed message is considered stale
+_CLAIM_SCAN_LIMIT = 50
 _MAX_NACK_RETRIES = 3
 
 
@@ -30,9 +33,10 @@ def _data_key(msg_id: str) -> str:
 class RedisAgentQueue:
     """Redis-backed agent queue using sorted sets (score = timestamp)."""
 
-    def __init__(self, redis_url: str) -> None:
+    def __init__(self, redis_url: str, *, processing_ttl_seconds: int | None = None) -> None:
         self._redis_url = redis_url
         self._client: aioredis.Redis | None = None
+        self._processing_ttl_seconds = max(60, int(processing_ttl_seconds or _PROCESSING_TTL))
 
     async def _get_client(self) -> aioredis.Redis:
         if self._client is None:
@@ -52,10 +56,15 @@ class RedisAgentQueue:
         pipe.zadd(_pending_key(agent_id), {msg_id: score})
         await pipe.execute()
 
-    async def claim_next(self, agent_id: str) -> dict[str, Any] | None:
+    async def claim_next(
+        self,
+        agent_id: str,
+        *,
+        blocked_partition_keys: set[str] | None = None,
+    ) -> dict[str, Any] | None:
         r = await self._get_client()
         # Reclaim stale processing messages first
-        stale_before = time.time() - _PROCESSING_TTL
+        stale_before = time.time() - self._processing_ttl_seconds
         stale_ids = await r.zrangebyscore(_processing_key(agent_id), 0, stale_before)
         if stale_ids:
             logger.warning(
@@ -70,22 +79,32 @@ class RedisAgentQueue:
                 pipe.zadd(_pending_key(agent_id), {sid: time.time()})
             await pipe.execute()
 
-        # Pop next pending message
-        results = await r.zpopmin(_pending_key(agent_id), 1)
-        if not results:
-            return None
-        msg_id = str(results[0][0])
-        await r.zadd(_processing_key(agent_id), {msg_id: time.time()})
-        raw = await r.get(_data_key(msg_id))
-        if raw is None:
-            await r.zrem(_processing_key(agent_id), msg_id)
-            return None
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            logger.warning("RedisAgentQueue: invalid JSON for message %s", msg_id)
-            await r.zrem(_processing_key(agent_id), msg_id)
-            return None
+        blocked = set(blocked_partition_keys or ())
+        candidates = await r.zrange(_pending_key(agent_id), 0, _CLAIM_SCAN_LIMIT - 1)
+        for raw_msg_id in candidates:
+            msg_id = str(raw_msg_id)
+            raw = await r.get(_data_key(msg_id))
+            if raw is None:
+                await r.zrem(_pending_key(agent_id), msg_id)
+                continue
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                logger.warning("RedisAgentQueue: invalid JSON for message %s", msg_id)
+                await r.zrem(_pending_key(agent_id), msg_id)
+                continue
+            partition_key = agent_queue_partition_key(message)
+            if partition_key and partition_key in blocked:
+                continue
+            removed = await r.zrem(_pending_key(agent_id), msg_id)
+            if not removed:
+                continue
+            await r.zadd(_processing_key(agent_id), {msg_id: time.time()})
+            if partition_key:
+                message["_partition_key"] = partition_key
+            return message
+
+        return None
 
     async def ack(self, message_id: str) -> None:
         r = await self._get_client()
@@ -122,3 +141,46 @@ class RedisAgentQueue:
         else:
             logger.warning("RedisAgentQueue: message %s exceeded max retries, dropping. error=%s", message_id, error)
             await r.delete(_data_key(message_id))
+
+    async def active_partition_keys(self, agent_id: str) -> set[str]:
+        r = await self._get_client()
+        pending_ids = await r.zrange(_pending_key(agent_id), 0, -1)
+        processing_ids = await r.zrange(_processing_key(agent_id), 0, -1)
+        msg_ids = list(dict.fromkeys([*pending_ids, *processing_ids]))
+        partitions: set[str] = set()
+        for raw_msg_id in msg_ids:
+            msg_id = str(raw_msg_id)
+            raw = await r.get(_data_key(msg_id))
+            if raw is None:
+                continue
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            partition_key = agent_queue_partition_key(message)
+            if partition_key:
+                partitions.add(partition_key)
+        return partitions
+
+    async def remove_pending_by_partition(self, agent_id: str, partition_key: str) -> int:
+        if not partition_key:
+            return 0
+        r = await self._get_client()
+        pending_ids = await r.zrange(_pending_key(agent_id), 0, -1)
+        removed = 0
+        for raw_msg_id in pending_ids:
+            msg_id = str(raw_msg_id)
+            raw = await r.get(_data_key(msg_id))
+            if raw is None:
+                await r.zrem(_pending_key(agent_id), msg_id)
+                continue
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if agent_queue_partition_key(message) != partition_key:
+                continue
+            if await r.zrem(_pending_key(agent_id), msg_id):
+                await r.delete(_data_key(msg_id))
+                removed += 1
+        return removed

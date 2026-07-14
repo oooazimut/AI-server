@@ -315,6 +315,17 @@ def _direct_task_create_response(
     portal_base_url: str = "",
 ) -> BitrixLLMFinalResult | None:
     for result in reversed(tool_results):
+        if result.status == "denied" and result.tool in {
+            "bitrix_warehouse_search",
+            "bitrix_my_tasks",
+            "bitrix_task_search",
+            "bitrix_project_search",
+        }:
+            return BitrixLLMFinalResult(
+                status="completed",
+                answer=_format_read_denied_answer(result.data, result.error),
+                model_usage=_local_model_usage(agent_id, "read_authorization_response"),
+            )
         if result.status != "ok":
             continue
         if result.tool == "bitrix_warehouse_search":
@@ -438,6 +449,14 @@ def _direct_task_create_response(
                 model_usage=_local_model_usage(agent_id, "calendar_event_discard_response"),
             )
     return None
+
+
+def _format_read_denied_answer(data: dict[str, Any], error: str | None) -> str:
+    authorization = data.get("authorization") if isinstance(data.get("authorization"), dict) else {}
+    message = _text(authorization.get("message")) if authorization else ""
+    if message:
+        return message
+    return _text(error) or "Для чтения данных Bitrix24 требуется авторизация."
 
 
 def _format_warehouse_answer(data: dict[str, Any], *, portal_base_url: str = "") -> str:
@@ -2820,7 +2839,7 @@ def _common_project_query(request: str) -> str:
     match = re.search(r"\bпроект[а-яё]*\s+(.+?)(?:[.?!]|$)", request, flags=re.IGNORECASE)
     if not match:
         return ""
-    return _clean_read_query(match.group(1))
+    return _clean_project_query(match.group(1))
 
 
 def _task_scope_from_text(lowered: str) -> str:
@@ -2898,6 +2917,23 @@ def _clean_read_query(value: str) -> str:
     text = str(value or "").strip(" \t\r\n\"'«».,!?")
     text = re.split(r"\s+(?:со|с)\s+(?:статусом|сроком)\b", text, maxsplit=1, flags=re.IGNORECASE)[0]
     text = re.split(r"\s+в\s+проекте\b", text, maxsplit=1, flags=re.IGNORECASE)[0]
+    return text.strip(" \t\r\n\"'«».,!?")
+
+
+def _clean_project_query(value: str) -> str:
+    text = _clean_read_query(value)
+    text = re.split(
+        r"\s+(?:ответь|покажи|дай|напиши|выведи)\b",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    text = re.split(
+        r"\s+(?:кратко|ссылку|ссылкой|название|id)\b",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
     return text.strip(" \t\r\n\"'«».,!?")
 
 

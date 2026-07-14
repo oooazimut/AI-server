@@ -103,6 +103,7 @@ class RedisConversationTrace:
             "actions": [action.model_dump() for action in result.actions_taken],
             "actions_requiring_approval": [action.model_dump() for action in result.actions_requiring_approval],
             "model_usage": [usage.model_dump() for usage in result.model_usage],
+            "metadata": result.metadata,
         }
         await self.record(event)
 
@@ -237,6 +238,7 @@ def _task_trace_fields(task: AgentTask) -> dict[str, Any]:
         "user_id": user.id if user else None,
         "channel": user.channel if user else "",
         "dialog_key": context.get("dialog_key") or "",
+        "base_dialog_key": context.get("base_dialog_key") or "",
         "dialog_id": context.get("dialog_id") or "",
         "recipient_id": context.get("recipient_id") or "",
         "message_id": (user.raw or {}).get("message_id") if user else None,

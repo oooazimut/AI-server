@@ -128,7 +128,7 @@ class PostgresDiagnostStore(PostgresAgentSchema):
                     result.handoff_to or [],
                     _jsonb([a.model_dump() for a in result.actions_taken]),
                     _jsonb([u.model_dump() for u in result.model_usage]),
-                    _jsonb({"dialog_key": task.context.get("dialog_key", "")}),
+                    _jsonb({"dialog_key": task.context.get("dialog_key", ""), **(result.metadata or {})}),
                     source,
                 ),
             )
