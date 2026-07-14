@@ -490,10 +490,18 @@ class BaseSpecialist:
                 details={},
             )
         )
+        terminal_answer_ready = bool(
+            terminal_response_metadata.get("terminal")
+            and terminal_response_metadata.get("answer_is_final")
+            and terminal_response_metadata.get("safe_to_send")
+        )
         # Decide status is authoritative for needs_clarification/needs_human:
         # compose only formats the answer text, not the conversational state.
-        # If decide said needs_clarification but compose returned completed, trust decide.
-        if (
+        # A terminal fast-return is the exception: the tool already produced a final,
+        # safe answer, so keep diagnostics aligned with what was actually sent.
+        if terminal_answer_ready:
+            effective_status = "completed"
+        elif (
             decision is not None
             and decision.status in ("needs_clarification", "needs_human")
             and final_result.status == "completed"
