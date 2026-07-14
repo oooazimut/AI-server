@@ -45,6 +45,8 @@ def health(request: Request) -> dict[str, Any]:
         "agent_orchestrator_worker_count": settings.agent_orchestrator_worker_count,
         "agent_bitrix_worker_count": settings.agent_bitrix_worker_count,
         "agent_task_timeout_seconds": settings.agent_task_timeout_seconds,
+        "bitrix_auto_lines_enabled": settings.bitrix_auto_lines_enabled,
+        "bitrix_auto_line_max": settings.bitrix_auto_line_max,
         "bitrix_search_indexer_enabled": settings.search_background_periodic_enabled,
         "bitrix_search_metadata_enabled": settings.search_background_periodic_metadata_enabled,
         "bitrix_search_content_enabled": (

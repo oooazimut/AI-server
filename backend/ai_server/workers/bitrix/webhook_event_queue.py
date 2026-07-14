@@ -10,10 +10,18 @@ from ai_server.attachments import AttachmentService
 from ai_server.integrations.bitrix.chat_parser import (
     build_agent_task_from_bitrix_chat,
     build_agent_task_from_task_event,
+    make_line_dialog_key,
 )
 from ai_server.integrations.bitrix.events import MESSAGE_EVENTS
+from ai_server.models import AgentTask
 from ai_server.settings import Settings
 from ai_server.utils import MOSCOW_TZ
+from ai_server.workers.bitrix.dialog_lines import (
+    DEFAULT_AUTO_LINE_MAX,
+    choose_auto_line_id,
+    dialog_line_label,
+    is_auto_line_candidate,
+)
 from ai_server.workers.bitrix.search_webhook_indexer import DISK_FILE_EVENT_MARKERS
 from ai_server.workers.ports import WebhookConsumePort
 
@@ -194,6 +202,7 @@ async def _route_event(
             transcriber=transcriber,
             settings=settings,
         )
+        task = await _maybe_assign_auto_dialog_line(task, agent_queue=agent_queue, settings=settings)
         if feedback_receiver is not None:
             try:
                 intercepted = await feedback_receiver.handle(task)
@@ -279,6 +288,52 @@ async def _route_event(
         result={"handled": False, "reason": "unsupported_event", "event": event_type},
     )
     return {"handled": False, "reason": "unsupported_event", "event": event_type}
+
+
+async def _maybe_assign_auto_dialog_line(
+    task: AgentTask,
+    *,
+    agent_queue: AgentQueuePort,
+    settings: Settings,
+) -> AgentTask:
+    if not getattr(settings, "bitrix_auto_lines_enabled", False):
+        return task
+    context = dict(task.context or {})
+    if context.get("dialog_line_id"):
+        return task
+    if not is_auto_line_candidate(task.request):
+        return task
+    base_dialog_key = str(context.get("base_dialog_key") or context.get("dialog_key") or "").strip()
+    if not base_dialog_key:
+        return task
+    active_partitions_fn = getattr(agent_queue, "active_partition_keys", None)
+    if active_partitions_fn is None:
+        return task
+    try:
+        active_partitions = await active_partitions_fn("orchestrator")
+    except Exception:
+        logger.exception("_maybe_assign_auto_dialog_line: failed to inspect active orchestrator partitions")
+        return task
+    line_id = choose_auto_line_id(
+        set(active_partitions),
+        base_dialog_key,
+        max_lines=getattr(settings, "bitrix_auto_line_max", DEFAULT_AUTO_LINE_MAX),
+    )
+    if line_id is None:
+        return task
+    line_id_text = str(line_id)
+    return task.model_copy(
+        update={
+            "context": {
+                **context,
+                "dialog_key": make_line_dialog_key(base_dialog_key, line_id_text),
+                "base_dialog_key": base_dialog_key,
+                "dialog_line_id": line_id_text,
+                "dialog_line_label": dialog_line_label(line_id),
+                "dialog_auto_line": True,
+            }
+        }
+    )
 
 
 async def _trace_route(

@@ -57,3 +57,12 @@ class InMemoryAgentQueue:
 
     async def nack(self, message_id: str, *, error: str) -> None:
         pass  # in-memory: no retry, message is dropped on error
+
+    async def active_partition_keys(self, agent_id: str) -> set[str]:
+        q = self._queue(agent_id)
+        partitions: set[str] = set()
+        for message in list(q._queue):
+            partition_key = agent_queue_partition_key(message)
+            if partition_key:
+                partitions.add(partition_key)
+        return partitions

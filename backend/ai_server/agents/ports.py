@@ -23,6 +23,8 @@ class AgentQueuePort(Protocol):
 
     async def nack(self, message_id: str, *, error: str) -> None: ...
 
+    async def active_partition_keys(self, agent_id: str) -> set[str]: ...
+
 
 class ChannelPort(Protocol):
     """Outbound port for delivering messages to a communication channel."""
