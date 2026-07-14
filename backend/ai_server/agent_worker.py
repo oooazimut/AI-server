@@ -190,7 +190,10 @@ async def main() -> None:
             **specialist_deps.as_build_kwargs(),
         )
 
-        agent_queue = RedisAgentQueue(settings.redis_url)
+        agent_queue = RedisAgentQueue(
+            settings.redis_url,
+            processing_ttl_seconds=settings.agent_queue_processing_ttl_seconds,
+        )
 
         if settings.scheduler_enabled and settings.vehicle_usage_enabled:
             _vu_store_ref = vehicle_usage_store
@@ -373,9 +376,32 @@ async def main() -> None:
                 )
             )
         )
-        agent_tasks.append(asyncio.create_task(orchestrator.run(agent_queue)))
+        agent_task_timeout = settings.agent_task_timeout_seconds
+        orchestrator_worker_count = max(1, settings.agent_orchestrator_worker_count)
+        bitrix_worker_count = max(1, settings.agent_bitrix_worker_count)
+        for index in range(orchestrator_worker_count):
+            agent_tasks.append(
+                asyncio.create_task(
+                    orchestrator.run(
+                        agent_queue,
+                        worker_name=f"orchestrator-{index + 1}",
+                        task_timeout_seconds=agent_task_timeout,
+                    )
+                )
+            )
         for sp in orchestrator.specialists.values():
-            agent_tasks.append(asyncio.create_task(sp.run(agent_queue)))  # type: ignore[union-attr]
+            specialist_id = str(getattr(getattr(sp, "manifest", None), "id", ""))
+            worker_count = bitrix_worker_count if specialist_id == "bitrix24" else 1
+            for index in range(worker_count):
+                agent_tasks.append(
+                    asyncio.create_task(
+                        sp.run(  # type: ignore[union-attr]
+                            agent_queue,
+                            worker_name=f"{specialist_id or 'specialist'}-{index + 1}",
+                            task_timeout_seconds=agent_task_timeout,
+                        )
+                    )
+                )
         agent_tasks.append(asyncio.create_task(portal_search_indexer.run(agent_queue)))
         if settings.diagnost_enabled:
             agent_tasks.append(asyncio.create_task(run_diagnost_event_worker(diagnost_queue, diagnost_store)))

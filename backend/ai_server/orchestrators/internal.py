@@ -164,7 +164,13 @@ class InternalOrchestrator(BaseSpecialist):
             )
             raise
 
-    async def run(self, queue: AgentQueuePort) -> None:
+    async def run(
+        self,
+        queue: AgentQueuePort,
+        *,
+        worker_name: str = "",
+        task_timeout_seconds: float | None = None,
+    ) -> None:
         """Queue consumer loop.
 
         Handles two message types:
@@ -173,7 +179,7 @@ class InternalOrchestrator(BaseSpecialist):
         """
         _poll_interval = 0.1
         while True:
-            message = await queue.claim_next("orchestrator")
+            message, partition_key = await self._claim_queue_message(queue, "orchestrator")
             if message is None:
                 await asyncio.sleep(_poll_interval)
                 continue
@@ -191,7 +197,7 @@ class InternalOrchestrator(BaseSpecialist):
                         logger.warning("Orchestrator: invalid task message %s: %s", msg_id, exc)
                         await queue.nack(msg_id, error=f"invalid message: {exc}")
                         continue
-                    await self.handle(task)
+                    await self._await_message_task(self.handle(task), timeout_seconds=task_timeout_seconds)
                 elif msg_type == "result":
                     try:
                         result = AgentResult.model_validate(message["payload"])
@@ -210,13 +216,21 @@ class InternalOrchestrator(BaseSpecialist):
                                 "dialog_key": routing.get("dialog_key") or "",
                             },
                         )
-                        await self._send_to_channel(stub_task, result)
+                        await self._await_message_task(
+                            self._send_to_channel(stub_task, result),
+                            timeout_seconds=task_timeout_seconds,
+                        )
                 await queue.ack(msg_id)
+            except TimeoutError:
+                logger.exception("Orchestrator worker %s timed out processing message %s", worker_name, msg_id)
+                await queue.nack(msg_id, error=f"TimeoutError: task exceeded {task_timeout_seconds}s")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.exception("Orchestrator failed processing message %s", msg_id)
                 await queue.nack(msg_id, error=f"{type(exc).__name__}: {exc}")
+            finally:
+                await self._release_queue_partition(partition_key)
 
     # ------------------------------------------------------------------
     # Factory

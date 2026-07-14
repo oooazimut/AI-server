@@ -12,7 +12,12 @@ class AgentQueuePort(Protocol):
 
     async def publish(self, message: dict[str, Any]) -> None: ...
 
-    async def claim_next(self, agent_id: str) -> dict[str, Any] | None: ...
+    async def claim_next(
+        self,
+        agent_id: str,
+        *,
+        blocked_partition_keys: set[str] | None = None,
+    ) -> dict[str, Any] | None: ...
 
     async def ack(self, message_id: str) -> None: ...
 
