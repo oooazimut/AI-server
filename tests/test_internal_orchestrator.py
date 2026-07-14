@@ -3,7 +3,7 @@ import asyncio
 from ai_server.agents.bitrix24 import Bitrix24Specialist
 from ai_server.agents.logistics import LogisticsSpecialist
 from ai_server.agents.pto import PtoSpecialist
-from ai_server.models import AgentManifest, AgentTask
+from ai_server.models import AgentManifest, AgentResult, AgentTask
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.orchestrators.tools import CallSpecialistTool
 from ai_server.registry import load_agent_manifests
@@ -61,6 +61,40 @@ def test_internal_orchestrator_delegates_bitrix_request():
     # actions: load_context, llm_decision, call_specialist, llm_final_answer
     assert result.actions_taken[1].name == "orchestrator_llm_decision"
     assert result.actions_taken[2].name == "call_specialist"
+
+
+def test_internal_orchestrator_fast_returns_terminal_specialist_answer():
+    class _TerminalSpecialist:
+        async def handle(self, task):
+            return AgentResult(
+                status="completed",
+                agent_id="bitrix24",
+                answer="terminal answer",
+                confidence=0.9,
+                metadata={
+                    "terminal": True,
+                    "answer_is_final": True,
+                    "safe_to_send": True,
+                    "fast_return": True,
+                    "fast_return_reason": "read_only_tool_success",
+                    "terminal_tool": "bitrix_my_tasks",
+                },
+            )
+
+    fake_llm = FakeInternalOrchestratorLLM(call_specialists=["bitrix24"], status="needs_clarification")
+    result = asyncio.run(
+        _make_orch({"bitrix24": _TerminalSpecialist()}, fake_llm).handle(
+            AgentTask(task_id="t1", request="Bitrix show my tasks")
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.answer == "terminal answer"
+    assert len(fake_llm.decide_calls) == 1
+    assert result.metadata["fast_return"] is True
+    assert result.metadata["terminal_tool"] == "call_specialist"
+    assert result.metadata["specialist_terminal_tool"] == "bitrix_my_tasks"
+    assert any(action.name == "orchestrator_fast_return" for action in result.actions_taken)
 
 
 def test_internal_orchestrator_delegates_pto_document_request():

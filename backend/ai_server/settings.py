@@ -30,6 +30,9 @@ class Settings:
     bitrix_task_close_control_interval_seconds: int
     bitrix_task_close_control_direct_limit: int
     bitrix_task_close_control_auto_close_limit: int
+    bitrix_dialog_guard_enabled: bool
+    bitrix_dialog_stuck_seconds: int
+    bitrix_dialog_pending_ttl_seconds: int
     bitrix_oauth_app_path: str
     bitrix_oauth_callback_path: str
     bitrix_oauth_token_endpoint: str
@@ -73,6 +76,10 @@ class Settings:
     webhook_event_queue_retry_base_seconds: int
     webhook_event_queue_retry_max_seconds: int
     webhook_event_queue_stale_processing_seconds: int
+    agent_orchestrator_worker_count: int
+    agent_bitrix_worker_count: int
+    agent_task_timeout_seconds: float
+    agent_queue_processing_ttl_seconds: int
     scheduler_enabled: bool
     search_index_max_tasks: int
     search_index_max_projects: int
@@ -433,6 +440,9 @@ def get_settings() -> Settings:
         or (5 * 60),
         bitrix_task_close_control_direct_limit=_env_int("BITRIX_TASK_CLOSE_CONTROL_DIRECT_LIMIT", 20) or 20,
         bitrix_task_close_control_auto_close_limit=_env_int("BITRIX_TASK_CLOSE_CONTROL_AUTO_CLOSE_LIMIT", 100) or 100,
+        bitrix_dialog_guard_enabled=_env_bool("BITRIX_DIALOG_GUARD_ENABLED", True),
+        bitrix_dialog_stuck_seconds=_env_int("BITRIX_DIALOG_STUCK_SECONDS", 120) or 120,
+        bitrix_dialog_pending_ttl_seconds=_env_int("BITRIX_DIALOG_PENDING_TTL_SECONDS", 600) or 600,
         bitrix_oauth_app_path=_env("BITRIX_OAUTH_APP_PATH", "/bitrix/app"),
         bitrix_oauth_callback_path=_env("BITRIX_OAUTH_CALLBACK_PATH", "/bitrix/oauth/callback"),
         bitrix_oauth_token_endpoint=_env("BITRIX_OAUTH_TOKEN_ENDPOINT", "https://oauth.bitrix.info/oauth/token/"),
@@ -477,6 +487,10 @@ def get_settings() -> Settings:
         webhook_event_queue_retry_max_seconds=_env_int("WEBHOOK_EVENT_QUEUE_RETRY_MAX_SECONDS", 300) or 300,
         webhook_event_queue_stale_processing_seconds=_env_int("WEBHOOK_EVENT_QUEUE_STALE_PROCESSING_SECONDS", 300)
         or 300,
+        agent_orchestrator_worker_count=_env_int("AGENT_ORCHESTRATOR_WORKER_COUNT", 1) or 1,
+        agent_bitrix_worker_count=_env_int("AGENT_BITRIX_WORKER_COUNT", 1) or 1,
+        agent_task_timeout_seconds=_env_float("AGENT_TASK_TIMEOUT_SECONDS", 300.0) or 300.0,
+        agent_queue_processing_ttl_seconds=_env_int("AGENT_QUEUE_PROCESSING_TTL_SECONDS", 600) or 600,
         scheduler_enabled=_env_bool("AI_SERVER_SCHEDULER_ENABLED", True),
         search_index_max_tasks=_env_int("SEARCH_INDEX_MAX_TASKS", 5000) or 5000,
         search_index_max_projects=_env_int("SEARCH_INDEX_MAX_PROJECTS", 200) or 200,

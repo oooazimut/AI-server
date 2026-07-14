@@ -48,7 +48,7 @@ async def build_agent_task_from_bitrix_chat(
         incoming = incoming.model_copy(
             update={"text": _merge_text_and_transcription(incoming.text, attachment_context["transcription_text"])}
         )
-    dialog_key = make_dialog_key(
+    base_dialog_key = make_dialog_key(
         chat_id=incoming.chat_id,
         dialog_id=incoming.dialog_id,
         user_id=incoming.user_id,
@@ -73,7 +73,8 @@ async def build_agent_task_from_bitrix_chat(
         ],
         context={
             "bitrix_event_type": incoming.event_type,
-            "dialog_key": dialog_key,
+            "dialog_key": base_dialog_key,
+            "base_dialog_key": base_dialog_key,
             "dialog_id": incoming.dialog_id or "",
             "channel_id": "bitrix24",
             "recipient_id": incoming.dialog_id or "",

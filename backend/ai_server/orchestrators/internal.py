@@ -16,7 +16,7 @@ from ai_server.agents.ports import (
     ResultPublisherPort,
     SchedulerPort,
 )
-from ai_server.models import AgentManifest, AgentResult, AgentTask, ScheduledTask
+from ai_server.models import AgentManifest, AgentResult, AgentTask, ScheduledTask, ToolResult, ToolStatus
 from ai_server.orchestrators.orchestrator_llm import (
     OrchestratorFinalResult,
     OrchestratorLLM,
@@ -56,6 +56,7 @@ class InternalOrchestrator(BaseSpecialist):
         footer_service: TechnicalFooterService | None = None,
         result_publisher: ResultPublisherPort | None = None,
         conversation_trace: Any = None,
+        dialog_guard: Any = None,
     ) -> None:
         super().__init__(
             manifest,
@@ -70,6 +71,7 @@ class InternalOrchestrator(BaseSpecialist):
         self._footer_svc = footer_service
         self._result_publisher = result_publisher
         self._conversation_trace = conversation_trace
+        self._dialog_guard = dialog_guard
 
     # ------------------------------------------------------------------
     # BaseSpecialist hooks
@@ -93,6 +95,27 @@ class InternalOrchestrator(BaseSpecialist):
                 logger.exception("_load_extra_context: failed to load pending_specialist")
         return task, {}
 
+    def _terminal_response_metadata(
+        self,
+        *,
+        tool_call: Any,
+        result: ToolResult | None,
+        action: Any | None,
+        approvals: list[Any],
+        task: AgentTask,
+    ) -> dict[str, Any] | None:
+        if tool_call.name != "call_specialist" or result is None or result.status != ToolStatus.OK or approvals:
+            return None
+        data = result.data if isinstance(result.data, dict) else {}
+        if not (data.get("terminal") and data.get("answer_is_final") and data.get("safe_to_send")):
+            return None
+        return {
+            "fast_return_reason": str(data.get("fast_return_reason") or "specialist_terminal_response"),
+            "terminal_tool": "call_specialist",
+            "terminal_specialist": str(data.get("specialist") or ""),
+            "specialist_terminal_tool": str(data.get("terminal_tool") or ""),
+        }
+
     # ------------------------------------------------------------------
     # Lifecycle overrides
     # ------------------------------------------------------------------
@@ -102,7 +125,14 @@ class InternalOrchestrator(BaseSpecialist):
         started_at = _trace_now_iso()
         dialog_key = task.context.get("dialog_key", "")
         logger.info("Orchestrator.handle: start task_id=%s dialog_key=%s", task.task_id, dialog_key)
+        active_marked = False
         try:
+            if self._dialog_guard is not None and dialog_key:
+                generation = await self._dialog_guard.mark_active(task, ttl_seconds=3600)
+                task = task.model_copy(
+                    update={"context": {**task.context, "dialog_cancel_generation": int(generation)}}
+                )
+                active_marked = True
             result = await super().handle(task)
             # Extract specialist IDs called during this turn for handoff_to
             specialist_ids = [
@@ -142,8 +172,17 @@ class InternalOrchestrator(BaseSpecialist):
                 details={"error": f"{type(exc).__name__}: {exc}"},
             )
             raise
+        finally:
+            if active_marked and self._dialog_guard is not None:
+                await self._dialog_guard.clear_active(task)
 
-    async def run(self, queue: AgentQueuePort) -> None:
+    async def run(
+        self,
+        queue: AgentQueuePort,
+        *,
+        worker_name: str = "",
+        task_timeout_seconds: float | None = None,
+    ) -> None:
         """Queue consumer loop.
 
         Handles two message types:
@@ -152,7 +191,7 @@ class InternalOrchestrator(BaseSpecialist):
         """
         _poll_interval = 0.1
         while True:
-            message = await queue.claim_next("orchestrator")
+            message, partition_key = await self._claim_queue_message(queue, "orchestrator")
             if message is None:
                 await asyncio.sleep(_poll_interval)
                 continue
@@ -170,7 +209,7 @@ class InternalOrchestrator(BaseSpecialist):
                         logger.warning("Orchestrator: invalid task message %s: %s", msg_id, exc)
                         await queue.nack(msg_id, error=f"invalid message: {exc}")
                         continue
-                    await self.handle(task)
+                    await self._await_message_task(self.handle(task), timeout_seconds=task_timeout_seconds)
                 elif msg_type == "result":
                     try:
                         result = AgentResult.model_validate(message["payload"])
@@ -189,13 +228,21 @@ class InternalOrchestrator(BaseSpecialist):
                                 "dialog_key": routing.get("dialog_key") or "",
                             },
                         )
-                        await self._send_to_channel(stub_task, result)
+                        await self._await_message_task(
+                            self._send_to_channel(stub_task, result),
+                            timeout_seconds=task_timeout_seconds,
+                        )
                 await queue.ack(msg_id)
+            except TimeoutError:
+                logger.exception("Orchestrator worker %s timed out processing message %s", worker_name, msg_id)
+                await queue.nack(msg_id, error=f"TimeoutError: task exceeded {task_timeout_seconds}s")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.exception("Orchestrator failed processing message %s", msg_id)
                 await queue.nack(msg_id, error=f"{type(exc).__name__}: {exc}")
+            finally:
+                await self._release_queue_partition(partition_key)
 
     # ------------------------------------------------------------------
     # Factory
@@ -245,6 +292,7 @@ class InternalOrchestrator(BaseSpecialist):
             footer_service=footer_service,
             result_publisher=result_publisher,
             conversation_trace=specialist_deps.get("conversation_trace"),
+            dialog_guard=specialist_deps.get("dialog_guard"),
         )
         # Break circular dep: CallSpecialistTool needs orch to schedule specialist tasks
         call_tool.schedule_fn = orch._apply_scheduled_tasks_from_specialist
@@ -317,8 +365,25 @@ class InternalOrchestrator(BaseSpecialist):
                     status="completed",
                     details={"user_id": user_id, "footer_chars": len(footer)},
                 )
-        body = append_footer(result.answer, footer) if result.answer else ""
+        answer = result.answer or ""
+        body = append_footer(answer, footer) if answer else ""
         if body:
+            if self._dialog_guard is not None and await self._dialog_guard.task_is_stale(task):
+                logger.info(
+                    "Suppressing stale channel send task_id=%s dialog_key=%s",
+                    task.task_id,
+                    task.context.get("dialog_key"),
+                )
+                if self._conversation_trace is not None:
+                    await self._conversation_trace.record_outbound(
+                        task=task,
+                        result=result,
+                        recipient_id=recipient_id,
+                        body=body,
+                        status="suppressed",
+                        error="dialog_cancelled",
+                    )
+                return
             send_started_at = _trace_now_iso()
             send_t0 = time.monotonic()
             try:
