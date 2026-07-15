@@ -12,7 +12,15 @@ from ai_server.agent_queue_utils import agent_queue_partition_key
 from ai_server.agents.ports import AgentQueuePort, AgentStorePort, ResultPublisherPort, SchedulerPort
 from ai_server.agents.tool import AgentTool
 from ai_server.knowledge import MarkdownKnowledgeBase
-from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult, ToolStatus
+from ai_server.models import (
+    ActionRecord,
+    AgentManifest,
+    AgentResult,
+    AgentTask,
+    ModelUsageRecord,
+    ToolResult,
+    ToolStatus,
+)
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
 from ai_server.utils import MOSCOW_TZ, optional_int, unique
@@ -503,7 +511,7 @@ class BaseSpecialist:
         # A terminal fast-return is the exception: the tool already produced a final,
         # safe answer, so keep diagnostics aligned with what was actually sent.
         if terminal_answer_ready:
-            effective_status = "completed"
+            effective_status = str(terminal_response_metadata.get("terminal_status") or "completed")
         elif (
             decision is not None
             and decision.status in ("needs_clarification", "needs_human")
@@ -526,17 +534,37 @@ class BaseSpecialist:
                 status="completed",
             )
 
+        tool_model_usage = self._model_usage_from_tool_results(tool_results)
         return AgentResult(
             status=status,
             agent_id=self.manifest.id,
             answer=final_result.answer,
             actions_taken=actions_taken,
             actions_requiring_approval=approval_actions,
-            model_usage=[*[item.model_usage for item in decision_results], final_result.model_usage],
+            model_usage=[*[item.model_usage for item in decision_results], *tool_model_usage, final_result.model_usage],
             confidence=decision.confidence,
             logs=self._logs(),
             metadata=terminal_response_metadata,
         )
+
+    def _model_usage_from_tool_results(self, tool_results: list[ToolResult]) -> list[ModelUsageRecord]:
+        usages: list[ModelUsageRecord] = []
+        for result in tool_results:
+            data = result.data if isinstance(result.data, dict) else {}
+            raw_items = data.get("model_usage") or []
+            if not isinstance(raw_items, list):
+                continue
+            for raw in raw_items:
+                if isinstance(raw, ModelUsageRecord):
+                    usages.append(raw)
+                    continue
+                if not isinstance(raw, dict):
+                    continue
+                try:
+                    usages.append(ModelUsageRecord.model_validate(raw))
+                except Exception:
+                    continue
+        return usages
 
     async def _claim_queue_message(
         self,

@@ -35,7 +35,14 @@ def _bitrix_specialist(*, tools=None, llm=None, settings=None) -> Bitrix24Specia
 def _bitrix_read_tool_definitions() -> list[dict]:
     return [
         ToolDefinition(name=name, description="", parameters={}).model_dump()
-        for name in ("bitrix_my_tasks", "bitrix_task_search", "bitrix_project_search", "bitrix_api", "none")
+        for name in (
+            "bitrix_my_tasks",
+            "bitrix_task_search",
+            "bitrix_project_search",
+            "bitrix_api",
+            "portal_search",
+            "none",
+        )
     ]
 
 
@@ -367,6 +374,56 @@ def test_bitrix_llm_decide_routes_created_by_task_read_to_deterministic_tool(mon
 
     assert [call.name for call in result.decision.tool_calls] == ["bitrix_task_search"]
     assert result.decision.tool_calls[0].args == {"scope": "created_by", "status": "active", "limit": 10}
+
+
+def test_bitrix_llm_decide_routes_contract_documents_to_portal_search(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request="Битрикс, покажи последние 10 договоров по Азимуту.",
+                user={"id": "1"},
+            ),
+            retrieval_hits=[],
+            tool_definitions=_bitrix_read_tool_definitions(),
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["portal_search"]
+    assert result.decision.tool_calls[0].args == {
+        "query": "договор Азимут",
+        "scope": "documents",
+        "limit": 10,
+    }
+
+
+def test_bitrix_llm_decide_routes_disk_scan_to_file_portal_search(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t1", request="Битрикс, найди на диске скан счета Азимут.", user={"id": "1"}),
+            retrieval_hits=[],
+            tool_definitions=_bitrix_read_tool_definitions(),
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["portal_search"]
+    assert result.decision.tool_calls[0].args == {
+        "query": "счет Азимут",
+        "scope": "files",
+        "limit": 10,
+    }
 
 
 def test_bitrix_llm_decide_routes_task_text_search_even_when_model_answers_from_history(monkeypatch):
