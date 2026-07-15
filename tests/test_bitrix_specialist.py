@@ -18,7 +18,7 @@ from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
 from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, FakeTaskDraftStore, RecordingLLMClient
 
 
-def _bitrix_specialist(*, tools=None, llm=None, settings=None) -> Bitrix24Specialist:
+def _bitrix_specialist(*, tools=None, llm=None, settings=None, conversation_trace=None) -> Bitrix24Specialist:
     manifest = get_agent_manifest("bitrix24")
     retriever = HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider())
     return Bitrix24Specialist(
@@ -29,7 +29,16 @@ def _bitrix_specialist(*, tools=None, llm=None, settings=None) -> Bitrix24Specia
         bitrix_user_client=tools.make_user_client() if tools is not None else None,
         llm=llm or FakeBitrixLLM(),
         settings=settings,
+        conversation_trace=conversation_trace,
     )
+
+
+class _RecordingConversationTrace:
+    def __init__(self) -> None:
+        self.events = []
+
+    async def record_timing(self, **kwargs):
+        self.events.append(kwargs)
 
 
 def _bitrix_read_tool_definitions() -> list[dict]:
@@ -190,6 +199,47 @@ def test_bitrix_specialist_searches_my_open_tasks():
     assert result.status == "completed"
     assert tools.my_tasks_calls[0] == {"status": "open", "limit": 10}
     assert "Проверить камеру" in result.answer
+
+
+def test_bitrix_specialist_fast_returns_portal_search_result_and_traces_tool():
+    trace = _RecordingConversationTrace()
+    tools = FakeResolverTools(
+        portal_search_result=ToolResult(
+            status="ok",
+            tool="portal_search",
+            data={
+                "query": "dogovor azimut",
+                "items": [{"title": "DOGOVOR Azimut", "path": "Dogovora/Azimut.docx"}],
+            },
+        )
+    )
+    llm = FakeBitrixLLM(
+        tool_call_steps=[
+            [BitrixLLMToolCall(name="portal_search", args={"query": "dogovor azimut", "limit": 10})],
+            [BitrixLLMToolCall(name="portal_search", args={"query": "dogovor azimut", "limit": 10})],
+        ],
+        final_answer="Nashel dogovor Azimut.",
+    )
+
+    result = asyncio.run(
+        _bitrix_specialist(tools=tools, llm=llm, conversation_trace=trace).handle(
+            AgentTask(task_id="t1", request="Bitrix find dogovor Azimut", user={"id": "1"})
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.answer == "Nashel dogovor Azimut."
+    assert len(llm.decide_calls) == 1
+    assert tools.portal_search_calls == [{"query": "dogovor azimut", "limit": 10}]
+    fast_return = [action for action in result.actions_taken if action.name == "bitrix_fast_return"]
+    assert fast_return
+    assert fast_return[0].details["terminal_tool"] == "portal_search"
+    tool_events = [event for event in trace.events if event["stage"] == "tool_execute"]
+    assert len(tool_events) == 1
+    assert tool_events[0]["tool"] == "portal_search"
+    assert tool_events[0]["details"]["tool"] == "portal_search"
+    assert tool_events[0]["details"]["tool_result_tool"] == "portal_search"
+    assert tool_events[0]["details"]["tool_result_status"] == "ok"
 
 
 def test_bitrix_specialist_treats_show_warehouse_as_stock_request():
@@ -3291,11 +3341,17 @@ def test_bitrix_skills_and_knowledge_loaded():
 class _FakePortalSearchTool:
     name = "portal_search"
 
+    def __init__(self, result: ToolResult | None = None, calls: list | None = None):
+        self._result = result or ToolResult(status="not_configured", tool="portal_search")
+        self._calls = calls
+
     def definition(self):
         return ToolDefinition(name="portal_search", description="", parameters={})
 
     async def execute(self, args, *, user_id=None, dialog_key=None, dialog_id=None):
-        return ToolResult(status="not_configured", tool="portal_search", data={"args": args})
+        if self._calls is not None:
+            self._calls.append(args)
+        return self._result
 
 
 class _FakeBitrixApiTool:
@@ -3363,6 +3419,7 @@ class FakeResolverTools:
         *,
         bitrix_api_result: ToolResult | None = None,
         my_tasks_result: ToolResult | None = None,
+        portal_search_result: ToolResult | None = None,
         task_search_result: ToolResult | None = None,
         project_search_result: ToolResult | None = None,
         warehouse_result: ToolResult | None = None,
@@ -3373,9 +3430,10 @@ class FakeResolverTools:
         self.task_search_calls: list = []
         self.project_search_calls: list = []
         self.warehouse_calls: list = []
+        self.portal_search_calls: list = []
         self._raw_user = raw_user
         self._tools = [
-            _FakePortalSearchTool(),
+            _FakePortalSearchTool(portal_search_result, self.portal_search_calls),
             _FakeMyTasksTool(
                 my_tasks_result or ToolResult(status="not_configured", tool="bitrix_my_tasks"),
                 self.my_tasks_calls,

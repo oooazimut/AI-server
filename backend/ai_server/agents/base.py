@@ -364,7 +364,7 @@ class BaseSpecialist:
                         status="error",
                         step=step,
                         tool=tool_call.name,
-                        details={"error": f"{type(exc).__name__}: {exc}"},
+                        details={"tool": tool_call.name, "error": f"{type(exc).__name__}: {exc}"},
                     )
                     raise
                 await self._record_timing(
@@ -376,6 +376,9 @@ class BaseSpecialist:
                     step=step,
                     tool=tool_call.name,
                     details={
+                        "tool": tool_call.name,
+                        "tool_result_tool": result.tool if result is not None else "",
+                        "tool_result_status": str(result.status) if result is not None else "",
                         "approvals_count": len(approvals),
                         "has_result": result is not None,
                     },
