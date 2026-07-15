@@ -1131,11 +1131,16 @@ def test_bitrix_specialist_task_create_draft_uses_current_user_profile_label():
         async def get_user(self, user_id: int):
             return {"ID": str(user_id), "NAME": "Дмитрий", "LAST_NAME": "Кулинич"}
 
+        async def search_projects(self, query: str, *, limit: int = 10):
+            assert query == "Кулинич Дмитрий"
+            return [{"ID": "43", "NAME": "Кулинич Дмитрий", "PROJECT": "Y"}]
+
+    user_client = _FakeUserClient()
     specialist = Bitrix24Specialist(
         get_agent_manifest("bitrix24"),
         retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
-        agent_tools=[TaskCreateDraftTool(store=store)],
-        bitrix_user_client=_FakeUserClient(),
+        agent_tools=[TaskCreateDraftTool(store=store, project_client=user_client)],
+        bitrix_user_client=user_client,
         llm=llm,
     )
 
@@ -1152,7 +1157,10 @@ def test_bitrix_specialist_task_create_draft_uses_current_user_profile_label():
 
     assert result.status == "needs_human"
     preview = llm.compose_calls[0]["tool_results"][0].data["preview"]
+    fields = llm.compose_calls[0]["tool_results"][0].data["params"]["fields"]
     assert preview["responsible"] == "Кулинич Дмитрий"
+    assert preview["project"] == "Кулинич Дмитрий"
+    assert fields["GROUP_ID"] == 43
     assert "текущий пользователь" not in preview["responsible"]
 
 

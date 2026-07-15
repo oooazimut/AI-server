@@ -105,8 +105,9 @@ def build_task_create_draft_from_args(args: dict[str, Any], *, user_id: int | No
 class TaskCreateDraftTool:
     name = "task_create_draft"
 
-    def __init__(self, store: TaskDraftStorePort) -> None:
+    def __init__(self, store: TaskDraftStorePort, project_client: Any | None = None) -> None:
         self._store = store
+        self._project_client = project_client
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -145,7 +146,18 @@ class TaskCreateDraftTool:
         dialog_key: str | None = None,
         dialog_id: str | None = None,
     ) -> ToolResult:
-        draft = build_task_create_draft_from_args(args, user_id=user_id)
+        resolved_args, project_note, project_error = await _args_with_resolved_project(
+            args,
+            project_client=self._project_client,
+        )
+        if project_error:
+            return ToolResult(
+                status=ToolStatus.NOT_FOUND,
+                tool=self.name,
+                error=project_error,
+                data={"args": resolved_args},
+            )
+        draft = build_task_create_draft_from_args(resolved_args, user_id=user_id)
         if not draft.is_ready:
             return ToolResult(
                 status=ToolStatus.CONTRACT_VIOLATION,
@@ -155,6 +167,9 @@ class TaskCreateDraftTool:
             )
         if dialog_key:
             await self._store.save_task_draft(dialog_key, draft.params)
+        notes = list(draft.notes)
+        if project_note:
+            notes.append(project_note)
         return ToolResult(
             status=ToolStatus.OK,
             tool=self.name,
@@ -162,7 +177,7 @@ class TaskCreateDraftTool:
                 "summary": draft.summary,
                 "params": draft.params,
                 "preview": draft.preview,
-                "notes": draft.notes,
+                "notes": notes,
             },
         )
 
@@ -331,6 +346,62 @@ class TaskDraftDiscardTool:
             tool=self.name,
             data={"discarded": bool(dialog_key)},
         )
+
+
+async def _args_with_resolved_project(
+    args: dict[str, Any],
+    *,
+    project_client: Any | None,
+) -> tuple[dict[str, Any], str, str]:
+    resolved_args = dict(args or {})
+    if optional_int(resolved_args.get("group_id")) is not None:
+        return resolved_args, "", ""
+    project_name = compact_text(str(resolved_args.get("project_name") or resolved_args.get("group_name") or ""))
+    default_personal_project = _truthy(resolved_args.get("_default_personal_project"))
+    if not project_name:
+        return resolved_args, "", ""
+    if project_client is None:
+        if default_personal_project:
+            return resolved_args, "", "default personal project requires Bitrix project resolver"
+        return resolved_args, "", ""
+    try:
+        projects = await project_client.search_projects(project_name, limit=10)
+    except (BitrixApiError, BitrixConfigError) as exc:
+        return resolved_args, "", str(exc)
+    except Exception as exc:
+        return resolved_args, "", f"{type(exc).__name__}: {exc}"
+    project = _matching_project(projects, project_name)
+    if project is None:
+        if default_personal_project:
+            return resolved_args, "", f"personal Bitrix project not found: {project_name}"
+        return resolved_args, "", ""
+    project_id = optional_int(project.get("ID") or project.get("id"))
+    if project_id is None:
+        return resolved_args, "", f"Bitrix project has no numeric ID: {project_name}"
+    resolved_name = compact_text(str(project.get("NAME") or project.get("name") or project_name))
+    resolved_args["group_id"] = project_id
+    resolved_args["project_name"] = resolved_name or project_name
+    return resolved_args, f"Проект по умолчанию: {resolved_args['project_name']} (#{project_id}).", ""
+
+
+def _matching_project(projects: object, project_name: str) -> dict[str, Any] | None:
+    if not isinstance(projects, list):
+        return None
+    normalized = _normalize_project_name(project_name)
+    exact: list[dict[str, Any]] = []
+    for project in projects:
+        if not isinstance(project, dict):
+            continue
+        name = compact_text(str(project.get("NAME") or project.get("name") or ""))
+        if _normalize_project_name(name) == normalized:
+            exact.append(project)
+    if len(exact) == 1:
+        return exact[0]
+    return None
+
+
+def _normalize_project_name(value: str) -> str:
+    return " ".join(compact_text(str(value or "")).casefold().replace("ё", "е").split())
 
 
 def _deadline_from_args(args: dict[str, Any]) -> tuple[str | None, str, bool, str]:
