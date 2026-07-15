@@ -92,6 +92,7 @@ _LLM_TOOL_NAMES = frozenset(
 
 _FAST_RETURN_READ_TOOLS = frozenset(
     {
+        "portal_search",
         "bitrix_warehouse_search",
         "bitrix_my_tasks",
         "bitrix_task_search",
