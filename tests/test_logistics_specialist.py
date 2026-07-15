@@ -15,6 +15,7 @@ from ai_server.agents.logistics.tools import (
     VehicleContextTool,
     VehicleGetOperatorsTool,
     VehicleGetReportTool,
+    VehicleReferenceTool,
     VehicleSaveDraftTool,
     VehicleSaveReportTool,
     VehicleSetOperatorsTool,
@@ -637,6 +638,53 @@ def test_vehicle_usage_get_operators_returns_only_operator_names(monkeypatch):
             {"user_id": 13, "full_name": "Коверга Дмитрий"},
         ],
     }
+
+
+def test_vehicle_usage_reference_returns_staff_vehicles_and_operators(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    store = FakeVehicleUsageStore()
+    store.upsert_employees([StaffMember(order=1, name="Borisov Andrey", user_id=27)])
+    store._vehicles = [{"id": 2, "brand_model": "Auto 2", "registration_number": ""}]
+    store.set_vehicle_usage_operators(operator_user_ids=[13], actor_user_id=1)
+    tool = VehicleReferenceTool(store)
+
+    result = anyio_run(tool.execute({}, user_id=1, dialog_id="1"))
+
+    assert result.status == ToolStatus.OK
+    assert result.data["staff_roster"] == [{"display_order": 1, "full_name": "Borisov Andrey", "user_id": 27}]
+    assert result.data["vehicles"] == [{"id": 2, "brand_model": "Auto 2", "registration_number": ""}]
+    assert result.data["operator_user_ids"] == [13]
+
+
+def test_vehicle_save_report_drafts_unknown_vehicle_reference(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    store = FakeVehicleUsageStore()
+    store.upsert_employees([StaffMember(order=1, name="Borisov Andrey", user_id=27)])
+    store._vehicles = [{"id": 2, "brand_model": "Auto 2", "registration_number": ""}]
+    tool = VehicleSaveReportTool(store, allowed_user_ids=frozenset({13}))
+
+    result = anyio_run(
+        tool.execute(
+            {
+                "request_date": "2026-07-15",
+                "source_text": "Borisov Andrey Auto 99",
+                "parsed": {
+                    "date": "2026-07-15",
+                    "people": [{"staff_order": 1, "full_name": "Borisov Andrey", "status": "worked"}],
+                    "vehicles": [{"vehicle_name": "Auto 99", "status": "in_use", "drivers": ["Borisov Andrey"]}],
+                },
+            },
+            user_id=13,
+            dialog_id="13",
+        )
+    )
+
+    assert result.status == ToolStatus.OK
+    assert result.data["draft_saved"] is True
+    assert result.data["needs_clarification"] is True
+    assert any(block["kind"] == "unknown_vehicle_references" for block in result.data["missing"])
+    assert store._requests[-1]["status"] == "pending_clarification"
+    assert store._day_reports == []
 
 
 def test_logistics_llm_compose_formats_get_operators_without_saving(monkeypatch):

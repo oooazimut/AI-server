@@ -127,6 +127,25 @@ def test_vehicle_store_upsert_employees(monkeypatch):
     assert any("SET active = FALSE" in sql for sql, _ in conn.calls)
 
 
+def test_vehicle_store_seed_default_vehicles_is_idempotent():
+    store = PostgresVehicleUsageStore("postgresql://fake")
+    conn = _FakeSyncConn()
+
+    store._seed_default_vehicles(conn)
+
+    insert_calls = [(sql, params) for sql, params in conn.calls if "INSERT INTO logistics.vehicles" in sql]
+    assert len(insert_calls) == 6
+    assert [params for _, params in insert_calls] == [
+        (1, "Авто 1"),
+        (2, "Авто 2"),
+        (3, "Авто 3"),
+        (4, "Авто 4"),
+        (5, "Авто 5"),
+        (6, "Авто 6"),
+    ]
+    assert all("ON CONFLICT (id) DO NOTHING" in sql for sql, _ in insert_calls)
+
+
 def test_vehicle_store_save_draft(monkeypatch):
     store = PostgresVehicleUsageStore("postgresql://fake")
     factory, conn = _sync_conn_factory(rows=[{"id": 42}])

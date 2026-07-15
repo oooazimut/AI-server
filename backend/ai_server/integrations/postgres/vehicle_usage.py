@@ -7,6 +7,15 @@ from ai_server.utils import MOSCOW_TZ
 
 from .agent_schema import PostgresAgentSchema
 
+DEFAULT_VEHICLES: tuple[tuple[int, str], ...] = (
+    (1, "Авто 1"),
+    (2, "Авто 2"),
+    (3, "Авто 3"),
+    (4, "Авто 4"),
+    (5, "Авто 5"),
+    (6, "Авто 6"),
+)
+
 
 def _now() -> str:
     from datetime import datetime
@@ -69,6 +78,7 @@ class PostgresVehicleUsageStore(PostgresAgentSchema):
             )
             db.execute("ALTER TABLE logistics.employees ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE")
             db.execute("ALTER TABLE logistics.vehicles ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE")
+            self._seed_default_vehicles(db)
             db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS logistics.vehicle_payment_cards (
@@ -152,6 +162,17 @@ class PostgresVehicleUsageStore(PostgresAgentSchema):
                     updated_at TEXT NOT NULL DEFAULT ''
                 )
                 """
+            )
+
+    def _seed_default_vehicles(self, db: Any) -> None:
+        for vehicle_id, vehicle_name in DEFAULT_VEHICLES:
+            db.execute(
+                """
+                INSERT INTO logistics.vehicles (id, brand_model, registration_number, active)
+                VALUES (%s, %s, '', TRUE)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                (vehicle_id, vehicle_name),
             )
 
     def _add_request_columns(self, db: Any) -> None:

@@ -19,6 +19,7 @@ from ai_server.agents.logistics.tools import (
     VehicleGetOperatorsTool,
     VehicleGetReportTool,
     VehicleGetVehiclePeriodReportTool,
+    VehicleReferenceTool,
     VehicleSaveDraftTool,
     VehicleSaveReportTool,
     VehicleSetOperatorsTool,
@@ -122,6 +123,7 @@ class LogisticsSpecialist(BaseSpecialist):
         admin_user_ids = logistics_vu_settings.admin_user_ids if logistics_vu_settings is not None else frozenset()
         tools: list[AgentTool] = [
             VehicleContextTool(vehicle_usage_store),
+            VehicleReferenceTool(vehicle_usage_store),
             VehicleGetOperatorsTool(vehicle_usage_store),
             VehicleSetOperatorsTool(vehicle_usage_store, admin_user_ids=admin_user_ids),
             VehicleStartDayTool(vehicle_usage_store, allowed_user_ids=allowed_user_ids),
