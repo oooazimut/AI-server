@@ -29,13 +29,23 @@ from ai_server.agents.logistics.tools import (
 from ai_server.agents.ports import SchedulerPort
 from ai_server.agents.tool import AgentTool
 from ai_server.knowledge import MarkdownKnowledgeBase
-from ai_server.models import AgentManifest, AgentResult, AgentTask, ScheduledTask
+from ai_server.models import AgentManifest, AgentResult, AgentTask, ScheduledTask, ToolResult, ToolStatus
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.skills import SkillStore
 from ai_server.tools.vehicle_usage import VehicleUsageStorePort
 from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)
+
+_FAST_RETURN_TOOLS = {
+    "vehicle_usage_reference",
+    "vehicle_usage_get_operators",
+    "vehicle_usage_get_report",
+    "vehicle_usage_get_employee_period_report",
+    "vehicle_usage_get_vehicle_period_report",
+    "vehicle_usage_save_report",
+    "vehicle_usage_update_report",
+}
 
 
 def _next_reminder_run_date(context: dict[str, Any], settings: VehicleUsageSettings, reminder_count: int) -> datetime:
@@ -234,6 +244,27 @@ class LogisticsSpecialist(BaseSpecialist):
 
     def _llm_failure_result(self, message: str):  # noqa: ANN201
         return logistics_llm_failure_result(message, agent_id=self.manifest.id)
+
+    def _terminal_response_metadata(
+        self,
+        *,
+        tool_call: Any,
+        result: ToolResult | None,
+        action: Any | None,
+        approvals: list[Any],
+        task: AgentTask,
+    ) -> dict[str, Any] | None:
+        if result is None or approvals:
+            return None
+        if tool_call.name not in _FAST_RETURN_TOOLS:
+            return None
+        if result.status != ToolStatus.OK:
+            return None
+        return {
+            "fast_return_reason": "vehicle_usage_tool_success",
+            "terminal_tool": tool_call.name,
+            "tool_status": str(result.status),
+        }
 
     def _logs(self) -> list[str]:
         return [

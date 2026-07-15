@@ -21,9 +21,9 @@ def _settings(monkeypatch, **overrides):
     return get_settings()
 
 
-def _response(*, finish_reason: str, content: str) -> dict:
+def _response(*, finish_reason: str, content: str, model: str = "test-model") -> dict:
     return {
-        "model": "test-model",
+        "model": model,
         "choices": [{"message": {"content": content}, "finish_reason": finish_reason}],
         "usage": {"prompt_tokens": 10, "completion_tokens": 5},
     }
@@ -174,3 +174,44 @@ def test_build_orchestrator_llm_client_falls_back_to_main_settings(monkeypatch):
 
     assert client._model == settings.llm_model
     assert client._reasoning is False
+
+
+def test_build_orchestrator_llm_client_uses_flash_model_when_routing_enabled(monkeypatch):
+    settings = _settings(
+        monkeypatch,
+        AI_SERVER_LLM_ROUTING_ENABLED="true",
+        AI_SERVER_LLM_FLASH_MODEL="deepseek-v4-flash",
+        AI_SERVER_LLM_PRO_MODEL="deepseek-v4-pro",
+    )
+
+    client = build_orchestrator_llm_client(settings)
+
+    assert client._model == "deepseek-v4-flash"
+    assert client._fallback_model == "deepseek-v4-pro"
+    assert client._reasoning is False
+
+
+def test_complete_falls_back_to_pro_model_when_flash_returns_invalid_json(monkeypatch):
+    settings = _settings(monkeypatch, AI_SERVER_LLM_MAX_TOKENS="100")
+    requests: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if payload["model"] == "flash-model":
+            return httpx.Response(200, json=_response(finish_reason="stop", content="not json", model="flash-model"))
+        return httpx.Response(200, json=_response(finish_reason="stop", content='{"answer": "ok"}', model="pro-model"))
+
+    monkeypatch.setattr(
+        "ai_server.llm.httpx.AsyncClient",
+        lambda *args, **kwargs: _RealAsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    client = OpenAICompatibleLLMClient(settings, model="flash-model", fallback_model="pro-model")
+    completion = asyncio.run(
+        client.complete(agent_id="test", messages=[{"role": "user", "content": "hi"}], json_mode=True)
+    )
+
+    assert [request["model"] for request in requests] == ["flash-model", "pro-model"]
+    assert completion.json_content() == {"answer": "ok"}
+    assert completion.model_usage.model == "pro-model"

@@ -115,7 +115,22 @@ class BitrixLLMFinalResult:
 class BitrixLLMService:
     def __init__(self, client: LLMClient | None = None, *, settings: Settings) -> None:
         self.client = client or OpenAICompatibleLLMClient()
+        self.read_client = self.client
+        if client is None and settings.llm_routing_enabled:
+            fallback_model = settings.llm_pro_model if settings.llm_flash_fallback_to_pro else None
+            self.read_client = OpenAICompatibleLLMClient(
+                settings,
+                model=settings.llm_flash_model or settings.llm_model,
+                fallback_model=fallback_model,
+            )
         self.settings = settings
+
+    def _decision_client_for_request(self, request: str) -> LLMClient:
+        if self.read_client is self.client:
+            return self.client
+        if _looks_like_bitrix_read_only_request(request):
+            return self.read_client
+        return self.client
 
     async def decide(
         self,
@@ -168,6 +183,14 @@ class BitrixLLMService:
                 raw={"source": "task_close_report_incident_route"},
             )
 
+        local_decision = _common_unsupported_vehicle_usage_decision(task.request, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "unsupported_vehicle_usage_route"),
+                raw={"source": "unsupported_vehicle_usage_route"},
+            )
+
         local_decision = _common_admin_panel_clarification_decision(task.request, tool_definitions)
         if local_decision is not None:
             return BitrixLLMDecisionResult(
@@ -209,7 +232,7 @@ class BitrixLLMService:
             )
 
         instructions = load_instructions(manifest)
-        completion = await self.client.complete(
+        completion = await self._decision_client_for_request(task.request).complete(
             agent_id=manifest.id,
             messages=[
                 {"role": "system", "content": _decision_system_prompt(instructions)},
@@ -2453,6 +2476,51 @@ def _common_admin_panel_clarification_decision(
     )
 
 
+def _common_unsupported_vehicle_usage_decision(
+    request: str,
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    clean_request = _strip_command_prefix(request)
+    lowered = clean_request.casefold()
+    if not _looks_like_vehicle_usage_admin_panel_request(lowered):
+        return None
+    if _looks_like_force_bitrix_request(lowered):
+        return None
+    return BitrixLLMDecision(
+        status="needs_clarification",
+        answer=(
+            "В Bitrix не нашёл такой раздел или отчёт. "
+            "Похожий сценарий найден у Логиста: отчёт по машинам и людям. "
+            "Если нужен он, напишите: Логист, покажи отчёт по машинам и людям. "
+            "Если вы точно хотите проверить именно Bitrix, повторите запрос с уточнением: "
+            "Битрикс, всё равно обработай этот запрос."
+        ),
+        confidence=0.86,
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="none",
+                args={},
+                summary="unsupported vehicle usage domain for bitrix",
+            )
+        ],
+    )
+
+
+def _looks_like_force_bitrix_request(lowered: str) -> bool:
+    force_terms = (
+        "всё равно",
+        "все равно",
+        "точно bitrix",
+        "точно битрикс",
+        "именно bitrix",
+        "именно битрикс",
+        "обработай этот запрос",
+        "передай в bitrix",
+        "передай в битрикс",
+    )
+    return any(term in lowered for term in force_terms)
+
+
 def _looks_like_ambiguous_admin_panel_request(lowered: str) -> bool:
     return (
         ("админ" in lowered and "панел" in lowered)
@@ -2911,6 +2979,40 @@ def _extract_task_query(request: str) -> str:
 def _strip_command_prefix(request: str) -> str:
     text = re.sub(r"^\[[^\]]+\]\s*", "", str(request or "")).strip()
     return re.sub(r"^битрикс[:,]?\s*", "", text, flags=re.IGNORECASE).strip()
+
+
+def _looks_like_bitrix_read_only_request(request: str) -> bool:
+    lowered = _strip_command_prefix(request).casefold()
+    write_terms = (
+        "созда",
+        "сдела",
+        "добав",
+        "измени",
+        "обнов",
+        "назнач",
+        "закрой",
+        "закрыть",
+        "удали",
+        "отмени",
+        "подтверд",
+        "сохрани",
+    )
+    if any(term in lowered for term in write_terms):
+        return False
+    read_terms = (
+        "покажи",
+        "найди",
+        "список",
+        "какие",
+        "какая",
+        "какой",
+        "мои задач",
+        "остат",
+        "проект",
+        "задач",
+        "склад",
+    )
+    return any(term in lowered for term in read_terms)
 
 
 def _clean_read_query(value: str) -> str:

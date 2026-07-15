@@ -46,6 +46,10 @@ class Settings:
     llm_api_key: str
     llm_temperature: float | None
     llm_max_tokens: int
+    llm_routing_enabled: bool
+    llm_flash_model: str
+    llm_pro_model: str
+    llm_flash_fallback_to_pro: bool
     orchestrator_llm_model: str
     orchestrator_llm_base_url: str
     orchestrator_llm_api_key: str
@@ -78,6 +82,7 @@ class Settings:
     webhook_event_queue_stale_processing_seconds: int
     agent_orchestrator_worker_count: int
     agent_bitrix_worker_count: int
+    agent_logistics_worker_count: int
     agent_task_timeout_seconds: float
     agent_queue_processing_ttl_seconds: int
     scheduler_enabled: bool
@@ -456,6 +461,15 @@ def get_settings() -> Settings:
         llm_api_key=_env("AI_SERVER_LLM_API_KEY", _env("LLM_API_KEY")),
         llm_temperature=_env_float("AI_SERVER_LLM_TEMPERATURE", _env_float("LLM_TEMPERATURE")),
         llm_max_tokens=_env_int("AI_SERVER_LLM_MAX_TOKENS", _env_int("LLM_MAX_TOKENS", 10000)) or 10000,
+        llm_routing_enabled=_env_bool("AI_SERVER_LLM_ROUTING_ENABLED", _env_bool("LLM_ROUTING_ENABLED", False)),
+        llm_flash_model=_env("AI_SERVER_LLM_FLASH_MODEL", _env("LLM_FLASH_MODEL", "deepseek-v4-flash")),
+        llm_pro_model=_env(
+            "AI_SERVER_LLM_PRO_MODEL",
+            _env("LLM_PRO_MODEL", _env("AI_SERVER_LLM_MODEL", _env("LLM_MODEL", "deepseek-v4-pro"))),
+        ),
+        llm_flash_fallback_to_pro=_env_bool(
+            "AI_SERVER_LLM_FLASH_FALLBACK_TO_PRO", _env_bool("LLM_FLASH_FALLBACK_TO_PRO", True)
+        ),
         orchestrator_llm_model=_env("AI_SERVER_ORCHESTRATOR_LLM_MODEL"),
         orchestrator_llm_base_url=_env("AI_SERVER_ORCHESTRATOR_LLM_BASE_URL"),
         orchestrator_llm_api_key=_env("AI_SERVER_ORCHESTRATOR_LLM_API_KEY"),
@@ -489,6 +503,7 @@ def get_settings() -> Settings:
         or 300,
         agent_orchestrator_worker_count=_env_int("AGENT_ORCHESTRATOR_WORKER_COUNT", 1) or 1,
         agent_bitrix_worker_count=_env_int("AGENT_BITRIX_WORKER_COUNT", 1) or 1,
+        agent_logistics_worker_count=_env_int("AGENT_LOGISTICS_WORKER_COUNT", 1) or 1,
         agent_task_timeout_seconds=_env_float("AGENT_TASK_TIMEOUT_SECONDS", 300.0) or 300.0,
         agent_queue_processing_ttl_seconds=_env_int("AGENT_QUEUE_PROCESSING_TTL_SECONDS", 600) or 600,
         scheduler_enabled=_env_bool("AI_SERVER_SCHEDULER_ENABLED", True),

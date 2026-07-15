@@ -105,6 +105,29 @@ def test_scheduler_can_be_disabled(monkeypatch):
     assert settings.scheduler_enabled is False
 
 
+def test_agent_worker_count_settings(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.delenv("AGENT_ORCHESTRATOR_WORKER_COUNT", raising=False)
+    monkeypatch.delenv("AGENT_BITRIX_WORKER_COUNT", raising=False)
+    monkeypatch.delenv("AGENT_LOGISTICS_WORKER_COUNT", raising=False)
+
+    defaults = get_settings()
+
+    assert defaults.agent_orchestrator_worker_count == 1
+    assert defaults.agent_bitrix_worker_count == 1
+    assert defaults.agent_logistics_worker_count == 1
+
+    monkeypatch.setenv("AGENT_ORCHESTRATOR_WORKER_COUNT", "3")
+    monkeypatch.setenv("AGENT_BITRIX_WORKER_COUNT", "4")
+    monkeypatch.setenv("AGENT_LOGISTICS_WORKER_COUNT", "2")
+
+    overridden = get_settings()
+
+    assert overridden.agent_orchestrator_worker_count == 3
+    assert overridden.agent_bitrix_worker_count == 4
+    assert overridden.agent_logistics_worker_count == 2
+
+
 def test_diagnost_can_be_disabled(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("DIAGNOST_ENABLED", "false")
