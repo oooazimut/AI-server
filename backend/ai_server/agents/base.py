@@ -503,7 +503,7 @@ class BaseSpecialist:
         # A terminal fast-return is the exception: the tool already produced a final,
         # safe answer, so keep diagnostics aligned with what was actually sent.
         if terminal_answer_ready:
-            effective_status = "completed"
+            effective_status = str(terminal_response_metadata.get("terminal_status") or "completed")
         elif (
             decision is not None
             and decision.status in ("needs_clarification", "needs_human")
