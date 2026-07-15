@@ -215,7 +215,7 @@ class TechnicalFooterService:
 
         lines = [_format_model_usage(result)]
         if self._settings.tech_footer_balance_enabled:
-            providers = {usage.provider.casefold() for usage in result.model_usage if usage.provider}
+            providers = _balance_providers(result.model_usage, self._balance_registry)
             balance_lines = await self._collect_balance_lines(providers)
             lines.extend(balance_lines)
         return ", ".join(line for line in lines if line)
@@ -236,7 +236,7 @@ class TechnicalFooterService:
 
         lines = [_format_model_usage_records(usages), f"Bitrix action: {status}."]
         if self._settings.tech_footer_balance_enabled:
-            providers = {usage.provider.casefold() for usage in usages if usage.provider}
+            providers = _balance_providers(usages, self._balance_registry)
             balance_lines = await self._collect_balance_lines(providers)
             lines.extend(balance_lines)
         return ", ".join(line for line in lines if line)
@@ -289,9 +289,18 @@ def _format_model_usage_records(usages: list[ModelUsageRecord], *, result: Agent
     parts = [_format_model_route(result=result, usages=visible_usages)]
     if any(usage.input_tokens is not None or usage.output_tokens is not None for usage in visible_usages):
         parts.append(f"{input_tokens}/{output_tokens} ток.")
+    elif any(usage.status == "skipped" or usage.provider == "local" for usage in visible_usages):
+        parts.append("0/0 ток.")
     if total_cost:
         parts.append(f"${total_cost:.4f}")
     return ", ".join(part for part in parts if part)
+
+
+def _balance_providers(usages: list[ModelUsageRecord], registry: dict[str, BalanceClient]) -> set[str]:
+    providers = {usage.provider.casefold() for usage in usages if usage.provider}
+    if "deepseek" in registry:
+        providers.add("deepseek")
+    return providers
 
 
 def _format_model_route(*, result: AgentResult | None, usages: list[ModelUsageRecord]) -> str:
