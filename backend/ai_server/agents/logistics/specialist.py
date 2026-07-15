@@ -54,6 +54,16 @@ def _next_reminder_run_date(context: dict[str, Any], settings: VehicleUsageSetti
     return datetime.now(MOSCOW_TZ) + timedelta(minutes=delay_minutes)
 
 
+def _manual_start_action_data(result: AgentResult) -> dict[str, Any] | None:
+    for action in result.actions_taken:
+        if action.name != "vehicle_usage_start_day" or str(action.status) != "ok":
+            continue
+        data = action.details.get("data")
+        if isinstance(data, dict):
+            return data
+    return None
+
+
 @dataclass
 class VehicleUsageSettings:
     manager_user_id: int | None
@@ -170,22 +180,21 @@ class LogisticsSpecialist(BaseSpecialist):
         if any(a.name in ("vehicle_usage_save_report", "vehicle_usage_cancel_day") for a in result.actions_taken):
             return [ScheduledTask(job_id=job_prefix, agent_id="logistics", cancel=True)]
 
-        # Schedule follow-up reminder after initial morning request or previous reminder
-        event = str(task.context.get("event") or "")
-        if event in ("vehicle_usage_morning", "vehicle_usage_reminder_due") and result.answer:
-            reminder_count = int(task.context.get("reminder_count") or 0) + 1
+        def _build_reminder(*, reminder_count: int, started_at: str) -> list[ScheduledTask]:
             if reminder_count > vu.max_reminders:
                 return []
-            run_date = _next_reminder_run_date(task.context, vu, reminder_count)
+            run_date = _next_reminder_run_date({"started_at": started_at}, vu, reminder_count)
             channel_id = str(task.context.get("channel_id") or "")
-            recipient_id = str(task.context.get("recipient_id") or "")
-            started_at = str(task.context.get("started_at") or datetime.now(MOSCOW_TZ).isoformat())
+            recipient_id = str(task.context.get("recipient_id") or task.context.get("dialog_id") or task.user.id or "")
+            dialog_id = str(task.context.get("dialog_id") or (task.user.raw or {}).get("dialog_id") or recipient_id)
             reminder_task = AgentTask(
                 task_id=f"vu_reminder_{uuid4().hex[:6]}",
+                user=task.user,
                 request=task.request,
                 context={
                     "channel_id": channel_id,
                     "recipient_id": recipient_id,
+                    "dialog_id": dialog_id,
                     "event": "vehicle_usage_reminder_due",
                     "request_date": request_date,
                     "reminder_count": reminder_count,
@@ -201,6 +210,21 @@ class LogisticsSpecialist(BaseSpecialist):
                     description=f"Vehicle usage reminder #{reminder_count}",
                 )
             ]
+
+        manual_start = _manual_start_action_data(result)
+        if manual_start is not None:
+            request_date = str(manual_start.get("request_date") or request_date)
+            job_prefix = f"vu_reminder_{request_date}"
+            job_id = f"{job_prefix}_{recipient_key}"
+            started_at = str(manual_start.get("sent_at") or datetime.now(MOSCOW_TZ).isoformat())
+            return _build_reminder(reminder_count=1, started_at=started_at)
+
+        # Schedule follow-up reminder after initial morning request or previous reminder
+        event = str(task.context.get("event") or "")
+        if event in ("vehicle_usage_morning", "vehicle_usage_reminder_due") and result.answer:
+            reminder_count = int(task.context.get("reminder_count") or 0) + 1
+            started_at = str(task.context.get("started_at") or datetime.now(MOSCOW_TZ).isoformat())
+            return _build_reminder(reminder_count=reminder_count, started_at=started_at)
 
         return []
 

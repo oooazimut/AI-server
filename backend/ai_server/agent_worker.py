@@ -229,6 +229,7 @@ async def main() -> None:
                             message=result.answer,
                             sent_at=started_at.isoformat(),
                             reminder_count=0,
+                            source="scheduled",
                         )
                     )
 

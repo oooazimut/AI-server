@@ -185,14 +185,16 @@ class VehicleStartDayTool:
             return denied
         request_date = _request_date(args.get("request_date"))
         message = str(args.get("message") or DEFAULT_START_MESSAGE).strip()
+        sent_at = _now().isoformat()
         request_id = self._store.create_sent_request(
             SentRequestData(
                 request_date=request_date,
                 user_id=user_id,
                 dialog_id=dialog_id or "",
                 message=message,
-                sent_at=_now().isoformat(),
+                sent_at=sent_at,
                 reminder_count=0,
+                source="manual",
             )
         )
         return ToolResult(
@@ -203,6 +205,7 @@ class VehicleStartDayTool:
                 "request_date": request_date,
                 "message": message,
                 "status": "sent",
+                "sent_at": sent_at,
             },
         )
 

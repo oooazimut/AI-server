@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
 
 from ai_server.agents.logistics import (
     LogisticsLLMDecision,
@@ -19,11 +20,12 @@ from ai_server.agents.logistics.tools import (
     VehicleSaveDraftTool,
     VehicleSaveReportTool,
     VehicleSetOperatorsTool,
+    VehicleStartDayTool,
 )
 from ai_server.models import ActionRecord, AgentResult, AgentTask, ToolResult, ToolStatus, UserContext
 from ai_server.registry import get_agent_manifest
 from ai_server.retrieval import HybridKnowledgeRetriever
-from ai_server.tools.vehicle_usage import StaffMember, resolve_vehicle_usage_operator_ids
+from ai_server.tools.vehicle_usage import SentRequestData, StaffMember, resolve_vehicle_usage_operator_ids
 from tests.fakes import FakeEmbeddingProvider, FakeLogisticsLLM, FakeVehicleUsageStore, RecordingLLMClient
 
 _FAKE_RETRIEVER = HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider())
@@ -1058,6 +1060,133 @@ def test_logistics_specialist_cancels_report_as_day_off(monkeypatch):
     assert store._day_reports[-1]["employee_statuses"] == [(1, "day_off", "Сегодня выходной, отчет не требуется.")]
     assert len(result.scheduled_tasks) == 1
     assert result.scheduled_tasks[0].cancel is True
+
+
+def test_manual_start_schedules_reminder_from_sent_at(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    manifest = get_agent_manifest("logistics")
+    assert manifest is not None
+    store = FakeVehicleUsageStore()
+    store.set_vehicle_usage_operators(operator_user_ids=[13], actor_user_id=1)
+    fake_llm = FakeLogisticsLLM(
+        tool_call_steps=[
+            [
+                LogisticsLLMToolCall(
+                    name="vehicle_usage_start_day",
+                    args={"request_date": "2026-07-15", "message": "Заполните отчет по машинам за сегодня."},
+                )
+            ],
+            [LogisticsLLMToolCall(name="none")],
+        ],
+        final_answer="Запустил отчет по машинам.",
+    )
+
+    result = anyio_run(
+        LogisticsSpecialist(
+            manifest,
+            retriever=_FAKE_RETRIEVER,
+            agent_tools=[VehicleStartDayTool(store, allowed_user_ids=frozenset({13}))],
+            llm=fake_llm,
+            vu_settings=_VU_SETTINGS,
+        ).handle(
+            AgentTask(
+                task_id="manual-start",
+                request="сегодня рабочий день, запусти отчет",
+                user=UserContext(id="13", raw={"dialog_id": "13"}),
+                context={"channel_id": "bitrix24", "recipient_id": "13", "dialog_id": "13"},
+            )
+        )
+    )
+
+    start_action = next(action for action in result.actions_taken if action.name == "vehicle_usage_start_day")
+    sent_at = datetime.fromisoformat(start_action.details["data"]["sent_at"])
+    assert len(result.scheduled_tasks) == 1
+    sched = result.scheduled_tasks[0]
+    assert sched.job_id == "vu_reminder_2026-07-15_13"
+    assert sched.task is not None
+    assert sched.task.context["event"] == "vehicle_usage_reminder_due"
+    assert sched.task.context["reminder_count"] == 1
+    assert sched.task.context["started_at"] == start_action.details["data"]["sent_at"]
+    assert datetime.fromisoformat(sched.trigger["run_date"]) == sent_at + timedelta(minutes=30)
+
+
+def test_auto_close_pending_draft_finalizes_unknowns(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    store = FakeVehicleUsageStore()
+    store.upsert_employees(
+        [StaffMember(order=1, user_id=15, name="Иван Петров"), StaffMember(order=2, user_id=16, name="Олег Сидоров")]
+    )
+    store.create_sent_request(
+        SentRequestData(
+            request_date="2026-07-15",
+            user_id=13,
+            dialog_id="13",
+            message="Заполните отчет по машинам за сегодня.",
+            sent_at="2026-07-15T13:00:00+03:00",
+            reminder_count=0,
+            source="manual",
+        )
+    )
+    store.save_draft(
+        request_date="2026-07-15",
+        user_id=13,
+        dialog_id="13",
+        response_text="Иван Петров работал",
+        parsed={
+            "date": "2026-07-15",
+            "people": [{"staff_order": 1, "full_name": "Иван Петров", "status": "worked"}],
+            "vehicles": [{"vehicle_id": 1, "vehicle_name": "Авто 1", "status": "idle"}],
+        },
+        status="pending_clarification",
+    )
+
+    result = store.auto_close_unanswered_day(
+        report_date="2026-07-15",
+        reason="No complete vehicle usage response was received by cutoff.",
+    )
+
+    assert result["status"] == "finalized_unknown"
+    report = store.get_day_report(report_date="2026-07-15")
+    statuses = {row[0]: row[1] for row in report["employee_statuses"]}
+    vehicle_statuses = {row[0]: row[2] for row in report["vehicle_assignments"]}
+    assert statuses[1] == "worked"
+    assert statuses[2] == "unknown"
+    assert vehicle_statuses[1] == "idle"
+    assert vehicle_statuses[2] == "unknown"
+    assert vehicle_statuses[3] == "unknown"
+
+
+def test_auto_close_scheduled_pending_draft_keeps_previous_behavior(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    store = FakeVehicleUsageStore()
+    store.create_sent_request(
+        SentRequestData(
+            request_date="2026-07-15",
+            user_id=13,
+            dialog_id="13",
+            message="Заполните отчет по машинам за сегодня.",
+            sent_at="2026-07-15T08:30:00+03:00",
+            reminder_count=0,
+            source="scheduled",
+        )
+    )
+    store.save_draft(
+        request_date="2026-07-15",
+        user_id=13,
+        dialog_id="13",
+        response_text="частичный отчет",
+        parsed={"date": "2026-07-15", "people": [], "vehicles": []},
+        status="pending_clarification",
+    )
+
+    result = store.auto_close_unanswered_day(
+        report_date="2026-07-15",
+        reason="No complete vehicle usage response was received by cutoff.",
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "useful_response_exists"
+    assert result["request_status"] == "pending_clarification"
 
 
 def test_morning_task_schedules_reminder(monkeypatch):

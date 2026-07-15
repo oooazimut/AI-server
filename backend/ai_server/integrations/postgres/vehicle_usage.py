@@ -72,12 +72,14 @@ class PostgresVehicleUsageStore(PostgresAgentSchema):
                     reminder_count INTEGER NOT NULL DEFAULT 0,
                     last_reminder_at TEXT,
                     escalated_at TEXT,
+                    source TEXT NOT NULL DEFAULT '',
                     UNIQUE (request_date, user_id)
                 )
                 """
             )
             db.execute("ALTER TABLE logistics.employees ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE")
             db.execute("ALTER TABLE logistics.vehicles ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE")
+            db.execute("ALTER TABLE logistics.vehicle_usage_requests ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT ''")
             self._seed_default_vehicles(db)
             db.execute(
                 """
@@ -558,9 +560,9 @@ class PostgresVehicleUsageStore(PostgresAgentSchema):
                 """
                 INSERT INTO logistics.vehicle_usage_requests (
                     request_date, user_id, dialog_id, status, message, sent_at,
-                    reminder_count, last_reminder_at, created_by_user_id, updated_by_user_id
+                    reminder_count, last_reminder_at, created_by_user_id, updated_by_user_id, source
                 )
-                VALUES (%s, %s, %s, 'sent', %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, 'sent', %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (request_date, user_id) DO UPDATE SET
                     dialog_id = EXCLUDED.dialog_id,
                     status = CASE
@@ -574,7 +576,8 @@ class PostgresVehicleUsageStore(PostgresAgentSchema):
                         logistics.vehicle_usage_requests.reminder_count, EXCLUDED.reminder_count
                     ),
                     last_reminder_at = EXCLUDED.last_reminder_at,
-                    updated_by_user_id = EXCLUDED.updated_by_user_id
+                    updated_by_user_id = EXCLUDED.updated_by_user_id,
+                    source = COALESCE(NULLIF(EXCLUDED.source, ''), logistics.vehicle_usage_requests.source)
                 """,
                 (
                     data.request_date,
@@ -586,6 +589,7 @@ class PostgresVehicleUsageStore(PostgresAgentSchema):
                     data.sent_at,
                     data.user_id,
                     data.user_id,
+                    str(getattr(data, "source", "") or ""),
                 ),
             )
             row = db.execute(
@@ -610,6 +614,7 @@ class PostgresVehicleUsageStore(PostgresAgentSchema):
                             "message": data.message,
                             "sent_at": data.sent_at,
                             "reminder_count": data.reminder_count,
+                            "source": str(getattr(data, "source", "") or ""),
                         },
                         ensure_ascii=False,
                         sort_keys=True,
@@ -1064,6 +1069,15 @@ class PostgresVehicleUsageStore(PostgresAgentSchema):
                 (report_date,),
             ).fetchone()
         request = _parse_row(row)
+        if _is_manual_pending_vehicle_usage_draft(request):
+            result = self.finalize_pending_unknowns(
+                report_date=report_date,
+                actor_user_id=_optional_int(request.get("user_id")) if request else None,
+                reason="Auto-filled missing vehicle usage data as unknown at day close.",
+            )
+            if result.get("status") == "finalized_unknown":
+                result["reason"] = "pending_draft_finalized_at_day_close"
+                return result
         if _has_useful_vehicle_usage_response(request):
             return {
                 "status": "skipped",
@@ -1359,6 +1373,18 @@ def _report_rows_from_completed(
         for employee_id in driver_ids:
             vehicle_assignments.append((vehicle_id, employee_id, status, notes))
     return employee_statuses, vehicle_assignments
+
+
+def _is_manual_pending_vehicle_usage_draft(request: dict[str, Any] | None) -> bool:
+    if not request:
+        return False
+    status = str(request.get("status") or "").strip()
+    source = str(request.get("source") or "").strip()
+    return (
+        source == "manual"
+        and status in {"pending_clarification", "pending_confirmation"}
+        and isinstance(request.get("parsed"), dict)
+    )
 
 
 def _has_useful_vehicle_usage_response(request: dict[str, Any] | None) -> bool:

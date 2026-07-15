@@ -94,6 +94,7 @@ class SentRequestData:
     message: str
     sent_at: str
     reminder_count: int
+    source: str = ""
 
 
 @dataclass(frozen=True)
