@@ -100,6 +100,13 @@ _FAST_RETURN_READ_TOOLS = frozenset(
     }
 )
 
+_FAST_RETURN_TASK_CREATE_TOOLS = frozenset(
+    {
+        "task_create_confirm",
+        "task_draft_discard",
+    }
+)
+
 
 class Bitrix24Specialist(BaseSpecialist):
     max_steps = 7
@@ -327,13 +334,18 @@ class Bitrix24Specialist(BaseSpecialist):
     ) -> dict[str, Any] | None:
         if result is None or approvals:
             return None
-        if tool_call.name not in _FAST_RETURN_READ_TOOLS:
+        if tool_call.name not in _FAST_RETURN_READ_TOOLS and tool_call.name not in _FAST_RETURN_TASK_CREATE_TOOLS:
             return None
         if _is_ambiguous_read_result(tool_call.name, result):
             return None
         if result.status == ToolStatus.OK:
+            reason = (
+                "task_create_tool_success"
+                if tool_call.name in _FAST_RETURN_TASK_CREATE_TOOLS
+                else "read_only_tool_success"
+            )
             return {
-                "fast_return_reason": "read_only_tool_success",
+                "fast_return_reason": reason,
                 "terminal_tool": tool_call.name,
                 "tool_status": str(result.status),
             }
