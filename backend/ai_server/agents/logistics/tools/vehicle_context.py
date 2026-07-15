@@ -46,3 +46,45 @@ class VehicleContextTool:
                 dialog_id=dialog_id or "",
             ),
         )
+
+
+class VehicleReferenceTool:
+    name = "vehicle_usage_reference"
+
+    def __init__(self, store: VehicleUsageStorePort | None = None) -> None:
+        self._store = store
+
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="vehicle_usage_reference",
+            description="Read the configured vehicle usage reference lists: staff, vehicles and report operators.",
+            parameters={"type": "object", "properties": {}},
+        )
+
+    async def execute(
+        self,
+        args: dict[str, Any],
+        *,
+        user_id: int | None = None,
+        dialog_key: str | None = None,
+        dialog_id: str | None = None,
+    ) -> ToolResult:
+        if self._store is None:
+            return ToolResult(
+                status=ToolStatus.NOT_CONFIGURED,
+                tool="vehicle_usage_reference",
+                error="VehicleUsageStore is not configured",
+            )
+        operator_ids: list[int] = []
+        getter = getattr(self._store, "vehicle_usage_operator_ids", None)
+        if callable(getter):
+            operator_ids = sorted(int(item) for item in getter() if int(item) > 0)
+        return ToolResult(
+            status=ToolStatus.OK,
+            tool="vehicle_usage_reference",
+            data={
+                "staff_roster": self._store.staff_roster(),
+                "vehicles": self._store.vehicles(),
+                "operator_user_ids": operator_ids,
+            },
+        )
