@@ -54,11 +54,13 @@ class OpenAICompatibleLLMClient:
         api_key: str | None = None,
         reasoning: bool = False,
         reasoning_effort: str | None = None,
+        fallback_model: str | None = None,
         timeout_seconds: float = 60.0,
     ) -> None:
         s = settings or get_settings()
         self._settings = s
         self._model = model or s.llm_model
+        self._fallback_model = fallback_model or ""
         self._base_url = base_url or s.llm_base_url
         self._api_key = api_key or s.llm_api_key
         self._reasoning = reasoning
@@ -77,17 +79,57 @@ class OpenAICompatibleLLMClient:
             raise LLMError("LLM is not configured")
 
         max_tokens = settings.llm_max_tokens
-        data = await self._request(agent_id=agent_id, messages=messages, json_mode=json_mode, max_tokens=max_tokens)
+        model = self._model
+        try:
+            data = await self._request(
+                agent_id=agent_id,
+                messages=messages,
+                json_mode=json_mode,
+                max_tokens=max_tokens,
+                model=model,
+            )
+        except LLMError:
+            fallback_model = self._fallback_model.strip()
+            if not fallback_model or fallback_model == model:
+                raise
+            model = fallback_model
+            data = await self._request(
+                agent_id=agent_id,
+                messages=messages,
+                json_mode=json_mode,
+                max_tokens=max_tokens,
+                model=model,
+            )
         if _is_length_truncated(data) and max_tokens > 0:
             data = await self._request(
                 agent_id=agent_id,
                 messages=messages,
                 json_mode=json_mode,
                 max_tokens=max_tokens * 2,
+                model=model,
             )
 
         content = _extract_content(data, strip_thinking=self._reasoning)
-        usage = _model_usage(agent_id=agent_id, data=data, settings=settings, model_default=self._model)
+        fallback_model = self._fallback_model.strip()
+        if json_mode and fallback_model and fallback_model != model and not _content_is_json_object(content):
+            model = fallback_model
+            data = await self._request(
+                agent_id=agent_id,
+                messages=messages,
+                json_mode=json_mode,
+                max_tokens=max_tokens,
+                model=model,
+            )
+            if _is_length_truncated(data) and max_tokens > 0:
+                data = await self._request(
+                    agent_id=agent_id,
+                    messages=messages,
+                    json_mode=json_mode,
+                    max_tokens=max_tokens * 2,
+                    model=model,
+                )
+            content = _extract_content(data, strip_thinking=self._reasoning)
+        usage = _model_usage(agent_id=agent_id, data=data, settings=settings, model_default=model)
         return LLMCompletion(content=content, model_usage=usage, raw=data)
 
     async def _request(
@@ -97,11 +139,12 @@ class OpenAICompatibleLLMClient:
         messages: list[dict[str, str]],
         json_mode: bool,
         max_tokens: int,
+        model: str,
     ) -> dict[str, Any]:
         settings = self._settings
         url = _chat_completions_url(settings.llm_provider, self._base_url)
         payload: dict[str, Any] = {
-            "model": self._model,
+            "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
         }
@@ -135,13 +178,20 @@ def build_llm_client(settings: Settings | None = None) -> OpenAICompatibleLLMCli
 
 
 def build_orchestrator_llm_client(settings: Settings) -> OpenAICompatibleLLMClient:
+    model = settings.orchestrator_llm_model or None
+    fallback_model = None
+    if settings.llm_routing_enabled and not model and not settings.orchestrator_llm_reasoning:
+        model = settings.llm_flash_model or settings.llm_model
+        if settings.llm_flash_fallback_to_pro:
+            fallback_model = settings.llm_pro_model or settings.llm_model
     return OpenAICompatibleLLMClient(
         settings,
-        model=settings.orchestrator_llm_model or None,
+        model=model,
         base_url=settings.orchestrator_llm_base_url or None,
         api_key=settings.orchestrator_llm_api_key or None,
         reasoning=settings.orchestrator_llm_reasoning,
         reasoning_effort=settings.orchestrator_llm_reasoning_effort or None,
+        fallback_model=fallback_model,
         timeout_seconds=settings.orchestrator_llm_timeout_seconds,
     )
 
@@ -175,6 +225,14 @@ def _extract_content(data: dict[str, Any], *, strip_thinking: bool = False) -> s
 
 def _strip_think_tags(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+
+def _content_is_json_object(content: str) -> bool:
+    try:
+        parsed = json.loads(_strip_json_fence(content))
+    except json.JSONDecodeError:
+        return False
+    return isinstance(parsed, dict)
 
 
 def _model_usage(

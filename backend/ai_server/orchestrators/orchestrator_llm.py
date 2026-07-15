@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -108,6 +109,20 @@ class OrchestratorLLMService:
         available_skills: list | None = None,
         **kwargs: Any,
     ) -> OrchestratorDecisionResult:
+        local_decision = _explicit_agent_direct_decision(task.request, tool_definitions)
+        if local_decision is not None:
+            return OrchestratorDecisionResult(
+                decision=local_decision,
+                model_usage=ModelUsageRecord(
+                    agent_id=manifest.id,
+                    provider="",
+                    model="",
+                    status="skipped",
+                    notes=["explicit_agent_direct_route"],
+                ),
+                raw={"source": "explicit_agent_direct_route"},
+            )
+
         local_decision = _vehicle_usage_direct_decision(task.request, tool_definitions)
         if local_decision is not None:
             return OrchestratorDecisionResult(
@@ -245,6 +260,8 @@ def _vehicle_usage_direct_decision(
     if "call_specialist" not in available_tools:
         return None
     text = _strip_synthetic_prefix(request).casefold()
+    if _explicit_agent_prefix(text) is not None:
+        return None
     if not _looks_like_vehicle_usage_admin_panel_request(text):
         return None
     return OrchestratorDecision(
@@ -261,8 +278,49 @@ def _vehicle_usage_direct_decision(
     )
 
 
+def _explicit_agent_direct_decision(
+    request: str,
+    tool_definitions: list[dict[str, Any]],
+) -> OrchestratorDecision | None:
+    available_tools = {str(tool.get("name") or "") for tool in tool_definitions or []}
+    if "call_specialist" not in available_tools:
+        return None
+    text = _strip_synthetic_prefix(request).casefold()
+    target = _explicit_agent_prefix(text)
+    if target is None:
+        return None
+    return OrchestratorDecision(
+        status="completed",
+        answer="Передаю запрос профильному специалисту.",
+        tool_calls=[
+            OrchestratorToolCall(
+                name="call_specialist",
+                args={"specialist_id": target, "request": request},
+                summary=f"explicit agent prefix route to {target}",
+            )
+        ],
+        confidence=0.95,
+    )
+
+
+def _explicit_agent_prefix(lowered: str) -> str | None:
+    text = str(lowered or "").strip()
+    normalized = re.sub(r"^[\s\ufeff]+", "", text)
+    for prefix, specialist_id in (
+        ("битрикс", "bitrix24"),
+        ("bitrix", "bitrix24"),
+        ("логист", "logistics"),
+        ("диагност", "diagnost"),
+        ("пто", "pto"),
+    ):
+        if re.match(rf"^{re.escape(prefix)}(?:\b|[\s:,.!?-])", normalized, flags=re.IGNORECASE):
+            return specialist_id
+    return None
+
+
 def _strip_synthetic_prefix(request: str) -> str:
-    return str(request or "").removeprefix("\ufeff").strip()
+    text = str(request or "").removeprefix("\ufeff").strip()
+    return re.sub(r"^\[[^\]]+\]\s*", "", text).strip()
 
 
 def _looks_like_ambiguous_admin_panel_request(lowered: str) -> bool:

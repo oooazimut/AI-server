@@ -173,6 +173,72 @@ def test_orchestrator_decide_routes_explicit_vehicle_admin_panel_to_logistics_wi
     assert call.args == {"specialist_id": "logistics", "request": request}
 
 
+def test_orchestrator_decide_respects_explicit_bitrix_prefix_for_vehicle_report_words():
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    service = OrchestratorLLMService(client)
+    request = "Битрикс, покажи админ-панель отчетов по машинам и людям"
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("internal_orchestrator"),
+            task=AgentTask(task_id="t1", request=request),
+            retrieval_hits=[],
+            tool_definitions=_tool_defs("call_specialist"),
+            tool_results=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "explicit_agent_direct_route"}
+    call = result.decision.tool_calls[0]
+    assert call.name == "call_specialist"
+    assert call.args == {"specialist_id": "bitrix24", "request": request}
+
+
+def test_orchestrator_decide_respects_explicit_bitrix_prefix_after_synthetic_test_tag():
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    service = OrchestratorLLMService(client)
+    request = "[AI-TEST-123 ROUTING] Битрикс, покажи админ-панель отчетов по машинам и людям"
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("internal_orchestrator"),
+            task=AgentTask(task_id="t1", request=request),
+            retrieval_hits=[],
+            tool_definitions=_tool_defs("call_specialist"),
+            tool_results=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "explicit_agent_direct_route"}
+    call = result.decision.tool_calls[0]
+    assert call.name == "call_specialist"
+    assert call.args == {"specialist_id": "bitrix24", "request": request}
+
+
+def test_orchestrator_decide_respects_explicit_logistics_prefix():
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    service = OrchestratorLLMService(client)
+    request = "Логист, покажи операторов отчета по машинам"
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("internal_orchestrator"),
+            task=AgentTask(task_id="t1", request=request),
+            retrieval_hits=[],
+            tool_definitions=_tool_defs("call_specialist"),
+            tool_results=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "explicit_agent_direct_route"}
+    call = result.decision.tool_calls[0]
+    assert call.name == "call_specialist"
+    assert call.args == {"specialist_id": "logistics", "request": request}
+
+
 def test_orchestrator_compose_passes_through_specialist_answer_without_llm():
     client = RecordingLLMClient(json.dumps({"answer": "wrong rewrite", "status": "completed"}))
     service = OrchestratorLLMService(client)

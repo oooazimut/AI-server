@@ -39,6 +39,22 @@ def _bitrix_read_tool_definitions() -> list[dict]:
     ]
 
 
+def test_bitrix_llm_selects_flash_only_for_read_only_requests(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("AI_SERVER_LLM_MODEL", "deepseek-v4-pro")
+    monkeypatch.setenv("AI_SERVER_LLM_ROUTING_ENABLED", "true")
+    monkeypatch.setenv("AI_SERVER_LLM_FLASH_MODEL", "deepseek-v4-flash")
+    monkeypatch.setenv("AI_SERVER_LLM_PRO_MODEL", "deepseek-v4-pro")
+
+    service = BitrixLLMService(settings=get_settings())
+
+    read_client = service._decision_client_for_request("Битрикс покажи мои задачи")
+    write_client = service._decision_client_for_request("Битрикс создай задачу на меня")
+
+    assert read_client._model == "deepseek-v4-flash"
+    assert write_client._model == "deepseek-v4-pro"
+
+
 def test_bitrix_specialist_loads_available_skills_and_rag_context():
     result = asyncio.run(
         _bitrix_specialist(tools=FakeResolverTools()).handle(
@@ -621,7 +637,40 @@ def test_bitrix_llm_does_not_route_ambiguous_operator_panel_request(monkeypatch)
         )
     )
 
+    assert client.calls == []
+    assert result.raw == {"source": "unsupported_vehicle_usage_route"}
+    assert result.decision.status == "needs_clarification"
+    assert "Bitrix" in result.decision.answer
+    assert "Логист" in result.decision.answer
+    assert "машинам и людям" in result.decision.answer
+    assert "всё равно обработай" in result.decision.answer
+    assert [call.name for call in result.decision.tool_calls] == ["none"]
+
+
+def test_bitrix_llm_allows_forced_bitrix_vehicle_request_to_reach_llm(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    service = BitrixLLMService(client, settings=get_settings())
+    tool_definitions = [
+        ToolDefinition(name="task_close_control_get", description="", parameters={}).model_dump(),
+        ToolDefinition(name="none", description="", parameters={}).model_dump(),
+    ]
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="forced-bitrix-vehicle-panel",
+                request="Битрикс, всё равно обработай этот запрос: покажи отчёт по машинам и людям",
+                user={"id": "1"},
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
     assert client.calls
+    assert result.raw == {}
     assert [call.name for call in result.decision.tool_calls] == ["none"]
 
 
