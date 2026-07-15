@@ -78,6 +78,7 @@ class Settings:
     webhook_event_queue_stale_processing_seconds: int
     agent_orchestrator_worker_count: int
     agent_bitrix_worker_count: int
+    agent_logistics_worker_count: int
     agent_task_timeout_seconds: float
     agent_queue_processing_ttl_seconds: int
     scheduler_enabled: bool
@@ -489,6 +490,7 @@ def get_settings() -> Settings:
         or 300,
         agent_orchestrator_worker_count=_env_int("AGENT_ORCHESTRATOR_WORKER_COUNT", 1) or 1,
         agent_bitrix_worker_count=_env_int("AGENT_BITRIX_WORKER_COUNT", 1) or 1,
+        agent_logistics_worker_count=_env_int("AGENT_LOGISTICS_WORKER_COUNT", 1) or 1,
         agent_task_timeout_seconds=_env_float("AGENT_TASK_TIMEOUT_SECONDS", 300.0) or 300.0,
         agent_queue_processing_ttl_seconds=_env_int("AGENT_QUEUE_PROCESSING_TTL_SECONDS", 600) or 600,
         scheduler_enabled=_env_bool("AI_SERVER_SCHEDULER_ENABLED", True),

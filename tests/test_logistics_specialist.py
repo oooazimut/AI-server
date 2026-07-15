@@ -899,6 +899,10 @@ def test_logistics_specialist_saves_confirmed_report(monkeypatch):
     )
 
     assert result.answer == "Сохранил утренний отчет."
+    assert len(fake_llm.decide_calls) == 2
+    assert result.metadata["fast_return"] is True
+    assert result.metadata["terminal_tool"] == "vehicle_usage_save_report"
+    assert any(action.name == "logistics_fast_return" for action in result.actions_taken)
     assert store._requests
     assert store._requests[-1]["status"] == "answered"
     assert store._day_reports
