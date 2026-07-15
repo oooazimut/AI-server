@@ -108,12 +108,23 @@ class InternalOrchestrator(BaseSpecialist):
             return None
         data = result.data if isinstance(result.data, dict) else {}
         if not (data.get("terminal") and data.get("answer_is_final") and data.get("safe_to_send")):
-            return None
+            specialist_status = str(data.get("status") or "")
+            answer = str(data.get("answer") or "").strip()
+            if specialist_status not in {"completed", "needs_clarification", "needs_human"} or not answer:
+                return None
+            return {
+                "fast_return_reason": "specialist_answer_terminal",
+                "terminal_tool": "call_specialist",
+                "terminal_specialist": str(data.get("specialist") or ""),
+                "specialist_status": specialist_status,
+                "terminal_status": specialist_status,
+            }
         return {
             "fast_return_reason": str(data.get("fast_return_reason") or "specialist_terminal_response"),
             "terminal_tool": "call_specialist",
             "terminal_specialist": str(data.get("specialist") or ""),
             "specialist_terminal_tool": str(data.get("terminal_tool") or ""),
+            "terminal_status": str(data.get("status") or "completed"),
         }
 
     # ------------------------------------------------------------------
