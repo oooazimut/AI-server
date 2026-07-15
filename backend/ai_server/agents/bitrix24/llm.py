@@ -388,8 +388,10 @@ def _direct_task_create_response(
                 model_usage=_local_model_usage(agent_id, "project_create_draft_response"),
             )
         if result.tool == "project_create_confirm":
+            confirm_data = result.data if isinstance(result.data, dict) else {}
+            has_followup_task = isinstance(confirm_data.get("followup_task_draft"), dict)
             return BitrixLLMFinalResult(
-                status="completed",
+                status="needs_human" if has_followup_task else "completed",
                 answer=_format_project_create_confirm_answer(result.data, portal_base_url=portal_base_url),
                 model_usage=_local_model_usage(agent_id, "project_create_confirm_response"),
             )
@@ -712,7 +714,11 @@ def _format_project_create_confirm_answer(data: dict[str, Any], *, portal_base_u
     name = _text(fields.get("NAME")) or _text(draft_fields.get("NAME")) or "проект"
     project_id = _created_project_id(data.get("result"))
     label = _project_link(name, project_id, portal_base_url=portal_base_url)
-    return f"Проект создан: {label}."
+    answer = f"Проект создан: {label}."
+    followup = data.get("followup_task_draft") if isinstance(data.get("followup_task_draft"), dict) else {}
+    if followup:
+        answer = f"{answer}\n\n{_format_task_create_draft_answer(followup)}"
+    return answer
 
 
 def _portal_search_title(*, scope: str, query: str) -> str:
@@ -876,6 +882,8 @@ def _ru_position_word(count: int) -> str:
 
 
 def _format_task_create_draft_answer(data: dict[str, Any]) -> str:
+    if data.get("requires_project_creation"):
+        return _format_task_create_requires_project_answer(data)
     preview = data.get("preview") if isinstance(data.get("preview"), dict) else {}
     params = data.get("params") if isinstance(data.get("params"), dict) else {}
     fields = params.get("fields") if isinstance(params.get("fields"), dict) else {}
@@ -899,6 +907,54 @@ def _format_task_create_draft_answer(data: dict[str, Any]) -> str:
             f"Описание: {description}",
             "",
             "Если всё верно, напишите: да, создай.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _format_task_create_requires_project_answer(data: dict[str, Any]) -> str:
+    project_name = _text(data.get("missing_project_name")) or "личный проект"
+    project_draft = data.get("project_draft") if isinstance(data.get("project_draft"), dict) else {}
+    project_preview = project_draft.get("preview") if isinstance(project_draft.get("preview"), dict) else {}
+    task_draft = data.get("pending_task_draft") if isinstance(data.get("pending_task_draft"), dict) else {}
+    task_preview = task_draft.get("preview") if isinstance(task_draft.get("preview"), dict) else {}
+    task_params = task_draft.get("params") if isinstance(task_draft.get("params"), dict) else {}
+    task_fields = task_params.get("fields") if isinstance(task_params.get("fields"), dict) else {}
+
+    title = _text(task_preview.get("title")) or _text(task_fields.get("TITLE")) or "задача"
+    responsible = _text(task_preview.get("responsible")) or "указанный сотрудник"
+    deadline = _text(task_preview.get("deadline")) or _deadline_label_from_fields(task_fields)
+    description = _clean_task_description(
+        _text(task_preview.get("description"))
+        or _text(task_fields.get("DESCRIPTION"))
+        or f"Краткое содержание: {title}"
+    )
+    project_type = _text(project_preview.get("type")) or "личный проект"
+    visibility = _text(project_preview.get("visibility"))
+    project_description = _text(project_preview.get("description"))
+
+    lines = [
+        f"Личный проект «{project_name}» не найден.",
+        "Сначала нужно создать проект, затем я подготовлю задачу в нём.",
+        "",
+        "Черновик проекта:",
+        f"Название: {project_name}",
+        f"Тип: {project_type}",
+    ]
+    if visibility:
+        lines.append(f"Открытость: {visibility}")
+    if project_description:
+        lines.append(f"Описание: {project_description}")
+    lines.extend(
+        [
+            "",
+            "После создания проекта будет подготовлен черновик задачи:",
+            f"Название: {title}",
+            f"Ответственный: {responsible}",
+            f"Срок: {deadline}",
+            f"Описание: {description}",
+            "",
+            "Если всё верно, напишите: да, создай проект.",
         ]
     )
     return "\n".join(lines)

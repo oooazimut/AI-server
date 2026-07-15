@@ -184,6 +184,35 @@ def test_project_confirm_uses_oauth_and_deletes_draft():
     assert "d:9" not in store._drafts
 
 
+def test_project_confirm_replaces_project_draft_with_followup_task_draft():
+    store = FakeTaskDraftStore()
+    anyio.run(
+        lambda: store.save_task_draft(
+            "d:9",
+            {
+                "_draft_type": PROJECT_CREATE_DRAFT_TYPE,
+                "method": "sonet_group.create",
+                "params": {"fields": {"NAME": "Кулинич Валерий", "OWNER_ID": 9}},
+                "after_project_create_task_draft": {
+                    "params": {"fields": {"TITLE": "Задача", "RESPONSIBLE_ID": 9}},
+                    "preview": {"title": "Задача", "responsible": "Кулинич Валерий"},
+                    "project_name": "Кулинич Валерий",
+                },
+            },
+        )
+    )
+    write_client = AsyncMock()
+    write_client.call = AsyncMock(return_value={"result": 777})
+    tool = ProjectCreateConfirmTool(store=store, write_client=write_client, oauth_required_for_writes=False)
+
+    result = _exec(tool, {}, dialog_key="d:9")
+
+    assert result.status == ToolStatus.OK
+    assert store._drafts["d:9"]["fields"]["GROUP_ID"] == 777
+    assert store._drafts["d:9"]["fields"]["TITLE"] == "Задача"
+    assert result.data["followup_task_draft"]["preview"]["project"] == "Кулинич Валерий"
+
+
 def test_project_confirm_ignores_other_draft_types():
     store = FakeTaskDraftStore()
     anyio.run(lambda: store.save_task_draft("d:9", {"fields": {"TITLE": "Задача"}}))

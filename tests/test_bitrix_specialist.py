@@ -1131,11 +1131,16 @@ def test_bitrix_specialist_task_create_draft_uses_current_user_profile_label():
         async def get_user(self, user_id: int):
             return {"ID": str(user_id), "NAME": "Дмитрий", "LAST_NAME": "Кулинич"}
 
+        async def search_projects(self, query: str, *, limit: int = 10):
+            assert query == "Кулинич Дмитрий"
+            return [{"ID": "43", "NAME": "Кулинич Дмитрий", "PROJECT": "Y"}]
+
+    user_client = _FakeUserClient()
     specialist = Bitrix24Specialist(
         get_agent_manifest("bitrix24"),
         retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
-        agent_tools=[TaskCreateDraftTool(store=store)],
-        bitrix_user_client=_FakeUserClient(),
+        agent_tools=[TaskCreateDraftTool(store=store, project_client=user_client)],
+        bitrix_user_client=user_client,
         llm=llm,
     )
 
@@ -1152,7 +1157,10 @@ def test_bitrix_specialist_task_create_draft_uses_current_user_profile_label():
 
     assert result.status == "needs_human"
     preview = llm.compose_calls[0]["tool_results"][0].data["preview"]
+    fields = llm.compose_calls[0]["tool_results"][0].data["params"]["fields"]
     assert preview["responsible"] == "Кулинич Дмитрий"
+    assert preview["project"] == "Кулинич Дмитрий"
+    assert fields["GROUP_ID"] == 43
     assert "текущий пользователь" not in preview["responsible"]
 
 
@@ -2258,6 +2266,56 @@ def test_bitrix_llm_compose_formats_project_create_confirm_with_project_link(mon
     assert "Кулинич Валерий" in result.answer
     assert "/workgroups/group/777/" in result.answer
     assert "/company/personal/user/" not in result.answer
+
+
+def test_bitrix_llm_compose_formats_project_create_confirm_with_followup_task(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="да, создай проект", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="project_create_confirm",
+                    data={
+                        "result": {"result": 777},
+                        "params": {"fields": {"NAME": "Кулинич Валерий"}},
+                        "followup_task_draft": {
+                            "params": {
+                                "fields": {
+                                    "TITLE": "проверить IP-камеру",
+                                    "RESPONSIBLE_ID": 13,
+                                    "GROUP_ID": 777,
+                                    "DEADLINE": "2026-07-20T19:00:00+03:00",
+                                    "DESCRIPTION": "Краткое содержание: проверить IP-камеру",
+                                }
+                            },
+                            "preview": {
+                                "title": "проверить IP-камеру",
+                                "responsible": "Кулинич Валерий",
+                                "project": "Кулинич Валерий",
+                                "deadline": "20.07.2026 19:00 МСК",
+                                "description": "Краткое содержание: проверить IP-камеру",
+                            },
+                        },
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert "Проект создан:" in result.answer
+    assert "Черновик задачи:" in result.answer
+    assert "Проект: Кулинич Валерий" in result.answer
+    assert "Если всё верно, напишите: да, создай." in result.answer
 
 
 def test_bitrix_llm_compose_formats_project_create_discard_without_llm(monkeypatch):

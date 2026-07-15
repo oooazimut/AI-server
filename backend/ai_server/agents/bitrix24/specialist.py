@@ -100,6 +100,13 @@ _FAST_RETURN_READ_TOOLS = frozenset(
     }
 )
 
+_FAST_RETURN_TASK_CREATE_TOOLS = frozenset(
+    {
+        "task_create_confirm",
+        "task_draft_discard",
+    }
+)
+
 
 class Bitrix24Specialist(BaseSpecialist):
     max_steps = 7
@@ -189,7 +196,7 @@ class Bitrix24Specialist(BaseSpecialist):
                 dry_run=_settings.agent_dry_run,
                 oauth_required_for_writes=_settings.bitrix_oauth_required_for_writes,
             ),
-            TaskCreateDraftTool(store=bitrix_store),
+            TaskCreateDraftTool(store=bitrix_store, project_client=bitrix_client),
             TaskCreateConfirmTool(
                 store=bitrix_store,
                 write_client=bitrix_client,
@@ -327,13 +334,18 @@ class Bitrix24Specialist(BaseSpecialist):
     ) -> dict[str, Any] | None:
         if result is None or approvals:
             return None
-        if tool_call.name not in _FAST_RETURN_READ_TOOLS:
+        if tool_call.name not in _FAST_RETURN_READ_TOOLS and tool_call.name not in _FAST_RETURN_TASK_CREATE_TOOLS:
             return None
         if _is_ambiguous_read_result(tool_call.name, result):
             return None
         if result.status == ToolStatus.OK:
+            reason = (
+                "task_create_tool_success"
+                if tool_call.name in _FAST_RETURN_TASK_CREATE_TOOLS
+                else "read_only_tool_success"
+            )
             return {
-                "fast_return_reason": "read_only_tool_success",
+                "fast_return_reason": reason,
                 "terminal_tool": tool_call.name,
                 "tool_status": str(result.status),
             }
@@ -459,17 +471,32 @@ def _tool_context_status(value: object) -> str:
 
 
 def _task_create_args_with_actor_label(args: dict[str, Any], task: AgentTask) -> dict[str, Any]:
-    if str(args.get("responsible_name") or args.get("responsible_label") or "").strip():
-        return args
     user_id = optional_int(task.user.id)
     responsible_id = optional_int(args.get("responsible_id"))
     responsible_self = _truthy(args.get("responsible_self"))
     if not responsible_self and (user_id is None or responsible_id != user_id):
         return args
     label = _current_user_label(task)
-    if label:
-        return {**args, "responsible_name": label}
-    return args
+    if not label:
+        return args
+    updated = dict(args)
+    if not str(updated.get("responsible_name") or updated.get("responsible_label") or "").strip():
+        updated["responsible_name"] = label
+    if not any(updated.get(key) for key in ("group_id", "project_name", "group_name")):
+        updated["project_name"] = _personal_project_name(label)
+        updated["_default_personal_project"] = True
+    return updated
+
+
+def _personal_project_name(label: str) -> str:
+    parts = [part for part in compact_user_label(label).split() if part]
+    if len(parts) >= 2:
+        return f"{parts[0]} {parts[1]}"
+    return label.strip()
+
+
+def compact_user_label(label: str) -> str:
+    return re.sub(r"\s+", " ", str(label or "")).strip()
 
 
 def _calendar_event_args_with_actor_label(args: dict[str, Any], task: AgentTask) -> dict[str, Any]:
