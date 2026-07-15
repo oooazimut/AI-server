@@ -168,6 +168,14 @@ class BitrixLLMService:
                 raw={"source": "task_close_report_incident_route"},
             )
 
+        local_decision = _common_unsupported_vehicle_usage_decision(task.request, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "unsupported_vehicle_usage_route"),
+                raw={"source": "unsupported_vehicle_usage_route"},
+            )
+
         local_decision = _common_admin_panel_clarification_decision(task.request, tool_definitions)
         if local_decision is not None:
             return BitrixLLMDecisionResult(
@@ -2448,6 +2456,31 @@ def _common_admin_panel_clarification_decision(
                 name="none",
                 args={},
                 summary="ambiguous admin panel clarification",
+            )
+        ],
+    )
+
+
+def _common_unsupported_vehicle_usage_decision(
+    request: str,
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    clean_request = _strip_command_prefix(request)
+    lowered = clean_request.casefold()
+    if not _looks_like_vehicle_usage_admin_panel_request(lowered):
+        return None
+    return BitrixLLMDecision(
+        status="needs_clarification",
+        answer=(
+            "В Bitrix не нашёл такой раздел или отчёт. "
+            "Уточните, нужен именно Bitrix-раздел или сценарий отчёта по машинам и людям."
+        ),
+        confidence=0.86,
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="none",
+                args={},
+                summary="unsupported vehicle usage domain for bitrix",
             )
         ],
     )
