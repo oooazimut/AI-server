@@ -1677,6 +1677,17 @@ _WRITE_TOOL_NAMES = frozenset(
     }
 )
 _READ_MARKERS = ("покажи", "найди", "найти", "выведи", "список", "какие", "ищи")
+_DOCUMENT_SEARCH_MARKERS = (
+    "договор",
+    "документ",
+    "файл",
+    "папк",
+    "скан",
+    "scan",
+    "диск",
+    "счет",
+    "счёт",
+)
 _WRITE_MARKERS = (
     "создай",
     "создать",
@@ -2740,6 +2751,12 @@ def _common_read_decision(request: str, tool_definitions: list[dict[str, Any]] |
     if any(marker in lowered for marker in _WRITE_MARKERS):
         return None
 
+    document_args = _common_document_read_args(clean_request)
+    if document_args is not None:
+        if require_declared_tool and "portal_search" not in available_tools:
+            return None
+        return _local_decision_tool("portal_search", document_args)
+
     task_args = _common_task_read_args(clean_request)
     if task_args is not None:
         if require_declared_tool and "bitrix_task_search" not in available_tools:
@@ -2753,6 +2770,66 @@ def _common_read_decision(request: str, tool_definitions: list[dict[str, Any]] |
         return _local_decision_tool("bitrix_project_search", {"query": project_query, "limit": 10})
 
     return None
+
+
+def _common_document_read_args(request: str) -> dict[str, Any] | None:
+    lowered = request.casefold()
+    if not _looks_like_document_search_request(lowered):
+        return None
+    query = _clean_document_query(request)
+    if not query:
+        return None
+    scope = "files" if _looks_like_file_or_disk_scope(lowered) else "documents"
+    return {"query": query, "scope": scope, "limit": _extract_document_limit(lowered) or 10}
+
+
+def _looks_like_document_search_request(lowered: str) -> bool:
+    return any(marker in lowered for marker in _DOCUMENT_SEARCH_MARKERS)
+
+
+def _looks_like_file_or_disk_scope(lowered: str) -> bool:
+    return any(marker in lowered for marker in ("файл", "папк", "диск", "скан", "scan"))
+
+
+def _extract_document_limit(lowered: str) -> int | None:
+    match = re.search(r"\b(?:последн(?:ие|их)?|первые|покажи|найди|выведи)\s+(\d{1,2})\b", lowered)
+    if not match:
+        return None
+    try:
+        return max(1, min(int(match.group(1)), 30))
+    except ValueError:
+        return None
+
+
+def _clean_document_query(request: str) -> str:
+    text = _clean_read_query(request)
+    text = re.sub(
+        r"\b(?:покажи|найди|найти|выведи|ищи|список|последн(?:ие|их)?|первые)\b",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\b\d{1,2}\b", " ", text)
+    text = re.sub(r"\b(?:по|на|в|из|для|мне|пожалуйста)\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\b(?:диске|диск|папке|папка|файлы|файл|документы|документ|сканы|скан)\b",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\s+", " ", text).strip(" \t\r\n\"'«».,!?")
+    replacements = {
+        "азимуту": "Азимут",
+        "договоры": "договор",
+        "договора": "договор",
+        "договоров": "договор",
+        "счета": "счет",
+        "счёта": "счет",
+        "счетов": "счет",
+        "счётов": "счет",
+    }
+    words = [replacements.get(word.casefold(), word) for word in text.split()]
+    return " ".join(words).strip()
 
 
 def _replace_decision_tool(decision: BitrixLLMDecision, name: str, args: dict[str, Any]) -> BitrixLLMDecision:

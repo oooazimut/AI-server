@@ -3,7 +3,7 @@ import asyncio
 from ai_server.agents.bitrix24 import Bitrix24Specialist
 from ai_server.agents.logistics import LogisticsSpecialist
 from ai_server.agents.pto import PtoSpecialist
-from ai_server.models import AgentManifest, AgentResult, AgentTask
+from ai_server.models import AgentManifest, AgentResult, AgentTask, ModelUsageRecord
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.orchestrators.tools import CallSpecialistTool
 from ai_server.registry import load_agent_manifests
@@ -71,6 +71,15 @@ def test_internal_orchestrator_fast_returns_terminal_specialist_answer():
                 agent_id="bitrix24",
                 answer="terminal answer",
                 confidence=0.9,
+                model_usage=[
+                    ModelUsageRecord(
+                        agent_id="bitrix24",
+                        provider="deepseek",
+                        model="deepseek-v4-flash",
+                        input_tokens=7154,
+                        output_tokens=195,
+                    )
+                ],
                 metadata={
                     "terminal": True,
                     "answer_is_final": True,
@@ -95,6 +104,34 @@ def test_internal_orchestrator_fast_returns_terminal_specialist_answer():
     assert result.metadata["terminal_tool"] == "call_specialist"
     assert result.metadata["specialist_terminal_tool"] == "bitrix_my_tasks"
     assert any(action.name == "orchestrator_fast_return" for action in result.actions_taken)
+    assert any(
+        usage.agent_id == "bitrix24" and usage.input_tokens == 7154 and usage.output_tokens == 195
+        for usage in result.model_usage
+    )
+
+
+def test_internal_orchestrator_stops_after_plain_specialist_clarification():
+    class _ClarifyingSpecialist:
+        async def handle(self, task):
+            return AgentResult(
+                status="needs_clarification",
+                agent_id="bitrix24",
+                answer="Уточните запрос.",
+                confidence=0.8,
+            )
+
+    fake_llm = FakeInternalOrchestratorLLM(call_specialists=["bitrix24"])
+    result = asyncio.run(
+        _make_orch({"bitrix24": _ClarifyingSpecialist()}, fake_llm).handle(
+            AgentTask(task_id="t1", request="Битрикс покажи договоры")
+        )
+    )
+
+    assert result.status == "needs_clarification"
+    assert result.answer == "Уточните запрос."
+    assert len(fake_llm.decide_calls) == 1
+    assert result.metadata["fast_return_reason"] == "specialist_answer_terminal"
+    assert result.metadata["terminal_status"] == "needs_clarification"
 
 
 def test_internal_orchestrator_delegates_pto_document_request():
