@@ -44,6 +44,7 @@ def health(request: Request) -> dict[str, Any]:
         "bitrix_webhook_worker_enabled": settings.webhook_event_worker_enabled,
         "agent_orchestrator_worker_count": settings.agent_orchestrator_worker_count,
         "agent_bitrix_worker_count": settings.agent_bitrix_worker_count,
+        "agent_logistics_worker_count": settings.agent_logistics_worker_count,
         "agent_task_timeout_seconds": settings.agent_task_timeout_seconds,
         "bitrix_dialog_guard_enabled": settings.bitrix_dialog_guard_enabled,
         "bitrix_dialog_stuck_seconds": settings.bitrix_dialog_stuck_seconds,

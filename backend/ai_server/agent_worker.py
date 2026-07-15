@@ -385,6 +385,7 @@ async def main() -> None:
         agent_task_timeout = settings.agent_task_timeout_seconds
         orchestrator_worker_count = max(1, settings.agent_orchestrator_worker_count)
         bitrix_worker_count = max(1, settings.agent_bitrix_worker_count)
+        logistics_worker_count = max(1, settings.agent_logistics_worker_count)
         for index in range(orchestrator_worker_count):
             agent_tasks.append(
                 asyncio.create_task(
@@ -397,7 +398,12 @@ async def main() -> None:
             )
         for sp in orchestrator.specialists.values():
             specialist_id = str(getattr(getattr(sp, "manifest", None), "id", ""))
-            worker_count = bitrix_worker_count if specialist_id == "bitrix24" else 1
+            if specialist_id == "bitrix24":
+                worker_count = bitrix_worker_count
+            elif specialist_id == "logistics":
+                worker_count = logistics_worker_count
+            else:
+                worker_count = 1
             for index in range(worker_count):
                 agent_tasks.append(
                     asyncio.create_task(
