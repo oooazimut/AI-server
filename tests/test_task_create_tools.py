@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import anyio
 
+from ai_server.agents.bitrix24.tools.project_create import PROJECT_CREATE_DRAFT_TYPE
 from ai_server.agents.bitrix24.tools.task_create import (
     TaskCreateConfirmTool,
     TaskCreateDraftTool,
@@ -83,6 +84,42 @@ def test_draft_tool_no_dialog_key_does_not_fail():
     )
     assert result.status == ToolStatus.OK
     assert not store._drafts
+
+
+def test_draft_tool_prepares_personal_project_before_default_self_task():
+    class _NoProjectClient:
+        async def search_projects(self, query: str, *, limit: int = 10):
+            assert query == "Кулинич Валерий"
+            return []
+
+    store = FakeTaskDraftStore()
+    tool = TaskCreateDraftTool(store=store, project_client=_NoProjectClient())
+
+    result = _exec(
+        tool,
+        {
+            "title": "Тест",
+            "responsible_self": True,
+            "responsible_name": "Кулинич Валерий",
+            "project_name": "Кулинич Валерий",
+            "_default_personal_project": True,
+            "no_deadline": True,
+        },
+        user_id=9,
+        dialog_key="d:42",
+        dialog_id="chat42",
+    )
+
+    assert result.status == ToolStatus.OK
+    assert result.data["requires_project_creation"] is True
+    assert result.data["missing_project_name"] == "Кулинич Валерий"
+    stored = store._drafts["d:42"]
+    assert stored["_draft_type"] == PROJECT_CREATE_DRAFT_TYPE
+    assert stored["params"]["fields"]["NAME"] == "Кулинич Валерий"
+    followup = stored["after_project_create_task_draft"]
+    assert followup["params"]["fields"]["TITLE"] == "Тест"
+    assert followup["params"]["fields"]["RESPONSIBLE_ID"] == 9
+    assert "GROUP_ID" not in followup["params"]["fields"]
 
 
 # ---------------------------------------------------------------------------

@@ -268,9 +268,21 @@ class ProjectCreateConfirmTool:
                     error=f"{type(exc).__name__}: {exc}",
                     data={"params": sanitized},
                 )
-            await self._store.delete_task_draft(dialog_key)
+            followup_task_draft = await _replace_with_followup_task_draft(
+                self._store,
+                dialog_key=dialog_key,
+                project_draft=draft,
+                project_create_result=result,
+            )
             return ToolResult(
-                status=ToolStatus.OK, tool=self.name, data={"result": result, "params": sanitized, "draft": draft}
+                status=ToolStatus.OK,
+                tool=self.name,
+                data=_project_confirm_data(
+                    result=result,
+                    params=sanitized,
+                    draft=draft,
+                    followup_task_draft=followup_task_draft,
+                ),
             )
 
         if self._write_client is None:
@@ -284,9 +296,21 @@ class ProjectCreateConfirmTool:
                 error=f"{type(exc).__name__}: {exc}",
                 data={"params": sanitized},
             )
-        await self._store.delete_task_draft(dialog_key)
+        followup_task_draft = await _replace_with_followup_task_draft(
+            self._store,
+            dialog_key=dialog_key,
+            project_draft=draft,
+            project_create_result=result,
+        )
         return ToolResult(
-            status=ToolStatus.OK, tool=self.name, data={"result": result, "params": sanitized, "draft": draft}
+            status=ToolStatus.OK,
+            tool=self.name,
+            data=_project_confirm_data(
+                result=result,
+                params=sanitized,
+                draft=draft,
+                followup_task_draft=followup_task_draft,
+            ),
         )
 
 
@@ -323,6 +347,78 @@ def _draft_preview(fields: dict[str, Any], *, personal_for_self: bool) -> dict[s
         "visibility": "открытый" if fields.get("OPENED") == "Y" else "закрытый",
         "description": compact_text(str(fields.get("DESCRIPTION") or "")),
     }
+
+
+async def _replace_with_followup_task_draft(
+    store: TaskDraftStorePort,
+    *,
+    dialog_key: str,
+    project_draft: dict[str, Any],
+    project_create_result: object,
+) -> dict[str, Any] | None:
+    followup_task_draft = _followup_task_draft(project_draft, project_create_result)
+    if followup_task_draft is None:
+        await store.delete_task_draft(dialog_key)
+        return None
+    await store.save_task_draft(dialog_key, followup_task_draft["params"])
+    return followup_task_draft
+
+
+def _project_confirm_data(
+    *,
+    result: object,
+    params: dict[str, Any],
+    draft: dict[str, Any],
+    followup_task_draft: dict[str, Any] | None,
+) -> dict[str, Any]:
+    data = {"result": result, "params": params, "draft": draft}
+    if followup_task_draft is not None:
+        data["followup_task_draft"] = followup_task_draft
+    return data
+
+
+def _followup_task_draft(project_draft: dict[str, Any], project_create_result: object) -> dict[str, Any] | None:
+    followup = project_draft.get("after_project_create_task_draft")
+    if not isinstance(followup, dict):
+        return None
+    params = followup.get("params") if isinstance(followup.get("params"), dict) else {}
+    fields = params.get("fields") if isinstance(params.get("fields"), dict) else {}
+    if not fields:
+        return None
+    project_id = _created_project_id(project_create_result)
+    if project_id is None:
+        return None
+    project_name = compact_text(str(followup.get("project_name") or ""))
+    task_fields = dict(fields)
+    task_fields["GROUP_ID"] = project_id
+    preview = dict(followup.get("preview")) if isinstance(followup.get("preview"), dict) else {}
+    if project_name:
+        preview["project"] = project_name
+    return {
+        "params": {"fields": task_fields},
+        "preview": preview,
+        "project_id": project_id,
+        "project_name": project_name,
+    }
+
+
+def _created_project_id(value: object) -> int | None:
+    direct = optional_int(value)
+    if direct is not None:
+        return direct
+    if not isinstance(value, dict):
+        return None
+    candidates: list[object] = [value.get("id"), value.get("ID"), value.get("group_id"), value.get("GROUP_ID")]
+    nested = value.get("result")
+    if isinstance(nested, dict):
+        candidates.extend([nested.get("id"), nested.get("ID"), nested.get("group_id"), nested.get("GROUP_ID")])
+    else:
+        candidates.append(nested)
+    for candidate in candidates:
+        project_id = optional_int(candidate)
+        if project_id is not None:
+            return project_id
+    return None
 
 
 def _same_personal_project_name(name: str, actor_name: str) -> bool:
