@@ -108,6 +108,19 @@ class OrchestratorLLMService:
         available_skills: list | None = None,
         **kwargs: Any,
     ) -> OrchestratorDecisionResult:
+        local_decision = _vehicle_usage_direct_decision(task.request, tool_definitions)
+        if local_decision is not None:
+            return OrchestratorDecisionResult(
+                decision=local_decision,
+                model_usage=ModelUsageRecord(
+                    agent_id=manifest.id,
+                    provider="",
+                    model="",
+                    status="skipped",
+                    notes=["vehicle_usage_direct_route"],
+                ),
+                raw={"source": "vehicle_usage_direct_route"},
+            )
         local_decision = _admin_panel_clarification_decision(task.request, tool_definitions)
         if local_decision is not None:
             return OrchestratorDecisionResult(
@@ -221,6 +234,30 @@ def _admin_panel_clarification_decision(
         answer="Уточните, какую панель показать: закрытие задач или отчет по машинам и людям.",
         tool_calls=[OrchestratorToolCall(name="none", args={}, summary="ambiguous admin panel clarification")],
         confidence=0.86,
+    )
+
+
+def _vehicle_usage_direct_decision(
+    request: str,
+    tool_definitions: list[dict[str, Any]],
+) -> OrchestratorDecision | None:
+    available_tools = {str(tool.get("name") or "") for tool in tool_definitions or []}
+    if "call_specialist" not in available_tools:
+        return None
+    text = _strip_synthetic_prefix(request).casefold()
+    if not _looks_like_vehicle_usage_admin_panel_request(text):
+        return None
+    return OrchestratorDecision(
+        status="completed",
+        answer="Передаю запрос Логисту.",
+        tool_calls=[
+            OrchestratorToolCall(
+                name="call_specialist",
+                args={"specialist_id": "logistics", "request": request},
+                summary="vehicle usage direct route",
+            )
+        ],
+        confidence=0.92,
     )
 
 
