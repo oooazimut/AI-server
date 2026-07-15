@@ -79,7 +79,9 @@ class PostgresVehicleUsageStore(PostgresAgentSchema):
             )
             db.execute("ALTER TABLE logistics.employees ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE")
             db.execute("ALTER TABLE logistics.vehicles ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE")
-            db.execute("ALTER TABLE logistics.vehicle_usage_requests ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT ''")
+            db.execute(
+                "ALTER TABLE logistics.vehicle_usage_requests ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT ''"
+            )
             self._seed_default_vehicles(db)
             db.execute(
                 """

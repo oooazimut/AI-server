@@ -461,6 +461,7 @@ def test_vehicle_store_auto_close_manual_pending_draft_finalizes_unknowns(monkey
     assert called["report_date"] == "2026-07-16"
     assert called["actor_user_id"] == 13
 
+
 def test_bitrix_store_save_proposal(monkeypatch):
     store = PostgresBitrixAgentStore("postgresql://fake")
     factory, conn = _sync_conn_factory(rows=[{"id": 7}])
