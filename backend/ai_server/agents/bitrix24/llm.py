@@ -2484,12 +2484,16 @@ def _common_unsupported_vehicle_usage_decision(
     lowered = clean_request.casefold()
     if not _looks_like_vehicle_usage_admin_panel_request(lowered):
         return None
+    if _looks_like_force_bitrix_request(lowered):
+        return None
     return BitrixLLMDecision(
         status="needs_clarification",
         answer=(
             "В Bitrix не нашёл такой раздел или отчёт. "
-            "Сценарий отчёта по машинам и людям находится у Логиста. "
-            "Если нужен он, напишите: Логист, покажи отчёт по машинам и людям."
+            "Похожий сценарий найден у Логиста: отчёт по машинам и людям. "
+            "Если нужен он, напишите: Логист, покажи отчёт по машинам и людям. "
+            "Если вы точно хотите проверить именно Bitrix, повторите запрос с уточнением: "
+            "Битрикс, всё равно обработай этот запрос."
         ),
         confidence=0.86,
         tool_calls=[
@@ -2500,6 +2504,21 @@ def _common_unsupported_vehicle_usage_decision(
             )
         ],
     )
+
+
+def _looks_like_force_bitrix_request(lowered: str) -> bool:
+    force_terms = (
+        "всё равно",
+        "все равно",
+        "точно bitrix",
+        "точно битрикс",
+        "именно bitrix",
+        "именно битрикс",
+        "обработай этот запрос",
+        "передай в bitrix",
+        "передай в битрикс",
+    )
+    return any(term in lowered for term in force_terms)
 
 
 def _looks_like_ambiguous_admin_panel_request(lowered: str) -> bool:

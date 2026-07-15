@@ -643,6 +643,34 @@ def test_bitrix_llm_does_not_route_ambiguous_operator_panel_request(monkeypatch)
     assert "Bitrix" in result.decision.answer
     assert "Логист" in result.decision.answer
     assert "машинам и людям" in result.decision.answer
+    assert "всё равно обработай" in result.decision.answer
+    assert [call.name for call in result.decision.tool_calls] == ["none"]
+
+
+def test_bitrix_llm_allows_forced_bitrix_vehicle_request_to_reach_llm(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    service = BitrixLLMService(client, settings=get_settings())
+    tool_definitions = [
+        ToolDefinition(name="task_close_control_get", description="", parameters={}).model_dump(),
+        ToolDefinition(name="none", description="", parameters={}).model_dump(),
+    ]
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="forced-bitrix-vehicle-panel",
+                request="Битрикс, всё равно обработай этот запрос: покажи отчёт по машинам и людям",
+                user={"id": "1"},
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls
+    assert result.raw == {}
     assert [call.name for call in result.decision.tool_calls] == ["none"]
 
 
