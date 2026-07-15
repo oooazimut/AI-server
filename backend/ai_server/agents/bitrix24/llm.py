@@ -115,7 +115,22 @@ class BitrixLLMFinalResult:
 class BitrixLLMService:
     def __init__(self, client: LLMClient | None = None, *, settings: Settings) -> None:
         self.client = client or OpenAICompatibleLLMClient()
+        self.read_client = self.client
+        if client is None and settings.llm_routing_enabled:
+            fallback_model = settings.llm_pro_model if settings.llm_flash_fallback_to_pro else None
+            self.read_client = OpenAICompatibleLLMClient(
+                settings,
+                model=settings.llm_flash_model or settings.llm_model,
+                fallback_model=fallback_model,
+            )
         self.settings = settings
+
+    def _decision_client_for_request(self, request: str) -> LLMClient:
+        if self.read_client is self.client:
+            return self.client
+        if _looks_like_bitrix_read_only_request(request):
+            return self.read_client
+        return self.client
 
     async def decide(
         self,
@@ -217,7 +232,7 @@ class BitrixLLMService:
             )
 
         instructions = load_instructions(manifest)
-        completion = await self.client.complete(
+        completion = await self._decision_client_for_request(task.request).complete(
             agent_id=manifest.id,
             messages=[
                 {"role": "system", "content": _decision_system_prompt(instructions)},
@@ -2944,6 +2959,40 @@ def _extract_task_query(request: str) -> str:
 def _strip_command_prefix(request: str) -> str:
     text = re.sub(r"^\[[^\]]+\]\s*", "", str(request or "")).strip()
     return re.sub(r"^битрикс[:,]?\s*", "", text, flags=re.IGNORECASE).strip()
+
+
+def _looks_like_bitrix_read_only_request(request: str) -> bool:
+    lowered = _strip_command_prefix(request).casefold()
+    write_terms = (
+        "созда",
+        "сдела",
+        "добав",
+        "измени",
+        "обнов",
+        "назнач",
+        "закрой",
+        "закрыть",
+        "удали",
+        "отмени",
+        "подтверд",
+        "сохрани",
+    )
+    if any(term in lowered for term in write_terms):
+        return False
+    read_terms = (
+        "покажи",
+        "найди",
+        "список",
+        "какие",
+        "какая",
+        "какой",
+        "мои задач",
+        "остат",
+        "проект",
+        "задач",
+        "склад",
+    )
+    return any(term in lowered for term in read_terms)
 
 
 def _clean_read_query(value: str) -> str:

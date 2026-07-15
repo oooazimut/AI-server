@@ -39,6 +39,22 @@ def _bitrix_read_tool_definitions() -> list[dict]:
     ]
 
 
+def test_bitrix_llm_selects_flash_only_for_read_only_requests(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("AI_SERVER_LLM_MODEL", "deepseek-v4-pro")
+    monkeypatch.setenv("AI_SERVER_LLM_ROUTING_ENABLED", "true")
+    monkeypatch.setenv("AI_SERVER_LLM_FLASH_MODEL", "deepseek-v4-flash")
+    monkeypatch.setenv("AI_SERVER_LLM_PRO_MODEL", "deepseek-v4-pro")
+
+    service = BitrixLLMService(settings=get_settings())
+
+    read_client = service._decision_client_for_request("Битрикс покажи мои задачи")
+    write_client = service._decision_client_for_request("Битрикс создай задачу на меня")
+
+    assert read_client._model == "deepseek-v4-flash"
+    assert write_client._model == "deepseek-v4-pro"
+
+
 def test_bitrix_specialist_loads_available_skills_and_rag_context():
     result = asyncio.run(
         _bitrix_specialist(tools=FakeResolverTools()).handle(
