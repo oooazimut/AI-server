@@ -333,6 +333,7 @@ class FakeVehicleUsageStore:
                 "sent_at": data.sent_at,
                 "reminder_count": data.reminder_count,
                 "status": "sent",
+                "source": str(getattr(data, "source", "") or ""),
             }
         )
         return req_id
@@ -356,6 +357,11 @@ class FakeVehicleUsageStore:
     ) -> int:
         req_id = self._next_id
         self._next_id += 1
+        source = ""
+        for previous in reversed(self._requests):
+            if previous.get("request_date") == request_date and previous.get("user_id") == user_id:
+                source = str(previous.get("source") or "")
+                break
         self._requests.append(
             {
                 "id": req_id,
@@ -365,6 +371,7 @@ class FakeVehicleUsageStore:
                 "response_text": response_text,
                 "parsed": parsed,
                 "status": status,
+                "source": source,
             }
         )
         return req_id
@@ -571,6 +578,17 @@ class FakeVehicleUsageStore:
         reason: str,
     ) -> dict[str, Any]:
         request = self.get_request(request_date=report_date, user_id=None)
+        if (
+            request
+            and request.get("source") == "manual"
+            and request.get("status") in {"pending_clarification", "pending_confirmation"}
+            and isinstance(request.get("parsed"), dict)
+        ):
+            return self.finalize_pending_unknowns(
+                report_date=report_date,
+                actor_user_id=request.get("user_id"),
+                reason="Auto-filled missing vehicle usage data as unknown at day close.",
+            )
         if request and request.get("status") in {
             "answered",
             "cancelled_day_off",

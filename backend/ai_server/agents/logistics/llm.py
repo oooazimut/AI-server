@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_TOOL_NAMES = {
     "vehicle_usage_context",
+    "vehicle_usage_reference",
     "vehicle_usage_get_operators",
     "vehicle_usage_set_operators",
     "vehicle_usage_start_day",
@@ -170,6 +171,19 @@ class LogisticsLLMService:
                     notes=["deterministic_vehicle_usage_get_operators"],
                 ),
             )
+        reference_answer = _compose_reference_answer(tool_results)
+        if reference_answer is not None:
+            return LogisticsLLMFinalResult(
+                status="completed",
+                answer=reference_answer,
+                model_usage=ModelUsageRecord(
+                    agent_id=manifest.id,
+                    provider="",
+                    model="",
+                    status="skipped",
+                    notes=["deterministic_vehicle_usage_reference"],
+                ),
+            )
         report_answer = _compose_get_report_answer(tool_results)
         if report_answer is not None:
             return LogisticsLLMFinalResult(
@@ -279,6 +293,8 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Не используй vehicle_usage_get_operators как подготовительный шаг для запуска отчета. "
         "Если человек явно спрашивает, кто сейчас операторы отчета по машинам/людям "
         "или просит список операторов отчета по машинам/людям, вызови vehicle_usage_get_operators. "
+        "Если человек явно просит справочник отчета по машинам, список сотрудников, список машин "
+        "или текущую настройку сотрудников/машин, вызови vehicle_usage_reference. "
         "Сначала получи vehicle_usage_context, если в tool_results еще нет roster/vehicles/latest_request. "
         "Если человек просит показать отчет за дату или исправить прошлый отчет — сначала вызови vehicle_usage_get_report. "
         "Сам распознавай естественный язык: кто работает, кто в отпуске/болеет/на объекте, какая машина за кем, "
@@ -299,7 +315,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         '{"status":"completed|needs_clarification|needs_human",'
         '"answer":"короткий предварительный ответ",'
         '"confidence":0.0,'
-        '"tool_calls":[{"name":"vehicle_usage_context|vehicle_usage_get_operators|vehicle_usage_set_operators|vehicle_usage_start_day|vehicle_usage_get_report|vehicle_usage_get_employee_period_report|vehicle_usage_get_vehicle_period_report|vehicle_usage_save_draft|vehicle_usage_save_report|vehicle_usage_update_report|vehicle_usage_cancel_day|none","args":{},"summary":""}]}.'
+        '"tool_calls":[{"name":"vehicle_usage_context|vehicle_usage_reference|vehicle_usage_get_operators|vehicle_usage_set_operators|vehicle_usage_start_day|vehicle_usage_get_report|vehicle_usage_get_employee_period_report|vehicle_usage_get_vehicle_period_report|vehicle_usage_save_draft|vehicle_usage_save_report|vehicle_usage_update_report|vehicle_usage_cancel_day|none","args":{},"summary":""}]}.'
         f"{extra}"
     )
 
@@ -379,6 +395,52 @@ def _compose_operators_answer(tool_results: list[ToolResult]) -> str | None:
             elif user_id:
                 lines.append(f"- Bitrix ID {user_id}")
         return "\n".join(lines) if len(lines) > 1 else "Операторы отчета по машинам не назначены."
+    return None
+
+
+def _compose_reference_answer(tool_results: list[ToolResult]) -> str | None:
+    for result in reversed(tool_results):
+        if result.tool != "vehicle_usage_reference" or str(result.status) != "ok":
+            continue
+        data = result.data if isinstance(result.data, dict) else {}
+        staff = data.get("staff_roster") if isinstance(data.get("staff_roster"), list) else []
+        vehicles = data.get("vehicles") if isinstance(data.get("vehicles"), list) else []
+        operator_ids = data.get("operator_user_ids") if isinstance(data.get("operator_user_ids"), list) else []
+        lines = ["Справочник отчета по машинам:"]
+        lines.append("")
+        lines.append("Сотрудники:")
+        if staff:
+            for item in staff:
+                if not isinstance(item, dict):
+                    continue
+                order = item.get("display_order") or item.get("id") or ""
+                name = str(item.get("full_name") or item.get("name") or "").strip()
+                user_id = item.get("user_id") or item.get("bitrix_user_id") or ""
+                suffix = f" / Bitrix ID {user_id}" if user_id else ""
+                lines.append(f"- {order}. {name}{suffix}".strip())
+        else:
+            lines.append("- нет активных сотрудников")
+        lines.append("")
+        lines.append("Машины:")
+        if vehicles:
+            for item in vehicles:
+                if not isinstance(item, dict):
+                    continue
+                vehicle_id = item.get("id") or item.get("vehicle_id") or ""
+                name = str(item.get("brand_model") or item.get("vehicle_name") or item.get("name") or "").strip()
+                number = str(item.get("registration_number") or "").strip()
+                suffix = f" / {number}" if number else ""
+                lines.append(f"- {vehicle_id}. {name}{suffix}".strip())
+        else:
+            lines.append("- нет активных машин")
+        lines.append("")
+        lines.append("Операторы:")
+        if operator_ids:
+            for operator_id in operator_ids:
+                lines.append(f"- Bitrix ID {operator_id}")
+        else:
+            lines.append("- не назначены")
+        return "\n".join(lines)
     return None
 
 

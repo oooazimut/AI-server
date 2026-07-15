@@ -185,14 +185,16 @@ class VehicleStartDayTool:
             return denied
         request_date = _request_date(args.get("request_date"))
         message = str(args.get("message") or DEFAULT_START_MESSAGE).strip()
+        sent_at = _now().isoformat()
         request_id = self._store.create_sent_request(
             SentRequestData(
                 request_date=request_date,
                 user_id=user_id,
                 dialog_id=dialog_id or "",
                 message=message,
-                sent_at=_now().isoformat(),
+                sent_at=sent_at,
                 reminder_count=0,
+                source="manual",
             )
         )
         return ToolResult(
@@ -203,6 +205,7 @@ class VehicleStartDayTool:
                 "request_date": request_date,
                 "message": message,
                 "status": "sent",
+                "sent_at": sent_at,
             },
         )
 
@@ -346,11 +349,14 @@ class VehicleSaveReportTool:
             )
         vehicle_assignments: list[tuple[int, int | None, str, str]] = []
         driver_employee_ids: set[int] = set()
+        unknown_vehicle_refs: list[str] = []
         for entry in _vehicle_entries(parsed):
-            vehicle_id = optional_int(entry.get("vehicle_id")) or vehicles_by_name.get(
-                _norm_name(entry.get("vehicle_name") or entry.get("name") or entry.get("vehicle"))
-            )
+            vehicle_ref = entry.get("vehicle_name") or entry.get("name") or entry.get("vehicle")
+            vehicle_id = optional_int(entry.get("vehicle_id")) or vehicles_by_name.get(_norm_name(vehicle_ref))
             if vehicle_id is None:
+                unknown_ref = str(vehicle_ref or entry.get("vehicle_id") or "").strip()
+                if unknown_ref and unknown_ref not in unknown_vehicle_refs:
+                    unknown_vehicle_refs.append(unknown_ref)
                 continue
             status = str(entry.get("status") or entry.get("assignment_status") or "")
             notes = str(entry.get("notes") or "")
@@ -377,6 +383,7 @@ class VehicleSaveReportTool:
             vehicle_assignments=vehicle_assignments,
             driver_employee_ids=driver_employee_ids,
             employee_requires_vehicle_ids=employee_requires_vehicle_ids,
+            unknown_vehicle_refs=unknown_vehicle_refs,
         )
         if completeness["needs_clarification"]:
             draft = dict(parsed)
@@ -891,6 +898,7 @@ def _validate_report_completeness(
     vehicle_assignments: list[tuple[int, int | None, str, str]],
     driver_employee_ids: set[int],
     employee_requires_vehicle_ids: set[int],
+    unknown_vehicle_refs: list[str] | None = None,
 ) -> dict[str, Any]:
     employees_by_id = _employees_by_id(roster)
     vehicles_by_id = _vehicles_by_id(vehicles)
@@ -927,6 +935,8 @@ def _validate_report_completeness(
         missing.append({"kind": "employee_vehicle_links", "items": employees_without_vehicle})
     if in_use_without_drivers:
         missing.append({"kind": "vehicle_drivers", "items": in_use_without_drivers})
+    if unknown_vehicle_refs:
+        missing.append({"kind": "unknown_vehicle_references", "items": unknown_vehicle_refs})
     unknown = []
     if unknown_employees:
         unknown.append({"kind": "employee_statuses", "items": unknown_employees})
@@ -986,6 +996,8 @@ def _clarification_questions(missing: list[dict[str, Any]], unknown: list[dict[s
             questions.append(f"Уточните машину для сотрудников: {items}.")
         elif kind == "vehicle_drivers":
             questions.append(f"Уточните водителей/сотрудников для машин: {items}.")
+        elif kind == "unknown_vehicle_references":
+            questions.append(f"Машины не найдены в справочнике: {items}. Уточните одну из известных машин.")
     for block in unknown:
         items = ", ".join(str(item) for item in block.get("items", []) if str(item).strip())
         if not items:

@@ -127,6 +127,25 @@ def test_vehicle_store_upsert_employees(monkeypatch):
     assert any("SET active = FALSE" in sql for sql, _ in conn.calls)
 
 
+def test_vehicle_store_seed_default_vehicles_is_idempotent():
+    store = PostgresVehicleUsageStore("postgresql://fake")
+    conn = _FakeSyncConn()
+
+    store._seed_default_vehicles(conn)
+
+    insert_calls = [(sql, params) for sql, params in conn.calls if "INSERT INTO logistics.vehicles" in sql]
+    assert len(insert_calls) == 6
+    assert [params for _, params in insert_calls] == [
+        (1, "Авто 1"),
+        (2, "Авто 2"),
+        (3, "Авто 3"),
+        (4, "Авто 4"),
+        (5, "Авто 5"),
+        (6, "Авто 6"),
+    ]
+    assert all("ON CONFLICT (id) DO NOTHING" in sql for sql, _ in insert_calls)
+
+
 def test_vehicle_store_save_draft(monkeypatch):
     store = PostgresVehicleUsageStore("postgresql://fake")
     factory, conn = _sync_conn_factory(rows=[{"id": 42}])
@@ -390,7 +409,7 @@ def test_vehicle_store_auto_close_unanswered_day_uses_operator(monkeypatch):
     assert cancelled == {"report_date": "2026-07-16", "user_id": 13, "dialog_id": "13", "reason": "no response"}
 
 
-def test_vehicle_store_auto_close_unanswered_day_skips_pending_draft(monkeypatch):
+def test_vehicle_store_auto_close_unanswered_day_keeps_scheduled_pending_draft(monkeypatch):
     store = PostgresVehicleUsageStore("postgresql://fake")
     factory, _conn = _sync_conn_factory(
         rows=[
@@ -400,6 +419,7 @@ def test_vehicle_store_auto_close_unanswered_day_skips_pending_draft(monkeypatch
                 "user_id": 13,
                 "dialog_id": "13",
                 "status": "pending_clarification",
+                "source": "scheduled",
                 "parsed_json": json.dumps({"people": []}),
             }
         ]
@@ -411,6 +431,35 @@ def test_vehicle_store_auto_close_unanswered_day_skips_pending_draft(monkeypatch
     assert result["status"] == "skipped"
     assert result["reason"] == "useful_response_exists"
     assert result["request_status"] == "pending_clarification"
+
+
+def test_vehicle_store_auto_close_manual_pending_draft_finalizes_unknowns(monkeypatch):
+    store = PostgresVehicleUsageStore("postgresql://fake")
+    pending = {
+        "id": 10,
+        "request_date": "2026-07-16",
+        "user_id": 13,
+        "dialog_id": "13",
+        "status": "pending_clarification",
+        "source": "manual",
+        "parsed_json": json.dumps({"people": []}),
+    }
+    factory, _conn = _sync_conn_factory(rows=[pending])
+    monkeypatch.setattr(store, "_sync_connect", factory)
+    called = {}
+
+    def fake_finalize(**kwargs):
+        called.update(kwargs)
+        return {"status": "finalized_unknown", "report_date": kwargs["report_date"]}
+
+    monkeypatch.setattr(store, "finalize_pending_unknowns", fake_finalize)
+
+    result = store.auto_close_unanswered_day(report_date="2026-07-16", reason="no response")
+
+    assert result["status"] == "finalized_unknown"
+    assert result["reason"] == "pending_draft_finalized_at_day_close"
+    assert called["report_date"] == "2026-07-16"
+    assert called["actor_user_id"] == 13
 
 
 def test_bitrix_store_save_proposal(monkeypatch):
@@ -785,6 +834,42 @@ def test_orchestrator_store_schema_name():
 def test_bitrix_store_schema_name():
     store = PostgresBitrixAgentStore("postgresql://fake")
     assert store._SCHEMA == "bitrix24"
+
+
+def test_vehicle_store_auto_close_pending_draft_finalizes_unknowns(monkeypatch):
+    store = PostgresVehicleUsageStore("postgresql://fake")
+    pending = {
+        "id": 7,
+        "request_date": "2026-07-15",
+        "user_id": 13,
+        "dialog_id": "13",
+        "status": "pending_clarification",
+        "response_text": "частичный отчет",
+        "source": "manual",
+        "parsed_json": json.dumps({"date": "2026-07-15", "people": [], "vehicles": []}),
+    }
+    factory, conn = _sync_conn_factory(rows=[pending])
+    monkeypatch.setattr(store, "_sync_connect", factory)
+    called = {}
+
+    def fake_finalize(**kwargs):
+        called.update(kwargs)
+        return {"status": "finalized_unknown", "report_date": kwargs["report_date"]}
+
+    monkeypatch.setattr(store, "finalize_pending_unknowns", fake_finalize)
+
+    result = store.auto_close_unanswered_day(
+        report_date="2026-07-15",
+        reason="No complete vehicle usage response was received by cutoff.",
+    )
+
+    assert result["status"] == "finalized_unknown"
+    assert result["reason"] == "pending_draft_finalized_at_day_close"
+    assert called["report_date"] == "2026-07-15"
+    assert called["actor_user_id"] == 13
+    sql, params = conn.calls[0]
+    assert "FROM logistics.vehicle_usage_requests" in sql
+    assert params == ("2026-07-15",)
 
 
 def test_vehicle_store_schema_name():
