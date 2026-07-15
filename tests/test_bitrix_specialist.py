@@ -641,6 +641,7 @@ def test_bitrix_llm_does_not_route_ambiguous_operator_panel_request(monkeypatch)
     assert result.raw == {"source": "unsupported_vehicle_usage_route"}
     assert result.decision.status == "needs_clarification"
     assert "Bitrix" in result.decision.answer
+    assert "Логист" in result.decision.answer
     assert "машинам и людям" in result.decision.answer
     assert [call.name for call in result.decision.tool_calls] == ["none"]
 
