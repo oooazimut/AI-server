@@ -13,7 +13,7 @@ import asyncio
 import logging
 import signal
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 from ai_server.agent_scheduler import AgentScheduler
@@ -22,6 +22,7 @@ from ai_server.agents.diagnost import DiagnostLLMService
 from ai_server.agents.kartoteka.llm import KartotekaLLMService
 from ai_server.agents.logistics import LogisticsLLMService
 from ai_server.agents.logistics.specialist import VehicleUsageSettings
+from ai_server.agents.logistics.tools.vehicle_save import DEFAULT_START_MESSAGE
 from ai_server.agents.pto import PtoLLMService
 from ai_server.attachments import AttachmentService
 from ai_server.channels.bitrix import BitrixChatChannel
@@ -39,7 +40,7 @@ from ai_server.integrations.redis.diagnost_queue import RedisDiagnostQueue
 from ai_server.integrations.redis.dialog_guard import RedisDialogGuard
 from ai_server.integrations.redis.event_queue import RedisEventQueue
 from ai_server.llm import build_orchestrator_llm_client
-from ai_server.models import AgentTask, UserContext
+from ai_server.models import AgentTask
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.orchestrators.orchestrator_llm import OrchestratorLLMService
 from ai_server.registry import load_agent_manifests
@@ -200,38 +201,74 @@ async def main() -> None:
 
         if settings.scheduler_enabled and settings.vehicle_usage_enabled:
             _vu_store_ref = vehicle_usage_store
-            _orch_ref = orchestrator
             _fallback_operator_ids = frozenset(settings.resolved_vehicle_usage_allowed_user_ids)
             _dry_run = settings.vehicle_usage_dry_run
 
-            async def _run_morning_for_operator(started_at: datetime, operator_id: int) -> None:
-                recipient_id = str(operator_id)
-                task = AgentTask(
-                    task_id=f"scheduled_vu_{operator_id}_{uuid4().hex[:8]}",
-                    user=UserContext(id=recipient_id, raw={"dialog_id": recipient_id}),
-                    request="vehicle_usage_morning",
-                    context={
-                        "channel_id": "bitrix24",
-                        "recipient_id": recipient_id,
-                        "dialog_id": recipient_id,
-                        "event": "vehicle_usage_morning",
-                        "started_at": started_at.isoformat(),
-                        "reminder_count": 0,
-                    },
+            def _vehicle_usage_reminder_run_date(started_at: datetime, reminder_count: int) -> datetime:
+                delays = settings.resolved_vehicle_usage_reminder_delays_minutes or (
+                    settings.vehicle_usage_reminder_interval_minutes,
                 )
-                result = await _orch_ref.handle(task)
-                if result.answer and _vu_store_ref is not None and not _dry_run:
+                index = max(0, min(reminder_count - 1, len(delays) - 1))
+                return started_at + timedelta(minutes=delays[index])
+
+            def _vehicle_usage_message(reminder_count: int) -> str:
+                if reminder_count <= 0:
+                    return DEFAULT_START_MESSAGE
+                return (
+                    f"Напоминание #{reminder_count}. Пожалуйста, отправьте отчет по машинам и людям за сегодня: "
+                    "кто работает, кто выходной/болеет/в отпуске, кто на какой машине, "
+                    "и какие машины свободны, на ремонте или не работают."
+                )
+
+            def _vehicle_usage_request_is_closed(started_at: datetime, operator_id: int) -> bool:
+                if _vu_store_ref is None:
+                    return False
+                request = _vu_store_ref.get_request(
+                    request_date=started_at.date().isoformat(),
+                    user_id=operator_id,
+                )
+                status = str((request or {}).get("status") or "").strip()
+                return status in {"answered", "cancelled_day_off"}
+
+            def _schedule_vehicle_usage_reminder(started_at: datetime, operator_id: int, reminder_count: int) -> None:
+                if reminder_count > settings.vehicle_usage_max_reminders:
+                    return
+                run_date = _vehicle_usage_reminder_run_date(started_at, reminder_count)
+                job_id = f"vu_reminder_{started_at.date().isoformat()}_{operator_id}"
+
+                async def _run_reminder() -> None:
+                    if _vehicle_usage_request_is_closed(started_at, operator_id):
+                        return
+                    await _send_vehicle_usage_message(started_at, operator_id, reminder_count=reminder_count)
+                    _schedule_vehicle_usage_reminder(started_at, operator_id, reminder_count + 1)
+
+                scheduler.add_job_at("logistics", job_id, _run_reminder, run_date, replace_existing=True)
+
+            async def _send_vehicle_usage_message(
+                started_at: datetime,
+                operator_id: int,
+                *,
+                reminder_count: int,
+            ) -> None:
+                recipient_id = str(operator_id)
+                message = _vehicle_usage_message(reminder_count)
+                await bitrix_channel.send(recipient_id, message)
+                if _vu_store_ref is not None and not _dry_run:
                     _vu_store_ref.create_sent_request(
                         SentRequestData(
                             request_date=started_at.date().isoformat(),
                             user_id=operator_id,
                             dialog_id=recipient_id,
-                            message=result.answer,
-                            sent_at=started_at.isoformat(),
-                            reminder_count=0,
-                            source="scheduled",
+                            message=message,
+                            sent_at=datetime.now(MOSCOW_TZ).isoformat(),
+                            reminder_count=reminder_count,
+                            source="scheduled" if reminder_count <= 0 else "scheduled_reminder",
                         )
                     )
+
+            async def _run_morning_for_operator(started_at: datetime, operator_id: int) -> None:
+                await _send_vehicle_usage_message(started_at, operator_id, reminder_count=0)
+                _schedule_vehicle_usage_reminder(started_at, operator_id, reminder_count=1)
 
             async def _run_morning() -> None:
                 started_at = datetime.now(MOSCOW_TZ)

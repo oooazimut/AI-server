@@ -338,8 +338,10 @@ class VehicleSaveReportTool:
         employee_requires_vehicle_ids: set[int] = set()
         for entry in _staff_entries(parsed):
             employee_id = optional_int(entry.get("staff_order")) or employees_by_name.get(
-                str(entry.get("full_name") or "").casefold()
+                _norm_name(entry.get("full_name") or entry.get("name"))
             )
+            if employee_id is None:
+                employee_id = _employee_id_by_name(entry.get("full_name") or entry.get("name"), employees_by_name)
             if employee_id is None:
                 continue
             if _status_requires_vehicle(entry.get("status")):
@@ -425,6 +427,7 @@ class VehicleSaveReportTool:
             vehicle_assignments=vehicle_assignments,
             actor_user_id=user_id,
         )
+        vehicles_saved = len({vehicle_id for vehicle_id, _driver_id, _status, _notes in vehicle_assignments})
         return ToolResult(
             status=ToolStatus.OK,
             tool="vehicle_usage_save_report",
@@ -432,6 +435,7 @@ class VehicleSaveReportTool:
                 "request_id": request_id,
                 "request_date": request_date,
                 "staff_entries_saved": len(employee_statuses),
+                "vehicles_saved": vehicles_saved,
                 "vehicle_assignments_saved": len(vehicle_assignments),
             },
         )
@@ -774,10 +778,59 @@ def _driver_ids(entry: dict[str, Any], employees_by_name: dict[str, int]) -> lis
         raw_drivers = [entry.get("driver") or entry.get("employee_name")]
     result: list[int] = []
     for raw_name in raw_drivers:
-        employee_id = employees_by_name.get(_norm_name(raw_name))
+        employee_id = _employee_id_by_name(raw_name, employees_by_name)
         if employee_id is not None and employee_id not in result:
             result.append(employee_id)
     return result
+
+
+def _employee_id_by_name(raw_name: Any, employees_by_name: dict[str, int]) -> int | None:
+    normalized = _norm_name(raw_name)
+    if not normalized:
+        return None
+    direct = employees_by_name.get(normalized)
+    if direct is not None:
+        return direct
+    raw_tokens = normalized.split()
+    best: tuple[int, int] | None = None
+    for candidate, employee_id in employees_by_name.items():
+        candidate_tokens = candidate.split()
+        if not candidate_tokens:
+            continue
+        matched = sum(1 for token in raw_tokens if any(_name_token_close(token, known) for known in candidate_tokens))
+        required = len(raw_tokens) if len(raw_tokens) <= 2 else 2
+        if matched < required:
+            continue
+        score = matched * 100 - abs(len(candidate) - len(normalized))
+        if best is None or score > best[0]:
+            best = (score, employee_id)
+    return best[1] if best is not None else None
+
+
+def _name_token_close(left: str, right: str) -> bool:
+    if left == right or left.startswith(right) or right.startswith(left):
+        return True
+    if min(len(left), len(right)) < 4:
+        return False
+    return _levenshtein_distance_limited(left, right, 1) <= 1
+
+
+def _levenshtein_distance_limited(left: str, right: str, limit: int) -> int:
+    if abs(len(left) - len(right)) > limit:
+        return limit + 1
+    previous = list(range(len(right) + 1))
+    for i, left_char in enumerate(left, start=1):
+        current = [i]
+        row_min = current[0]
+        for j, right_char in enumerate(right, start=1):
+            cost = 0 if left_char == right_char else 1
+            value = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost)
+            current.append(value)
+            row_min = min(row_min, value)
+        if row_min > limit:
+            return limit + 1
+        previous = current
+    return previous[-1]
 
 
 def _augment_vehicle_assignments_from_text(

@@ -314,6 +314,7 @@ def test_logistics_llm_compose_formats_save_report_without_llm(monkeypatch):
                         "request_date": "2026-07-08",
                         "staff_entries_saved": 11,
                         "vehicle_assignments_saved": 8,
+                        "vehicles_saved": 6,
                     },
                 )
             ],
@@ -323,7 +324,8 @@ def test_logistics_llm_compose_formats_save_report_without_llm(monkeypatch):
     assert not client.calls
     assert "Финальный отчет по машинам за 2026-07-08 сохранен" in result.answer
     assert "сотрудники: 11" in result.answer
-    assert "машины: 8" in result.answer
+    assert "машины: 6" in result.answer
+    assert "машины: 8" not in result.answer
 
 
 def test_logistics_llm_compose_formats_incomplete_save_report_without_llm(monkeypatch):
@@ -1226,6 +1228,115 @@ def test_morning_task_schedules_reminder(monkeypatch):
     assert sched.task.context["channel_id"] == "bitrix24"
     assert sched.task.context["recipient_id"] == "chat77"
     assert sched.task.context["reminder_count"] == 1
+
+
+def test_logistics_compose_prioritizes_save_report_over_operator_lookup(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    manifest = get_agent_manifest("logistics")
+    assert manifest is not None
+    service = LogisticsLLMService(RecordingLLMClient('{"status":"completed","answer":"wrong"}'))
+
+    result = anyio_run(
+        service.compose(
+            manifest=manifest,
+            task=AgentTask(task_id="save", request="отчет"),
+            decision=LogisticsLLMDecision(status="completed", answer="", tool_calls=[]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="vehicle_usage_get_operators",
+                    data={"operators": [{"user_id": 13, "full_name": "Коверга Дмитрий"}]},
+                ),
+                ToolResult(
+                    status="ok",
+                    tool="vehicle_usage_save_report",
+                    data={
+                        "request_date": "2026-07-16",
+                        "staff_entries_saved": 11,
+                        "vehicles_saved": 6,
+                        "vehicle_assignments_saved": 7,
+                    },
+                ),
+            ],
+        )
+    )
+
+    assert result.status == "completed"
+    assert "Финальный отчет по машинам за 2026-07-16 сохранен." in result.answer
+    assert "Операторы отчета" not in result.answer
+
+
+def test_vehicle_usage_save_report_matches_minor_employee_name_typos(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    store = FakeVehicleUsageStore()
+    store.upsert_employees([StaffMember(order=8, user_id=29, name="Никаненок Алексейи")])
+    tool = VehicleSaveReportTool(store, allowed_user_ids=frozenset({13}))
+
+    result = anyio_run(
+        tool.execute(
+            {
+                "request_date": "2026-07-16",
+                "source_text": "Никоненок Авто 3",
+                "parsed": {
+                    "date": "2026-07-16",
+                    "people": [{"full_name": "Никаненок Алексей", "status": "На авто"}],
+                    "vehicles": [
+                        {"vehicle_name": "Авто 1", "status": "idle", "drivers": []},
+                        {"vehicle_name": "Авто 2", "status": "idle", "drivers": []},
+                        {"vehicle_name": "Авто 3", "status": "in_use", "drivers": ["Никоненок Алексей"]},
+                    ],
+                },
+            },
+            user_id=13,
+            dialog_id="13",
+        )
+    )
+
+    assert result.status == "ok"
+    assert not result.data.get("needs_clarification")
+    assert result.data["vehicle_assignments_saved"] == 3
+
+
+def test_vehicle_usage_save_report_counts_unique_vehicles_separately(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    store = FakeVehicleUsageStore()
+    store.upsert_employees(
+        [
+            StaffMember(order=1, name="Борисов Андрей", user_id=27),
+            StaffMember(order=2, name="Карасев Алексей", user_id=25),
+        ]
+    )
+    store._vehicles = [{"id": 2, "brand_model": "Авто 2", "registration_number": ""}]
+    tool = VehicleSaveReportTool(store, allowed_user_ids=frozenset({13}))
+
+    result = anyio_run(
+        tool.execute(
+            {
+                "request_date": "2026-07-16",
+                "source_text": "Борисов и Карасев Авто 2",
+                "parsed": {
+                    "date": "2026-07-16",
+                    "people": [
+                        {"full_name": "Борисов Андрей", "status": "worked"},
+                        {"full_name": "Карасев Алексей", "status": "worked"},
+                    ],
+                    "vehicles": [
+                        {
+                            "vehicle_name": "Авто 2",
+                            "status": "in_use",
+                            "drivers": ["Борисов Андрей", "Карасев Алексей"],
+                        }
+                    ],
+                },
+            },
+            user_id=13,
+            dialog_id="13",
+        )
+    )
+
+    assert result.status == "ok"
+    assert result.data["vehicles_saved"] == 1
+    assert result.data["vehicle_assignments_saved"] == 2
 
 
 def test_reminder_increments_count(monkeypatch):

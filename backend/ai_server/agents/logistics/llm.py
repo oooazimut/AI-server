@@ -158,6 +158,32 @@ class LogisticsLLMService:
         tool_results: list[ToolResult],
         approval_actions: list[dict[str, Any]] | None = None,
     ) -> LogisticsLLMFinalResult:
+        save_answer = _compose_save_report_answer(tool_results)
+        if save_answer is not None:
+            return LogisticsLLMFinalResult(
+                status="needs_clarification" if _save_report_needs_clarification(tool_results) else "completed",
+                answer=save_answer,
+                model_usage=ModelUsageRecord(
+                    agent_id=manifest.id,
+                    provider="",
+                    model="",
+                    status="skipped",
+                    notes=["deterministic_vehicle_usage_save_report"],
+                ),
+            )
+        update_answer = _compose_update_report_answer(tool_results)
+        if update_answer is not None:
+            return LogisticsLLMFinalResult(
+                status="completed",
+                answer=update_answer,
+                model_usage=ModelUsageRecord(
+                    agent_id=manifest.id,
+                    provider="",
+                    model="",
+                    status="skipped",
+                    notes=["deterministic_vehicle_usage_update_report"],
+                ),
+            )
         operators_answer = _compose_operators_answer(tool_results)
         if operators_answer is not None:
             return LogisticsLLMFinalResult(
@@ -208,32 +234,6 @@ class LogisticsLLMService:
                     model="",
                     status="skipped",
                     notes=["deterministic_vehicle_usage_period_report"],
-                ),
-            )
-        save_answer = _compose_save_report_answer(tool_results)
-        if save_answer is not None:
-            return LogisticsLLMFinalResult(
-                status="needs_clarification" if _save_report_needs_clarification(tool_results) else "completed",
-                answer=save_answer,
-                model_usage=ModelUsageRecord(
-                    agent_id=manifest.id,
-                    provider="",
-                    model="",
-                    status="skipped",
-                    notes=["deterministic_vehicle_usage_save_report"],
-                ),
-            )
-        update_answer = _compose_update_report_answer(tool_results)
-        if update_answer is not None:
-            return LogisticsLLMFinalResult(
-                status="completed",
-                answer=update_answer,
-                model_usage=ModelUsageRecord(
-                    agent_id=manifest.id,
-                    provider="",
-                    model="",
-                    status="skipped",
-                    notes=["deterministic_vehicle_usage_update_report"],
                 ),
             )
         completion = await self.client.complete(
@@ -573,7 +573,7 @@ def _compose_save_report_answer(tool_results: list[ToolResult]) -> str | None:
             lines.extend(["", "Уточните только эти пункты."])
             return "\n".join(lines)
         staff_count = int(data.get("staff_entries_saved") or 0)
-        vehicle_count = int(data.get("vehicle_assignments_saved") or 0)
+        vehicle_count = int(data.get("vehicles_saved") or data.get("vehicle_assignments_saved") or 0)
         lines = [f"Финальный отчет по машинам за {report_date} сохранен."]
         details = []
         if staff_count:
