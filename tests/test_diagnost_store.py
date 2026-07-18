@@ -76,6 +76,21 @@ def test_save_event_inserts_row():
     assert "ON CONFLICT" in joined
 
 
+def test_save_trace_snapshot_updates_canonical_event():
+    store = _store()
+    db = AsyncMock()
+    db.__aenter__ = AsyncMock(return_value=db)
+    db.__aexit__ = AsyncMock(return_value=False)
+    db.execute = AsyncMock()
+
+    with patch.object(store, "_connect", AsyncMock(return_value=db)):
+        _run(store.save_trace_snapshot("ev-1", [{"trace_type": "inbound_message"}]))
+
+    sql = db.execute.call_args.args[0]
+    assert "trace_snapshot" in sql
+    assert "trace_captured_at" in sql
+
+
 # ── save_incident ──────────────────────────────────────────────────────────────
 
 

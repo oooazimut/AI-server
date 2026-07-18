@@ -137,6 +137,21 @@ def test_diagnost_can_be_disabled(monkeypatch):
     assert settings.diagnost_enabled is False
 
 
+def test_diagnost_trace_is_on_and_feedback_is_off_by_default(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.delenv("DIAGNOST_FEEDBACK_ENABLED", raising=False)
+    monkeypatch.delenv("DIAGNOST_TRACE_SNAPSHOT_ENABLED", raising=False)
+    monkeypatch.delenv("CONVERSATION_TRACE_ENABLED", raising=False)
+    monkeypatch.delenv("LEARNING_EVENTS_ENABLED", raising=False)
+
+    settings = get_settings()
+
+    assert settings.diagnost_feedback_enabled is False
+    assert settings.diagnost_trace_snapshot_enabled is True
+    assert settings.conversation_trace_enabled is True
+    assert settings.learning_events_enabled is False
+
+
 def test_bitrix_oauth_urls_are_resolved(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://ai.example.com")

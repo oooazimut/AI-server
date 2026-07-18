@@ -365,7 +365,7 @@ async def main() -> None:
             "errors": 0,
             "last_error": None,
         }
-        feedback_receiver = FeedbackReceiverAdapter(diagnost_store)
+        feedback_receiver = FeedbackReceiverAdapter(diagnost_store) if settings.diagnost_feedback_enabled else None
         agent_tasks.append(
             asyncio.create_task(
                 run_webhook_event_worker(
@@ -416,8 +416,21 @@ async def main() -> None:
                 )
         agent_tasks.append(asyncio.create_task(portal_search_indexer.run(agent_queue)))
         if settings.diagnost_enabled:
-            agent_tasks.append(asyncio.create_task(run_diagnost_event_worker(diagnost_queue, diagnost_store)))
-            agent_tasks.append(asyncio.create_task(run_feedback_scheduler_worker(diagnost_store, bitrix)))
+            agent_tasks.append(
+                asyncio.create_task(
+                    run_diagnost_event_worker(
+                        diagnost_queue,
+                        diagnost_store,
+                        conversation_trace=conversation_trace,
+                        feedback_enabled=settings.diagnost_feedback_enabled,
+                        trace_snapshot_enabled=settings.diagnost_trace_snapshot_enabled,
+                        trace_settle_seconds=settings.diagnost_trace_settle_seconds,
+                        high_latency_ms=settings.diagnost_high_latency_ms,
+                    )
+                )
+            )
+            if settings.diagnost_feedback_enabled:
+                agent_tasks.append(asyncio.create_task(run_feedback_scheduler_worker(diagnost_store, bitrix)))
         else:
             logger.info("Diagnost workers disabled by DIAGNOST_ENABLED=false")
 
