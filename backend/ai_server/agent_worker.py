@@ -112,6 +112,10 @@ async def main() -> None:
 
     diagnost_store = PostgresDiagnostStore(settings.database_url)
     await diagnost_store.ensure_schema()
+    if not settings.diagnost_feedback_enabled:
+        cancelled_feedback = await diagnost_store.cancel_pending_feedback()
+        if cancelled_feedback:
+            logger.info("Diagnost feedback disabled: cancelled %d pending prompts", cancelled_feedback)
 
     portal_search_indexer = PortalSearchIndexerWorker(
         bitrix,

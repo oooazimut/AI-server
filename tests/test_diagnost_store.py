@@ -91,6 +91,24 @@ def test_save_trace_snapshot_updates_canonical_event():
     assert "trace_captured_at" in sql
 
 
+def test_cancel_pending_feedback_updates_only_pending_rows():
+    store = _store()
+    db = AsyncMock()
+    db.__aenter__ = AsyncMock(return_value=db)
+    db.__aexit__ = AsyncMock(return_value=False)
+    cursor = AsyncMock()
+    cursor.rowcount = 3
+    db.execute = AsyncMock(return_value=cursor)
+
+    with patch.object(store, "_connect", AsyncMock(return_value=db)):
+        count = _run(store.cancel_pending_feedback())
+
+    assert count == 3
+    sql = db.execute.call_args.args[0]
+    assert "status = 'cancelled'" in sql
+    assert "status = 'pending'" in sql
+
+
 # ── save_incident ──────────────────────────────────────────────────────────────
 
 

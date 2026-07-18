@@ -120,6 +120,14 @@ class PostgresDiagnostStore(PostgresAgentSchema):
                 (_jsonb(trace), event_id),
             )
 
+    async def cancel_pending_feedback(self) -> int:
+        """Prevent old unsent prompts from resurfacing while feedback is disabled."""
+        async with await self._connect() as db:
+            cur = await db.execute(
+                "UPDATE diagnost.pending_feedback SET status = 'cancelled' WHERE status = 'pending'"
+            )
+            return int(cur.rowcount or 0)
+
     async def save_event(self, task: AgentTask, result: AgentResult, *, source: str = "orchestrator") -> None:
         user_id = str(task.user.id) if task.user and task.user.id is not None else None
         channel = task.user.channel if task.user else None

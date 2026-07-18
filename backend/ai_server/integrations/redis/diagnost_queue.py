@@ -14,6 +14,7 @@ _PREFIX = "ai_server:dq"
 _PROCESSING_TTL = 300
 _MAX_NACK_RETRIES = 3
 _DATA_TTL = 3600 * 48
+_MISSING_DATA_SCAN_LIMIT = 100
 
 
 def _pending_key() -> str:
@@ -60,21 +61,22 @@ class RedisDiagnostQueue:
                 pipe.zadd(_pending_key(), {sid: time.time()})
             await pipe.execute()
 
-        results = await r.zpopmin(_pending_key(), 1)
-        if not results:
-            return None
-        msg_id = str(results[0][0])
-        await r.zadd(_processing_key(), {msg_id: time.time()})
-        raw = await r.get(_data_key(msg_id))
-        if raw is None:
-            await r.zrem(_processing_key(), msg_id)
-            return None
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            logger.warning("RedisDiagnostQueue: invalid JSON for message %s", msg_id)
-            await r.zrem(_processing_key(), msg_id)
-            return None
+        for _ in range(_MISSING_DATA_SCAN_LIMIT):
+            results = await r.zpopmin(_pending_key(), 1)
+            if not results:
+                return None
+            msg_id = str(results[0][0])
+            await r.zadd(_processing_key(), {msg_id: time.time()})
+            raw = await r.get(_data_key(msg_id))
+            if raw is None:
+                await r.zrem(_processing_key(), msg_id)
+                continue
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                logger.warning("RedisDiagnostQueue: invalid JSON for message %s", msg_id)
+                await r.zrem(_processing_key(), msg_id)
+        return None
 
     async def ack(self, msg_id: str) -> None:
         r = await self._get_client()
