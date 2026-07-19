@@ -142,7 +142,9 @@ class CallSpecialistTool:
 
     async def execute_with_task(self, args: dict[str, Any], *, task: AgentTask) -> ToolResult:
         specialist_id = str(args.get("specialist_id") or "").strip()
-        request = str(args.get("request") or "").strip()
+        planned_request = str(args.get("request") or "").strip()
+        original_request = str(task.context.get("t0006_original_request") or "").strip()
+        request = original_request or planned_request
 
         specialist = self._specialists.get(specialist_id)
         if specialist is None:
@@ -153,7 +155,16 @@ class CallSpecialistTool:
             )
 
         dialog_key = str(task.context.get("dialog_key") or "") or None
-        sub_task = task.model_copy(update={"request": request})
+        sub_task = task.model_copy(update={
+            "request": request,
+            "context": {
+                **task.context,
+                "t0006_effective_specialist_request": request,
+                "t0006_planned_subtask_request": str(
+                    task.context.get("t0006_planned_subtask_request") or planned_request
+                ),
+            },
+        })
         try:
             sr = await specialist.handle(sub_task)
         except Exception as exc:

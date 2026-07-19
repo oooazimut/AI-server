@@ -85,13 +85,13 @@ class _Specialist:
         return self.result
 
 
-def _live_subject(result):
+def _live_subject(result, *, planner=None):
     specialist = _Specialist(result)
     specialist_manifest = AgentManifest(id="bitrix24", name="Битрикс", kind="specialist", description="test")
     call = CallSpecialistTool({"bitrix24": specialist}, [specialist_manifest])
     orchestrator = PlanAuthoritativeOrchestrator(
         AgentManifest(id="internal_orchestrator", name="Оркестр", kind="orchestrator", description="test"),
-        agent_tools=[call], planner=_Planner(), llm=_Planner(),
+        agent_tools=[call], planner=planner or _Planner(), llm=planner or _Planner(),
     )
     return orchestrator, specialist
 
@@ -118,3 +118,34 @@ def test_handle_preserves_approval_and_needs_human_state():
     output = asyncio.run(subject.handle(AgentTask(task_id="t1", request="склад")))
     assert output.status == "needs_human"
     assert [item.name for item in output.actions_requiring_approval] == ["write"]
+
+
+class _RephrasingPlanner(_Planner):
+    async def plan(self, *, task, constraints, **kwargs):
+        return _plan(
+            task.request,
+            plan_id=constraints["plan_id"],
+            subtasks=[{"subtask_id": "s1", "specialist_id": "bitrix24", "request": "planner-shortened-input"}],
+        ), ModelUsageRecord(agent_id="test", provider="test", model="test")
+
+
+@pytest.mark.parametrize(
+    "original_request",
+    [
+        "Битрикс найди проект Ларгус-2.",
+        "Битрикс найди проект Ларгус 2.",
+        "Битрикс создай задачу на меня: подготовить тестовый отчет. Не создавай сразу.",
+        "Битрикс отмени черновик задачи.",
+        "Битрикс создай задачу в проекте Ларгус-2 на меня: проверить документы. Не создавай сразу.",
+    ],
+)
+def test_handle_preserves_verbatim_request_for_validated_bitrix_specialist(original_request):
+    subject, specialist = _live_subject(AgentResult(status="completed", agent_id="bitrix24", answer="ready"), planner=_RephrasingPlanner())
+
+    asyncio.run(subject.handle(AgentTask(task_id="t1", request=original_request, context={"dialog_key": "d1", "dialog_id": "chat1"})))
+
+    received = specialist.tasks[0]
+    assert received.request == original_request
+    assert received.context["t0006_original_request"] == original_request
+    assert received.context["t0006_effective_specialist_request"] == original_request
+    assert received.context["t0006_planned_subtask_request"] == "planner-shortened-input"

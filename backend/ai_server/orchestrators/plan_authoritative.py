@@ -238,6 +238,12 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                 "t0006_response_hash": response_hash,
                 "t0006_subtask_id": subtask.subtask_id,
                 "t0006_attempt_id": attempt_id,
+                # The planner is authorized to choose a specialist, never to
+                # silently rewrite the user's request seen by that specialist.
+                # Keep both values for causal audit while dispatching the
+                # original, validated dialog-bound request.
+                "t0006_original_request": task.request,
+                "t0006_planned_subtask_request": subtask.request,
             }})
             value = await call.execute_with_task(
                 {"specialist_id": subtask.specialist_id, "request": subtask.request}, task=correlated_task
