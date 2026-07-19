@@ -41,7 +41,7 @@ from ai_server.integrations.redis.event_queue import RedisEventQueue
 from ai_server.llm import build_orchestrator_llm_client
 from ai_server.models import AgentTask, UserContext
 from ai_server.orchestrators.internal import InternalOrchestrator
-from ai_server.orchestrators.orchestrator_llm import OrchestratorLLMService
+from ai_server.orchestrators.plan_authoritative import DeepSeekPlanService
 from ai_server.registry import load_agent_manifests
 from ai_server.runtime import ensure_runtime_dirs
 from ai_server.settings import get_settings
@@ -171,7 +171,7 @@ async def main() -> None:
             bitrix_oauth=bitrix_oauth,
             bitrix_bot=bitrix,
             scheduler=scheduler,
-            orchestrator_llm=OrchestratorLLMService(build_orchestrator_llm_client(settings)),
+            orchestrator_llm=DeepSeekPlanService(build_orchestrator_llm_client(settings)),
             orchestrator_store=orchestrator_store,
             bitrix_llm=bitrix_llm_svc,
             bitrix_store=bitrix_store,

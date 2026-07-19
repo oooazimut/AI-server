@@ -273,6 +273,22 @@ class InternalOrchestrator(BaseSpecialist):
         result_publisher: ResultPublisherPort | None = None,
         **specialist_deps: Any,
     ) -> InternalOrchestrator:
+        # S04 staging runtime is plan-authoritative.  The legacy BaseSpecialist
+        # decision loop is not retained as a fallback when this planner is wired.
+        if hasattr(orchestrator_llm, "plan") and hasattr(orchestrator_llm, "finalize"):
+            from ai_server.orchestrators.plan_authoritative import PlanAuthoritativeOrchestrator
+
+            return PlanAuthoritativeOrchestrator.build(
+                manifest,
+                manifests=manifests,
+                orchestrator_llm=orchestrator_llm,
+                orchestrator_store=orchestrator_store,
+                orchestrator_retriever=orchestrator_retriever,
+                channels=channels,
+                footer_service=footer_service,
+                result_publisher=result_publisher,
+                **specialist_deps,
+            )
         _manifests = manifests or []
         if not specialist_deps.get("bitrix_bot"):
             specialist_deps["bitrix_bot"] = specialist_deps.get("bitrix_client")
