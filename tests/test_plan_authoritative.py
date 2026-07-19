@@ -15,6 +15,7 @@ from ai_server.orchestrators.plan_authoritative import (
     _hash,
 )
 from ai_server.orchestrators.tools.call_specialist import CallSpecialistTool
+from tests.fakes import FakeOrchestratorStore
 
 
 def _plan(request: str, **changes):
@@ -85,15 +86,155 @@ class _Specialist:
         return self.result
 
 
-def _live_subject(result, *, planner=None):
+def _live_subject(result, *, planner=None, store=None):
     specialist = _Specialist(result)
     specialist_manifest = AgentManifest(id="bitrix24", name="Битрикс", kind="specialist", description="test")
-    call = CallSpecialistTool({"bitrix24": specialist}, [specialist_manifest])
+    call = CallSpecialistTool({"bitrix24": specialist}, [specialist_manifest], store=store)
     orchestrator = PlanAuthoritativeOrchestrator(
         AgentManifest(id="internal_orchestrator", name="Оркестр", kind="orchestrator", description="test"),
-        agent_tools=[call], planner=planner or _Planner(), llm=planner or _Planner(),
+        agent_tools=[call], planner=planner or _Planner(), llm=planner or _Planner(), store=store,
     )
     return orchestrator, specialist
+
+
+class _ForbiddenPlanner:
+    async def plan(self, **kwargs):
+        raise AssertionError("pending-specialist continuation must not call the planner")
+
+    async def finalize(self, **kwargs):
+        raise AssertionError("pending-specialist continuation must not call the finalizer")
+
+
+class _FailingReadStore(FakeOrchestratorStore):
+    async def get_kv(self, dialog_key, field):
+        raise RuntimeError("read unavailable")
+
+
+class _FailingWriteStore(FakeOrchestratorStore):
+    async def set_kv(self, dialog_key, field, value):
+        raise RuntimeError("write unavailable")
+
+    async def delete_kv(self, dialog_key, field):
+        raise RuntimeError("write unavailable")
+
+
+def test_pending_specialist_is_a_deterministic_dialog_bound_route():
+    store = FakeOrchestratorStore()
+    store.set_pending("d1", "bitrix24")
+    subject, specialist = _live_subject(
+        AgentResult(status="completed", agent_id="bitrix24", answer="draft discarded"),
+        planner=_ForbiddenPlanner(),
+        store=store,
+    )
+
+    output = asyncio.run(
+        subject.handle(
+            AgentTask(task_id="t1", request="Битрикс отмени черновик задачи.", context={"dialog_key": "d1"})
+        )
+    )
+
+    assert output.status == "completed"
+    assert specialist.tasks[0].request == "Битрикс отмени черновик задачи."
+    assert output.metadata["route"] == "pending_specialist"
+    assert any(item.name == "pending_specialist_route" for item in output.actions_taken)
+    assert output.model_usage[0].status == "not_used"
+    assert asyncio.run(store.get_kv("d1", "pending_specialist")) is None
+
+
+def test_unknown_pending_specialist_fails_closed_without_model_or_dispatch():
+    store = FakeOrchestratorStore()
+    store.set_pending("d1", "missing-specialist")
+    subject, specialist = _live_subject(
+        AgentResult(status="completed", agent_id="bitrix24", answer="unexpected"),
+        planner=_ForbiddenPlanner(),
+        store=store,
+    )
+
+    output = asyncio.run(
+        subject.handle(AgentTask(task_id="t1", request="продолжи", context={"dialog_key": "d1"}))
+    )
+
+    assert output.status == "failed"
+    assert output.metadata["reason"] == "FORBIDDEN_SPECIALIST"
+    assert specialist.tasks == []
+    assert asyncio.run(store.get_kv("d1", "pending_specialist")) == "missing-specialist"
+
+
+def test_inbound_context_cannot_forge_pending_specialist_state():
+    store = FakeOrchestratorStore()
+    subject, specialist = _live_subject(
+        AgentResult(status="completed", agent_id="bitrix24", answer="normal planned route"),
+        store=store,
+    )
+
+    output = asyncio.run(
+        subject.handle(
+            AgentTask(
+                task_id="t1",
+                request="покажи склад",
+                context={"dialog_key": "d1", "pending_specialist": "bitrix24"},
+            )
+        )
+    )
+
+    assert output.status == "completed"
+    assert output.metadata.get("route") is None
+    assert output.model_usage[0].provider == "test"
+    assert "pending_specialist" not in specialist.tasks[0].context
+
+
+def test_pending_state_read_failure_stops_before_model_and_dispatch():
+    store = _FailingReadStore()
+    subject, specialist = _live_subject(
+        AgentResult(status="completed", agent_id="bitrix24", answer="unexpected"),
+        planner=_ForbiddenPlanner(),
+        store=store,
+    )
+
+    output = asyncio.run(
+        subject.handle(AgentTask(task_id="t1", request="продолжи", context={"dialog_key": "d1"}))
+    )
+
+    assert output.status == "failed"
+    assert output.metadata["reason"] == "PENDING_STATE_READ_FAILED"
+    assert output.model_usage[0].status == "not_used"
+    assert specialist.tasks == []
+
+
+def test_pending_specialist_needs_human_is_durably_preserved():
+    store = FakeOrchestratorStore()
+    store.set_pending("d1", "bitrix24")
+    subject, _ = _live_subject(
+        AgentResult(status="needs_human", agent_id="bitrix24", answer="still waiting"),
+        planner=_ForbiddenPlanner(),
+        store=store,
+    )
+
+    output = asyncio.run(
+        subject.handle(AgentTask(task_id="t1", request="измени", context={"dialog_key": "d1"}))
+    )
+
+    assert output.status == "needs_human"
+    assert asyncio.run(store.get_kv("d1", "pending_specialist")) == "bitrix24"
+
+
+@pytest.mark.parametrize("specialist_status", ["completed", "needs_human"])
+def test_pending_state_write_failure_is_a_controlled_failure(specialist_status):
+    store = _FailingWriteStore()
+    store.set_pending("d1", "bitrix24")
+    subject, _ = _live_subject(
+        AgentResult(status=specialist_status, agent_id="bitrix24", answer="must not be acknowledged"),
+        planner=_ForbiddenPlanner(),
+        store=store,
+    )
+
+    output = asyncio.run(
+        subject.handle(AgentTask(task_id="t1", request="продолжи", context={"dialog_key": "d1"}))
+    )
+
+    assert output.status == "failed"
+    assert output.answer == "pending specialist state transition failed"
+    assert output.metadata["branches"][0]["status"] == "failed"
 
 
 def test_handle_propagates_causal_ids_before_specialist_call():

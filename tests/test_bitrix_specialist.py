@@ -2292,6 +2292,37 @@ def test_bitrix_llm_decide_routes_project_draft_discard_without_llm(monkeypatch)
     assert result.decision.tool_calls[0].args == {}
 
 
+def test_bitrix_llm_uses_active_project_draft_type_when_cancel_text_says_task(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient("{}")
+    service = BitrixLLMService(client, settings=get_settings())
+    tool_definitions = [
+        {"name": "task_draft_discard", "description": "", "parameters": {}},
+        {"name": "project_create_discard", "description": "", "parameters": {}},
+        {"name": "none", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request="Битрикс отмени черновик задачи.",
+                user={"id": "13"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {"_draft_type": "project_create", "params": {"fields": {"NAME": "Тест"}}},
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["project_create_discard"]
+
+
 def test_bitrix_llm_routes_project_confirmation_without_llm(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient(

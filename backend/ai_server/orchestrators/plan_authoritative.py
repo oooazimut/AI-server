@@ -186,6 +186,22 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             if agent_id in call._specialists
         }
 
+    async def _load_authoritative_pending_specialist(
+        self, task: AgentTask
+    ) -> tuple[AgentTask, str | None]:
+        """Load dialog continuation only from durable KV, never inbound context."""
+        context = {key: value for key, value in task.context.items() if key != "pending_specialist"}
+        task = task.model_copy(update={"context": context})
+        dialog_key = str(context.get("dialog_key") or "")
+        if self.store is None or not dialog_key or not hasattr(self.store, "get_kv"):
+            return task, None
+        pending = await self.store.get_kv(dialog_key, "pending_specialist")  # type: ignore[attr-defined]
+        if pending:
+            task = task.model_copy(
+                update={"context": {**context, "pending_specialist": str(pending)}}
+            )
+        return task, None
+
     async def handle(self, task: AgentTask) -> AgentResult:
         started = time.monotonic()
         dialog_key = str(task.context.get("dialog_key") or "")
@@ -195,17 +211,89 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             task = task.model_copy(update={"context": {**task.context, "dialog_cancel_generation": int(generation)}})
             active = True
         try:
+            try:
+                task, _ = await self._load_authoritative_pending_specialist(task)
+            except Exception:
+                usage = ModelUsageRecord(
+                    agent_id=self.manifest.id,
+                    provider="internal",
+                    model="pending-specialist-state-machine",
+                    status="not_used",
+                    notes=["No model call: durable pending-specialist state was unavailable."],
+                )
+                result = self._terminal(
+                    task,
+                    "failed",
+                    "Не удалось безопасно проверить состояние текущего диалога.",
+                    usage,
+                    {"reason": "PENDING_STATE_READ_FAILED", "route": "pending_specialist"},
+                )
+                result = result.model_copy(
+                    update={"metadata": {**result.metadata, "total_ms": round((time.monotonic() - started) * 1000, 1)}}
+                )
+                await self._send_to_channel(task, result)
+                await self._publish_result(task, result)
+                return result
             catalog = self._catalog()
             constraints = _constraints(task.request, catalog)
             plan_id = f"plan-{uuid.uuid4().hex}"
-            raw, usage = await self._planner.plan(manifest=self.manifest, task=task, catalog=catalog, constraints={**constraints, "plan_id": plan_id, "request_hash": _hash(task.request)})
+            pending_specialist = str(task.context.get("pending_specialist") or "").strip()
+            deterministic_route: str | None = None
+            if pending_specialist:
+                # A pending specialist is durable dialog state, not an LLM routing
+                # suggestion.  Bind the continuation to the inbound request and
+                # let normal plan validation fail closed if the catalog changed.
+                raw = json.dumps(
+                    {
+                        "schema_version": PLAN_SCHEMA,
+                        "plan_id": plan_id,
+                        "request_hash": _hash(task.request),
+                        "state": "EXECUTE",
+                        "clarification": None,
+                        "max_rounds": 1,
+                        "subtasks": [
+                            {
+                                "subtask_id": f"pending-{uuid.uuid4().hex}",
+                                "specialist_id": pending_specialist,
+                                "request": task.request,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                usage = ModelUsageRecord(
+                    agent_id=self.manifest.id,
+                    provider="internal",
+                    model="pending-specialist-state-machine",
+                    status="not_used",
+                    notes=["No model call: continued the dialog-bound pending specialist."],
+                )
+                deterministic_route = "pending_specialist"
+            else:
+                raw, usage = await self._planner.plan(manifest=self.manifest, task=task, catalog=catalog, constraints={**constraints, "plan_id": plan_id, "request_hash": _hash(task.request)})
             response_hash = _hash(raw)
             try:
                 plan = _decode_plan(raw, plan_id=plan_id, request=task.request, constraints=constraints)
             except PlanRejected as exc:
-                result = self._terminal(task, "failed", "Не удалось безопасно подтвердить план обработки запроса.", usage, {"reason": str(exc), "response_hash": response_hash, "plan_id": plan_id})
+                metadata = {"reason": str(exc), "response_hash": response_hash, "plan_id": plan_id}
+                if deterministic_route:
+                    metadata.update(
+                        {
+                            "route": deterministic_route,
+                            "pending_specialist_id": pending_specialist,
+                        }
+                    )
+                result = self._terminal(task, "failed", "Не удалось безопасно подтвердить план обработки запроса.", usage, metadata)
             else:
-                result = await self._execute(task, plan, response_hash, usage)
+                result = await self._execute(
+                    task,
+                    plan,
+                    response_hash,
+                    usage,
+                    deterministic_route=deterministic_route,
+                )
             result = result.model_copy(update={"metadata": {**result.metadata, "total_ms": round((time.monotonic() - started) * 1000, 1)}})
             await self._send_to_channel(task, result)
             await self._publish_result(task, result)
@@ -217,8 +305,18 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
     def _terminal(self, task: AgentTask, status: str, answer: str, usage: ModelUsageRecord, metadata: dict[str, Any]) -> AgentResult:
         return AgentResult(status=status, agent_id=self.manifest.id, answer=answer, model_usage=[usage], actions_taken=[ActionRecord(name="plan_validation", status="rejected", details=metadata)], metadata=metadata)
 
-    async def _execute(self, task: AgentTask, plan: Plan, response_hash: str, usage: ModelUsageRecord) -> AgentResult:
+    async def _execute(
+        self,
+        task: AgentTask,
+        plan: Plan,
+        response_hash: str,
+        usage: ModelUsageRecord,
+        *,
+        deterministic_route: str | None = None,
+    ) -> AgentResult:
         base_meta = {"plan_id": plan.plan_id, "response_hash": response_hash, "plan_state": plan.state}
+        if deterministic_route:
+            base_meta["route"] = deterministic_route
         if plan.state == "CLARIFICATION_REQUIRED":
             return AgentResult(status="needs_clarification", agent_id=self.manifest.id, answer=plan.clarification or "Уточните запрос.", model_usage=[usage], actions_taken=[ActionRecord(name="plan_validation", status="ok", details=base_meta)], metadata=base_meta)
         if plan.state == "NOT_SUPPORTED":
@@ -253,6 +351,8 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
         completed = await asyncio.gather(*(run(item) for item in plan.subtasks), return_exceptions=True)
         facts: list[dict[str, Any]] = []
         actions: list[ActionRecord] = [ActionRecord(name="plan_validation", status="ok", details=base_meta)]
+        if deterministic_route:
+            actions.append(ActionRecord(name="pending_specialist_route", status="ok", details=base_meta))
         approvals: list[ActionRecord] = []
         for item, value in zip(plan.subtasks, completed, strict=True):
             if isinstance(value, Exception):
@@ -267,14 +367,18 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                 if isinstance(raw_approval, dict):
                     approvals.append(ActionRecord.model_validate(raw_approval))
             actions.append(ActionRecord(name="call_specialist", status=str(tool.status), details={**base_meta, "subtask_id": item.subtask_id, "attempt_id": attempt_id, "specialist_id": item.specialist_id}))
-        try:
-            raw_final, final_usage = await self._planner.finalize(manifest=self.manifest, task=task, plan_id=plan.plan_id, response_hash=response_hash, results=facts)
-            answer = self._decode_final(raw_final, plan.plan_id, response_hash, facts)
-            usages = [usage, final_usage]
-        except Exception:
+        if deterministic_route:
             answer = "; ".join(str(item["answer"]).strip() for item in facts if str(item["answer"]).strip()) or "Не удалось получить подтверждённый результат специалистов."
             usages = [usage]
-            actions.append(ActionRecord(name="final_validation", status="fallback", details=base_meta))
+        else:
+            try:
+                raw_final, final_usage = await self._planner.finalize(manifest=self.manifest, task=task, plan_id=plan.plan_id, response_hash=response_hash, results=facts)
+                answer = self._decode_final(raw_final, plan.plan_id, response_hash, facts)
+                usages = [usage, final_usage]
+            except Exception:
+                answer = "; ".join(str(item["answer"]).strip() for item in facts if str(item["answer"]).strip()) or "Не удалось получить подтверждённый результат специалистов."
+                usages = [usage]
+                actions.append(ActionRecord(name="final_validation", status="fallback", details=base_meta))
         branch_statuses = {str(item["status"]) for item in facts}
         if approvals or "needs_human" in branch_statuses:
             status = "needs_human"
