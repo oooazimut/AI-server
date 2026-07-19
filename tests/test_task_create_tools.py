@@ -39,6 +39,7 @@ def test_draft_tool_saves_to_store():
     )
     assert result.status == ToolStatus.OK
     assert "d:42" in store._drafts
+    assert store._drafts["d:42"]["_draft_type"] == "task_create"
     assert store._drafts["d:42"]["fields"]["TITLE"] == "Тест"
 
 
@@ -144,6 +145,9 @@ def test_confirm_tool_creates_task():
 
     assert result.status == ToolStatus.OK
     assert result.data["result"]["task"]["id"] == 777
+    write_client.call.assert_awaited_once_with(
+        "tasks.task.add", {"fields": {"TITLE": "Задача", "RESPONSIBLE_ID": 9}}
+    )
     assert "d:1" not in store._drafts
 
 

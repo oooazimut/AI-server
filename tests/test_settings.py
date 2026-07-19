@@ -65,6 +65,17 @@ def test_bitrix_oauth_bot_settings_can_be_loaded(monkeypatch):
     assert settings.bitrix_bot_oauth_user_id == 9
 
 
+def test_bitrix_draft_ttl_defaults_to_fifteen_minutes_and_allows_override(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.delenv("BITRIX_TASK_DRAFT_TTL_MINUTES", raising=False)
+
+    assert get_settings().bitrix_task_draft_ttl_minutes == 15
+
+    monkeypatch.setenv("BITRIX_TASK_DRAFT_TTL_MINUTES", "23")
+
+    assert get_settings().bitrix_task_draft_ttl_minutes == 23
+
+
 def test_task_close_control_worker_settings(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.delenv("BITRIX_TASK_CLOSE_CONTROL_WORKER_ENABLED", raising=False)

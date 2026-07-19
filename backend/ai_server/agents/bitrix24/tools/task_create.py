@@ -15,6 +15,7 @@ from ai_server.utils import MOSCOW_TZ, compact_text, optional_int, unique
 
 DEFAULT_TASK_DEADLINE_WORKING_DAYS = 3
 DEFAULT_TASK_DEADLINE_HOUR = 19
+TASK_CREATE_DRAFT_TYPE = "task_create"
 
 
 @dataclass(frozen=True)
@@ -93,7 +94,7 @@ def build_task_create_draft_from_args(args: dict[str, Any], *, user_id: int | No
         fields["NO_DEADLINE"] = True
 
     return BitrixTaskCreateDraft(
-        params={"fields": fields} if fields else {},
+        params={"_draft_type": TASK_CREATE_DRAFT_TYPE, "fields": fields} if fields else {},
         summary=_summary(title=title, responsible_id=responsible_id, deadline=deadline, group_id=group_id),
         preview=_draft_preview(fields, responsible_label=responsible_label, project_label=project_label)
         if fields
@@ -244,7 +245,7 @@ class TaskCreateConfirmTool:
                 tool=self.name,
                 error="no pending task draft found for this dialog",
             )
-        if draft_params.get("_draft_type") not in (None, "task_create"):
+        if draft_params.get("_draft_type") not in (None, TASK_CREATE_DRAFT_TYPE):
             return ToolResult(
                 status=ToolStatus.NOT_FOUND,
                 tool=self.name,
@@ -257,7 +258,8 @@ class TaskCreateConfirmTool:
                 tool=self.name,
                 data={"params": draft_params},
             )
-        sanitized = apply_write_policy("tasks.task.add", draft_params)
+        write_params = {key: value for key, value in draft_params.items() if not str(key).startswith("_")}
+        sanitized = apply_write_policy("tasks.task.add", write_params)
 
         if self._oauth_required_for_writes:
             context_error = _write_context_error(user_id=user_id, dialog_id=dialog_id)

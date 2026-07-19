@@ -437,7 +437,7 @@ def get_settings() -> Settings:
         bitrix_oauth_client_secret=_env("BITRIX_OAUTH_CLIENT_SECRET"),
         bitrix_oauth_enabled=_env_bool("BITRIX_OAUTH_ENABLED", True),
         bitrix_oauth_required_for_writes=_env_bool("BITRIX_OAUTH_REQUIRED_FOR_WRITES", True),
-        bitrix_task_draft_ttl_minutes=_env_int("BITRIX_TASK_DRAFT_TTL_MINUTES", 24 * 60) or (24 * 60),
+        bitrix_task_draft_ttl_minutes=_env_int("BITRIX_TASK_DRAFT_TTL_MINUTES", 15) or 15,
         bitrix_task_close_report_admin_user_ids=_env("BITRIX_TASK_CLOSE_REPORT_ADMIN_USER_IDS", "1"),
         bitrix_task_close_report_auto_restore_hours=_env_int_default("BITRIX_TASK_CLOSE_REPORT_AUTO_RESTORE_HOURS", 24),
         bitrix_task_close_control_admin_user_ids=_env(

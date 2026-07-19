@@ -2,6 +2,8 @@ import asyncio
 import json
 from datetime import date
 
+import pytest
+
 import ai_server.agents.bitrix24.llm as bitrix_llm
 from ai_server.agents.bitrix24 import Bitrix24Specialist, BitrixLLMDecision, BitrixLLMService, BitrixLLMToolCall
 from ai_server.agents.bitrix24.llm import ALLOWED_TOOL_NAMES
@@ -16,6 +18,23 @@ from ai_server.settings import get_settings
 from ai_server.skills import SkillStore
 from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
 from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, FakeTaskDraftStore, RecordingLLMClient
+
+
+def _writable_profile(user_id: int = 13) -> dict:
+    return {
+        "status": "ok",
+        "data": {
+            "user_id": user_id,
+            "profile": {
+                "id": user_id,
+                "label": "Иванов Иван",
+                "active": True,
+                "is_admin": False,
+                "user_type": "employee",
+                "work_position": "Монтажник",
+            },
+        },
+    }
 
 
 def _bitrix_specialist(*, tools=None, llm=None, settings=None, conversation_trace=None) -> Bitrix24Specialist:
@@ -1054,6 +1073,57 @@ def test_bitrix_specialist_task_create_draft_saves_to_store():
     assert draft_fields["DEADLINE"]
 
 
+def test_bitrix_specialist_exact_release_task_draft_is_deterministic_and_persisted():
+    store = FakeTaskDraftStore()
+    client = RecordingLLMClient("not-json")
+
+    class _UserClient:
+        async def get_user(self, user_id: int):
+            return {
+                "ID": str(user_id),
+                "NAME": "Иван",
+                "LAST_NAME": "Иванов",
+                "ACTIVE": "Y",
+                "IS_ADMIN": "N",
+                "USER_TYPE": "employee",
+                "WORK_POSITION": "Монтажник",
+            }
+
+        async def search_projects(self, query: str, *, limit: int = 10):
+            assert query == "Иванов Иван"
+            return [{"ID": "43", "NAME": "Иванов Иван", "PROJECT": "Y"}]
+
+    user_client = _UserClient()
+    specialist = Bitrix24Specialist(
+        get_agent_manifest("bitrix24"),
+        retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
+        agent_tools=[TaskCreateDraftTool(store=store, project_client=user_client)],
+        bitrix_user_client=user_client,
+        llm=BitrixLLMService(client, settings=get_settings()),
+    )
+
+    result = asyncio.run(
+        specialist.handle(
+            AgentTask(
+                task_id="t1",
+                request=(
+                    "Битрикс создай задачу на меня: подготовить тестовый отчет. "
+                    "Не создавай сразу, только покажи черновик для подтверждения."
+                ),
+                user={"id": "9"},
+                context={"dialog_key": "d:9", "dialog_id": "chat9"},
+            )
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert all(phrase in result.answer for phrase in ("Черновик задачи", "Срок", "Если всё верно"))
+    assert store._drafts["d:9"]["_draft_type"] == "task_create"
+    assert store._drafts["d:9"]["fields"]["TITLE"] == "подготовить тестовый отчет"
+    assert store._drafts["d:9"]["fields"]["RESPONSIBLE_ID"] == 9
+
+
 def test_bitrix_specialist_enforces_structured_task_close_draft_response():
     store = FakeTaskDraftStore()
     specialist = Bitrix24Specialist(
@@ -2006,15 +2076,88 @@ def test_bitrix_llm_does_not_treat_preview_request_as_task_draft_discard(monkeyp
                     "Не создавай сразу, только покажи черновик для подтверждения."
                 ),
                 user={"id": "13"},
-                context={"dialog_id": "chat4321"},
+                context={"dialog_id": "chat4321", "bitrix_current_user_profile": _writable_profile()},
             ),
             retrieval_hits=[],
             tool_definitions=tool_definitions,
         )
     )
 
-    assert len(client.calls) == 1
+    assert len(client.calls) == 0
+    assert result.raw == {"source": "task_create_draft_route"}
     assert [call.name for call in result.decision.tool_calls] == ["task_create_draft"]
+    assert result.decision.tool_calls[0].args == {
+        "title": "подготовить тестовый отчет",
+        "responsible_self": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("request_text", "expected_title"),
+    [
+        ("Создай задачу на меня: проверить камеры.", "проверить камеры"),
+        ("Поставьте задачу для меня: подготовить акт! Только покажи черновик.", "подготовить акт"),
+        ("Создать задачу: сверить остатки. Не создавай сразу.", "сверить остатки"),
+    ],
+)
+def test_bitrix_llm_routes_unambiguous_self_task_draft_without_llm(monkeypatch, request_text, expected_title):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient("not-json")
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request=request_text,
+                user={"id": "13"},
+                context={"dialog_id": "chat4321", "bitrix_current_user_profile": _writable_profile()},
+            ),
+            retrieval_hits=[],
+            tool_definitions=[{"name": "task_create_draft", "description": "", "parameters": {}}],
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_create_draft_route"}
+    assert result.decision.tool_calls[0].args == {"title": expected_title, "responsible_self": True}
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Создай задачу в проекте Ларгус-2 на меня: проверить документы.",
+        "Создай задачу на меня: подготовить документы для проекта Ларгус-2.",
+        "Создай задачу для Коверги Дмитрия: проверить документы.",
+        "Создай задачу: проверить документы, назначь Иванова исполнителем.",
+        "Создай задачу: поручи Иванову проверить документы.",
+        "Создай задачу: проверить документы, ответственный Иванов.",
+        "Создай задачу на меня без сформулированного заголовка",
+    ],
+)
+def test_bitrix_llm_leaves_lookup_dependent_or_incomplete_task_drafts_to_model(monkeypatch, request_text):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient(
+        json.dumps({"status": "needs_clarification", "answer": "Уточните детали.", "confidence": 0.5, "tool_calls": []})
+    )
+    service = BitrixLLMService(client, settings=get_settings())
+
+    asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request=request_text,
+                user={"id": "13"},
+                context={"dialog_id": "chat4321", "bitrix_current_user_profile": _writable_profile()},
+            ),
+            retrieval_hits=[],
+            tool_definitions=[{"name": "task_create_draft", "description": "", "parameters": {}}],
+        )
+    )
+
+    assert len(client.calls) == 1
 
 
 def test_bitrix_llm_decide_routes_task_close_draft_discard_without_llm(monkeypatch):

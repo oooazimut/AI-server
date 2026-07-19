@@ -88,7 +88,7 @@ def planner_prompt(*, plan_id: str, request: str, dialog_history: list[dict[str,
     }
 
 
-def final_prompt(*, plan_id: str, response_hash: str, request: str, results: list["BranchResult"]) -> dict[str, Any]:
+def final_prompt(*, plan_id: str, response_hash: str, request: str, results: list[BranchResult]) -> dict[str, Any]:
     return {
         "schema_version": FINAL_SCHEMA,
         "plan_id": plan_id,

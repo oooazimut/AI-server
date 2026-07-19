@@ -215,6 +215,14 @@ class BitrixLLMService:
                 raw={"source": "task_close_start_route"},
             )
 
+        local_decision = _common_task_create_draft_decision(task.request, task.context, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "task_create_draft_route"),
+                raw={"source": "task_create_draft_route"},
+            )
+
         local_decision = _common_calendar_event_draft_decision(task.request, tool_definitions)
         if local_decision is not None:
             return BitrixLLMDecisionResult(
@@ -1759,6 +1767,11 @@ _CALENDAR_REMINDER_TITLE_CUTOFF_RE = re.compile(
     r"\s+(?:не\s+добавляй|только\s+покажи|покажи\s+черновик|создай\s+черновик|для\s+подтверждения)\b.*",
     re.IGNORECASE | re.DOTALL,
 )
+_TASK_CREATE_TITLE_CUTOFF_RE = re.compile(
+    r"(?:[.?!]\s*|\s+)(?:не\s+создавай|не\s+добавляй|только\s+покажи|покажи\s+черновик|"
+    r"создай\s+черновик|для\s+подтверждения)\b.*",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _common_draft_discard_decision(
@@ -1825,6 +1838,68 @@ def _discard_decision_tool(name: str, summary: str) -> BitrixLLMDecision:
             )
         ],
     )
+
+
+def _common_task_create_draft_decision(
+    request: str,
+    context: dict[str, Any],
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    """Route an unambiguous self-assigned task draft without model variance.
+
+    Project resolution and named assignees deliberately remain with the model/tool
+    loop because they require Bitrix lookups.  The simple current-user contract is
+    fully typed already, so letting the model occasionally answer without calling
+    ``task_create_draft`` only makes an otherwise deterministic write preview flaky.
+    """
+
+    if not _draft_discard_tool_available(tool_definitions, "task_create_draft"):
+        return None
+    if _write_profile_from_bitrix_profile(context.get("bitrix_current_user_profile")) not in {
+        "member_write",
+        "full_bitrix_write",
+    }:
+        return None
+    args = _simple_self_task_draft_args(_strip_command_prefix(request))
+    if args is None:
+        return None
+    return BitrixLLMDecision(
+        status="completed",
+        answer="",
+        confidence=0.95,
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="task_create_draft",
+                args=args,
+                summary="deterministic Bitrix current-user task draft routing",
+            )
+        ],
+    )
+
+
+def _simple_self_task_draft_args(request: str) -> dict[str, Any] | None:
+    lowered = request.casefold()
+    if "задач" not in lowered:
+        return None
+    if not re.search(r"\b(?:создай|создайте|создать|поставь|поставьте|поставить)\s+задач", lowered):
+        return None
+    if "проект" in lowered:
+        return None
+    assignment_markers = ("назнач", "поруч", "исполнител", "ответственн")
+    if any(marker in lowered for marker in assignment_markers):
+        return None
+
+    match = re.search(r"\bзадач[ауи]?\b(?P<between>[^:]{0,80}):\s*(?P<title>.+)", request, flags=re.IGNORECASE | re.DOTALL)
+    if match is None:
+        return None
+    between = match.group("between").casefold()
+    if between.strip() and not re.fullmatch(r"\s*(?:на|для)\s+меня\s*", between):
+        return None
+    title = _TASK_CREATE_TITLE_CUTOFF_RE.split(match.group("title"), maxsplit=1)[0]
+    title = title.strip(" \t\r\n\"'«».,!?;:-")
+    if not title:
+        return None
+    return {"title": title, "responsible_self": True}
 
 
 def _common_draft_confirm_decision(

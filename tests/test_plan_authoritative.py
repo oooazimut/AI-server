@@ -1,11 +1,10 @@
-import json
 import asyncio
+import json
 
 import pytest
 
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ModelUsageRecord
 from ai_server.orchestrators.internal import InternalOrchestrator
-from ai_server.orchestrators.tools.call_specialist import CallSpecialistTool
 from ai_server.orchestrators.plan_authoritative import (
     FINAL_SCHEMA,
     PLAN_SCHEMA,
@@ -15,6 +14,7 @@ from ai_server.orchestrators.plan_authoritative import (
     _decode_plan,
     _hash,
 )
+from ai_server.orchestrators.tools.call_specialist import CallSpecialistTool
 
 
 def _plan(request: str, **changes):

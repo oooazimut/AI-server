@@ -14,10 +14,10 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ModelUsageRecord, ToolResult, ToolStatus
+from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
+from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ModelUsageRecord, ToolResult
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.orchestrators.tools.call_specialist import CallSpecialistTool
-from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 
 PLAN_SCHEMA = "t0006.plan.v1"
 FINAL_SCHEMA = "t0006.final.v1"
@@ -150,9 +150,9 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
         self._planner = planner
 
     @classmethod
-    def build(cls, manifest: AgentManifest | None, **kwargs: Any) -> "PlanAuthoritativeOrchestrator":
-        from ai_server.specialists import build_specialist_registry
+    def build(cls, manifest: AgentManifest | None, **kwargs: Any) -> PlanAuthoritativeOrchestrator:
         from ai_server.orchestrators.tools import ManageSuspendedTool, ScheduleTaskTool
+        from ai_server.specialists import build_specialist_registry
 
         manifests = kwargs.pop("manifests", None) or []
         planner = kwargs.pop("orchestrator_llm")
