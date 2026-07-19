@@ -404,9 +404,14 @@ def _direct_task_create_response(
                 model_usage=_local_model_usage(agent_id, "project_create_confirm_response"),
             )
         if result.tool == "project_create_discard":
+            data = result.data if isinstance(result.data, dict) else {}
             return BitrixLLMFinalResult(
                 status="completed",
-                answer="Черновик проекта удалён.",
+                answer=(
+                    "Черновик проекта и связанной задачи удалён."
+                    if data.get("linked_task")
+                    else "Черновик проекта удалён."
+                ),
                 model_usage=_local_model_usage(agent_id, "project_create_discard_response"),
             )
         if result.tool == "task_create_draft":
@@ -1847,10 +1852,9 @@ def _common_task_create_draft_decision(
 ) -> BitrixLLMDecision | None:
     """Route an unambiguous self-assigned task draft without model variance.
 
-    Project resolution and named assignees deliberately remain with the model/tool
-    loop because they require Bitrix lookups.  The simple current-user contract is
-    fully typed already, so letting the model occasionally answer without calling
-    ``task_create_draft`` only makes an otherwise deterministic write preview flaky.
+    Named assignees remain with the model/tool loop.  The task draft tool already
+    resolves an exact project name through its bounded Bitrix lookup, so an
+    unambiguous current-user project task is deterministic too.
     """
 
     if not _draft_discard_tool_available(tool_definitions, "task_create_draft"):
@@ -1883,8 +1887,6 @@ def _simple_self_task_draft_args(request: str) -> dict[str, Any] | None:
         return None
     if not re.search(r"\b(?:создай|создайте|создать|поставь|поставьте|поставить)\s+задач", lowered):
         return None
-    if "проект" in lowered:
-        return None
     assignment_markers = ("назнач", "поруч", "исполнител", "ответственн")
     if any(marker in lowered for marker in assignment_markers):
         return None
@@ -1892,14 +1894,29 @@ def _simple_self_task_draft_args(request: str) -> dict[str, Any] | None:
     match = re.search(r"\bзадач[ауи]?\b(?P<between>[^:]{0,80}):\s*(?P<title>.+)", request, flags=re.IGNORECASE | re.DOTALL)
     if match is None:
         return None
-    between = match.group("between").casefold()
-    if between.strip() and not re.fullmatch(r"\s*(?:на|для)\s+меня\s*", between):
+    between = match.group("between")
+    project_match = re.fullmatch(
+        r"\s*в\s+проекте\s+(?P<project>.+?)\s+(?:на|для)\s+меня\s*",
+        between,
+        flags=re.IGNORECASE,
+    )
+    if project_match is None and "проект" in lowered:
+        return None
+    if project_match is None and between.strip() and not re.fullmatch(
+        r"\s*(?:на|для)\s+меня\s*", between, flags=re.IGNORECASE
+    ):
         return None
     title = _TASK_CREATE_TITLE_CUTOFF_RE.split(match.group("title"), maxsplit=1)[0]
     title = title.strip(" \t\r\n\"'«».,!?;:-")
     if not title:
         return None
-    return {"title": title, "responsible_self": True}
+    args: dict[str, Any] = {"title": title, "responsible_self": True}
+    if project_match is not None:
+        project_name = project_match.group("project").strip(" \t\r\n\"'«».,!?;:-")
+        if not project_name:
+            return None
+        args["project_name"] = project_name
+    return args
 
 
 def _common_draft_confirm_decision(

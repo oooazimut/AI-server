@@ -2124,10 +2124,37 @@ def test_bitrix_llm_routes_unambiguous_self_task_draft_without_llm(monkeypatch, 
     assert result.decision.tool_calls[0].args == {"title": expected_title, "responsible_self": True}
 
 
+def test_bitrix_llm_routes_unambiguous_project_self_task_draft_without_llm(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient("not-json")
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request="Создай задачу в проекте Ларгус-2 на меня: проверить документы.",
+                user={"id": "13"},
+                context={"dialog_id": "chat4321", "bitrix_current_user_profile": _writable_profile()},
+            ),
+            retrieval_hits=[],
+            tool_definitions=[{"name": "task_create_draft", "description": "", "parameters": {}}],
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_create_draft_route"}
+    assert result.decision.tool_calls[0].args == {
+        "title": "проверить документы",
+        "responsible_self": True,
+        "project_name": "Ларгус-2",
+    }
+
+
 @pytest.mark.parametrize(
     "request_text",
     [
-        "Создай задачу в проекте Ларгус-2 на меня: проверить документы.",
         "Создай задачу на меня: подготовить документы для проекта Ларгус-2.",
         "Создай задачу для Коверги Дмитрия: проверить документы.",
         "Создай задачу: проверить документы, назначь Иванова исполнителем.",
@@ -2509,6 +2536,30 @@ def test_bitrix_llm_compose_formats_project_create_discard_without_llm(monkeypat
     assert client.calls == []
     assert result.status == "completed"
     assert result.answer == "Черновик проекта удалён."
+
+
+def test_bitrix_llm_compose_mentions_linked_task_when_project_draft_is_discarded(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="отмени черновик задачи", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="project_create_discard",
+                    data={"discarded": True, "linked_task": True},
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.answer == "Черновик проекта и связанной задачи удалён."
 
 
 def test_bitrix_llm_compose_formats_task_draft_without_profile_links(monkeypatch):

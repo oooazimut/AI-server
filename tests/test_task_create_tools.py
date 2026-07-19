@@ -123,6 +123,60 @@ def test_draft_tool_prepares_personal_project_before_default_self_task():
     assert "GROUP_ID" not in followup["params"]["fields"]
 
 
+def test_explicit_project_draft_requires_one_exact_numeric_project():
+    class _ProjectClient:
+        async def search_projects(self, query: str, *, limit: int = 10):
+            return [{"ID": "77", "NAME": "Ларгус-2"}]
+
+    store = FakeTaskDraftStore()
+    tool = TaskCreateDraftTool(store=store, project_client=_ProjectClient())
+
+    result = _exec(
+        tool,
+        {"title": "Тест", "responsible_self": True, "project_name": "Ларгус-2"},
+        user_id=9,
+        dialog_key="d:42",
+    )
+
+    assert result.status == ToolStatus.OK
+    assert store._drafts["d:42"]["fields"]["GROUP_ID"] == 77
+
+
+def test_explicit_project_draft_without_resolver_fails_closed():
+    store = FakeTaskDraftStore()
+    tool = TaskCreateDraftTool(store=store, project_client=None)
+
+    result = _exec(
+        tool,
+        {"title": "Тест", "responsible_self": True, "project_name": "Ларгус-2"},
+        user_id=9,
+        dialog_key="d:42",
+    )
+
+    assert result.status == ToolStatus.NOT_FOUND
+    assert store._drafts == {}
+
+
+def test_explicit_project_draft_with_zero_or_ambiguous_matches_fails_closed():
+    class _ProjectClient:
+        def __init__(self, projects):
+            self.projects = projects
+
+        async def search_projects(self, query: str, *, limit: int = 10):
+            return self.projects
+
+    for projects in ([], [{"ID": "77", "NAME": "Ларгус-2"}, {"ID": "78", "NAME": "Ларгус-2"}]):
+        store = FakeTaskDraftStore()
+        result = _exec(
+            TaskCreateDraftTool(store=store, project_client=_ProjectClient(projects)),
+            {"title": "Тест", "responsible_self": True, "project_name": "Ларгус-2"},
+            user_id=9,
+            dialog_key="d:42",
+        )
+        assert result.status == ToolStatus.NOT_FOUND
+        assert store._drafts == {}
+
+
 # ---------------------------------------------------------------------------
 # TaskCreateConfirmTool
 # ---------------------------------------------------------------------------

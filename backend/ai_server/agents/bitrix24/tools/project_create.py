@@ -335,9 +335,18 @@ class ProjectCreateDiscardTool:
         dialog_key: str | None = None,
         dialog_id: str | None = None,
     ) -> ToolResult:
+        linked_task = False
         if dialog_key:
+            draft = await self._store.get_task_draft(dialog_key)
+            linked_task = isinstance(draft, dict) and isinstance(
+                draft.get("after_project_create_task_draft"), dict
+            )
             await self._store.delete_task_draft(dialog_key)
-        return ToolResult(status=ToolStatus.OK, tool=self.name, data={"discarded": bool(dialog_key)})
+        return ToolResult(
+            status=ToolStatus.OK,
+            tool=self.name,
+            data={"discarded": bool(dialog_key), "linked_task": linked_task},
+        )
 
 
 def _draft_preview(fields: dict[str, Any], *, personal_for_self: bool) -> dict[str, str]:

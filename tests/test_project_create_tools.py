@@ -235,6 +235,25 @@ def test_project_discard_deletes_draft():
     result = _exec(tool, {}, dialog_key="d:9")
 
     assert result.status == ToolStatus.OK
+    assert result.data["linked_task"] is False
+    assert "d:9" not in store._drafts
+
+
+def test_project_discard_reports_linked_task_from_deleted_draft():
+    store = FakeTaskDraftStore()
+    anyio.run(
+        lambda: store.save_task_draft(
+            "d:9",
+            {
+                "_draft_type": PROJECT_CREATE_DRAFT_TYPE,
+                "after_project_create_task_draft": {"params": {"fields": {"TITLE": "Тест"}}},
+            },
+        )
+    )
+    result = _exec(ProjectCreateDiscardTool(store=store), {}, dialog_key="d:9")
+
+    assert result.status == ToolStatus.OK
+    assert result.data["linked_task"] is True
     assert "d:9" not in store._drafts
 
 

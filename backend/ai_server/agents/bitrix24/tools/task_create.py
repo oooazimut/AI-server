@@ -373,9 +373,8 @@ async def _args_with_resolved_project(
     if not project_name:
         return resolved_args, "", ""
     if project_client is None:
-        if default_personal_project:
-            return resolved_args, "", "default personal project requires Bitrix project resolver"
-        return resolved_args, "", ""
+        label = "default personal project" if default_personal_project else "explicit project"
+        return resolved_args, "", f"{label} requires Bitrix project resolver"
     try:
         projects = await project_client.search_projects(project_name, limit=10)
     except (BitrixApiError, BitrixConfigError) as exc:
@@ -386,7 +385,7 @@ async def _args_with_resolved_project(
     if project is None:
         if default_personal_project:
             return resolved_args, "", f"personal Bitrix project not found: {project_name}"
-        return resolved_args, "", ""
+        return resolved_args, "", f"exact Bitrix project not found or ambiguous: {project_name}"
     project_id = optional_int(project.get("ID") or project.get("id"))
     if project_id is None:
         return resolved_args, "", f"Bitrix project has no numeric ID: {project_name}"
