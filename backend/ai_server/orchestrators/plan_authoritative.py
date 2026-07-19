@@ -229,22 +229,37 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
         if not isinstance(call, CallSpecialistTool):
             return self._terminal(task, "failed", "Исполнитель специалистов недоступен.", usage, {**base_meta, "reason": "CALL_TOOL_UNAVAILABLE"})
 
-        async def run(subtask: Subtask) -> tuple[Subtask, ToolResult]:
-            value = await call.execute_with_task({"specialist_id": subtask.specialist_id, "request": subtask.request}, task=task)
-            return subtask, value
+        async def run(subtask: Subtask) -> tuple[Subtask, str, ToolResult]:
+            # Correlation is created *before* reaching the specialist, so its
+            # own trace and any durable result can be joined to this plan.
+            attempt_id = f"attempt-{uuid.uuid4().hex}"
+            correlated_task = task.model_copy(update={"context": {**task.context,
+                "t0006_plan_id": plan.plan_id,
+                "t0006_response_hash": response_hash,
+                "t0006_subtask_id": subtask.subtask_id,
+                "t0006_attempt_id": attempt_id,
+            }})
+            value = await call.execute_with_task(
+                {"specialist_id": subtask.specialist_id, "request": subtask.request}, task=correlated_task
+            )
+            return subtask, attempt_id, value
 
         completed = await asyncio.gather(*(run(item) for item in plan.subtasks), return_exceptions=True)
         facts: list[dict[str, Any]] = []
         actions: list[ActionRecord] = [ActionRecord(name="plan_validation", status="ok", details=base_meta)]
+        approvals: list[ActionRecord] = []
         for item, value in zip(plan.subtasks, completed, strict=True):
-            attempt_id = f"attempt-{uuid.uuid4().hex}"
             if isinstance(value, Exception):
+                attempt_id = f"attempt-{uuid.uuid4().hex}"
                 facts.append({"subtask_id": item.subtask_id, "attempt_id": attempt_id, "status": "failed", "answer": "Специалист не завершил обработку."})
                 actions.append(ActionRecord(name="call_specialist", status="error", details={**base_meta, "subtask_id": item.subtask_id, "attempt_id": attempt_id, "specialist_id": item.specialist_id}))
                 continue
-            _, tool = value
+            _, attempt_id, tool = value
             data = tool.data if isinstance(tool.data, dict) else {}
             facts.append({"subtask_id": item.subtask_id, "attempt_id": attempt_id, "status": str(data.get("status") or tool.status), "answer": str(data.get("answer") or tool.error or "")})
+            for raw_approval in data.get("actions_requiring_approval", []):
+                if isinstance(raw_approval, dict):
+                    approvals.append(ActionRecord.model_validate(raw_approval))
             actions.append(ActionRecord(name="call_specialist", status=str(tool.status), details={**base_meta, "subtask_id": item.subtask_id, "attempt_id": attempt_id, "specialist_id": item.specialist_id}))
         try:
             raw_final, final_usage = await self._planner.finalize(manifest=self.manifest, task=task, plan_id=plan.plan_id, response_hash=response_hash, results=facts)
@@ -254,8 +269,20 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             answer = "; ".join(str(item["answer"]).strip() for item in facts if str(item["answer"]).strip()) or "Не удалось получить подтверждённый результат специалистов."
             usages = [usage]
             actions.append(ActionRecord(name="final_validation", status="fallback", details=base_meta))
-        status = "completed" if any(item["status"] == "completed" for item in facts) else "failed"
-        return AgentResult(status=status, agent_id=self.manifest.id, answer=answer, model_usage=usages, actions_taken=actions, handoff_to=sorted({item.specialist_id for item in plan.subtasks}), metadata={**base_meta, "branches": facts})
+        branch_statuses = {str(item["status"]) for item in facts}
+        if approvals or "needs_human" in branch_statuses:
+            status = "needs_human"
+        elif "needs_clarification" in branch_statuses:
+            status = "needs_clarification"
+        elif "completed" in branch_statuses:
+            status = "completed"
+        else:
+            status = "failed"
+        return AgentResult(
+            status=status, agent_id=self.manifest.id, answer=answer, model_usage=usages,
+            actions_taken=actions, actions_requiring_approval=approvals,
+            handoff_to=sorted({item.specialist_id for item in plan.subtasks}), metadata={**base_meta, "branches": facts},
+        )
 
     @staticmethod
     def _decode_final(raw: str, plan_id: str, response_hash: str, facts: list[dict[str, Any]]) -> str:

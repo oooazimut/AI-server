@@ -1,9 +1,11 @@
 import json
+import asyncio
 
 import pytest
 
-from ai_server.models import AgentManifest
+from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ModelUsageRecord
 from ai_server.orchestrators.internal import InternalOrchestrator
+from ai_server.orchestrators.tools.call_specialist import CallSpecialistTool
 from ai_server.orchestrators.plan_authoritative import (
     FINAL_SCHEMA,
     PLAN_SCHEMA,
@@ -63,3 +65,56 @@ def test_live_factory_selects_plan_authoritative_runtime():
         orchestrator_llm=Planner(),
     )
     assert isinstance(subject, PlanAuthoritativeOrchestrator)
+
+
+class _Planner:
+    async def plan(self, *, task, constraints, **kwargs):
+        return _plan(task.request, plan_id=constraints["plan_id"]), ModelUsageRecord(agent_id="test", provider="test", model="test")
+
+    async def finalize(self, *, plan_id, response_hash, results, **kwargs):
+        return json.dumps({"schema_version": FINAL_SCHEMA, "plan_id": plan_id, "response_hash": response_hash, "ordered_subtask_ids": [item["subtask_id"] for item in results]}), ModelUsageRecord(agent_id="test", provider="test", model="test")
+
+
+class _Specialist:
+    def __init__(self, result):
+        self.result = result
+        self.tasks = []
+
+    async def handle(self, task):
+        self.tasks.append(task)
+        return self.result
+
+
+def _live_subject(result):
+    specialist = _Specialist(result)
+    specialist_manifest = AgentManifest(id="bitrix24", name="Битрикс", kind="specialist", description="test")
+    call = CallSpecialistTool({"bitrix24": specialist}, [specialist_manifest])
+    orchestrator = PlanAuthoritativeOrchestrator(
+        AgentManifest(id="internal_orchestrator", name="Оркестр", kind="orchestrator", description="test"),
+        agent_tools=[call], planner=_Planner(), llm=_Planner(),
+    )
+    return orchestrator, specialist
+
+
+def test_handle_propagates_causal_ids_before_specialist_call():
+    result = AgentResult(status="completed", agent_id="bitrix24", answer="ready")
+    subject, specialist = _live_subject(result)
+    output = asyncio.run(subject.handle(AgentTask(task_id="t1", request="склад", context={"dialog_key": "d1"})))
+    assert output.status == "completed"
+    received = specialist.tasks[0].context
+    assert received["t0006_plan_id"].startswith("plan-")
+    assert len(received["t0006_response_hash"]) == 64
+    assert received["t0006_subtask_id"] == "s1"
+    assert received["t0006_attempt_id"].startswith("attempt-")
+    assert output.metadata["branches"][0]["attempt_id"] == received["t0006_attempt_id"]
+
+
+def test_handle_preserves_approval_and_needs_human_state():
+    specialist_result = AgentResult(
+        status="needs_human", agent_id="bitrix24", answer="approval needed",
+        actions_requiring_approval=[ActionRecord(name="write", status="pending")],
+    )
+    subject, _ = _live_subject(specialist_result)
+    output = asyncio.run(subject.handle(AgentTask(task_id="t1", request="склад")))
+    assert output.status == "needs_human"
+    assert [item.name for item in output.actions_requiring_approval] == ["write"]
