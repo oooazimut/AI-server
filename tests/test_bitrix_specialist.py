@@ -7,6 +7,7 @@ import pytest
 import ai_server.agents.bitrix24.llm as bitrix_llm
 from ai_server.agents.bitrix24 import Bitrix24Specialist, BitrixLLMDecision, BitrixLLMService, BitrixLLMToolCall
 from ai_server.agents.bitrix24.llm import ALLOWED_TOOL_NAMES
+from ai_server.agents.bitrix24.tools.project_create import ProjectCreateDiscardTool
 from ai_server.agents.bitrix24.tools.task_close import TaskCloseDraftTool
 from ai_server.agents.bitrix24.tools.task_close_control import TaskCloseControlUpdateTool
 from ai_server.agents.bitrix24.tools.task_create import TaskCreateDraftTool
@@ -17,7 +18,13 @@ from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import get_settings
 from ai_server.skills import SkillStore
 from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
-from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, FakeTaskDraftStore, RecordingLLMClient
+from tests.fakes import (
+    FakeBitrixLLM,
+    FakeEmbeddingProvider,
+    FakePortalSearchIndex,
+    FakeTaskDraftStore,
+    RecordingLLMClient,
+)
 
 
 def _writable_profile(user_id: int = 13) -> dict:
@@ -1071,6 +1078,69 @@ def test_bitrix_specialist_task_create_draft_saves_to_store():
     assert draft_fields["RESPONSIBLE_ID"] == 9
     assert draft_fields["CREATED_BY"] == 9
     assert draft_fields["DEADLINE"]
+
+
+def test_bitrix_specialist_build_wires_portal_snapshot_into_task_draft_tool():
+    store = FakeTaskDraftStore()
+    index = FakePortalSearchIndex()
+    oauth = object()
+
+    specialist = Bitrix24Specialist.build(
+        get_agent_manifest("bitrix24"),
+        bitrix_store=store,
+        portal_search_index=index,
+        bitrix_oauth=oauth,
+        settings=get_settings(),
+    )
+
+    tool = specialist._tool_registry["task_create_draft"]
+    assert isinstance(tool, TaskCreateDraftTool)
+    assert tool._portal_search is index
+    assert tool._bitrix_oauth is oauth
+
+
+def test_bitrix_specialist_project_discard_fast_returns_first_linked_result():
+    store = FakeTaskDraftStore()
+    asyncio.run(
+        store.save_task_draft(
+            "d:9",
+            {
+                "_draft_type": "project_create",
+                "params": {"fields": {"NAME": "Иванов Иван"}},
+                "after_project_create_task_draft": {
+                    "params": {"_draft_type": "task_create", "fields": {"TITLE": "Тест"}},
+                },
+            },
+        )
+    )
+    client = RecordingLLMClient("not-json")
+    specialist = Bitrix24Specialist(
+        get_agent_manifest("bitrix24"),
+        agent_tools=[ProjectCreateDiscardTool(store=store)],
+        draft_store=store,
+        llm=BitrixLLMService(client, settings=get_settings()),
+        settings=get_settings(),
+    )
+
+    result = asyncio.run(
+        specialist.handle(
+            AgentTask(
+                task_id="t1",
+                request="Битрикс отмени черновик задачи.",
+                user={"id": "9"},
+                context={"dialog_key": "d:9", "dialog_id": "chat9"},
+            )
+        )
+    )
+
+    discard_actions = [action for action in result.actions_taken if action.name == "project_create_discard"]
+    assert client.calls == []
+    assert len(discard_actions) == 1
+    assert result.status == "completed"
+    assert result.answer == "Черновик проекта и связанной задачи удалён."
+    assert result.metadata["fast_return"] is True
+    assert result.metadata["terminal_tool"] == "project_create_discard"
+    assert "d:9" not in store._drafts
 
 
 def test_bitrix_specialist_exact_release_task_draft_is_deterministic_and_persisted():

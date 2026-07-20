@@ -104,6 +104,7 @@ _FAST_RETURN_TASK_CREATE_TOOLS = frozenset(
     {
         "task_create_confirm",
         "task_draft_discard",
+        "project_create_discard",
     }
 )
 
@@ -196,7 +197,12 @@ class Bitrix24Specialist(BaseSpecialist):
                 dry_run=_settings.agent_dry_run,
                 oauth_required_for_writes=_settings.bitrix_oauth_required_for_writes,
             ),
-            TaskCreateDraftTool(store=bitrix_store, project_client=bitrix_client),
+            TaskCreateDraftTool(
+                store=bitrix_store,
+                project_client=bitrix_client,
+                portal_search=portal_search_index,
+                bitrix_oauth=bitrix_oauth,
+            ),
             TaskCreateConfirmTool(
                 store=bitrix_store,
                 write_client=bitrix_client,
