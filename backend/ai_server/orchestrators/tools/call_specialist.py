@@ -73,6 +73,22 @@ class CallSpecialistTool:
             },
         )
 
+    async def get_active_bitrix_draft(self, dialog_key: str) -> dict[str, Any] | None:
+        """Read a Bitrix write draft without invoking a model or Bitrix API."""
+        specialist = self._specialists.get("bitrix24")
+        getter = getattr(specialist, "get_active_draft", None)
+        if not callable(getter) or not dialog_key:
+            return None
+        draft = await getter(dialog_key)
+        return dict(draft) if isinstance(draft, dict) else None
+
+    async def discard_active_bitrix_draft(self, dialog_key: str, *, expected_draft_id: str) -> bool:
+        specialist = self._specialists.get("bitrix24")
+        discard = getattr(specialist, "discard_active_draft", None)
+        if not callable(discard) or not dialog_key or not expected_draft_id:
+            return False
+        return bool(await discard(dialog_key, expected_draft_id=expected_draft_id))
+
     async def _persist_pending_state(
         self,
         *,

@@ -301,6 +301,34 @@ def test_handle_preserves_approval_and_needs_human_state():
     assert [item.name for item in output.actions_requiring_approval] == ["write"]
 
 
+def test_new_explicit_calendar_request_is_held_behind_active_task_draft():
+    class DraftingSpecialist(_Specialist):
+        async def get_active_draft(self, dialog_key):
+            return {"_draft_id": "draft-1", "_draft_type": "task_create", "_draft_version": 1}
+
+    store = FakeOrchestratorStore()
+    specialist = DraftingSpecialist(AgentResult(status="completed", agent_id="bitrix24", answer="unexpected"))
+    manifest = AgentManifest(
+        id="bitrix24", name="Bitrix", kind="specialist", description="test", capabilities=["bitrix_warehouse_search"]
+    )
+    call = CallSpecialistTool({"bitrix24": specialist}, [manifest], store=store)
+    subject = PlanAuthoritativeOrchestrator(
+        AgentManifest(id="internal_orchestrator", name="Orchestrator", kind="orchestrator", description="test"),
+        agent_tools=[call],
+        planner=_Planner(),
+        llm=_Planner(),
+        store=store,
+    )
+
+    output = asyncio.run(
+        subject.handle(AgentTask(task_id="t1", request="Напомни мне завтра позвонить Борисову", context={"dialog_key": "d1"}))
+    )
+
+    assert output.metadata["reason"] == "REPLACEMENT_CANDIDATE_SAVED"
+    assert specialist.tasks == []
+    assert asyncio.run(store.get_replacement_candidate("d1"))["request_text"] == "Напомни мне завтра позвонить Борисову"
+
+
 def test_multi_source_partial_failure_keeps_success_and_names_failed_source():
     class _MultiPlanner(_Planner):
         async def plan(self, *, task, constraints, **kwargs):
@@ -434,7 +462,7 @@ def test_repairable_plan_contract_failure_gets_one_changed_method_retry():
             "status": "accepted",
         },
     ]
-    assert len(output.model_usage) == 3
+    assert len(output.model_usage) == 2
     assert len(specialist.tasks) == 1
 
 
@@ -490,7 +518,7 @@ class _MalformedFinalPlanner(_Planner):
         )
 
 
-def test_malformed_final_preserves_usage_and_response_hash_before_fallback():
+def test_single_verified_specialist_skips_final_model_call():
     subject, specialist = _live_subject(
         AgentResult(status="completed", agent_id="bitrix24", answer="executor fact"),
         planner=_MalformedFinalPlanner(),
@@ -500,11 +528,10 @@ def test_malformed_final_preserves_usage_and_response_hash_before_fallback():
 
     assert output.status == "completed"
     assert output.answer == "executor fact"
-    assert [usage.model for usage in output.model_usage] == ["test", "test-final"]
+    assert [usage.model for usage in output.model_usage] == ["test"]
     final_action = next(action for action in output.actions_taken if action.name == "final_validation")
-    assert final_action.status == "fallback"
-    assert final_action.details["reason"] == "FINAL_SCHEMA_MISMATCH"
-    assert final_action.details["final_response_hash"] == _hash(json.dumps({"unexpected": True}))
+    assert final_action.status == "deterministic"
+    assert final_action.details["reason"] == "SINGLE_VERIFIED_SPECIALIST_RESULT"
     assert len(specialist.tasks) == 1
 
 

@@ -16,6 +16,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from ai_server.agents.bitrix24.draft_confirmation import matches_draft_confirmation
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ModelUsageRecord, ToolResult
 from ai_server.orchestrators.internal import InternalOrchestrator
@@ -26,6 +27,39 @@ FINAL_SCHEMA = "t0006.final.v1"
 REPAIRABLE_PLAN_REJECTIONS = frozenset(
     {"INVALID_JSON", "PLAN_SCHEMA_MISMATCH", "PLAN_BINDING_MISMATCH", "NON_EXECUTION_PLAN_INVALID"}
 )
+
+_DRAFT_CONTINUE = "продолжить текущий черновик"
+_DRAFT_REPLACE = "отменить текущий черновик и запустить новый запрос"
+
+
+def _normalized_text(value: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s-]", " ", value.casefold())).strip()
+
+
+def _draft_intent(request: str) -> str | None:
+    text = _normalized_text(request)
+    if re.search(r"\bнапомни\b|\bкалендар", text):
+        return "calendar_event"
+    if re.search(r"\bсозда(?:й|ть|йте)\s+проект", text):
+        return "project_create"
+    if re.search(r"\bзакр(?:ой|ыть|ойте)\s+задач", text):
+        return "task_close"
+    if re.search(r"\bсозда(?:й|ть|йте)\s+задач", text):
+        return "task_create"
+    return None
+
+
+def _draft_discard_request(request: str) -> bool:
+    text = _normalized_text(request)
+    return any(marker in text for marker in ("отмени черновик", "отменить черновик", "не создавай", "удали черновик"))
+
+
+def _is_new_request_during_draft(request: str, draft: dict[str, Any]) -> bool:
+    if matches_draft_confirmation(request, draft) or _draft_discard_request(request):
+        return False
+    incoming = _draft_intent(request)
+    active = str(draft.get("_draft_type") or "")
+    return bool(incoming and incoming != active)
 
 
 class PlanAuthoritativeLLM(Protocol):
@@ -411,6 +445,80 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
         if self.store is not None and dialog_key and answer and hasattr(self.store, "append_turn"):
             await self.store.append_turn(dialog_key, task.request, answer)  # type: ignore[attr-defined]
 
+    def _draft_control_result(self, task: AgentTask, answer: str, *, reason: str) -> AgentResult:
+        usage = ModelUsageRecord(
+            agent_id=self.manifest.id,
+            provider="internal",
+            model="active-draft-state-machine",
+            status="not_used",
+            notes=["No model call: protected active draft state was handled deterministically."],
+        )
+        return AgentResult(
+            status="needs_clarification",
+            agent_id=self.manifest.id,
+            answer=answer,
+            model_usage=[usage],
+            actions_taken=[ActionRecord(name="active_draft_guard", status="ok", details={"reason": reason})],
+            metadata={"reason": reason, "route": "active_draft_guard"},
+        )
+
+    async def _guard_active_draft(self, task: AgentTask) -> tuple[AgentTask, AgentResult | None]:
+        """Keep a new explicit write intent out of an existing draft's tool path."""
+        dialog_key = str(task.context.get("dialog_key") or "")
+        call = self._tool_registry.get("call_specialist")
+        if not dialog_key or not isinstance(call, CallSpecialistTool) or self.store is None:
+            return task, None
+        get_candidate = getattr(self.store, "get_replacement_candidate", None)
+        save_candidate = getattr(self.store, "save_replacement_candidate", None)
+        delete_candidate = getattr(self.store, "delete_replacement_candidate", None)
+        if not callable(get_candidate) or not callable(save_candidate) or not callable(delete_candidate):
+            return task, None
+        candidate = await get_candidate(dialog_key)
+        request = _normalized_text(task.request)
+        if candidate:
+            if request == _DRAFT_CONTINUE:
+                await delete_candidate(dialog_key)
+                return task, self._draft_control_result(
+                    task,
+                    "Продолжаем текущий черновик. Подтвердите его указанной фразой или внесите уточнение.",
+                    reason="REPLACEMENT_CANDIDATE_DISMISSED",
+                )
+            if request == _DRAFT_REPLACE:
+                discarded = await call.discard_active_bitrix_draft(
+                    dialog_key, expected_draft_id=str(candidate.get("draft_id") or "")
+                )
+                if not discarded:
+                    return task, self._draft_control_result(
+                        task,
+                        "Не удалось безопасно отменить прежний черновик: он уже изменён или истёк. Проверьте его состояние.",
+                        reason="REPLACEMENT_DRAFT_CHANGED",
+                    )
+                await delete_candidate(dialog_key)
+                replacement = task.model_copy(update={"request": str(candidate.get("request_text") or "")})
+                return replacement, None
+            return task, self._draft_control_result(
+                task,
+                "Есть незавершённый черновик и сохранён новый запрос. Напишите: «Продолжить текущий черновик» "
+                "или «Отменить текущий черновик и запустить новый запрос».",
+                reason="REPLACEMENT_CANDIDATE_WAITING",
+            )
+        draft = await call.get_active_bitrix_draft(dialog_key)
+        if not draft or not _is_new_request_during_draft(task.request, draft):
+            return task, None
+        await save_candidate(
+            dialog_key,
+            request_text=task.request,
+            draft_id=str(draft.get("_draft_id") or ""),
+            draft_type=str(draft.get("_draft_type") or ""),
+            ttl_minutes=15,
+        )
+        return task, self._draft_control_result(
+            task,
+            "Текущий черновик ещё не завершён; новый запрос сохранён на 15 минут и пока не запущен. "
+            "Напишите: «Продолжить текущий черновик» или «Отменить текущий черновик и запустить новый запрос».",
+            reason="REPLACEMENT_CANDIDATE_SAVED",
+        )
+
     async def handle(self, task: AgentTask) -> AgentResult:
         started = time.monotonic()
         dialog_key = str(task.context.get("dialog_key") or "")
@@ -423,6 +531,7 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             try:
                 task, _ = await self._load_authoritative_pending_specialist(task)
                 task = await self._load_authoritative_dialog_history(task)
+                task, draft_guard_result = await self._guard_active_draft(task)
             except Exception:
                 usage = ModelUsageRecord(
                     agent_id=self.manifest.id,
@@ -441,6 +550,14 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                 result = result.model_copy(
                     update={"metadata": {**result.metadata, "total_ms": round((time.monotonic() - started) * 1000, 1)}}
                 )
+                await self._send_to_channel(task, result)
+                await self._publish_result(task, result)
+                return result
+            if draft_guard_result is not None:
+                result = draft_guard_result.model_copy(
+                    update={"metadata": {**draft_guard_result.metadata, "total_ms": round((time.monotonic() - started) * 1000, 1)}}
+                )
+                await self._append_authoritative_dialog_turn(task, result.answer)
                 await self._send_to_channel(task, result)
                 await self._publish_result(task, result)
                 return result
@@ -706,12 +823,20 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                     },
                 )
             )
-        if deterministic_route:
+        if deterministic_route or len(facts) == 1:
             answer = (
                 "; ".join(str(item["answer"]).strip() for item in facts if str(item["answer"]).strip())
                 or "Не удалось получить подтверждённый результат специалистов."
             )
             usages = list(planner_usages)
+            if len(facts) == 1 and not deterministic_route:
+                actions.append(
+                    ActionRecord(
+                        name="final_validation",
+                        status="deterministic",
+                        details={**base_meta, "reason": "SINGLE_VERIFIED_SPECIALIST_RESULT"},
+                    )
+                )
         else:
             usages = list(planner_usages)
             try:

@@ -937,6 +937,7 @@ class FakeOrchestratorStore:
     def __init__(self) -> None:
         self._kv: dict[tuple[str, str], str] = {}
         self._turns: dict[str, list[dict[str, str]]] = {}
+        self._replacement_candidates: dict[str, dict[str, str]] = {}
 
     def set_pending(self, dialog_key: str, specialist_id: str) -> None:
         self._kv[(dialog_key, "pending_specialist")] = specialist_id
@@ -963,6 +964,27 @@ class FakeOrchestratorStore:
 
     async def delete_kv(self, dialog_key: str, field: str) -> None:
         self._kv.pop((dialog_key, field), None)
+
+    async def save_replacement_candidate(self, dialog_key, *, request_text, draft_id, draft_type, ttl_minutes=15):
+        current = self._replacement_candidates.get(dialog_key)
+        if current:
+            return dict(current)
+        value = {
+            "request_text": str(request_text),
+            "draft_id": str(draft_id),
+            "draft_type": str(draft_type),
+            "created_at": "fake-now",
+            "expires_at": "fake-later",
+        }
+        self._replacement_candidates[dialog_key] = value
+        return dict(value)
+
+    async def get_replacement_candidate(self, dialog_key):
+        current = self._replacement_candidates.get(dialog_key)
+        return dict(current) if current else None
+
+    async def delete_replacement_candidate(self, dialog_key):
+        self._replacement_candidates.pop(dialog_key, None)
 
 
 def _fake_usage(*, agent_id: str = "bitrix24") -> ModelUsageRecord:

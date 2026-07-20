@@ -151,6 +151,32 @@ class Bitrix24Specialist(BaseSpecialist):
             conversation_trace=conversation_trace,
         )
 
+    async def get_active_draft(self, dialog_key: str) -> dict[str, Any] | None:
+        """Expose only the dialog-bound active draft to the orchestrator.
+
+        This is a local PostgreSQL read.  It lets the orchestrator protect an
+        existing write draft before a new unrelated request reaches a tool.
+        """
+        if not dialog_key or self._draft_store is None:
+            return None
+        return await self._draft_store.get_task_draft(
+            dialog_key,
+            ttl_minutes=self._settings_for_qc.bitrix_task_draft_ttl_minutes if self._settings_for_qc else None,
+        )
+
+    async def discard_active_draft(self, dialog_key: str, *, expected_draft_id: str) -> bool:
+        """Cancel exactly the protected draft, never a later replacement."""
+        draft = await self.get_active_draft(dialog_key)
+        if not draft or str(draft.get("_draft_id") or "") != expected_draft_id or self._draft_store is None:
+            return False
+        await self._draft_store.delete_task_draft(
+            dialog_key,
+            status="cancelled",
+            expected_draft_id=expected_draft_id,
+            expected_version=int(draft.get("_draft_version") or 0) or None,
+        )
+        return True
+
     @classmethod
     def build(
         cls,
