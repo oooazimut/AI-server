@@ -32,7 +32,7 @@ class BitrixWarehouseSearchTool:
                 "Read-only warehouse/store lookup in Bitrix catalog. Use it for requests about warehouses, "
                 "stores, stock locations, inventory leftovers, or phrases like 'find warehouse Borisov'. "
                 "It calls catalog.store.list and optionally catalog.storeproduct.list. Product rows include "
-                "only items with a positive available amount. Use product_limit=10 by default and product_offset "
+                "only items with a positive available amount. Use product_limit=50 by default and product_offset "
                 "for follow-up requests asking for the next items."
             ),
             parameters={
@@ -67,7 +67,7 @@ class BitrixWarehouseSearchTool:
             return ToolResult(status=ToolStatus.INVALID_TOOL_CALL, tool=self.name, error="query is required")
 
         limit = max(1, min(int(args.get("limit") or 10), 20))
-        product_limit = max(1, min(int(args.get("product_limit") or 10), 50))
+        product_limit = max(1, min(int(args.get("product_limit") or 50), 50))
         product_offset = max(0, int(args.get("product_offset") or args.get("offset") or 0))
         include_products = bool(args.get("include_products"))
 

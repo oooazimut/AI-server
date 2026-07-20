@@ -7,6 +7,7 @@ import pytest
 import ai_server.agents.bitrix24.llm as bitrix_llm
 from ai_server.agents.bitrix24 import Bitrix24Specialist, BitrixLLMDecision, BitrixLLMService, BitrixLLMToolCall
 from ai_server.agents.bitrix24.llm import ALLOWED_TOOL_NAMES
+from ai_server.agents.bitrix24.specialist import _warehouse_args_with_default_products
 from ai_server.agents.bitrix24.tools.project_create import ProjectCreateDiscardTool
 from ai_server.agents.bitrix24.tools.task_close import TaskCloseDraftTool
 from ai_server.agents.bitrix24.tools.task_close_control import TaskCloseControlUpdateTool
@@ -297,6 +298,17 @@ def test_bitrix_specialist_treats_show_warehouse_as_stock_request():
 
     assert result.status == "completed"
     assert tools.warehouse_calls == [{"query": "Борисов", "include_products": True, "product_limit": 50}]
+
+
+def test_show_all_warehouse_request_always_resets_product_page_to_first():
+    args = _warehouse_args_with_default_products(
+        {"query": "Ларгус 2", "include_products": True, "product_limit": 10, "product_offset": 50},
+        AgentTask(task_id="t1", request="Покажи все позиции по складу Ларгус 2"),
+    )
+
+    assert args["include_products"] is True
+    assert args["product_limit"] == 50
+    assert args["product_offset"] == 0
 
 
 def test_bitrix_specialist_fast_returns_read_only_tools():

@@ -31,6 +31,7 @@ REPAIRABLE_PLAN_REJECTIONS = frozenset(
         "PLAN_BINDING_MISMATCH",
         "NON_EXECUTION_PLAN_INVALID",
         "DUPLICATE_SUBTASK",
+        "WAREHOUSE_SEGMENT_INCOMPLETE",
     }
 )
 
@@ -267,6 +268,46 @@ def _explicit_segments(request: str, catalog: dict[str, Any]) -> list[dict[str, 
     return voice_segments or segments
 
 
+def _required_warehouse_labels(request: str, catalog: dict[str, Any]) -> list[str]:
+    """Return unambiguous simple warehouse labels explicitly enumerated by a user.
+
+    This is deliberately a narrow fail-closed guard, not a replacement for the
+    Pro planner.  It activates only when a warehouse request contains an
+    explicit list connector (comma or ``и``).  Each resulting label must be
+    represented by its own validated Bitrix warehouse subtask.
+    """
+    capabilities = set((catalog.get("bitrix24") or {}).get("capabilities", []))
+    if "bitrix_warehouse_search" not in capabilities:
+        return []
+    text = _normalized_text(request)
+    match = re.search(r"\b(?:покажи|найди|выведи)\s+(?:мне\s+)?склад(?:ы)?\s+(.+)", text)
+    if not match:
+        return []
+    tail = match.group(1)
+    if "," not in request and " и " not in f" {tail} ":
+        return []
+    excluded = {
+        "и",
+        "или",
+        "склад",
+        "склады",
+        "все",
+        "всё",
+        "позиции",
+        "остатки",
+        "покажи",
+        "найди",
+        "выведи",
+        "мне",
+    }
+    labels: list[str] = []
+    for token in tail.split():
+        if token in excluded or token.isdigit() or token in labels:
+            continue
+        labels.append(token)
+    return labels if len(labels) > 1 else []
+
+
 def _constraints(
     request: str, catalog: dict[str, Any], *, pending_specialist: str | None = None
 ) -> dict[str, Any]:
@@ -277,6 +318,7 @@ def _constraints(
         "allowed_specialists": sorted(catalog),
         "capability_catalog": catalog,
         "explicit_segments": _explicit_segments(request, catalog),
+        "required_warehouse_labels": _required_warehouse_labels(request, catalog),
         "pending_specialist": pending_specialist or None,
         "max_subtasks": 8,
         "max_round_trips": 3,
@@ -359,6 +401,20 @@ def _decode_plan(raw: str, *, plan_id: str, request: str, constraints: dict[str,
         subtasks.append(Subtask(subtask_id, segment_id, specialist_id, capability, subrequest))
     if expected_segments and seen_segments != set(expected_segments):
         raise PlanRejected("SEGMENT_COMPLETENESS_FAILED")
+    required_warehouse_labels = list(constraints.get("required_warehouse_labels") or [])
+    if required_warehouse_labels:
+        label_counts = {label: 0 for label in required_warehouse_labels}
+        for subtask in subtasks:
+            if subtask.specialist_id != "bitrix24" or subtask.capability != "bitrix_warehouse_search":
+                continue
+            subtask_words = set(_normalized_text(subtask.request).split())
+            represented = [label for label in required_warehouse_labels if label in subtask_words]
+            if len(represented) > 1:
+                raise PlanRejected("WAREHOUSE_SEGMENT_INCOMPLETE")
+            if represented:
+                label_counts[represented[0]] += 1
+        if any(count != 1 for count in label_counts.values()):
+            raise PlanRejected("WAREHOUSE_SEGMENT_INCOMPLETE")
     return Plan(plan_id, state, clarification, subtasks)
 
 
@@ -545,7 +601,6 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             try:
                 task, _ = await self._load_authoritative_pending_specialist(task)
                 task = await self._load_authoritative_dialog_history(task)
-                task, draft_guard_result = await self._guard_active_draft(task)
             except Exception:
                 usage = ModelUsageRecord(
                     agent_id=self.manifest.id,
@@ -564,14 +619,6 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                 result = result.model_copy(
                     update={"metadata": {**result.metadata, "total_ms": round((time.monotonic() - started) * 1000, 1)}}
                 )
-                await self._send_to_channel(task, result)
-                await self._publish_result(task, result)
-                return result
-            if draft_guard_result is not None:
-                result = draft_guard_result.model_copy(
-                    update={"metadata": {**draft_guard_result.metadata, "total_ms": round((time.monotonic() - started) * 1000, 1)}}
-                )
-                await self._append_authoritative_dialog_turn(task, result.answer)
                 await self._send_to_channel(task, result)
                 await self._publish_result(task, result)
                 return result
@@ -839,13 +886,20 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                     },
                 )
             )
-        if deterministic_route or len(facts) == 1:
+        single_verified_fact = (
+            not deterministic_route
+            and len(facts) == 1
+            and facts[0]["status"] == "completed"
+            and bool(str(facts[0]["answer"]).strip())
+            and not approvals
+        )
+        if deterministic_route or single_verified_fact:
             answer = (
                 "; ".join(str(item["answer"]).strip() for item in facts if str(item["answer"]).strip())
                 or "Не удалось получить подтверждённый результат специалистов."
             )
             usages = list(planner_usages)
-            if len(facts) == 1 and not deterministic_route:
+            if single_verified_fact:
                 actions.append(
                     ActionRecord(
                         name="final_validation",

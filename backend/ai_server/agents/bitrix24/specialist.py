@@ -606,10 +606,14 @@ def _project_create_args_with_actor_context(args: dict[str, Any], task: AgentTas
 
 
 def _warehouse_args_with_default_products(args: dict[str, Any], task: AgentTask) -> dict[str, Any]:
+    request = str(task.request or "")
+    defaults = {**args, "product_limit": int(args.get("product_limit") or 50)}
+    if _warehouse_request_resets_page(request):
+        return {**defaults, "include_products": True, "product_limit": 50, "product_offset": 0}
     if args.get("include_products") is True:
-        return args
-    if _warehouse_request_implies_stock(str(task.request or "")):
-        return {**args, "include_products": True, "product_limit": int(args.get("product_limit") or 50)}
+        return defaults
+    if _warehouse_request_implies_stock(request):
+        return {**defaults, "include_products": True}
     return args
 
 
@@ -618,6 +622,14 @@ def _warehouse_request_implies_stock(request: str) -> bool:
     if any(marker in normalized for marker in ("остат", "налич", "что есть", "что находится")):
         return True
     return bool(re.search(r"\b(?:битрикс\s+)?покажи(?:те)?\s+(?:мне\s+)?склад\b", normalized))
+
+
+def _warehouse_request_resets_page(request: str) -> bool:
+    normalized = request.casefold().replace("ё", "е")
+    return any(
+        marker in normalized
+        for marker in ("покажи все", "покажи всё", "выведи все", "выведи всё", "все позиции", "начиная с 1")
+    )
 
 
 def _args_with_actor_admin_context(

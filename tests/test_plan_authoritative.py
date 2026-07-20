@@ -301,7 +301,7 @@ def test_handle_preserves_approval_and_needs_human_state():
     assert [item.name for item in output.actions_requiring_approval] == ["write"]
 
 
-def test_new_explicit_calendar_request_is_held_behind_active_task_draft():
+def test_new_calendar_request_reaches_pro_plan_despite_active_task_draft():
     class DraftingSpecialist(_Specialist):
         async def get_active_draft(self, dialog_key):
             return {"_draft_id": "draft-1", "_draft_type": "task_create", "_draft_version": 1}
@@ -324,12 +324,11 @@ def test_new_explicit_calendar_request_is_held_behind_active_task_draft():
         subject.handle(AgentTask(task_id="t1", request="Напомни мне завтра позвонить Борисову", context={"dialog_key": "d1"}))
     )
 
-    assert output.metadata["reason"] == "REPLACEMENT_CANDIDATE_SAVED"
-    assert specialist.tasks == []
-    assert asyncio.run(store.get_replacement_candidate("d1"))["request_text"] == "Напомни мне завтра позвонить Борисову"
+    assert output.status == "completed"
+    assert len(specialist.tasks) == 1
 
 
-def test_second_task_draft_is_held_behind_an_active_task_draft():
+def test_second_task_draft_reaches_pro_plan_despite_active_task_draft():
     class DraftingSpecialist(_Specialist):
         async def get_active_draft(self, dialog_key):
             return {"_draft_id": "draft-1", "_draft_type": "task_create", "_draft_version": 1}
@@ -352,8 +351,8 @@ def test_second_task_draft_is_held_behind_an_active_task_draft():
         subject.handle(AgentTask(task_id="t1", request="создай задачу проверить договор", context={"dialog_key": "d1"}))
     )
 
-    assert output.metadata["reason"] == "REPLACEMENT_CANDIDATE_SAVED"
-    assert specialist.tasks == []
+    assert output.status == "completed"
+    assert len(specialist.tasks) == 1
 
 
 def test_duplicate_branch_is_rejected_before_any_specialist_can_run():
@@ -380,6 +379,27 @@ def test_duplicate_branch_is_rejected_before_any_specialist_can_run():
     )
 
     with pytest.raises(PlanRejected, match="DUPLICATE_SUBTASK"):
+        _decode_plan(raw, plan_id="p1", request=request, constraints=constraints)
+
+
+def test_explicit_three_warehouse_request_requires_one_branch_per_label():
+    request = "Покажи склад Борисова Карасева и Ивашина"
+    constraints = _constraints(request, {"bitrix24": {"capabilities": ["bitrix_warehouse_search"]}})
+    raw = _plan(
+        request,
+        subtasks=[
+            {
+                "subtask_id": "s1",
+                "segment_id": None,
+                "specialist_id": "bitrix24",
+                "capability": "bitrix_warehouse_search",
+                "request": "покажи склад Ивашина",
+            }
+        ],
+    )
+
+    assert constraints["required_warehouse_labels"] == ["борисова", "карасева", "ивашина"]
+    with pytest.raises(PlanRejected, match="WAREHOUSE_SEGMENT_INCOMPLETE"):
         _decode_plan(raw, plan_id="p1", request=request, constraints=constraints)
 
 

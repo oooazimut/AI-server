@@ -12,6 +12,14 @@ _PHRASES = {
     "admin_change": "да, подтверждаю изменение настройки",
 }
 
+_REQUIRED_TYPE_WORDS = {
+    "task_create": ("задачи",),
+    "task_close": ("закрываю", "задачу"),
+    "calendar_event": ("календаре",),
+    "project_create": ("проекта",),
+    "admin_change": ("настройки",),
+}
+
 
 def draft_confirmation_phrase(draft_type: str | None) -> str:
     """The one unambiguous user-facing confirmation phrase for a draft type."""
@@ -37,7 +45,13 @@ def matches_draft_confirmation(request: str, draft: dict[str, Any] | None) -> bo
     # never turn an unrelated "да" into confirmation of a write draft.
     if len(actual_words) < max(2, len(expected_words) - 1) or len(actual_words) > len(expected_words) + 1:
         return False
-    return _word_distance(expected_words, actual_words) <= 1
+    if _word_distance(expected_words, actual_words) > 1:
+        return False
+    # The action type is a safety boundary.  A voice typo in it is acceptable,
+    # but omitting it must never turn a task confirmation into a calendar or
+    # project confirmation (or vice versa).
+    required = _REQUIRED_TYPE_WORDS.get(str(draft.get("_draft_type") or "task_create"), ("задачи",))
+    return all(any(_character_distance(word, seen) <= 1 for seen in actual_words) for word in required)
 
 
 def _normalize(value: str) -> str:
