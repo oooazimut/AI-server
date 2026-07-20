@@ -25,7 +25,13 @@ from ai_server.orchestrators.tools.call_specialist import CallSpecialistTool
 PLAN_SCHEMA = "t0007.plan.v1"
 FINAL_SCHEMA = "t0006.final.v1"
 REPAIRABLE_PLAN_REJECTIONS = frozenset(
-    {"INVALID_JSON", "PLAN_SCHEMA_MISMATCH", "PLAN_BINDING_MISMATCH", "NON_EXECUTION_PLAN_INVALID"}
+    {
+        "INVALID_JSON",
+        "PLAN_SCHEMA_MISMATCH",
+        "PLAN_BINDING_MISMATCH",
+        "NON_EXECUTION_PLAN_INVALID",
+        "DUPLICATE_SUBTASK",
+    }
 )
 
 _DRAFT_CONTINUE = "продолжить текущий черновик"
@@ -58,8 +64,11 @@ def _is_new_request_during_draft(request: str, draft: dict[str, Any]) -> bool:
     if matches_draft_confirmation(request, draft) or _draft_discard_request(request):
         return False
     incoming = _draft_intent(request)
-    active = str(draft.get("_draft_type") or "")
-    return bool(incoming and incoming != active)
+    # A read-only request has no draft intent and must remain available while a
+    # draft is waiting for confirmation.  Every new write intent, including a
+    # second request of the same type, is held as a replacement candidate: two
+    # concurrent drafts in one dialog are never safe.
+    return bool(incoming)
 
 
 class PlanAuthoritativeLLM(Protocol):
@@ -306,6 +315,7 @@ def _decode_plan(raw: str, *, plan_id: str, request: str, constraints: dict[str,
     expected_segments = {item["segment_id"]: item for item in constraints.get("explicit_segments", [])}
     seen: set[str] = set()
     seen_segments: set[str] = set()
+    seen_dispatches: set[tuple[str, str, str]] = set()
     subtasks: list[Subtask] = []
     for item in items:
         if not isinstance(item, dict) or set(item) != {
@@ -334,6 +344,9 @@ def _decode_plan(raw: str, *, plan_id: str, request: str, constraints: dict[str,
             raise PlanRejected("FORBIDDEN_CAPABILITY")
         if not isinstance(subrequest, str) or not subrequest.strip():
             raise PlanRejected("SUBTASK_REQUEST_INVALID")
+        dispatch_key = (specialist_id, capability, _normalized_text(subrequest))
+        if dispatch_key in seen_dispatches:
+            raise PlanRejected("DUPLICATE_SUBTASK")
         if expected_segments:
             expected = expected_segments.get(segment_id or "")
             if expected is None or expected["specialist_id"] != specialist_id or expected["request"] != subrequest:
@@ -342,6 +355,7 @@ def _decode_plan(raw: str, *, plan_id: str, request: str, constraints: dict[str,
         elif segment_id is not None:
             raise PlanRejected("SEGMENT_BINDING_INVALID")
         seen.add(subtask_id)
+        seen_dispatches.add(dispatch_key)
         subtasks.append(Subtask(subtask_id, segment_id, specialist_id, capability, subrequest))
     if expected_segments and seen_segments != set(expected_segments):
         raise PlanRejected("SEGMENT_COMPLETENESS_FAILED")
@@ -745,13 +759,15 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                         "t0006_response_hash": response_hash,
                         "t0006_subtask_id": subtask.subtask_id,
                         "t0006_attempt_id": attempt_id,
-                        # The planner is authorized to choose a specialist, never to
-                        # silently rewrite the user's request seen by that specialist.
-                        # Keep both values for causal audit while dispatching the
-                        # original, validated dialog-bound request.
+                        # Keep the raw dialog request for audit.  A single
+                        # subtask still receives it verbatim; every branch of a
+                        # composite plan receives only its validated atom, so a
+                        # Bitrix specialist cannot re-parse the whole request and
+                        # accidentally run the last mentioned warehouse for all
+                        # branches.
                         "t0006_original_request": task.request,
                         "t0006_planned_subtask_request": subtask.request,
-                        "t0007_explicit_segment_request": subtask.request if subtask.segment_id else "",
+                        "t0007_dispatch_request": subtask.request if len(plan.subtasks) > 1 else task.request,
                     }
                 }
             )

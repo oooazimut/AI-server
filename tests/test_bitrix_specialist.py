@@ -296,7 +296,7 @@ def test_bitrix_specialist_treats_show_warehouse_as_stock_request():
     )
 
     assert result.status == "completed"
-    assert tools.warehouse_calls == [{"query": "Борисов", "include_products": True, "product_limit": 10}]
+    assert tools.warehouse_calls == [{"query": "Борисов", "include_products": True, "product_limit": 50}]
 
 
 def test_bitrix_specialist_fast_returns_read_only_tools():

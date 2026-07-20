@@ -194,8 +194,11 @@ class CallSpecialistTool:
         specialist_id = str(args.get("specialist_id") or "").strip()
         planned_request = str(args.get("request") or "").strip()
         original_request = str(task.context.get("t0006_original_request") or "").strip()
-        explicit_segment_request = str(task.context.get("t0007_explicit_segment_request") or "").strip()
-        request = explicit_segment_request or original_request or planned_request
+        dispatch_request = str(task.context.get("t0007_dispatch_request") or "").strip()
+        # The orchestrator, rather than a specialist, owns decomposition.  A
+        # non-empty dispatch request is therefore the only request the
+        # specialist may execute for this branch; the original is audit-only.
+        request = dispatch_request or original_request or planned_request
 
         specialist = self._specialists.get(specialist_id)
         if specialist is None:

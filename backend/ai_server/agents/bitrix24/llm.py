@@ -520,7 +520,8 @@ def _format_warehouse_answer(data: dict[str, Any], *, portal_base_url: str = "")
         return f"На складе {store_label} положительных остатков не найдено."
 
     lines = [f"Остатки по складу {store_label}:"]
-    for index, item in enumerate(items, start=1):
+    offset = _int_value(products.get("offset")) or 0
+    for index, item in enumerate(items, start=offset + 1):
         if not isinstance(item, dict):
             continue
         name = _text(item.get("product_name")) or "товар"
@@ -530,7 +531,6 @@ def _format_warehouse_answer(data: dict[str, Any], *, portal_base_url: str = "")
         lines.append(f"{index}. {title}{suffix}")
 
     total = _int_value(products.get("available_items_with_names")) or _int_value(products.get("available_items_seen"))
-    offset = _int_value(products.get("offset")) or 0
     shown = len(items)
     limit = _int_value(products.get("limit")) or shown
     if total:
@@ -1630,7 +1630,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Произвольное создание проектов доступно только Bitrix-администратору. Личные проекты по умолчанию открытые и видимые. "
         "Для поиска складов, остатков и запросов вида 'найди склад Борисов' используй bitrix_warehouse_search, "
         "а не свободный bitrix_api. Если пользователь просит что есть на складе/остатки или говорит 'покажи склад <название>', передай include_products=true "
-        "и product_limit=10, если пользователь не попросил другое количество. Для следующих позиций используй product_offset. "
+        "и product_limit=50, если пользователь не попросил другое количество. Для следующих позиций используй product_offset. "
         "Не вызывай search.search: этот метод в текущем Bitrix недоступен. "
         "Для создания задачи используй task_create_draft. "
         "Для task_create_draft именно ты распознаёшь title, responsible_id/responsible_self, "

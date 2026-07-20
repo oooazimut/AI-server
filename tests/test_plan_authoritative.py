@@ -329,6 +329,93 @@ def test_new_explicit_calendar_request_is_held_behind_active_task_draft():
     assert asyncio.run(store.get_replacement_candidate("d1"))["request_text"] == "Напомни мне завтра позвонить Борисову"
 
 
+def test_second_task_draft_is_held_behind_an_active_task_draft():
+    class DraftingSpecialist(_Specialist):
+        async def get_active_draft(self, dialog_key):
+            return {"_draft_id": "draft-1", "_draft_type": "task_create", "_draft_version": 1}
+
+    store = FakeOrchestratorStore()
+    specialist = DraftingSpecialist(AgentResult(status="completed", agent_id="bitrix24", answer="unexpected"))
+    manifest = AgentManifest(
+        id="bitrix24", name="Bitrix", kind="specialist", description="test", capabilities=["bitrix_warehouse_search"]
+    )
+    call = CallSpecialistTool({"bitrix24": specialist}, [manifest], store=store)
+    subject = PlanAuthoritativeOrchestrator(
+        AgentManifest(id="internal_orchestrator", name="Orchestrator", kind="orchestrator", description="test"),
+        agent_tools=[call],
+        planner=_Planner(),
+        llm=_Planner(),
+        store=store,
+    )
+
+    output = asyncio.run(
+        subject.handle(AgentTask(task_id="t1", request="создай задачу проверить договор", context={"dialog_key": "d1"}))
+    )
+
+    assert output.metadata["reason"] == "REPLACEMENT_CANDIDATE_SAVED"
+    assert specialist.tasks == []
+
+
+def test_duplicate_branch_is_rejected_before_any_specialist_can_run():
+    request = "покажи склад Борисова"
+    constraints = _constraints(request, {"bitrix24": {"capabilities": ["bitrix_warehouse_search"]}})
+    raw = _plan(
+        request,
+        subtasks=[
+            {
+                "subtask_id": "s1",
+                "segment_id": None,
+                "specialist_id": "bitrix24",
+                "capability": "bitrix_warehouse_search",
+                "request": request,
+            },
+            {
+                "subtask_id": "s2",
+                "segment_id": None,
+                "specialist_id": "bitrix24",
+                "capability": "bitrix_warehouse_search",
+                "request": request,
+            },
+        ],
+    )
+
+    with pytest.raises(PlanRejected, match="DUPLICATE_SUBTASK"):
+        _decode_plan(raw, plan_id="p1", request=request, constraints=constraints)
+
+
+def test_composite_plan_dispatches_each_validated_branch_not_the_whole_dialog_request():
+    class CompositePlanner(_Planner):
+        async def plan(self, *, task, constraints, **kwargs):
+            return _plan(
+                task.request,
+                plan_id=constraints["plan_id"],
+                subtasks=[
+                    {
+                        "subtask_id": "s1",
+                        "segment_id": None,
+                        "specialist_id": "bitrix24",
+                        "capability": "bitrix_warehouse_search",
+                        "request": "покажи склад Борисова",
+                    },
+                    {
+                        "subtask_id": "s2",
+                        "segment_id": None,
+                        "specialist_id": "bitrix24",
+                        "capability": "bitrix_warehouse_search",
+                        "request": "покажи склад Карасева",
+                    },
+                ],
+            ), ModelUsageRecord(agent_id="test", provider="test", model="test")
+
+    subject, specialist = _live_subject(
+        AgentResult(status="completed", agent_id="bitrix24", answer="ready"), planner=CompositePlanner()
+    )
+
+    asyncio.run(subject.handle(AgentTask(task_id="t1", request="склады Борисова и Карасева")))
+
+    assert [item.request for item in specialist.tasks] == ["покажи склад Борисова", "покажи склад Карасева"]
+
+
 def test_multi_source_partial_failure_keeps_success_and_names_failed_source():
     class _MultiPlanner(_Planner):
         async def plan(self, *, task, constraints, **kwargs):

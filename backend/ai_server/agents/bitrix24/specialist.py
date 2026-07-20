@@ -609,7 +609,7 @@ def _warehouse_args_with_default_products(args: dict[str, Any], task: AgentTask)
     if args.get("include_products") is True:
         return args
     if _warehouse_request_implies_stock(str(task.request or "")):
-        return {**args, "include_products": True, "product_limit": int(args.get("product_limit") or 10)}
+        return {**args, "include_products": True, "product_limit": int(args.get("product_limit") or 50)}
     return args
 
 
