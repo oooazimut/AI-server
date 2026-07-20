@@ -19,9 +19,10 @@ def _make_result(status: str = "completed", confidence: float = 0.9) -> AgentRes
     return AgentResult(status=status, agent_id="internal_orchestrator", answer="тест", confidence=confidence)
 
 
-def _msg(task: AgentTask, result: AgentResult, msg_id: str = "msg-1") -> dict:
+def _msg(task: AgentTask, result: AgentResult, msg_id: str = "msg-1", *, source: str = "orchestrator") -> dict:
     return {
         "_id": msg_id,
+        "source": source,
         "task": task.model_dump(),
         "result": result.model_dump(),
     }
@@ -199,6 +200,43 @@ def test_trace_incident_detects_missing_outbound():
     )
 
     assert _trace_incident_reasons(task, _make_result(), [], high_latency_ms=120000) == ["missing_outbound"]
+
+
+def test_trace_incident_detects_unknown_outbound_outcome():
+    task = _make_task()
+    trace = [{"trace_type": "outbound_message", "send_status": "unknown"}]
+
+    assert _trace_incident_reasons(task, _make_result(), trace, high_latency_ms=120000) == [
+        "outbound_unknown"
+    ]
+
+
+def test_outbound_delivery_event_creates_unknown_incident_from_terminal_trace():
+    task = _make_task("task-outbound-unknown")
+    result = _make_result()
+    queue = AsyncMock()
+    queue.claim_next = AsyncMock(
+        side_effect=[_msg(task, result, source="outbound_delivery"), None, None, None]
+    )
+    queue.ack = AsyncMock()
+    store = AsyncMock()
+    store.save_event = AsyncMock()
+    store.save_trace_snapshot = AsyncMock()
+    store.save_incident = AsyncMock()
+    trace = AsyncMock()
+    trace.by_task = AsyncMock(
+        return_value=[{"trace_type": "outbound_message", "send_status": "unknown"}]
+    )
+
+    _run_one(
+        queue,
+        store,
+        conversation_trace=trace,
+        trace_snapshot_enabled=True,
+        trace_settle_seconds=0,
+    )
+
+    store.save_incident.assert_awaited_once_with("task-outbound-unknown", reason="outbound_unknown")
 
 
 def test_worker_skips_malformed_message():

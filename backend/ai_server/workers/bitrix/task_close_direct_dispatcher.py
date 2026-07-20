@@ -25,6 +25,7 @@ from ai_server.integrations.bitrix.task_close_direct_queue import (
     TASK_CLOSE_DIRECT_STATUS_ACTIVE,
     auto_close_direct_close_event_as_unconfirmed,
 )
+from ai_server.models import AgentResult, AgentTask
 from ai_server.settings import Settings
 from ai_server.utils import MOSCOW_TZ
 
@@ -36,6 +37,7 @@ class DirectTaskCloseDraftDispatchStats:
     candidates: int = 0
     drafts_created: int = 0
     messages_sent: int = 0
+    messages_queued: int = 0
     skipped: int = 0
     blocked: int = 0
     errors: list[str] = field(default_factory=list)
@@ -45,6 +47,7 @@ class DirectTaskCloseDraftDispatchStats:
             "candidates": self.candidates,
             "drafts_created": self.drafts_created,
             "messages_sent": self.messages_sent,
+            "messages_queued": self.messages_queued,
             "skipped": self.skipped,
             "blocked": self.blocked,
             "errors": list(self.errors),
@@ -88,6 +91,7 @@ async def run_task_close_direct_control_worker(
     store: Any,
     settings: Settings,
     status: dict[str, Any],
+    outbound_queue: Any = None,
 ) -> None:
     interval_seconds = max(int(settings.bitrix_task_close_control_interval_seconds), 30)
     status.update(
@@ -113,6 +117,7 @@ async def run_task_close_direct_control_worker(
                 store=store,
                 settings=settings,
                 status=status,
+                outbound_queue=outbound_queue,
             )
             status["last_success_at"] = _now().isoformat()
             status["last_error"] = None
@@ -137,6 +142,7 @@ async def run_task_close_direct_control_once(
     settings: Settings,
     status: dict[str, Any] | None = None,
     now: datetime | None = None,
+    outbound_queue: Any = None,
 ) -> dict[str, Any]:
     now_dt = now or _now()
     if status is not None:
@@ -147,6 +153,7 @@ async def run_task_close_direct_control_once(
         settings=settings,
         limit=max(int(settings.bitrix_task_close_control_direct_limit), 1),
         now=now_dt,
+        outbound_queue=outbound_queue,
     )
     auto_close_stats = await auto_close_direct_task_close_reports(
         bitrix=bitrix,
@@ -173,6 +180,7 @@ async def dispatch_direct_task_close_drafts(
     settings: Settings,
     limit: int = 20,
     now: datetime | None = None,
+    outbound_queue: Any = None,
 ) -> DirectTaskCloseDraftDispatchStats:
     stats = DirectTaskCloseDraftDispatchStats()
     lister = getattr(store, "list_task_close_processing_states", None)
@@ -187,15 +195,27 @@ async def dispatch_direct_task_close_drafts(
     now_iso = (now or datetime.now(MOSCOW_TZ)).isoformat(timespec="seconds")
     for state in states:
         try:
-            result = await _dispatch_one(bitrix=bitrix, store=store, settings=settings, state=state, now_iso=now_iso)
+            result = await _dispatch_one(
+                bitrix=bitrix,
+                store=store,
+                settings=settings,
+                state=state,
+                now_iso=now_iso,
+                outbound_queue=outbound_queue,
+            )
         except Exception as exc:  # pragma: no cover - defensive: one bad task must not stop metadata sync
             stats.errors.append(f"{state.get('task_id')}:{type(exc).__name__}: {exc}")
             continue
         if result == "created":
             stats.drafts_created += 1
             stats.messages_sent += 1
+        elif result == "created_queued":
+            stats.drafts_created += 1
+            stats.messages_queued += 1
         elif result == "sent_existing":
             stats.messages_sent += 1
+        elif result == "queued_existing":
+            stats.messages_queued += 1
         elif result == "blocked":
             stats.blocked += 1
         else:
@@ -384,9 +404,10 @@ async def _dispatch_one(
     settings: Settings,
     state: dict[str, Any],
     now_iso: str,
+    outbound_queue: Any = None,
 ) -> str:
     payload = dict(state.get("payload") or {})
-    if payload.get("direct_close_draft_sent_at"):
+    if payload.get("direct_close_draft_sent_at") or payload.get("direct_close_draft_queued_at"):
         return "skipped"
     task_id = safe_int(state.get("task_id") or payload.get("task_id"))
     close_event_key = str(payload.get("close_event_key") or "").strip()
@@ -432,7 +453,34 @@ async def _dispatch_one(
 
     message = _direct_close_draft_message(draft)
     if not settings.agent_dry_run:
-        await bitrix.send_bot_message(recipient_id, message, bot_id=settings.bitrix_bot_id)
+        if outbound_queue is not None:
+            delivery_key = f"task_close_direct:{task_id}:{close_event_key}:draft"
+            outbound_task = AgentTask(
+                task_id=f"task-close-direct:{task_id}:{close_event_key}",
+                request="task_close_direct_draft",
+                context={
+                    "channel_id": "bitrix24",
+                    "recipient_id": recipient_id,
+                    "dialog_key": draft_dialog_key,
+                    "event": "task_close_direct",
+                },
+            )
+            outbound_result = AgentResult(
+                status="completed",
+                agent_id="bitrix24",
+                answer=message,
+            )
+            delivery_id, _ = await outbound_queue.enqueue(
+                delivery_key=delivery_key,
+                channel_id="bitrix24",
+                recipient_id=recipient_id,
+                body=message,
+                task=outbound_task.model_dump(),
+                result=outbound_result.model_dump(),
+            )
+        else:
+            await bitrix.send_bot_message(recipient_id, message, bot_id=settings.bitrix_bot_id)
+            delivery_id = ""
     _update_state(
         store,
         state=state,
@@ -440,9 +488,13 @@ async def _dispatch_one(
             **payload,
             "recipient_id": recipient_id,
             "draft_dialog_key": draft_dialog_key,
-            "direct_close_draft_sent_at": now_iso,
+            "direct_close_draft_sent_at": now_iso if outbound_queue is None else "",
+            "direct_close_draft_queued_at": now_iso if outbound_queue is not None else "",
+            "direct_close_draft_delivery_id": delivery_id if not settings.agent_dry_run else "",
         },
     )
+    if outbound_queue is not None:
+        return "created_queued" if created else "queued_existing"
     return "created" if created else "sent_existing"
 
 

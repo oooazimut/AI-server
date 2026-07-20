@@ -88,6 +88,15 @@ class RecordingBitrix:
         return {"result": True}
 
 
+class RecordingOutbox:
+    def __init__(self) -> None:
+        self.items: list[dict] = []
+
+    async def enqueue(self, **kwargs):
+        self.items.append(dict(kwargs))
+        return "delivery-task-close-1", True
+
+
 class RecordingOAuthClient:
     def __init__(self, *, fail_close: bool = False, task_closed: bool = False) -> None:
         self.fail_close = fail_close
@@ -175,6 +184,55 @@ def test_dispatcher_creates_direct_close_draft_and_sends_message(monkeypatch):
     assert state is not None
     assert state["status"] == TASK_CLOSE_DIRECT_STATUS_ACTIVE
     assert state["payload"]["direct_close_draft_sent_at"]
+
+
+def test_dispatcher_queues_direct_close_draft_without_contacting_bitrix(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    store = DraftQueueStore()
+    bitrix = RecordingBitrix()
+    outbox = RecordingOutbox()
+    enqueue_direct_close_event(
+        store,
+        task_id=8877,
+        close_event_key="closed_at:2026-07-12T12:00:00+03:00",
+        responsible_id=231,
+        dialog_key="231",
+        closed_at="2026-07-12T12:00:00+03:00",
+        task_title="Queued close",
+        payload={
+            "recipient_id": "231",
+            "draft_dialog_key": "dialog:231:user:231",
+            "task_results": ["Done"],
+        },
+    )
+    activate_next_direct_close_event(store, responsible_id=231, dialog_key="231")
+
+    stats = anyio.run(
+        lambda: dispatch_direct_task_close_drafts(
+            bitrix=bitrix,
+            store=store,
+            settings=get_settings(),
+            outbound_queue=outbox,
+        )
+    )
+
+    assert stats.drafts_created == 1
+    assert stats.messages_sent == 0
+    assert stats.messages_queued == 1
+    assert bitrix.messages == []
+    assert len(outbox.items) == 1
+    assert outbox.items[0]["delivery_key"] == (
+        "task_close_direct:8877:closed_at:2026-07-12T12:00:00+03:00:draft"
+    )
+    assert outbox.items[0]["task"]["task_id"].startswith("task-close-direct:8877:")
+    state = store.get_task_close_processing_state(
+        task_id=8877,
+        state_key=direct_close_state_key("closed_at:2026-07-12T12:00:00+03:00"),
+    )
+    assert state is not None
+    assert state["payload"]["direct_close_draft_queued_at"]
+    assert state["payload"]["direct_close_draft_delivery_id"] == "delivery-task-close-1"
+    assert not state["payload"]["direct_close_draft_sent_at"]
 
 
 def test_dispatcher_keeps_direct_close_points_unknown_without_specific_result(monkeypatch):

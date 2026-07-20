@@ -16,6 +16,7 @@ from ai_server.agents.ports import (
     ResultPublisherPort,
     SchedulerPort,
 )
+from ai_server.integrations.redis.outbound_queue import outbound_delivery_key
 from ai_server.models import AgentManifest, AgentResult, AgentTask, ScheduledTask, ToolResult, ToolStatus
 from ai_server.orchestrators.orchestrator_llm import (
     OrchestratorFinalResult,
@@ -57,6 +58,7 @@ class InternalOrchestrator(BaseSpecialist):
         result_publisher: ResultPublisherPort | None = None,
         conversation_trace: Any = None,
         dialog_guard: Any = None,
+        outbound_queue: Any = None,
     ) -> None:
         super().__init__(
             manifest,
@@ -72,6 +74,7 @@ class InternalOrchestrator(BaseSpecialist):
         self._result_publisher = result_publisher
         self._conversation_trace = conversation_trace
         self._dialog_guard = dialog_guard
+        self._outbound_queue = outbound_queue
 
     # ------------------------------------------------------------------
     # BaseSpecialist hooks
@@ -231,7 +234,7 @@ class InternalOrchestrator(BaseSpecialist):
                     routing = message.get("routing") or {}
                     if routing.get("channel_id") and routing.get("recipient_id"):
                         stub_task = AgentTask(
-                            task_id="",
+                            task_id=str(message.get("correlation_id") or msg_id),
                             request="",
                             context={
                                 "channel_id": routing["channel_id"],
@@ -320,6 +323,7 @@ class InternalOrchestrator(BaseSpecialist):
             result_publisher=result_publisher,
             conversation_trace=specialist_deps.get("conversation_trace"),
             dialog_guard=specialist_deps.get("dialog_guard"),
+            outbound_queue=specialist_deps.get("outbound_queue"),
         )
         # Break circular dep: CallSpecialistTool needs orch to schedule specialist tasks
         call_tool.schedule_fn = orch._apply_scheduled_tasks_from_specialist
@@ -409,6 +413,57 @@ class InternalOrchestrator(BaseSpecialist):
                         body=body,
                         status="suppressed",
                         error="dialog_cancelled",
+                    )
+                return
+            if self._outbound_queue is not None:
+                send_started_at = _trace_now_iso()
+                send_t0 = time.monotonic()
+                delivery_key = outbound_delivery_key(
+                    channel_id=str(channel_id),
+                    recipient_id=str(recipient_id),
+                    task_id=str(task.task_id),
+                    body=body,
+                )
+                try:
+                    delivery_id, created = await self._outbound_queue.enqueue(
+                        delivery_key=delivery_key,
+                        channel_id=str(channel_id),
+                        recipient_id=str(recipient_id),
+                        body=body,
+                        task=task.model_dump(),
+                        result=result.model_dump(),
+                    )
+                except Exception:
+                    await self._record_timing(
+                        task,
+                        stage="channel_outbox_enqueue",
+                        started_at=send_started_at,
+                        elapsed_ms=(time.monotonic() - send_t0) * 1000,
+                        status="error",
+                        details={"channel_id": channel_id, "recipient_id": recipient_id},
+                    )
+                    raise
+                await self._record_timing(
+                    task,
+                    stage="channel_outbox_enqueue",
+                    started_at=send_started_at,
+                    elapsed_ms=(time.monotonic() - send_t0) * 1000,
+                    status="queued" if created else "deduplicated",
+                    details={
+                        "channel_id": channel_id,
+                        "recipient_id": recipient_id,
+                        "delivery_id": delivery_id,
+                        "body_chars": len(body),
+                    },
+                )
+                if self._conversation_trace is not None:
+                    await self._conversation_trace.record_outbound(
+                        task=task,
+                        result=result,
+                        recipient_id=str(recipient_id),
+                        body=body,
+                        status="queued" if created else "deduplicated",
+                        delivery_id=delivery_id,
                     )
                 return
             send_started_at = _trace_now_iso()

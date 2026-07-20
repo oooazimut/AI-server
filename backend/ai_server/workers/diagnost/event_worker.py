@@ -72,7 +72,7 @@ async def run_diagnost_event_worker(
             elif confidence < confidence_threshold:
                 await store.save_incident(task.task_id, reason="low_confidence")
 
-            if source == "orchestrator" and trace_snapshot:
+            if source in {"orchestrator", "outbound_delivery"} and trace_snapshot:
                 for reason in _trace_incident_reasons(task, result, trace_snapshot, high_latency_ms=high_latency_ms):
                     await store.save_incident(task.task_id, reason=reason)
 
@@ -114,6 +114,8 @@ def _trace_incident_reasons(
     outbound = [event for event in trace if event.get("trace_type") == "outbound_message"]
     if any(str(event.get("send_status") or "").lower() == "error" for event in outbound):
         reasons.append("outbound_failed")
+    if any(str(event.get("send_status") or "").lower() == "unknown" for event in outbound):
+        reasons.append("outbound_unknown")
     if any(str(event.get("send_status") or "").lower() == "suppressed" for event in outbound):
         reasons.append("outbound_suppressed")
     expects_outbound = bool(

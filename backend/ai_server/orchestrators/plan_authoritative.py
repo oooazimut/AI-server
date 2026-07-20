@@ -205,6 +205,7 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             llm=planner, store=store, scheduler=kwargs.get("scheduler"), retriever=retriever,
             channels=channels, footer_service=footer_service, result_publisher=result_publisher,
             conversation_trace=kwargs.get("conversation_trace"), dialog_guard=kwargs.get("dialog_guard"), planner=planner,
+            outbound_queue=kwargs.get("outbound_queue"),
         )
         call.schedule_fn = instance._apply_scheduled_tasks_from_specialist
         return instance

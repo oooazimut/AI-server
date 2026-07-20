@@ -38,6 +38,7 @@ from ai_server.integrations.redis.conversation_trace import RedisConversationTra
 from ai_server.integrations.redis.diagnost_queue import RedisDiagnostQueue
 from ai_server.integrations.redis.dialog_guard import RedisDialogGuard
 from ai_server.integrations.redis.event_queue import RedisEventQueue
+from ai_server.integrations.redis.outbound_queue import RedisOutboundQueue
 from ai_server.llm import build_orchestrator_llm_client
 from ai_server.models import AgentTask, UserContext
 from ai_server.orchestrators.internal import InternalOrchestrator
@@ -60,6 +61,7 @@ from ai_server.workers.diagnost.event_worker import run_diagnost_event_worker
 from ai_server.workers.diagnost.feedback_receiver import FeedbackReceiverAdapter
 from ai_server.workers.diagnost.feedback_scheduler import run_feedback_scheduler_worker
 from ai_server.workers.logistics.staff_sync import run_staff_sync
+from ai_server.workers.orchestrator.outbound_delivery import run_outbound_delivery_worker
 from ai_server.workers.orchestrator.result_publisher import OrchestratorResultPublisher, SpecialistResultPublisher
 
 logger = logging.getLogger(__name__)
@@ -125,6 +127,7 @@ async def main() -> None:
     )
     diagnost_queue = RedisDiagnostQueue(settings.redis_url)
     conversation_trace = RedisConversationTrace(settings.redis_url, settings=settings)
+    outbound_queue = RedisOutboundQueue(settings.redis_url)
     dialog_guard = RedisDialogGuard(settings.redis_url, settings=settings)
     result_publisher = OrchestratorResultPublisher(diagnost_queue, conversation_trace=conversation_trace)
     specialist_result_publisher = SpecialistResultPublisher(diagnost_queue, conversation_trace=conversation_trace)
@@ -142,6 +145,19 @@ async def main() -> None:
         logger.info("AgentScheduler disabled by AI_SERVER_SCHEDULER_ENABLED=false")
 
     agent_tasks: list[asyncio.Task] = []
+    bitrix_channel = BitrixChatChannel(settings=settings, bitrix=bitrix)
+    # The outbox is an independent durable subsystem: it must drain an existing
+    # backlog even when inbound webhook processing is intentionally disabled.
+    agent_tasks.append(
+        asyncio.create_task(
+            run_outbound_delivery_worker(
+                outbound_queue,
+                channels={"bitrix24": bitrix_channel},
+                conversation_trace=conversation_trace,
+                incident_queue=diagnost_queue,
+            )
+        )
+    )
 
     if settings.webhook_event_queue_enabled and settings.webhook_event_worker_enabled:
         bitrix_llm_svc = BitrixLLMService(settings=settings)
@@ -162,7 +178,6 @@ async def main() -> None:
             else None
         )
 
-        bitrix_channel = BitrixChatChannel(settings=settings, bitrix=bitrix)
         specialist_deps = SpecialistDeps(
             settings=settings,
             manifests=manifests,
@@ -189,6 +204,7 @@ async def main() -> None:
             footer_service=TechnicalFooterService(settings=settings),
             conversation_trace=conversation_trace,
             dialog_guard=dialog_guard,
+            outbound_queue=outbound_queue,
             result_publisher=result_publisher,
         )
         orch_manifest = next((m for m in manifests if m.kind == "orchestrator"), None)
@@ -478,6 +494,7 @@ async def main() -> None:
                     store=portal_search,
                     settings=settings,
                     status=_task_close_direct_status,
+                    outbound_queue=outbound_queue,
                 )
             )
         )
@@ -538,6 +555,7 @@ async def main() -> None:
         t.cancel()
     await asyncio.gather(*agent_tasks, return_exceptions=True)
     scheduler.stop()
+    await outbound_queue.close()
     logger.info("Agent worker stopped")
 
 
