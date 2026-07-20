@@ -21,6 +21,7 @@ from ai_server.orchestrators.tools.call_specialist import CallSpecialistTool
 
 PLAN_SCHEMA = "t0006.plan.v1"
 FINAL_SCHEMA = "t0006.final.v1"
+REPAIRABLE_PLAN_REJECTIONS = frozenset({"INVALID_JSON", "PLAN_SCHEMA_MISMATCH", "PLAN_BINDING_MISMATCH"})
 
 
 class PlanAuthoritativeLLM(Protocol):
@@ -35,17 +36,49 @@ class DeepSeekPlanService:
         self.client = client or OpenAICompatibleLLMClient()
 
     async def plan(self, *, manifest: AgentManifest, task: AgentTask, catalog: dict[str, Any], constraints: dict[str, Any]) -> tuple[str, ModelUsageRecord]:
+        repair_reason = str(constraints.get("repair_reason") or "")
+        payload: dict[str, Any] = {
+            "schema_version": PLAN_SCHEMA,
+            "plan_id": constraints["plan_id"],
+            "request": task.request,
+            "request_hash": constraints["request_hash"],
+            "capability_catalog": catalog,
+            "hard_constraints": {
+                key: value
+                for key, value in constraints.items()
+                if key not in {"plan_id", "request_hash", "repair_reason", "repair_attempt"}
+            },
+            "required_response": {
+                "schema_version": PLAN_SCHEMA,
+                "plan_id": constraints["plan_id"],
+                "request_hash": constraints["request_hash"],
+                "state": "EXECUTE|CLARIFICATION_REQUIRED|CATALOG|NOT_SUPPORTED",
+                "clarification": "string or null",
+                "max_rounds": "integer 1..3",
+                "subtasks": [
+                    {
+                        "subtask_id": "unique",
+                        "specialist_id": "catalog id",
+                        "request": "bounded request",
+                    }
+                ],
+            },
+        }
+        if repair_reason:
+            payload["repair_instruction"] = {
+                "attempt": int(constraints.get("repair_attempt") or 2),
+                "previous_rejection": repair_reason,
+                "instruction": (
+                    "The previous response was rejected before dispatch. Return one fresh JSON object "
+                    "with exactly the required_response keys and exact binding values."
+                ),
+            }
         completion = await self.client.complete(
             agent_id=manifest.id,
             json_mode=True,
             messages=[
                 {"role": "system", "content": "Return only strict JSON. You are an untrusted planner; do not call tools or compose a user answer."},
-                {"role": "user", "content": json.dumps({
-                    "schema_version": PLAN_SCHEMA, "plan_id": constraints["plan_id"], "request": task.request,
-                    "request_hash": constraints["request_hash"], "capability_catalog": catalog,
-                    "hard_constraints": {k: v for k, v in constraints.items() if k not in {"plan_id", "request_hash"}},
-                    "required_response": {"schema_version": PLAN_SCHEMA, "plan_id": constraints["plan_id"], "request_hash": constraints["request_hash"], "state": "EXECUTE|CLARIFICATION_REQUIRED|CATALOG|NOT_SUPPORTED", "clarification": "string or null", "max_rounds": "integer 1..3", "subtasks": [{"subtask_id": "unique", "specialist_id": "catalog id", "request": "bounded request"}]},
-                }, ensure_ascii=False)},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
         )
         return completion.content, completion.model_usage
@@ -239,6 +272,10 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             plan_id = f"plan-{uuid.uuid4().hex}"
             pending_specialist = str(task.context.get("pending_specialist") or "").strip()
             deterministic_route: str | None = None
+            planner_usages: list[ModelUsageRecord] = []
+            planner_rejections: list[str] = []
+            planner_attempt_audit: list[dict[str, Any]] = []
+            plan: Plan | None = None
             if pending_specialist:
                 # A pending specialist is durable dialog state, not an LLM routing
                 # suggestion.  Bind the continuation to the inbound request and
@@ -270,14 +307,70 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                     status="not_used",
                     notes=["No model call: continued the dialog-bound pending specialist."],
                 )
+                planner_usages.append(usage)
                 deterministic_route = "pending_specialist"
+                response_hash = _hash(raw)
+                try:
+                    plan = _decode_plan(raw, plan_id=plan_id, request=task.request, constraints=constraints)
+                except PlanRejected as exc:
+                    planner_rejections.append(str(exc))
             else:
-                raw, usage = await self._planner.plan(manifest=self.manifest, task=task, catalog=catalog, constraints={**constraints, "plan_id": plan_id, "request_hash": _hash(task.request)})
-            response_hash = _hash(raw)
-            try:
-                plan = _decode_plan(raw, plan_id=plan_id, request=task.request, constraints=constraints)
-            except PlanRejected as exc:
-                metadata = {"reason": str(exc), "response_hash": response_hash, "plan_id": plan_id}
+                for attempt in range(1, 3):
+                    call_constraints = {
+                        **constraints,
+                        "plan_id": plan_id,
+                        "request_hash": _hash(task.request),
+                    }
+                    if planner_rejections:
+                        call_constraints.update(
+                            {
+                                "repair_reason": planner_rejections[-1],
+                                "repair_attempt": attempt,
+                            }
+                        )
+                    try:
+                        raw, usage = await self._planner.plan(
+                            manifest=self.manifest,
+                            task=task,
+                            catalog=catalog,
+                            constraints=call_constraints,
+                        )
+                    except Exception:
+                        if attempt == 1:
+                            raise
+                        reason = "MODEL_REPAIR_UNAVAILABLE"
+                        planner_rejections.append(reason)
+                        planner_attempt_audit.append(
+                            {"attempt": attempt, "status": "error", "rejection": reason}
+                        )
+                        break
+                    planner_usages.append(usage)
+                    response_hash = _hash(raw)
+                    attempt_audit = {
+                        "attempt": attempt,
+                        "response_hash": response_hash,
+                        "status": "accepted",
+                    }
+                    planner_attempt_audit.append(attempt_audit)
+                    try:
+                        plan = _decode_plan(raw, plan_id=plan_id, request=task.request, constraints=constraints)
+                    except PlanRejected as exc:
+                        reason = str(exc)
+                        attempt_audit.update({"status": "rejected", "rejection": reason})
+                        planner_rejections.append(reason)
+                        if attempt == 1 and reason in REPAIRABLE_PLAN_REJECTIONS:
+                            continue
+                    break
+            if plan is None:
+                reason = planner_rejections[-1] if planner_rejections else "MODEL_PLAN_UNAVAILABLE"
+                metadata = {
+                    "reason": reason,
+                    "response_hash": response_hash,
+                    "plan_id": plan_id,
+                    "planner_attempts": len(planner_attempt_audit),
+                    "planner_rejections": planner_rejections,
+                    "planner_attempt_audit": planner_attempt_audit,
+                }
                 if deterministic_route:
                     metadata.update(
                         {
@@ -285,13 +378,15 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                             "pending_specialist_id": pending_specialist,
                         }
                     )
-                result = self._terminal(task, "failed", "Не удалось безопасно подтвердить план обработки запроса.", usage, metadata)
+                result = self._terminal(task, "failed", "Не удалось безопасно подтвердить план обработки запроса.", planner_usages, metadata)
             else:
                 result = await self._execute(
                     task,
                     plan,
                     response_hash,
-                    usage,
+                    planner_usages,
+                    planner_rejections=planner_rejections,
+                    planner_attempt_audit=planner_attempt_audit,
                     deterministic_route=deterministic_route,
                 )
             result = result.model_copy(update={"metadata": {**result.metadata, "total_ms": round((time.monotonic() - started) * 1000, 1)}})
@@ -302,30 +397,49 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             if active and self._dialog_guard is not None:
                 await self._dialog_guard.clear_active(task)
 
-    def _terminal(self, task: AgentTask, status: str, answer: str, usage: ModelUsageRecord, metadata: dict[str, Any]) -> AgentResult:
-        return AgentResult(status=status, agent_id=self.manifest.id, answer=answer, model_usage=[usage], actions_taken=[ActionRecord(name="plan_validation", status="rejected", details=metadata)], metadata=metadata)
+    def _terminal(
+        self,
+        task: AgentTask,
+        status: str,
+        answer: str,
+        usage: ModelUsageRecord | list[ModelUsageRecord],
+        metadata: dict[str, Any],
+    ) -> AgentResult:
+        model_usage = usage if isinstance(usage, list) else [usage]
+        return AgentResult(status=status, agent_id=self.manifest.id, answer=answer, model_usage=model_usage, actions_taken=[ActionRecord(name="plan_validation", status="rejected", details=metadata)], metadata=metadata)
 
     async def _execute(
         self,
         task: AgentTask,
         plan: Plan,
         response_hash: str,
-        usage: ModelUsageRecord,
+        planner_usages: list[ModelUsageRecord],
         *,
+        planner_rejections: list[str] | None = None,
+        planner_attempt_audit: list[dict[str, Any]] | None = None,
         deterministic_route: str | None = None,
     ) -> AgentResult:
-        base_meta = {"plan_id": plan.plan_id, "response_hash": response_hash, "plan_state": plan.state}
+        base_meta = {
+            "plan_id": plan.plan_id,
+            "response_hash": response_hash,
+            "plan_state": plan.state,
+            "planner_attempts": len(planner_attempt_audit or []),
+        }
+        if planner_rejections:
+            base_meta["planner_rejections"] = list(planner_rejections)
+        if planner_attempt_audit:
+            base_meta["planner_attempt_audit"] = list(planner_attempt_audit)
         if deterministic_route:
             base_meta["route"] = deterministic_route
         if plan.state == "CLARIFICATION_REQUIRED":
-            return AgentResult(status="needs_clarification", agent_id=self.manifest.id, answer=plan.clarification or "Уточните запрос.", model_usage=[usage], actions_taken=[ActionRecord(name="plan_validation", status="ok", details=base_meta)], metadata=base_meta)
+            return AgentResult(status="needs_clarification", agent_id=self.manifest.id, answer=plan.clarification or "Уточните запрос.", model_usage=list(planner_usages), actions_taken=[ActionRecord(name="plan_validation", status="ok", details=base_meta)], metadata=base_meta)
         if plan.state == "NOT_SUPPORTED":
-            return AgentResult(status="completed", agent_id=self.manifest.id, answer="Запрос не входит в активный каталог возможностей.", model_usage=[usage], actions_taken=[ActionRecord(name="plan_validation", status="ok", details=base_meta)], metadata=base_meta)
+            return AgentResult(status="completed", agent_id=self.manifest.id, answer="Запрос не входит в активный каталог возможностей.", model_usage=list(planner_usages), actions_taken=[ActionRecord(name="plan_validation", status="ok", details=base_meta)], metadata=base_meta)
         if plan.state == "CATALOG":
-            return AgentResult(status="completed", agent_id=self.manifest.id, answer="Доступны только подтверждённые возможности активных специалистов.", model_usage=[usage], actions_taken=[ActionRecord(name="plan_validation", status="ok", details=base_meta)], metadata=base_meta)
+            return AgentResult(status="completed", agent_id=self.manifest.id, answer="Доступны только подтверждённые возможности активных специалистов.", model_usage=list(planner_usages), actions_taken=[ActionRecord(name="plan_validation", status="ok", details=base_meta)], metadata=base_meta)
         call = self._tool_registry.get("call_specialist")
         if not isinstance(call, CallSpecialistTool):
-            return self._terminal(task, "failed", "Исполнитель специалистов недоступен.", usage, {**base_meta, "reason": "CALL_TOOL_UNAVAILABLE"})
+            return self._terminal(task, "failed", "Исполнитель специалистов недоступен.", planner_usages, {**base_meta, "reason": "CALL_TOOL_UNAVAILABLE"})
 
         async def run(subtask: Subtask) -> tuple[Subtask, str, ToolResult]:
             # Correlation is created *before* reaching the specialist, so its
@@ -369,16 +483,28 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             actions.append(ActionRecord(name="call_specialist", status=str(tool.status), details={**base_meta, "subtask_id": item.subtask_id, "attempt_id": attempt_id, "specialist_id": item.specialist_id}))
         if deterministic_route:
             answer = "; ".join(str(item["answer"]).strip() for item in facts if str(item["answer"]).strip()) or "Не удалось получить подтверждённый результат специалистов."
-            usages = [usage]
+            usages = list(planner_usages)
         else:
+            usages = list(planner_usages)
             try:
                 raw_final, final_usage = await self._planner.finalize(manifest=self.manifest, task=task, plan_id=plan.plan_id, response_hash=response_hash, results=facts)
-                answer = self._decode_final(raw_final, plan.plan_id, response_hash, facts)
-                usages = [usage, final_usage]
             except Exception:
                 answer = "; ".join(str(item["answer"]).strip() for item in facts if str(item["answer"]).strip()) or "Не удалось получить подтверждённый результат специалистов."
-                usages = [usage]
-                actions.append(ActionRecord(name="final_validation", status="fallback", details=base_meta))
+                actions.append(ActionRecord(name="final_validation", status="fallback", details={**base_meta, "reason": "FINAL_MODEL_UNAVAILABLE"}))
+            else:
+                usages.append(final_usage)
+                try:
+                    answer = self._decode_final(raw_final, plan.plan_id, response_hash, facts)
+                except Exception as exc:
+                    reason = str(exc) if isinstance(exc, PlanRejected) else "FINAL_SCHEMA_INVALID"
+                    answer = "; ".join(str(item["answer"]).strip() for item in facts if str(item["answer"]).strip()) or "Не удалось получить подтверждённый результат специалистов."
+                    actions.append(
+                        ActionRecord(
+                            name="final_validation",
+                            status="fallback",
+                            details={**base_meta, "reason": reason, "final_response_hash": _hash(raw_final)},
+                        )
+                    )
         branch_statuses = {str(item["status"]) for item in facts}
         if approvals or "needs_human" in branch_statuses:
             status = "needs_human"

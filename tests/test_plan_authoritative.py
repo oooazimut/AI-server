@@ -270,6 +270,153 @@ class _RephrasingPlanner(_Planner):
         ), ModelUsageRecord(agent_id="test", provider="test", model="test")
 
 
+class _RepairingPlanner(_Planner):
+    def __init__(self, *, second_valid=True, first_reason="schema", second_raises=False):
+        self.calls = []
+        self.second_valid = second_valid
+        self.first_reason = first_reason
+        self.second_raises = second_raises
+
+    async def plan(self, *, task, constraints, **kwargs):
+        self.calls.append(dict(constraints))
+        usage = ModelUsageRecord(agent_id="test", provider="test", model="test")
+        if len(self.calls) == 1:
+            if self.first_reason == "semantic":
+                return _plan(
+                    task.request,
+                    plan_id=constraints["plan_id"],
+                    subtasks=[{"subtask_id": "s1", "specialist_id": "missing", "request": task.request}],
+                ), usage
+            return json.dumps({"unexpected": True}), usage
+        if self.second_raises:
+            raise RuntimeError("provider unavailable during repair")
+        if not self.second_valid:
+            return json.dumps({"still_unexpected": True}), usage
+        return _plan(task.request, plan_id=constraints["plan_id"]), usage
+
+
+def test_repairable_plan_contract_failure_gets_one_changed_method_retry():
+    planner = _RepairingPlanner()
+    subject, specialist = _live_subject(
+        AgentResult(status="completed", agent_id="bitrix24", answer="ready"),
+        planner=planner,
+    )
+
+    output = asyncio.run(subject.handle(AgentTask(task_id="t1", request="warehouse")))
+
+    assert output.status == "completed"
+    assert len(planner.calls) == 2
+    assert "repair_reason" not in planner.calls[0]
+    assert planner.calls[1]["repair_reason"] == "PLAN_SCHEMA_MISMATCH"
+    assert planner.calls[1]["repair_attempt"] == 2
+    assert output.metadata["planner_attempts"] == 2
+    assert output.metadata["planner_rejections"] == ["PLAN_SCHEMA_MISMATCH"]
+    assert output.metadata["planner_attempt_audit"] == [
+        {
+            "attempt": 1,
+            "response_hash": _hash(json.dumps({"unexpected": True})),
+            "status": "rejected",
+            "rejection": "PLAN_SCHEMA_MISMATCH",
+        },
+        {
+            "attempt": 2,
+            "response_hash": output.metadata["response_hash"],
+            "status": "accepted",
+        },
+    ]
+    assert len(output.model_usage) == 3
+    assert len(specialist.tasks) == 1
+
+
+def test_repairable_plan_contract_failure_fails_closed_after_one_retry():
+    planner = _RepairingPlanner(second_valid=False)
+    subject, specialist = _live_subject(
+        AgentResult(status="completed", agent_id="bitrix24", answer="unexpected"),
+        planner=planner,
+    )
+
+    output = asyncio.run(subject.handle(AgentTask(task_id="t1", request="warehouse")))
+
+    assert output.status == "failed"
+    assert len(planner.calls) == 2
+    assert output.metadata["reason"] == "PLAN_SCHEMA_MISMATCH"
+    assert output.metadata["planner_attempts"] == 2
+    assert len(output.model_usage) == 2
+    assert specialist.tasks == []
+
+
+def test_repair_provider_error_fails_closed_and_preserves_first_attempt_audit():
+    planner = _RepairingPlanner(second_raises=True)
+    subject, specialist = _live_subject(
+        AgentResult(status="completed", agent_id="bitrix24", answer="unexpected"),
+        planner=planner,
+    )
+
+    output = asyncio.run(subject.handle(AgentTask(task_id="t1", request="warehouse")))
+
+    assert output.status == "failed"
+    assert output.metadata["reason"] == "MODEL_REPAIR_UNAVAILABLE"
+    assert output.metadata["planner_attempts"] == 2
+    assert output.metadata["planner_rejections"] == [
+        "PLAN_SCHEMA_MISMATCH",
+        "MODEL_REPAIR_UNAVAILABLE",
+    ]
+    assert output.metadata["planner_attempt_audit"][0]["response_hash"] == _hash(
+        json.dumps({"unexpected": True})
+    )
+    assert output.metadata["planner_attempt_audit"][1] == {
+        "attempt": 2,
+        "status": "error",
+        "rejection": "MODEL_REPAIR_UNAVAILABLE",
+    }
+    assert len(output.model_usage) == 1
+    assert specialist.tasks == []
+
+
+class _MalformedFinalPlanner(_Planner):
+    async def finalize(self, **kwargs):
+        return json.dumps({"unexpected": True}), ModelUsageRecord(
+            agent_id="test",
+            provider="test",
+            model="test-final",
+        )
+
+
+def test_malformed_final_preserves_usage_and_response_hash_before_fallback():
+    subject, specialist = _live_subject(
+        AgentResult(status="completed", agent_id="bitrix24", answer="executor fact"),
+        planner=_MalformedFinalPlanner(),
+    )
+
+    output = asyncio.run(subject.handle(AgentTask(task_id="t1", request="warehouse")))
+
+    assert output.status == "completed"
+    assert output.answer == "executor fact"
+    assert [usage.model for usage in output.model_usage] == ["test", "test-final"]
+    final_action = next(action for action in output.actions_taken if action.name == "final_validation")
+    assert final_action.status == "fallback"
+    assert final_action.details["reason"] == "FINAL_SCHEMA_MISMATCH"
+    assert final_action.details["final_response_hash"] == _hash(json.dumps({"unexpected": True}))
+    assert len(specialist.tasks) == 1
+
+
+def test_semantic_plan_rejection_is_not_retried():
+    planner = _RepairingPlanner(first_reason="semantic")
+    subject, specialist = _live_subject(
+        AgentResult(status="completed", agent_id="bitrix24", answer="unexpected"),
+        planner=planner,
+    )
+
+    output = asyncio.run(subject.handle(AgentTask(task_id="t1", request="warehouse")))
+
+    assert output.status == "failed"
+    assert len(planner.calls) == 1
+    assert output.metadata["reason"] == "FORBIDDEN_SPECIALIST"
+    assert output.metadata["planner_attempts"] == 1
+    assert len(output.model_usage) == 1
+    assert specialist.tasks == []
+
+
 @pytest.mark.parametrize(
     "original_request",
     [
