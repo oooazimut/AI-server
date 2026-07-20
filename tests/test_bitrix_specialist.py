@@ -850,7 +850,13 @@ def test_bitrix_specialist_injects_admin_context_for_task_close_control_tool(mon
 
     class TaskCloseControlTools:
         def agent_tools(self):
-            return [TaskCloseControlUpdateTool(store=store)]
+            client = self.make_user_client()
+
+            class OAuth:
+                async def client_for_user(self, user_id: int):
+                    return client
+
+            return [TaskCloseControlUpdateTool(store=store, user_client=client, bitrix_oauth=OAuth())]
 
         def make_user_client(self):
             class UserClient:
@@ -870,23 +876,38 @@ def test_bitrix_specialist_injects_admin_context_for_task_close_control_tool(mon
 
     result = asyncio.run(
         _bitrix_specialist(tools=TaskCloseControlTools(), llm=llm).handle(
-            AgentTask(task_id="t1", request="добавь 13 оператором контроля закрытия задач", user={"id": "1"})
+            AgentTask(
+                task_id="t1",
+                request="добавь 13 оператором контроля закрытия задач",
+                user={"id": "1"},
+                context={"dialog_key": "d:1"},
+            )
         )
     )
 
-    assert result.status == "completed"
-    assert store.task_close_operator_ids() == {13}
+    assert result.status == "needs_human"
+    assert store.task_close_operator_ids() == set()
     assert store.task_close_controlled_user_ids() == set()
+    assert store._drafts["d:1"]["_draft_type"] == "admin_change"
+    assert store._drafts["d:1"]["_original_request"] == "добавь 13 оператором контроля закрытия задач"
+    assert store._drafts["d:1"]["_draft_user_id"] == 1
+    assert store._drafts["d:1"]["_draft_specialist"] == "bitrix24"
 
 
-def test_bitrix_specialist_uses_configured_task_close_control_admin_ids(monkeypatch):
+def test_bitrix_specialist_does_not_elevate_configured_task_close_control_admin_ids(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("BITRIX_TASK_CLOSE_CONTROL_ADMIN_USER_IDS", "1")
     store = FakeTaskDraftStore()
 
     class TaskCloseControlTools:
         def agent_tools(self):
-            return [TaskCloseControlUpdateTool(store=store)]
+            client = self.make_user_client()
+
+            class OAuth:
+                async def client_for_user(self, user_id: int):
+                    return client
+
+            return [TaskCloseControlUpdateTool(store=store, user_client=client, bitrix_oauth=OAuth())]
 
         def make_user_client(self):
             class UserClient:
@@ -910,12 +931,17 @@ def test_bitrix_specialist_uses_configured_task_close_control_admin_ids(monkeypa
 
     result = asyncio.run(
         _bitrix_specialist(tools=TaskCloseControlTools(), llm=llm, settings=get_settings()).handle(
-            AgentTask(task_id="t1", request="добавь 13 оператором контроля закрытия задач", user={"id": "1"})
+            AgentTask(
+                task_id="t1",
+                request="добавь 13 оператором контроля закрытия задач",
+                user={"id": "1"},
+                context={"dialog_key": "d:1"},
+            )
         )
     )
 
     assert result.status == "completed"
-    assert store.task_close_operator_ids() == {13}
+    assert store.task_close_operator_ids() == set()
     assert store.task_close_controlled_user_ids() == set()
 
 
@@ -1530,6 +1556,45 @@ def test_bitrix_llm_routes_task_close_confirmation_without_llm(monkeypatch):
     assert [call.name for call in result.decision.tool_calls] == ["task_close_confirm"]
 
 
+@pytest.mark.parametrize(
+    ("request_text", "operation", "source"),
+    [
+        ("да, подтверждаю", "confirm", "draft_confirm_route"),
+        ("отмени черновик", "discard", "draft_discard_route"),
+    ],
+)
+def test_bitrix_llm_routes_admin_change_draft_without_llm(monkeypatch, request_text, operation, source):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request=request_text,
+                user={"id": "1"},
+                context={
+                    "dialog_id": "chat1",
+                    "pending_task_draft": {
+                        "_draft_type": "admin_change",
+                        "action": "add_operator",
+                        "target_user_id": 13,
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=[
+                {"name": "task_close_control_update", "description": "", "parameters": {}},
+            ],
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": source}
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_control_update"]
+    assert result.decision.tool_calls[0].args == {"operation": operation}
+
+
 def test_bitrix_llm_routes_task_close_start_to_draft_without_llm(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
@@ -1560,6 +1625,7 @@ def test_bitrix_llm_routes_task_close_start_to_draft_without_llm(monkeypatch):
     assert [call.name for call in result.decision.tool_calls] == ["task_close_draft"]
     args = result.decision.tool_calls[0].args
     assert args["task_id"] == 8899
+    assert args["close_now"] is True
     assert args["overall_status"] == "unconfirmed"
     assert args["unconfirmed_items"] == ["результат выполнения не указан"]
     assert "что сделано по задаче" in args["missing_fields"]

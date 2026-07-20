@@ -9,6 +9,15 @@ from datetime import datetime
 from typing import Any
 
 from ai_server.agents.bitrix24.ports import TaskDraftStorePort
+from ai_server.agents.bitrix24.tools.draft_lifecycle import (
+    attach_draft_metadata,
+    bitrix_mutation_outcome,
+    claim_exact_draft,
+    discard_exact_draft,
+    release_exact_draft,
+    renew_exact_draft_claim,
+    resolve_unknown_draft_claim,
+)
 from ai_server.agents.bitrix24.tools.read_client import resolve_current_user_read_client
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
@@ -235,11 +244,11 @@ class TaskCloseDraftTool:
         return ToolDefinition(
             name=self.name,
             description=(
-                "Prepare a Bitrix task closing draft. Use instead of direct bitrix_api writes for task closing. "
+                "Close an explicitly requested Bitrix task immediately as the current OAuth user, then prepare "
+                "the protected four-block result-review draft. Use instead of direct bitrix_api writes. "
                 "Call as soon as the task is identified; if completion details are missing, put them into "
-                "missing_fields/unconfirmed_items so the user sees a full draft. The user must confirm before "
-                "a protected AI close report file is saved and, when the task is still open, "
-                "tasks.task.complete/tasks.task.approve is executed."
+                "missing_fields/unconfirmed_items so the user sees a full draft. Confirmation updates the "
+                "protected AI close report and never closes the same task again."
             ),
             parameters={
                 "type": "object",
@@ -310,6 +319,10 @@ class TaskCloseDraftTool:
                         "enum": ["complete", "approve"],
                         "description": "complete for performer completion, approve for creator approval.",
                     },
+                    "close_now": {
+                        "type": "boolean",
+                        "description": "True only for the user's explicit chat command to close this task now.",
+                    },
                 },
                 "required": ["task_id"],
             },
@@ -334,6 +347,66 @@ class TaskCloseDraftTool:
         enriched_args, access_error = await self._enrich_args_from_task(args, user_id=user_id)
         if access_error is not None:
             return access_error
+        claimed_recovery = await self._store.get_claimed_task_draft(
+            dialog_key,
+            expected_type=TASK_CLOSE_DRAFT_TYPE,
+        )
+        if isinstance(claimed_recovery, dict):
+            claimed_task_id = optional_int(claimed_recovery.get("task_id"))
+            requested_task_id = optional_int(enriched_args.get("task_id"))
+            if claimed_task_id != requested_task_id:
+                return ToolResult(
+                    status=ToolStatus.DENIED,
+                    tool=self.name,
+                    error="another task close operation has an unresolved outcome in this dialog",
+                    data={"draft_id": claimed_recovery.get("_draft_id"), "task_id": claimed_task_id},
+                )
+            status_was_read = _truthy(enriched_args.get("_verified_remote_status_read"))
+            if _truthy(enriched_args.get("_verified_remote_closed")):
+                recovered = build_task_close_draft_from_args(
+                    _merge_task_close_draft_args(claimed_recovery, args, enriched_args)
+                )
+                if not recovered.is_ready:
+                    return ToolResult(
+                        status=ToolStatus.ERROR,
+                        tool=self.name,
+                        error="closed task recovery draft is invalid",
+                    )
+                recovered.payload.update(
+                    attach_draft_metadata(recovered.payload, source_args=claimed_recovery, user_id=user_id)
+                )
+                recovered.payload["already_closed"] = True
+                recovered.payload["_direct_close_already_closed"] = True
+                recovered.payload["_closed_from_chat"] = True
+                finalized = await self._store.finalize_task_draft_claim(
+                    dialog_key,
+                    draft_id=str(claimed_recovery.get("_draft_id") or ""),
+                    params=recovered.payload,
+                    claim_token=str(claimed_recovery.get("_draft_claim_token") or ""),
+                )
+                if finalized is None:
+                    return ToolResult(
+                        status=ToolStatus.ERROR,
+                        tool=self.name,
+                        error="closed task recovery could not finalize the protected review draft",
+                    )
+                return ToolResult(
+                    status=ToolStatus.OK,
+                    tool=self.name,
+                    data={"status": "recovered_closed_draft", "draft": finalized, "preview": recovered.preview},
+                )
+            if not status_was_read:
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool=self.name,
+                    error="task close outcome is unresolved; fresh current-user Bitrix status proof is required",
+                    data={"draft_id": claimed_recovery.get("_draft_id"), "task_id": claimed_task_id},
+                )
+            await self._store.release_task_draft(
+                dialog_key,
+                draft_id=str(claimed_recovery.get("_draft_id") or ""),
+                claim_token=str(claimed_recovery.get("_draft_claim_token") or ""),
+            )
         draft = build_task_close_draft_from_args(enriched_args)
         if not draft.is_ready:
             return ToolResult(
@@ -342,6 +415,7 @@ class TaskCloseDraftTool:
                 error=f"task_close_draft called outside contract: {'; '.join(draft.contract_errors)}",
                 data=draft.as_action_details(),
             )
+        draft.payload.update(attach_draft_metadata(draft.payload, source_args=args, user_id=user_id))
         existing = await self._store.get_task_draft(dialog_key)
         if isinstance(existing, dict) and existing.get("_draft_type") == TASK_CLOSE_DRAFT_TYPE:
             current_task_id = optional_int(existing.get("task_id"))
@@ -381,18 +455,133 @@ class TaskCloseDraftTool:
                     error=f"merged task_close_draft is invalid: {'; '.join(merged.contract_errors)}",
                     data=merged.as_action_details(),
                 )
-            await self._store.save_task_draft(dialog_key, merged.payload)
+            draft = merged
+            draft_status = "updated_draft"
+        elif isinstance(existing, dict):
             return ToolResult(
-                status=ToolStatus.OK,
+                status=ToolStatus.DENIED,
                 tool=self.name,
-                data={"status": "updated_draft", "draft": merged.payload, "preview": merged.preview},
+                error="another typed draft is active in this dialog",
+                data={
+                    "status": "active_draft_conflict",
+                    "draft_id": existing.get("_draft_id"),
+                    "draft_type": existing.get("_draft_type"),
+                },
             )
+        else:
+            draft_status = "new_draft"
+
+        draft.payload.update(attach_draft_metadata(draft.payload, source_args={**(existing or {}), **args}, user_id=user_id))
         await self._store.save_task_draft(dialog_key, draft.payload)
+        stored = await self._store.get_task_draft(dialog_key)
+        should_close_now = _truthy(enriched_args.get("close_now")) and not _truthy(
+            enriched_args.get("already_closed")
+        )
+        if should_close_now:
+            if not isinstance(stored, dict):
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool=self.name,
+                    error="reserved task close draft could not be reloaded",
+                )
+            claimed = await claim_exact_draft(
+                self._store,
+                dialog_key=dialog_key,
+                draft=stored,
+                expected_type=TASK_CLOSE_DRAFT_TYPE,
+            )
+            if claimed is None:
+                return ToolResult(
+                    status=ToolStatus.DENIED,
+                    tool=self.name,
+                    error="task close draft changed, expired, or is already being processed",
+                )
+            if not await renew_exact_draft_claim(self._store, dialog_key=dialog_key, draft=claimed):
+                return ToolResult(status=ToolStatus.DENIED, tool=self.name, error="task close draft claim was lost")
+            close_error = await self._close_now_as_current_user(enriched_args, user_id=user_id)
+            if close_error is not None:
+                if str((close_error.data or {}).get("mutation_outcome") or "") in {
+                    "not_started",
+                    "rejected",
+                }:
+                    await release_exact_draft(self._store, dialog_key=dialog_key, draft=claimed)
+                return close_error
+            draft.payload["already_closed"] = True
+            draft.payload["_direct_close_already_closed"] = True
+            draft.payload["_closed_from_chat"] = True
+            finalized = await self._store.finalize_task_draft_claim(
+                dialog_key,
+                draft_id=str(claimed.get("_draft_id") or ""),
+                params=draft.payload,
+                claim_token=str(claimed.get("_draft_claim_token") or ""),
+            )
+            if finalized is None:
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool=self.name,
+                    error="task was closed but the protected review draft could not be finalized; audit is required",
+                )
+            draft.payload.update(finalized)
         return ToolResult(
             status=ToolStatus.OK,
             tool=self.name,
-            data={"status": "new_draft", "draft": draft.payload, "preview": draft.preview},
+            data={"status": draft_status, "draft": draft.payload, "preview": draft.preview},
         )
+
+    async def _close_now_as_current_user(
+        self,
+        args: dict[str, Any],
+        *,
+        user_id: int | None,
+    ) -> ToolResult | None:
+        task_id = optional_int(args.get("task_id"))
+        if task_id is None:
+            return ToolResult(
+                status=ToolStatus.INVALID_TOOL_CALL,
+                tool=self.name,
+                error="task_close_draft.close_now requires task_id",
+            )
+        if self._bitrix_oauth is None:
+            return ToolResult(
+                status=ToolStatus.NOT_CONFIGURED,
+                tool=self.name,
+                error="Bitrix OAuth is required to close a task from chat.",
+                data={"task_id": task_id, "mutation_outcome": "not_started"},
+            )
+        try:
+            oauth_client = await self._bitrix_oauth.client_for_user(user_id)
+            method = "tasks.task.approve" if _close_action(args.get("action")) == "approve" else "tasks.task.complete"
+            await oauth_client.call(method, apply_write_policy(method, {"taskId": task_id}))
+        except BitrixOAuthTokenMissing as exc:
+            return ToolResult(
+                status=ToolStatus.NOT_CONFIGURED,
+                tool=self.name,
+                error=str(exc),
+                data={"task_id": task_id, "mutation_outcome": "not_started"},
+            )
+        except BitrixConfigError as exc:
+            return ToolResult(
+                status=ToolStatus.NOT_CONFIGURED,
+                tool=self.name,
+                error=str(exc),
+                data={"task_id": task_id, "mutation_outcome": "not_started"},
+            )
+        except BitrixApiError as exc:
+            outcome = "unknown" if str(exc.error).upper().startswith("HTTP_5") else "rejected"
+            return ToolResult(
+                status=ToolStatus.ERROR,
+                tool=self.name,
+                error=str(exc),
+                data={"task_id": task_id, "mutation_outcome": outcome},
+            )
+        except Exception as exc:
+            return ToolResult(
+                status=ToolStatus.ERROR,
+                tool=self.name,
+                error=f"{type(exc).__name__}: {exc}",
+                data={"task_id": task_id, "mutation_outcome": "unknown"},
+            )
+        return None
 
     async def _enrich_args_from_task(
         self,
@@ -445,8 +634,10 @@ class TaskCloseDraftTool:
             enriched["source_task_description_empty"] = not bool(description_points)
 
         status = compact_text(_first_text(task, "status", "STATUS"))
-        if "already_closed" not in enriched and "task_already_closed" not in enriched:
-            enriched["already_closed"] = status == "5" or bool(_first_text(task, "closedDate", "CLOSED_DATE"))
+        verified_closed = status == "5" or bool(_first_text(task, "closedDate", "CLOSED_DATE"))
+        enriched["_verified_remote_status_read"] = True
+        enriched["_verified_remote_closed"] = verified_closed
+        enriched["already_closed"] = verified_closed
 
         if not _task_close_has_user_result(enriched):
             enriched.setdefault("overall_status", "unconfirmed")
@@ -504,6 +695,21 @@ class TaskCloseConfirmTool:
                 error="task_close_confirm requires dialog_key",
             )
         draft = await self._store.get_task_draft(dialog_key, ttl_minutes=self._draft_ttl_minutes)
+        if not draft:
+            unresolved = await resolve_unknown_draft_claim(
+                self._store, dialog_key=dialog_key, expected_type=TASK_CLOSE_DRAFT_TYPE
+            )
+            if unresolved is not None:
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool=self.name,
+                    error="task close outcome requires durable status reconciliation before retry",
+                    data={
+                        "mutation_outcome": "unknown",
+                        "resolution_status": unresolved.get("_draft_resolution_status"),
+                        "draft_id": unresolved.get("_draft_id"),
+                    },
+                )
         if not draft or draft.get("_draft_type") != TASK_CLOSE_DRAFT_TYPE:
             return ToolResult(
                 status=ToolStatus.NOT_FOUND,
@@ -530,33 +736,66 @@ class TaskCloseConfirmTool:
                     error="System Bitrix write_client is required to attach protected task close report.",
                     data={"draft": draft},
                 )
+            claimed = None
             try:
                 oauth_client = await self._bitrix_oauth.client_for_user(user_id)
+                claimed = await claim_exact_draft(
+                    self._store, dialog_key=dialog_key, draft=draft, expected_type=TASK_CLOSE_DRAFT_TYPE
+                )
+                if claimed is None:
+                    return ToolResult(
+                        status=ToolStatus.DENIED,
+                        tool=self.name,
+                        error="task close draft changed, expired, or is already being confirmed",
+                    )
                 result = await _execute_task_close(
                     close_call=oauth_client.call,
                     report_call=self._write_client.call if self._write_client is not None else None,
                     draft=draft,
+                    claim_guard=lambda: renew_exact_draft_claim(
+                        self._store, dialog_key=dialog_key, draft=claimed
+                    ),
                 )
             except BitrixOAuthTokenMissing as exc:
+                if claimed is not None:
+                    await release_exact_draft(self._store, dialog_key=dialog_key, draft=claimed)
                 return ToolResult(
                     status=ToolStatus.NOT_CONFIGURED, tool=self.name, error=str(exc), data={"draft": draft}
                 )
-            except (BitrixApiError, BitrixConfigError) as exc:
+            except BitrixConfigError as exc:
+                if claimed is not None:
+                    await release_exact_draft(self._store, dialog_key=dialog_key, draft=claimed)
                 return ToolResult(
-                    status=ToolStatus.NOT_CONFIGURED if isinstance(exc, BitrixConfigError) else ToolStatus.ERROR,
+                    status=ToolStatus.NOT_CONFIGURED,
                     tool=self.name,
                     error=str(exc),
-                    data={"draft": draft},
+                    data={"draft": draft, "mutation_outcome": "not_started"},
+                )
+            except BitrixApiError as exc:
+                outcome = bitrix_mutation_outcome(exc)
+                if claimed is not None and outcome == "rejected":
+                    await release_exact_draft(self._store, dialog_key=dialog_key, draft=claimed)
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool=self.name,
+                    error=str(exc),
+                    data={"draft": draft, "mutation_outcome": outcome},
                 )
             except Exception as exc:
                 return ToolResult(
                     status=ToolStatus.ERROR,
                     tool=self.name,
                     error=f"{type(exc).__name__}: {exc}",
-                    data={"draft": draft},
+                    data={"draft": draft, "mutation_outcome": "unknown"},
                 )
             _complete_direct_close_queue_from_draft(self._store, draft, actor_user_id=user_id)
-            await self._store.delete_task_draft(dialog_key)
+            await self._store.delete_task_draft(
+                dialog_key,
+                status="confirmed",
+                expected_draft_id=str(claimed.get("_draft_id") or ""),
+                expected_version=optional_int(claimed.get("_draft_version")),
+                expected_claim_token=str(claimed.get("_draft_claim_token") or ""),
+            )
             return ToolResult(status=ToolStatus.OK, tool=self.name, data={**result, "draft": draft})
 
         if self._write_client is None:
@@ -566,18 +805,39 @@ class TaskCloseConfirmTool:
                 error="write_client is not configured",
                 data={"draft": draft},
             )
+        claimed = await claim_exact_draft(
+            self._store, dialog_key=dialog_key, draft=draft, expected_type=TASK_CLOSE_DRAFT_TYPE
+        )
+        if claimed is None:
+            return ToolResult(
+                status=ToolStatus.DENIED,
+                tool=self.name,
+                error="task close draft changed, expired, or is already being confirmed",
+            )
         try:
             result = await _execute_task_close(
                 close_call=self._write_client.call,
                 report_call=self._write_client.call,
                 draft=draft,
+                claim_guard=lambda: renew_exact_draft_claim(
+                    self._store, dialog_key=dialog_key, draft=claimed
+                ),
             )
         except Exception as exc:
             return ToolResult(
-                status=ToolStatus.ERROR, tool=self.name, error=f"{type(exc).__name__}: {exc}", data={"draft": draft}
+                status=ToolStatus.ERROR,
+                tool=self.name,
+                error=f"{type(exc).__name__}: {exc}",
+                data={"draft": draft, "mutation_outcome": "unknown"},
             )
         _complete_direct_close_queue_from_draft(self._store, draft, actor_user_id=user_id)
-        await self._store.delete_task_draft(dialog_key)
+        await self._store.delete_task_draft(
+            dialog_key,
+            status="confirmed",
+            expected_draft_id=str(claimed.get("_draft_id") or ""),
+            expected_version=optional_int(claimed.get("_draft_version")),
+            expected_claim_token=str(claimed.get("_draft_claim_token") or ""),
+        )
         return ToolResult(status=ToolStatus.OK, tool=self.name, data={**result, "draft": draft})
 
 
@@ -605,8 +865,13 @@ class TaskCloseDiscardTool:
         draft = None
         if dialog_key:
             draft = await self._store.get_task_draft(dialog_key)
-        if dialog_key:
-            await self._store.delete_task_draft(dialog_key)
+        if dialog_key and isinstance(draft, dict) and draft.get("_draft_type") == TASK_CLOSE_DRAFT_TYPE:
+            await discard_exact_draft(
+                self._store,
+                dialog_key=dialog_key,
+                draft=draft,
+                expected_type=TASK_CLOSE_DRAFT_TYPE,
+            )
         if isinstance(draft, dict):
             _discard_direct_close_queue_from_draft(self._store, draft, actor_user_id=user_id)
         return ToolResult(status=ToolStatus.OK, tool=self.name, data={"discarded": bool(dialog_key)})
@@ -772,6 +1037,7 @@ async def _execute_task_close(
     close_call: Callable[[str, dict[str, Any]], Awaitable[Any]],
     report_call: Callable[[str, dict[str, Any]], Awaitable[Any]] | None,
     draft: dict[str, Any],
+    claim_guard: Callable[[], Awaitable[bool]] | None = None,
 ) -> dict[str, Any]:
     task_id = optional_int(draft.get("task_id"))
     if task_id is None:
@@ -787,6 +1053,7 @@ async def _execute_task_close(
         close_method = "already_closed"
         close_result = {"skipped": True, "reason": "task_already_closed"}
     else:
+        await _require_current_claim(claim_guard)
         close_params = apply_write_policy(close_method, {"taskId": task_id})
         close_result = await close_call(close_method, close_params)
 
@@ -814,6 +1081,7 @@ async def _execute_task_close(
                     ],
                 },
             )
+            await _require_current_claim(claim_guard)
             report_add = await report_call("disk.file.uploadversion", report_params)
             report_method = "disk.file.uploadversion"
         else:
@@ -827,6 +1095,7 @@ async def _execute_task_close(
                     },
                 },
             )
+            await _require_current_claim(claim_guard)
             report_add = await report_call("task.item.addfile", report_params)
             report_method = "task.item.addfile"
     return {
@@ -852,6 +1121,11 @@ async def _execute_task_close(
         "ai_close_incomplete": bool(draft.get("ai_close_incomplete")),
         "ai_close_marker": str(draft.get("ai_close_marker") or ""),
     }
+
+
+async def _require_current_claim(claim_guard: Callable[[], Awaitable[bool]] | None) -> None:
+    if claim_guard is not None and not await claim_guard():
+        raise RuntimeError("DRAFT_CLAIM_LOST")
 
 
 def _complete_direct_close_queue_from_draft(

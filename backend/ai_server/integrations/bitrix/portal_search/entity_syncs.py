@@ -384,9 +384,11 @@ def _task_close_direct_control_metadata(
     dialog_key = str(responsible_id or "")
     description = str(_first(task, "description", "DESCRIPTION") or "")
     controlled_user_ids = _task_close_controlled_user_ids(index)
+    controlled_from = _task_close_controlled_from(index, responsible_id)
+    effective_control_start = _latest_datetime_text(control_enabled_from, controlled_from)
     decision = decide_task_close_control(
         closed_at=closed_at,
-        control_enabled_from=control_enabled_from,
+        control_enabled_from=effective_control_start,
         user_is_controlled=bool(responsible_id is not None and responsible_id in controlled_user_ids),
     )
     payload = {
@@ -400,6 +402,8 @@ def _task_close_direct_control_metadata(
         "closed_at": to_str(closed_at),
         "changed_at": to_str(changed_at),
         "control_enabled_from": control_enabled_from,
+        "controlled_from": controlled_from,
+        "effective_control_start": effective_control_start,
         "seen_at": now_iso,
         "task_description": description,
         "task_points": _task_points_from_description(description),
@@ -521,6 +525,24 @@ def _task_close_controlled_user_ids(index: PortalSearchIndex) -> set[int]:
     if not callable(getter):
         return set()
     return {item for item in (safe_int(value) for value in getter()) if item is not None and item > 0}
+
+
+def _task_close_controlled_from(index: PortalSearchIndex, user_id: int | None) -> str:
+    getter = getattr(index, "get_task_close_controlled_user", None)
+    if user_id is None or not callable(getter):
+        return ""
+    row = getter(user_id)
+    if not isinstance(row, dict) or row.get("active") is False:
+        return ""
+    return str(row.get("controlled_from") or "").strip()
+
+
+def _latest_datetime_text(*values: object) -> str:
+    parsed = [(value, _parse_datetime(value)) for value in values if str(value or "").strip()]
+    dated = [(str(value), dt) for value, dt in parsed if dt is not None]
+    if not dated:
+        return str(next((value for value in values if str(value or "").strip()), ""))
+    return max(dated, key=lambda item: item[1])[0]
 
 
 def _task_close_control_event_metadata(

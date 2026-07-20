@@ -20,7 +20,6 @@ from ai_server.integrations.bitrix.task_close_control import (
 )
 from ai_server.integrations.bitrix.task_close_direct_queue import (
     TASK_CLOSE_DIRECT_STATUS_ACTIVE,
-    TASK_CLOSE_DIRECT_STATUS_PENDING,
     direct_close_state_key,
 )
 from ai_server.integrations.bitrix.task_close_reports import task_close_report_state_key
@@ -381,7 +380,12 @@ def test_portal_metadata_sync_queues_controlled_direct_closed_tasks(monkeypatch)
         value="2026-07-12T00:00:00+03:00",
         updated_by=1,
     )
-    index.upsert_task_close_controlled_user(user_id=13, active=True, updated_by=1)
+    index.upsert_task_close_controlled_user(
+        user_id=13,
+        active=True,
+        updated_by=1,
+        controlled_from="2026-07-12T12:15:00+03:00",
+    )
 
     class DirectClosedBitrix(FakePortalBitrix):
         async def list_all_tasks(self, **kwargs):
@@ -426,15 +430,16 @@ def test_portal_metadata_sync_queues_controlled_direct_closed_tasks(monkeypatch)
     late_event = index.get_task_close_control_event(task_id=402, close_event_key=late_key)
     assert early_event is not None
     assert late_event is not None
-    assert early_event["decision"] == TASK_CLOSE_DECISION_CONTROLLED
+    assert early_event["decision"] == TASK_CLOSE_DECISION_IGNORED_BEFORE_START
     assert late_event["decision"] == TASK_CLOSE_DECISION_CONTROLLED
+    assert early_event["payload"]["controlled_from"] == "2026-07-12T12:15:00+03:00"
+    assert early_event["payload"]["effective_control_start"] == "2026-07-12T12:15:00+03:00"
 
     early_state = index.get_task_close_processing_state(task_id=401, state_key=direct_close_state_key(early_key))
     late_state = index.get_task_close_processing_state(task_id=402, state_key=direct_close_state_key(late_key))
-    assert early_state is not None
+    assert early_state is None
     assert late_state is not None
-    assert early_state["status"] == TASK_CLOSE_DIRECT_STATUS_ACTIVE
-    assert late_state["status"] == TASK_CLOSE_DIRECT_STATUS_PENDING
+    assert late_state["status"] == TASK_CLOSE_DIRECT_STATUS_ACTIVE
 
 
 def test_portal_metadata_sync_keeps_uncontrolled_direct_close_ignored_after_user_added(monkeypatch):
@@ -491,7 +496,12 @@ def test_portal_metadata_sync_ignores_direct_close_before_control_start(monkeypa
         value="2026-07-12T00:00:00+03:00",
         updated_by=1,
     )
-    index.upsert_task_close_controlled_user(user_id=13, active=True, updated_by=1)
+    index.upsert_task_close_controlled_user(
+        user_id=13,
+        active=True,
+        updated_by=1,
+        controlled_from="2026-07-12T00:00:00+03:00",
+    )
 
     class OldDirectClosedBitrix(FakePortalBitrix):
         async def list_all_tasks(self, **kwargs):

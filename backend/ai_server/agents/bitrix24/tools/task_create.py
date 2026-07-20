@@ -6,6 +6,15 @@ from typing import Any
 
 from ai_server.agents.bitrix24.ports import TaskDraftStorePort
 from ai_server.agents.bitrix24.tools.bitrix_api import _normalize_project_name
+from ai_server.agents.bitrix24.tools.draft_lifecycle import (
+    attach_draft_metadata,
+    bitrix_mutation_outcome,
+    claim_exact_draft,
+    discard_exact_draft,
+    release_exact_draft,
+    renew_exact_draft_claim,
+    resolve_unknown_draft_claim,
+)
 from ai_server.agents.bitrix24.tools.project_create import build_project_create_draft_from_args
 from ai_server.agents.bitrix24.tools.read_client import resolve_current_user_read_client
 from ai_server.agents.bitrix24.tools.tasks import _search_projects_snapshot
@@ -189,7 +198,7 @@ class TaskCreateDraftTool:
                 error=f"task_create_draft called outside contract: {'; '.join(draft.contract_errors)}",
                 data=draft.as_action_details(),
             )
-        stored_params = dict(draft.params)
+        stored_params = attach_draft_metadata(dict(draft.params), source_args=resolved_args, user_id=user_id)
         resolved_project = resolved_args.get("_resolved_project")
         if isinstance(resolved_project, dict):
             stored_params["_resolved_project"] = dict(resolved_project)
@@ -257,6 +266,20 @@ class TaskCreateConfirmTool:
             )
         draft_params = await self._store.get_task_draft(dialog_key, ttl_minutes=self._draft_ttl_minutes)
         if not draft_params:
+            unresolved = await resolve_unknown_draft_claim(
+                self._store, dialog_key=dialog_key, expected_type=TASK_CREATE_DRAFT_TYPE
+            )
+            if unresolved is not None:
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool=self.name,
+                    error="task creation outcome requires durable audit before retry",
+                    data={
+                        "mutation_outcome": "unknown",
+                        "resolution_status": unresolved.get("_draft_resolution_status"),
+                        "draft_id": unresolved.get("_draft_id"),
+                    },
+                )
             return ToolResult(
                 status=ToolStatus.NOT_FOUND,
                 tool=self.name,
@@ -295,6 +318,7 @@ class TaskCreateConfirmTool:
                     error="Bitrix OAuth is required for task creation.",
                     data={"params": sanitized},
                 )
+            claimed = None
             try:
                 oauth_client = await self._bitrix_oauth.client_for_user(user_id)
                 project_error = await _validate_resolved_project_reference(oauth_client, project_reference)
@@ -305,20 +329,45 @@ class TaskCreateConfirmTool:
                         error=project_error.error,
                         data={"params": sanitized},
                     )
+                claimed = await claim_exact_draft(
+                    self._store, dialog_key=dialog_key, draft=draft_params, expected_type=TASK_CREATE_DRAFT_TYPE
+                )
+                if claimed is None:
+                    return ToolResult(
+                        status=ToolStatus.DENIED,
+                        tool=self.name,
+                        error="task draft changed, expired, or is already being confirmed",
+                    )
+                if not await renew_exact_draft_claim(self._store, dialog_key=dialog_key, draft=claimed):
+                    return ToolResult(status=ToolStatus.DENIED, tool=self.name, error="task draft claim was lost")
                 result = await oauth_client.call("tasks.task.add", sanitized)
             except BitrixOAuthTokenMissing as exc:
+                if claimed is not None:
+                    await release_exact_draft(self._store, dialog_key=dialog_key, draft=claimed)
                 return ToolResult(
                     status=ToolStatus.NOT_CONFIGURED,
                     tool=self.name,
                     error=str(exc),
                     data={"params": sanitized},
                 )
-            except (BitrixApiError, BitrixConfigError) as exc:
+            except BitrixConfigError as exc:
+                if claimed is not None:
+                    await release_exact_draft(self._store, dialog_key=dialog_key, draft=claimed)
                 return ToolResult(
-                    status=ToolStatus.NOT_CONFIGURED if isinstance(exc, BitrixConfigError) else ToolStatus.ERROR,
+                    status=ToolStatus.NOT_CONFIGURED,
                     tool=self.name,
                     error=str(exc),
-                    data={"params": sanitized},
+                    data={"params": sanitized, "mutation_outcome": "not_started"},
+                )
+            except BitrixApiError as exc:
+                outcome = bitrix_mutation_outcome(exc)
+                if claimed is not None and outcome == "rejected":
+                    await release_exact_draft(self._store, dialog_key=dialog_key, draft=claimed)
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool=self.name,
+                    error=str(exc),
+                    data={"params": sanitized, "mutation_outcome": outcome},
                 )
             except Exception as exc:
                 return ToolResult(
@@ -327,7 +376,13 @@ class TaskCreateConfirmTool:
                     error=f"{type(exc).__name__}: {exc}",
                     data={"params": sanitized},
                 )
-            await self._store.delete_task_draft(dialog_key)
+            await self._store.delete_task_draft(
+                dialog_key,
+                status="confirmed",
+                expected_draft_id=str(claimed.get("_draft_id") or ""),
+                expected_version=optional_int(claimed.get("_draft_version")),
+                expected_claim_token=str(claimed.get("_draft_claim_token") or ""),
+            )
             return ToolResult(
                 status=ToolStatus.OK,
                 tool=self.name,
@@ -340,6 +395,7 @@ class TaskCreateConfirmTool:
                 tool=self.name,
                 error="write_client is not configured",
             )
+        claimed = None
         try:
             project_error = await _validate_resolved_project_reference(self._write_client, project_reference)
             if project_error is not None:
@@ -347,16 +403,34 @@ class TaskCreateConfirmTool:
                     status=project_error.status,
                     tool=self.name,
                     error=project_error.error,
-                    data={"params": sanitized},
+                    data={"params": sanitized, "mutation_outcome": "unknown"},
                 )
+            claimed = await claim_exact_draft(
+                self._store, dialog_key=dialog_key, draft=draft_params, expected_type=TASK_CREATE_DRAFT_TYPE
+            )
+            if claimed is None:
+                return ToolResult(
+                    status=ToolStatus.DENIED,
+                    tool=self.name,
+                    error="task draft changed, expired, or is already being confirmed",
+                )
+            if not await renew_exact_draft_claim(self._store, dialog_key=dialog_key, draft=claimed):
+                return ToolResult(status=ToolStatus.DENIED, tool=self.name, error="task draft claim was lost")
             result = await self._write_client.call("tasks.task.add", sanitized)
         except Exception as exc:
             return ToolResult(
                 status=ToolStatus.ERROR,
                 tool=self.name,
                 error=f"{type(exc).__name__}: {exc}",
+                data={"mutation_outcome": "unknown"},
             )
-        await self._store.delete_task_draft(dialog_key)
+        await self._store.delete_task_draft(
+            dialog_key,
+            status="confirmed",
+            expected_draft_id=str(claimed.get("_draft_id") or ""),
+            expected_version=optional_int(claimed.get("_draft_version")),
+            expected_claim_token=str(claimed.get("_draft_claim_token") or ""),
+        )
         return ToolResult(
             status=ToolStatus.OK,
             tool=self.name,
@@ -386,7 +460,14 @@ class TaskDraftDiscardTool:
         dialog_id: str | None = None,
     ) -> ToolResult:
         if dialog_key:
-            await self._store.delete_task_draft(dialog_key)
+            draft = await self._store.get_task_draft(dialog_key)
+            if isinstance(draft, dict) and draft.get("_draft_type") in (None, TASK_CREATE_DRAFT_TYPE):
+                await discard_exact_draft(
+                    self._store,
+                    dialog_key=dialog_key,
+                    draft=draft,
+                    expected_type=TASK_CREATE_DRAFT_TYPE,
+                )
         return ToolResult(
             status=ToolStatus.OK,
             tool=self.name,

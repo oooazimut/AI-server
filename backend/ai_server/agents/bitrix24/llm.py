@@ -1630,6 +1630,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "For task closing draft updates, keep the four blocks isolated: block 1/task points only records each work item status (completed/not done/unconfirmed), block 2 only records used materials/equipment, block 3 only records the user's overall status and reasons, and block 4 only records additional information. Ignore extra text inside the wrong block and never move it to another block. "
         "If permission_context.pending_task_draft._draft_type is calendar_event and the current user explicitly confirms calendar creation, call calendar_event_confirm. "
         "If permission_context.pending_task_draft._draft_type is project_create and the current user explicitly confirms project creation, call project_create_confirm. "
+        "If permission_context.pending_task_draft._draft_type is admin_change, confirm with task_close_control_update operation=confirm and cancel with operation=discard. "
         "If the current user explicitly cancels or rejects a task creation draft, call task_draft_discard. "
         "If the current user explicitly cancels or rejects a task closing draft, call task_close_discard. "
         "If the current user explicitly cancels or rejects a calendar event draft, call calendar_event_discard. "
@@ -1796,9 +1797,15 @@ def _common_draft_discard_decision(
             "task_close": "task_close_discard",
             "calendar_event": "calendar_event_discard",
             "project_create": "project_create_discard",
+            "admin_change": "task_close_control_update",
         }.get(draft_type)
         if tool_name and _draft_discard_tool_available(tool_definitions, tool_name):
-            return _discard_decision_tool(tool_name, f"deterministic Bitrix {draft_type} draft discard routing")
+            args = {"operation": "discard"} if draft_type == "admin_change" else None
+            return _discard_decision_tool(
+                tool_name,
+                f"deterministic Bitrix {draft_type} draft discard routing",
+                args=args,
+            )
         return None
 
     fallback_tool = _draft_discard_tool_from_text(lowered)
@@ -1830,7 +1837,12 @@ def _is_draft_discard_request(lowered_request: str) -> bool:
     return any(marker in lowered_request for marker in ("отмени", "отменить", "удали", "удалить"))
 
 
-def _discard_decision_tool(name: str, summary: str) -> BitrixLLMDecision:
+def _discard_decision_tool(
+    name: str,
+    summary: str,
+    *,
+    args: dict[str, Any] | None = None,
+) -> BitrixLLMDecision:
     return BitrixLLMDecision(
         status="completed",
         answer="",
@@ -1838,7 +1850,7 @@ def _discard_decision_tool(name: str, summary: str) -> BitrixLLMDecision:
         tool_calls=[
             BitrixLLMToolCall(
                 name=name,
-                args={},
+                args=args or {},
                 summary=summary,
             )
         ],
@@ -1936,12 +1948,18 @@ def _common_draft_confirm_decision(
         "task_close": "task_close_confirm",
         "calendar_event": "calendar_event_confirm",
         "project_create": "project_create_confirm",
+        "admin_change": "task_close_control_update",
     }.get(draft_type)
     if not tool_name:
         return None
     if not _draft_discard_tool_available(tool_definitions, tool_name):
         return None
-    return _confirm_decision_tool(tool_name, f"deterministic Bitrix {draft_type} draft confirm routing")
+    args = {"operation": "confirm"} if draft_type == "admin_change" else None
+    return _confirm_decision_tool(
+        tool_name,
+        f"deterministic Bitrix {draft_type} draft confirm routing",
+        args=args,
+    )
 
 
 def _is_draft_confirm_request(lowered_request: str) -> bool:
@@ -1959,7 +1977,12 @@ def _is_draft_confirm_request(lowered_request: str) -> bool:
     )
 
 
-def _confirm_decision_tool(name: str, summary: str) -> BitrixLLMDecision:
+def _confirm_decision_tool(
+    name: str,
+    summary: str,
+    *,
+    args: dict[str, Any] | None = None,
+) -> BitrixLLMDecision:
     return BitrixLLMDecision(
         status="completed",
         answer="",
@@ -1967,7 +1990,7 @@ def _confirm_decision_tool(name: str, summary: str) -> BitrixLLMDecision:
         tool_calls=[
             BitrixLLMToolCall(
                 name=name,
-                args={},
+                args=args or {},
                 summary=summary,
             )
         ],
@@ -1996,6 +2019,7 @@ def _common_task_close_start_decision(
                 name="task_close_draft",
                 args={
                     "task_id": task_id,
+                    "close_now": True,
                     "overall_status": "unconfirmed",
                     "unconfirmed_items": ["результат выполнения не указан"],
                     "missing_fields": [

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 from ai_server.integrations.bitrix.portal_search.types import CONTENT_INDEX_VERSION, CONTENT_TERMINAL_STATUSES
@@ -11,6 +13,8 @@ from ai_server.integrations.postgres.orchestrator_agent import PostgresOrchestra
 from ai_server.integrations.postgres.pto_agent import PostgresPtoAgentStore
 from ai_server.integrations.postgres.vehicle_usage import PostgresVehicleUsageStore, _parse_row
 from ai_server.tools.vehicle_usage import StaffMember
+
+_real_bitrix_ensure_schema = PostgresBitrixAgentStore.ensure_schema
 
 # ---------------------------------------------------------------------------
 # Fake psycopg sync connection
@@ -531,7 +535,7 @@ def test_bitrix_store_update_responsible_response(monkeypatch):
     assert any("responsible_response" in sql for sql, _ in conn.calls)
 
 
-def test_bitrix_store_upserts_task_close_controlled_user_without_controlled_from(monkeypatch):
+def test_bitrix_store_upserts_task_close_controlled_user_with_stable_controlled_from(monkeypatch):
     store = PostgresBitrixAgentStore("postgresql://fake")
     factory, conn = _sync_conn_factory()
     monkeypatch.setattr(store, "_sync_connect", factory)
@@ -540,7 +544,28 @@ def test_bitrix_store_upserts_task_close_controlled_user_without_controlled_from
 
     sql, params = conn.calls[0]
     assert "task_close_controlled_users" in sql
-    assert "controlled_from" not in sql
+    assert "controlled_from" in sql
+    assert "controlled_from IS NULL" in sql
+    assert params == (231, True, True, 1)
+
+
+def test_bitrix_store_schema_backfills_date_only_control_cutoff():
+    source = inspect.getsource(_real_bitrix_ensure_schema)
+    assert "length(setting.value) = 10" in source
+    assert "setting.value::date::timestamp AT TIME ZONE 'Europe/Moscow'" in source
+    assert "($|[T ])" in source
+
+
+def test_bitrix_store_updates_one_task_close_operator_without_replacing_list(monkeypatch):
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    factory, conn = _sync_conn_factory()
+    monkeypatch.setattr(store, "_sync_connect", factory)
+
+    store.upsert_task_close_operator(user_id=231, active=True, updated_by=1)
+
+    sql, params = conn.calls[0]
+    assert "INSERT INTO bitrix24.task_close_control_operators" in sql
+    assert "UPDATE bitrix24.task_close_control_operators\n                SET active = FALSE" not in sql
     assert params == (231, True, 1)
 
 
@@ -691,13 +716,17 @@ def test_bitrix_store_lists_task_close_drafts(monkeypatch):
     rows = [
         {
             "dialog_key": "dialog:231:user:231",
-            "params_json": json.dumps({"_draft_type": "task_close", "task_id": 8875}),
-            "created_at": "2026-07-12T19:00:00+03:00",
+                "params_json": json.dumps({"_draft_type": "task_close", "task_id": 8875}),
+                "status": "active",
+                "created_at": "2026-07-12T19:00:00+03:00",
+                "updated_at": "2026-07-12T19:00:00+03:00",
         },
         {
             "dialog_key": "dialog:231:user:231:task-create",
-            "params_json": json.dumps({"_draft_type": "task_create", "title": "skip"}),
-            "created_at": "2026-07-12T19:01:00+03:00",
+                "params_json": json.dumps({"_draft_type": "task_create", "title": "skip"}),
+                "status": "active",
+                "created_at": "2026-07-12T19:01:00+03:00",
+                "updated_at": "2026-07-12T19:01:00+03:00",
         },
     ]
     factory, conn = _sync_conn_factory(rows=rows)
@@ -707,13 +736,15 @@ def test_bitrix_store_lists_task_close_drafts(monkeypatch):
 
     assert result == [
         {
-            "dialog_key": "dialog:231:user:231",
-            "params": {"_draft_type": "task_close", "task_id": 8875},
-            "created_at": "2026-07-12T19:00:00+03:00",
+                "dialog_key": "dialog:231:user:231",
+                "params": {"_draft_type": "task_close", "task_id": 8875},
+                "status": "active",
+                "created_at": "2026-07-12T19:00:00+03:00",
+                "updated_at": "2026-07-12T19:00:00+03:00",
         }
     ]
     sql, params = conn.calls[0]
-    assert "pending_task_draft" in sql
+    assert "interactive_drafts" in sql
     assert params == (50,)
 
 
@@ -834,6 +865,215 @@ def test_orchestrator_store_schema_name():
 def test_bitrix_store_schema_name():
     store = PostgresBitrixAgentStore("postgresql://fake")
     assert store._SCHEMA == "bitrix24"
+
+
+def test_bitrix_store_task_draft_edit_preserves_identity_and_original_expiry():
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    created_at = datetime(2026, 7, 20, 10, 0, tzinfo=UTC)
+    expires_at = created_at + timedelta(minutes=15)
+    active_cursor = AsyncMock()
+    active_cursor.fetchone = AsyncMock(
+        return_value={
+            "draft_id": "draft-1",
+            "draft_type": "task_create",
+            "original_request": "исходный текст",
+            "params_json": json.dumps({"_draft_type": "task_create"}),
+            "status": "active",
+            "version": 2,
+            "created_at": created_at,
+            "expires_at": expires_at,
+        }
+    )
+    default_cursor = AsyncMock()
+    conn = AsyncMock()
+    conn.__aenter__ = AsyncMock(return_value=conn)
+    conn.__aexit__ = AsyncMock(return_value=False)
+    conn.execute = AsyncMock(side_effect=[active_cursor, default_cursor, default_cursor, default_cursor])
+
+    async def run():
+        with patch.object(store, "_connect", AsyncMock(return_value=conn)):
+            await store.save_task_draft(
+                "dialog:13",
+                {
+                    "_draft_type": "task_create",
+                    "_original_request": "изменённый текст",
+                    "_draft_user_id": 13,
+                    "fields": {"TITLE": "Тест"},
+                },
+            )
+
+    anyio_run(run())
+    insert_call = next(
+        call for call in conn.execute.await_args_list if "INSERT INTO bitrix24.interactive_drafts" in call.args[0]
+    )
+    params = insert_call.args[1]
+    payload = json.loads(params[6])
+    assert params[0] == "draft-1"
+    assert params[7] == 3
+    assert params[8] == created_at
+    assert params[10] == expires_at
+    assert payload["_draft_id"] == "draft-1"
+    assert payload["_draft_version"] == 3
+    assert payload["_draft_created_at"] == created_at.isoformat()
+    assert payload["_draft_expires_at"] == expires_at.isoformat()
+    assert payload["_original_request"] == "исходный текст"
+    transition_call = next(
+        call
+        for call in conn.execute.await_args_list
+        if "INSERT INTO bitrix24.interactive_draft_transitions" in call.args[0]
+    )
+    transition_payload = json.loads(transition_call.args[1][3])
+    assert transition_payload["_original_request"] == "исходный текст"
+    assert transition_payload["_edit_request"] == "изменённый текст"
+
+
+def test_bitrix_store_does_not_promote_expired_legacy_draft_without_ttl_argument():
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    no_typed_cursor = AsyncMock()
+    no_typed_cursor.fetchone = AsyncMock(return_value=None)
+    legacy_cursor = AsyncMock()
+    legacy_cursor.fetchone = AsyncMock(
+        return_value={
+            "params_json": json.dumps({"_draft_type": "task_create", "fields": {"TITLE": "old"}}),
+            "created_at": datetime(2020, 1, 1, tzinfo=UTC),
+        }
+    )
+    read_conn = AsyncMock()
+    read_conn.__aenter__ = AsyncMock(return_value=read_conn)
+    read_conn.__aexit__ = AsyncMock(return_value=False)
+    read_conn.execute = AsyncMock(side_effect=[no_typed_cursor, legacy_cursor])
+    delete_conn = AsyncMock()
+    delete_conn.__aenter__ = AsyncMock(return_value=delete_conn)
+    delete_conn.__aexit__ = AsyncMock(return_value=False)
+    delete_conn.execute = AsyncMock(return_value=AsyncMock())
+
+    async def run():
+        with patch.object(store, "_connect", AsyncMock(side_effect=[read_conn, delete_conn])):
+            return await store.get_task_draft("dialog:13")
+
+    result = anyio_run(run())
+    assert result is None
+    sql, params = delete_conn.execute.await_args.args
+    assert "DELETE FROM bitrix24.pending_task_draft" in sql
+    assert params == ("dialog:13", datetime(2020, 1, 1, tzinfo=UTC))
+
+
+def test_bitrix_store_claims_exact_task_draft_once_with_cas():
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    payload = {"_draft_id": "draft-1", "_draft_version": 3, "_draft_type": "task_create"}
+    claimed_cursor = AsyncMock()
+    claimed_cursor.fetchone = AsyncMock(
+        return_value={"draft_id": "draft-1", "params_json": json.dumps(payload), "user_id": 13}
+    )
+    default_cursor = AsyncMock()
+    conn = AsyncMock()
+    conn.__aenter__ = AsyncMock(return_value=conn)
+    conn.__aexit__ = AsyncMock(return_value=False)
+    conn.execute = AsyncMock(side_effect=[claimed_cursor, default_cursor])
+
+    async def run():
+        with patch.object(store, "_connect", AsyncMock(return_value=conn)):
+            return await store.claim_task_draft(
+                "dialog:13",
+                expected_draft_id="draft-1",
+                expected_version=3,
+                expected_type="task_create",
+            )
+
+    result = anyio_run(run())
+    assert {key: result[key] for key in payload} == payload
+    assert result["_draft_claim_token"]
+    sql, params = conn.execute.await_args_list[0].args
+    assert "status = 'confirming'" in sql
+    assert "version = %s" in sql
+    assert params[3:7] == ("dialog:13", "draft-1", 3, "task_create")
+
+
+def test_bitrix_store_confirms_admin_change_in_one_locked_transaction():
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    draft = {
+        "_draft_id": "draft-admin-1",
+        "_draft_version": 2,
+        "_draft_type": "admin_change",
+        "action": "add_operator",
+        "field": "operator",
+        "target_user_id": 13,
+        "old_value": False,
+        "new_value": True,
+    }
+    draft_cursor = AsyncMock()
+    draft_cursor.fetchone = AsyncMock(return_value={"params_json": json.dumps(draft)})
+    member_cursor = AsyncMock()
+    member_cursor.fetchone = AsyncMock(return_value=None)
+    default_cursor = AsyncMock()
+    conn = AsyncMock()
+    conn.__aenter__ = AsyncMock(return_value=conn)
+    conn.__aexit__ = AsyncMock(return_value=False)
+    conn.execute = AsyncMock(
+        side_effect=[
+            draft_cursor,
+            default_cursor,
+            member_cursor,
+            default_cursor,
+            default_cursor,
+            default_cursor,
+            default_cursor,
+            default_cursor,
+        ]
+    )
+
+    async def run():
+        with patch.object(store, "_connect", AsyncMock(return_value=conn)):
+            return await store.confirm_admin_change_draft(
+                dialog_key="dialog:1",
+                draft_id="draft-admin-1",
+                draft_version=2,
+                actor_user_id=1,
+            )
+
+    result = anyio_run(run())
+    assert result["status"] == "confirmed"
+    sql_calls = [call.args[0] for call in conn.execute.await_args_list]
+    assert "FOR UPDATE" in sql_calls[0]
+    assert "pg_advisory_xact_lock" in sql_calls[1]
+    assert "task_close_control_operators" in sql_calls[2] and "FOR UPDATE" in sql_calls[2]
+    assert "INSERT INTO bitrix24.task_close_control_operators" in sql_calls[3]
+    assert "INSERT INTO bitrix24.task_close_control_revisions" in sql_calls[4]
+    assert "status = 'confirmed'" in sql_calls[5]
+    assert "interactive_draft_transitions" in sql_calls[6]
+    assert "pending_task_draft" in sql_calls[7]
+
+
+def test_bitrix_store_reclaims_only_stale_finalizing_draft_with_new_lease_token():
+    store = PostgresBitrixAgentStore("postgresql://fake")
+    payload = {"_draft_id": "draft-1", "_draft_version": 3, "_draft_type": "task_close"}
+    claimed_cursor = AsyncMock()
+    claimed_cursor.fetchone = AsyncMock(
+        return_value={"draft_id": "draft-1", "params_json": json.dumps(payload), "user_id": 13}
+    )
+    default_cursor = AsyncMock()
+    conn = AsyncMock()
+    conn.__aenter__ = AsyncMock(return_value=conn)
+    conn.__aexit__ = AsyncMock(return_value=False)
+    conn.execute = AsyncMock(side_effect=[claimed_cursor, default_cursor])
+
+    async def run():
+        with patch.object(store, "_connect", AsyncMock(return_value=conn)):
+            return await store.reclaim_stale_finalizing_task_draft(
+                "dialog:13",
+                expected_draft_id="draft-1",
+                expected_version=3,
+                expected_type="task_close",
+                lease_seconds=300,
+            )
+
+    result = anyio_run(run())
+    assert result["_reclaimed_finalizing"] is True
+    assert result["_draft_claim_token"]
+    sql, params = conn.execute.await_args_list[0].args
+    assert "status = 'finalizing'" in sql
+    assert "COALESCE(claimed_at, updated_at) <= %s" in sql
+    assert params[3:7] == ("dialog:13", "draft-1", 3, "task_close")
 
 
 def test_vehicle_store_auto_close_pending_draft_finalizes_unknowns(monkeypatch):

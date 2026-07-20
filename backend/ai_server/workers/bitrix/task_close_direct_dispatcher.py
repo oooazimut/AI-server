@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 from typing import Any
 
+from ai_server.agents.bitrix24.tools.draft_lifecycle import renew_exact_draft_claim
 from ai_server.agents.bitrix24.tools.task_close import (
     TASK_CLOSE_DRAFT_TYPE,
     _execute_task_close,
@@ -17,7 +18,6 @@ from ai_server.agents.bitrix24.tools.task_close_control import (
     TASK_CLOSE_AUTO_CLOSE_TIME_KEY,
     TASK_CLOSE_DEFAULT_AUTO_CLOSE_TIME,
 )
-from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
 from ai_server.integrations.bitrix.oauth import BitrixOAuthError
 from ai_server.integrations.bitrix.task_close_direct_queue import (
     TASK_CLOSE_DIRECT_OPEN_STATUSES,
@@ -218,16 +218,15 @@ async def auto_close_direct_task_close_reports(
         due=_is_auto_close_due(now_dt, auto_close_time),
         auto_close_time=auto_close_time,
     )
-    if not stats.due:
-        return stats
     lister = getattr(store, "list_task_close_processing_states", None)
-    if not callable(lister):
-        return stats
-
-    states = lister(
-        statuses=list(TASK_CLOSE_DIRECT_OPEN_STATUSES),
-        state_key_prefix=TASK_CLOSE_DIRECT_QUEUE_PREFIX,
-        limit=limit,
+    states = (
+        lister(
+            statuses=list(TASK_CLOSE_DIRECT_OPEN_STATUSES),
+            state_key_prefix=TASK_CLOSE_DIRECT_QUEUE_PREFIX,
+            limit=limit,
+        )
+        if stats.due and callable(lister)
+        else []
     )
     stats.candidates = len(states)
     if settings.agent_dry_run:
@@ -246,12 +245,11 @@ async def auto_close_direct_task_close_reports(
                 payload.get("draft_dialog_key") or _private_dialog_key(safe_int(payload.get("responsible_id")))
             )
             existing_draft = await _existing_draft(store, draft_dialog_key)
-            draft = _auto_close_draft_from_state(state=state, payload=payload, existing_draft=existing_draft)
+            if existing_draft:
+                stats.skipped += 1
+                continue
+            draft = _auto_close_draft_from_state(state=state, payload=payload, existing_draft=None)
             result = await _execute_task_close(close_call=bitrix.call, report_call=bitrix.call, draft=draft)
-            if existing_draft and _same_task_close_draft(existing_draft, task_id):
-                deleter = getattr(store, "delete_task_draft", None)
-                if callable(deleter) and draft_dialog_key:
-                    await deleter(draft_dialog_key)
             auto_close_direct_close_event_as_unconfirmed(
                 store,
                 task_id=task_id,
@@ -267,7 +265,7 @@ async def auto_close_direct_task_close_reports(
             continue
         stats.reports_written += 1
         stats.closed += 1
-    draft_rows = await _list_task_close_drafts(store, limit=limit)
+    draft_rows = await _list_task_close_drafts(store, limit=limit, expired_only=True)
     stats.open_drafts = len(draft_rows)
     for row in draft_rows:
         dialog_key = str(row.get("dialog_key") or "")
@@ -282,6 +280,30 @@ async def auto_close_direct_task_close_reports(
         if _truthy(draft.get("_direct_close_auto_closed")):
             stats.skipped += 1
             continue
+        row_status = str(row.get("status") or "active")
+        claim_name = (
+            "reclaim_stale_finalizing_task_draft"
+            if row_status == "finalizing"
+            else "claim_expired_task_draft"
+        )
+        claim = getattr(store, claim_name, None)
+        claimed = None
+        if callable(claim):
+            draft_id = str(draft.get("_draft_id") or "")
+            draft_version = safe_int(draft.get("_draft_version"))
+            if not draft_id or draft_version is None:
+                stats.errors.append(f"draft:{task_id}:missing_cas_identity")
+                continue
+            claimed = await claim(
+                dialog_key,
+                expected_draft_id=draft_id,
+                expected_version=draft_version,
+                expected_type=TASK_CLOSE_DRAFT_TYPE,
+            )
+            if not isinstance(claimed, dict):
+                stats.skipped += 1
+                continue
+            draft = claimed
         try:
             prepared = _auto_close_open_draft(draft)
             user_id = _user_id_from_dialog_key(dialog_key)
@@ -290,27 +312,44 @@ async def auto_close_direct_task_close_reports(
                 bitrix_oauth=bitrix_oauth,
                 draft=prepared,
                 user_id=user_id,
+                claim_guard=lambda dialog_key=dialog_key, draft=draft: renew_exact_draft_claim(
+                    store,
+                    dialog_key=dialog_key,
+                    draft=draft,
+                    expected_status="finalizing",
+                ),
             )
             deleter = getattr(store, "delete_task_draft", None)
             if callable(deleter) and dialog_key:
-                deleted = deleter(dialog_key)
+                deleted = deleter(
+                    dialog_key,
+                    status="finalized",
+                    expected_draft_id=str(draft.get("_draft_id") or ""),
+                    expected_version=safe_int(draft.get("_draft_version")),
+                    expected_claim_token=str(draft.get("_draft_claim_token") or ""),
+                )
                 if inspect.isawaitable(deleted):
                     await deleted
             if actor_mode == "oauth_user":
                 stats.oauth_closed += 1
-            elif actor_mode == "system_webhook_fallback":
-                stats.system_fallback_closed += 1
-                stats.admin_notifications += await _notify_admin_system_fallback(
-                    bitrix=bitrix,
-                    settings=settings,
-                    draft=prepared,
-                    result=result,
-                )
+            close_event_key = str(draft.get("_direct_close_close_event_key") or "").strip()
+            if not close_event_key:
+                matching_states = [
+                    state
+                    for state in states
+                    if safe_int(state.get("task_id") or (state.get("payload") or {}).get("task_id")) == task_id
+                    and str((state.get("payload") or {}).get("draft_dialog_key") or "") == dialog_key
+                    and str((state.get("payload") or {}).get("close_event_key") or "").strip()
+                ]
+                if len(matching_states) == 1:
+                    close_event_key = str(matching_states[0]["payload"]["close_event_key"]).strip()
+            if not close_event_key:
+                close_event_key = f"open_draft:{dialog_key or task_id}"
             payload_updates = {
                 "auto_close_report_method": result.get("report_method"),
                 "auto_close_report_file_name": result.get("report_file_name"),
                 "auto_close_actor_mode": actor_mode,
-                "close_event_key": f"open_draft:{dialog_key or task_id}",
+                "close_event_key": close_event_key,
             }
             auto_close_direct_close_event_as_unconfirmed(
                 store,
@@ -319,7 +358,18 @@ async def auto_close_direct_task_close_reports(
                 now_iso=now_iso,
                 payload_updates=payload_updates,
             )
-        except Exception as exc:  # pragma: no cover - defensive: one bad draft must not stop the batch
+        except BitrixOAuthError as exc:
+            if isinstance(claimed, dict):
+                releaser = getattr(store, "release_task_draft", None)
+                if callable(releaser):
+                    await releaser(
+                        dialog_key,
+                        draft_id=str(claimed.get("_draft_id") or ""),
+                        claim_token=str(claimed.get("_draft_claim_token") or ""),
+                    )
+            stats.errors.append(f"draft:{task_id}:{type(exc).__name__}: {exc}")
+            continue
+        except Exception as exc:  # pragma: no cover - unknown remote outcome remains finalizing
             stats.errors.append(f"draft:{task_id}:{type(exc).__name__}: {exc}")
             continue
         stats.reports_written += 1
@@ -487,16 +537,18 @@ def _auto_close_draft_from_state(
 
 def _auto_close_open_draft(draft: dict[str, Any]) -> dict[str, Any]:
     draft_args = dict(draft)
+    unknown_fields = [f"unknown: {item}" for item in _string_list(draft.get("missing_fields"))]
     unconfirmed_items = _unique_strings(
         [
             *_string_list(draft.get("unconfirmed_items")),
             *_string_list(draft.get("unresolved_items")),
+            *unknown_fields,
             "Draft was not confirmed before the auto-close time.",
         ]
     )
     draft_args.update(
         {
-            "already_closed": False,
+            "already_closed": _truthy(draft.get("already_closed")),
             "unconfirmed_items": unconfirmed_items,
         }
     )
@@ -516,49 +568,49 @@ async def _execute_auto_close_with_fallback(
     bitrix_oauth: Any | None,
     draft: dict[str, Any],
     user_id: int | None,
+    claim_guard: Any | None = None,
 ) -> tuple[dict[str, Any], str]:
-    if bitrix_oauth is not None and user_id is not None:
-        close_stage_error = True
-        try:
-            oauth_client = await bitrix_oauth.client_for_user(user_id)
-            close_stage_error = True
-
-            async def oauth_close_call(method: str, payload: dict[str, Any]) -> Any:
-                nonlocal close_stage_error
-                close_stage_error = True
-                return await oauth_client.call(method, payload)
-
-            async def system_report_call(method: str, payload: dict[str, Any]) -> Any:
-                nonlocal close_stage_error
-                close_stage_error = False
-                return await bitrix.call(method, payload)
-
-            result = await _execute_task_close(
-                close_call=oauth_close_call,
-                report_call=system_report_call,
-                draft=draft,
-            )
-            result["auto_close_actor_mode"] = "oauth_user"
-            result["auto_close_actor_user_id"] = user_id
-            return result, "oauth_user"
-        except (BitrixOAuthError, BitrixApiError, BitrixConfigError) as exc:
-            if not close_stage_error:
-                raise
-            fallback_draft = _system_fallback_draft(draft, reason=f"{type(exc).__name__}: {exc}")
-        except Exception as exc:
-            if not close_stage_error:
-                raise
-            fallback_draft = _system_fallback_draft(draft, reason=f"{type(exc).__name__}: {exc}")
-    else:
-        reason = "OAuth user context is not available for auto-close."
-        fallback_draft = _system_fallback_draft(draft, reason=reason)
-
-    result = await _execute_task_close(close_call=bitrix.call, report_call=bitrix.call, draft=fallback_draft)
-    result["auto_close_actor_mode"] = "system_webhook_fallback"
-    result["auto_close_system_webhook_fallback_reason"] = str(
-        fallback_draft.get("_auto_close_system_webhook_fallback_reason") or ""
+    if bitrix_oauth is None or user_id is None:
+        raise BitrixOAuthError("OAuth user context is required for task auto-close.")
+    oauth_client = await bitrix_oauth.client_for_user(user_id)
+    task_id = safe_int(draft.get("task_id"))
+    if task_id is None:
+        raise ValueError("task closing draft has no task_id")
+    status_response = await oauth_client.call(
+        "tasks.task.get",
+        {"taskId": task_id, "select": ["ID", "STATUS", "CLOSED_DATE"]},
     )
-    return result, "system_webhook_fallback"
+    status_task = _task_from_status_response(status_response)
+    if not status_task:
+        raise BitrixOAuthError("Fresh current-user task status proof is required for task auto-close.")
+    status = str(status_task.get("STATUS") or status_task.get("status") or "").strip()
+    closed_date = status_task.get("CLOSED_DATE") or status_task.get("closedDate")
+    verified_draft = dict(draft)
+    verified_closed = status == "5" or bool(closed_date)
+    verified_draft["already_closed"] = verified_closed
+    verified_draft["_direct_close_already_closed"] = verified_closed
+    result = await _execute_task_close(
+        close_call=oauth_client.call,
+        report_call=bitrix.call,
+        draft=verified_draft,
+        claim_guard=claim_guard,
+    )
+    result["auto_close_actor_mode"] = "oauth_user"
+    result["auto_close_actor_user_id"] = user_id
+    return result, "oauth_user"
+
+
+def _task_from_status_response(response: object) -> dict[str, Any]:
+    if not isinstance(response, dict):
+        return {}
+    result = response.get("result")
+    if isinstance(result, dict) and isinstance(result.get("task"), dict):
+        return dict(result["task"])
+    if isinstance(response.get("task"), dict):
+        return dict(response["task"])
+    if isinstance(result, dict):
+        return dict(result)
+    return {}
 
 
 def _system_fallback_draft(draft: dict[str, Any], *, reason: str) -> dict[str, Any]:
@@ -618,18 +670,25 @@ async def _notify_admin_system_fallback(
 
 
 async def _existing_draft(store: Any, dialog_key: str) -> dict[str, Any] | None:
-    getter = getattr(store, "get_task_draft", None)
+    getter = getattr(store, "get_task_draft_for_finalizer", None)
+    if not callable(getter):
+        getter = getattr(store, "get_task_draft", None)
     if not callable(getter):
         return None
     draft = await getter(dialog_key)
     return dict(draft) if isinstance(draft, dict) else None
 
 
-async def _list_task_close_drafts(store: Any, *, limit: int) -> list[dict[str, Any]]:
+async def _list_task_close_drafts(
+    store: Any,
+    *,
+    limit: int,
+    expired_only: bool = False,
+) -> list[dict[str, Any]]:
     lister = getattr(store, "list_task_drafts", None)
     if not callable(lister):
         return []
-    rows = lister(draft_type=TASK_CLOSE_DRAFT_TYPE, limit=limit)
+    rows = lister(draft_type=TASK_CLOSE_DRAFT_TYPE, limit=limit, expired_only=expired_only)
     if inspect.isawaitable(rows):
         rows = await rows
     return [dict(row) for row in rows if isinstance(row, dict)]

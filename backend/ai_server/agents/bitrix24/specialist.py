@@ -228,7 +228,11 @@ class Bitrix24Specialist(BaseSpecialist):
                 settings=_settings,
             ),
             TaskCloseControlGetTool(store=bitrix_store, user_client=bitrix_client),
-            TaskCloseControlUpdateTool(store=bitrix_store, user_client=bitrix_client),
+            TaskCloseControlUpdateTool(
+                store=bitrix_store,
+                user_client=bitrix_client,
+                bitrix_oauth=bitrix_oauth,
+            ),
             CalendarEventDraftTool(store=bitrix_store),
             CalendarEventConfirmTool(
                 store=bitrix_store,
@@ -293,21 +297,37 @@ class Bitrix24Specialist(BaseSpecialist):
         task: AgentTask,
     ) -> tuple[ToolResult | None, Any | None, list[Any]]:
         if tool_call.name == "task_create_draft":
-            args = _task_create_args_with_actor_label(dict(tool_call.args or {}), task)
+            args = _draft_args_with_metadata(
+                _task_create_args_with_actor_label(dict(tool_call.args or {}), task),
+                task,
+            )
             tool_call = SimpleNamespace(
                 name=tool_call.name,
                 args=args,
                 summary=getattr(tool_call, "summary", ""),
             )
         elif tool_call.name == "calendar_event_draft":
-            args = _calendar_event_args_with_actor_label(dict(tool_call.args or {}), task)
+            args = _draft_args_with_metadata(
+                _calendar_event_args_with_actor_label(dict(tool_call.args or {}), task),
+                task,
+            )
             tool_call = SimpleNamespace(
                 name=tool_call.name,
                 args=args,
                 summary=getattr(tool_call, "summary", ""),
             )
         elif tool_call.name == "project_create_draft":
-            args = _project_create_args_with_actor_context(dict(tool_call.args or {}), task)
+            args = _draft_args_with_metadata(
+                _project_create_args_with_actor_context(dict(tool_call.args or {}), task),
+                task,
+            )
+            tool_call = SimpleNamespace(
+                name=tool_call.name,
+                args=args,
+                summary=getattr(tool_call, "summary", ""),
+            )
+        elif tool_call.name == "task_close_draft":
+            args = _draft_args_with_metadata(dict(tool_call.args or {}), task)
             tool_call = SimpleNamespace(
                 name=tool_call.name,
                 args=args,
@@ -321,7 +341,9 @@ class Bitrix24Specialist(BaseSpecialist):
                 summary=getattr(tool_call, "summary", ""),
             )
         elif tool_call.name in {"task_close_control_get", "task_close_control_update"}:
-            args = _args_with_actor_admin_context(dict(tool_call.args or {}), task, settings=self._settings_for_qc)
+            args = _args_with_actor_admin_context(dict(tool_call.args or {}), task)
+            if tool_call.name == "task_close_control_update":
+                args = _draft_args_with_metadata(args, task)
             tool_call = SimpleNamespace(
                 name=tool_call.name,
                 args=args,
@@ -541,14 +563,19 @@ def _warehouse_request_implies_stock(request: str) -> bool:
 def _args_with_actor_admin_context(
     args: dict[str, Any],
     task: AgentTask,
-    *,
-    settings: Settings | None = None,
 ) -> dict[str, Any]:
     profile = _current_user_profile(task)
-    user_id = optional_int(task.user.id)
-    configured_admin_ids = set(settings.resolved_task_close_control_admin_user_ids if settings is not None else [])
-    actor_is_admin = bool(profile.get("is_admin")) or bool(user_id is not None and user_id in configured_admin_ids)
+    actor_is_admin = bool(profile.get("is_admin"))
     return {**args, "_actor_is_admin": actor_is_admin}
+
+
+def _draft_args_with_metadata(args: dict[str, Any], task: AgentTask) -> dict[str, Any]:
+    return {
+        **args,
+        "_original_request": str(task.request or ""),
+        "_draft_user_id": optional_int(task.user.id) if task.user.id is not None else None,
+        "_draft_specialist": "bitrix24",
+    }
 
 
 def _current_user_label(task: AgentTask) -> str:
@@ -623,4 +650,26 @@ def _enforce_task_close_response(result: AgentResult, *, settings: Settings | No
             return result.model_copy(update={"status": "completed", "answer": answer})
         if action.name == "task_close_discard":
             return result.model_copy(update={"status": "completed", "answer": "Черновик закрытия задачи удалён."})
+        if action.name == "task_close_control_update":
+            operation = str(data.get("operation") or "")
+            if operation == "prepare":
+                return result.model_copy(
+                    update={"status": "needs_human", "answer": _format_admin_change_draft_answer(data)}
+                )
+            if operation == "discard":
+                return result.model_copy(update={"status": "completed", "answer": "Черновик изменения настроек удалён."})
+            if operation == "confirm":
+                return result.model_copy(update={"status": "completed", "answer": "Изменение настроек подтверждено."})
     return result
+
+
+def _format_admin_change_draft_answer(data: dict[str, Any]) -> str:
+    draft = data.get("draft") if isinstance(data.get("draft"), dict) else {}
+    field = str(draft.get("field") or draft.get("action") or "настройка")
+    target = str(draft.get("target_user_name") or draft.get("target_user_id") or "").strip()
+    subject = f"{field} ({target})" if target else field
+    return (
+        f"Подготовлен черновик изменения: {subject}; "
+        f"было — {draft.get('old_value')!s}, станет — {draft.get('new_value')!s}. "
+        "Черновик действует 15 минут. Подтвердите или отмените изменение."
+    )

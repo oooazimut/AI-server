@@ -8,6 +8,10 @@ from unittest.mock import AsyncMock, call
 
 import anyio
 
+from ai_server.agents.bitrix24.tools.draft_lifecycle import (
+    renew_exact_draft_claim,
+    resolve_unknown_draft_claim,
+)
 from ai_server.agents.bitrix24.tools.task_close import (
     INCOMPLETE_CLOSE_MARKER,
     TASK_CLOSE_DRAFT_TYPE,
@@ -248,6 +252,250 @@ def test_close_draft_marks_already_closed_task():
     draft = store._drafts["d:13"]
     assert draft["already_closed"] is True
     assert result.data["preview"]["already_closed"] is True
+
+
+def test_close_draft_close_now_reserves_then_closes_as_oauth_user():
+    store = FakeTaskDraftStore()
+    oauth_client = AsyncMock()
+    oauth_client.call = AsyncMock(return_value={"task": {"id": 139}})
+    tool = TaskCloseDraftTool(store=store, bitrix_oauth=FakeBitrixOAuth(oauth_client))
+
+    result = _exec(
+        tool,
+        {
+            "task_id": 139,
+            "task_title": "Проверить камеры",
+            "close_now": True,
+            "overall_status": "unconfirmed",
+            "unconfirmed_items": ["результат не указан"],
+        },
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+
+    assert result.status == ToolStatus.OK
+    oauth_client.call.assert_awaited_once()
+    method, params = oauth_client.call.await_args.args
+    assert method == "tasks.task.complete"
+    assert params["taskId"] == 139
+    stored = store._drafts["d:13"]
+    assert stored["already_closed"] is True
+    assert stored["_direct_close_already_closed"] is True
+    assert stored["_closed_from_chat"] is True
+    assert "d:13" not in store._confirming
+
+
+def test_close_draft_close_now_does_not_close_second_task_during_active_conflict():
+    store = FakeTaskDraftStore()
+    oauth_client = AsyncMock()
+    oauth_client.call = AsyncMock(return_value={})
+    tool = TaskCloseDraftTool(store=store, bitrix_oauth=FakeBitrixOAuth(oauth_client))
+    first = _exec(
+        tool,
+        {"task_id": 139, "task_title": "Первая", "overall_status": "unconfirmed"},
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+
+    second = _exec(
+        tool,
+        {"task_id": 140, "task_title": "Вторая", "close_now": True, "overall_status": "unconfirmed"},
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+
+    assert first.status == ToolStatus.OK
+    assert second.status == ToolStatus.OK
+    assert second.data["status"] == "active_draft_conflict"
+    oauth_client.call.assert_not_awaited()
+
+
+def test_close_draft_close_now_unknown_failure_keeps_exact_draft_claimed():
+    store = FakeTaskDraftStore()
+    oauth_client = AsyncMock()
+    oauth_client.call = AsyncMock(side_effect=RuntimeError("close failed"))
+    tool = TaskCloseDraftTool(store=store, bitrix_oauth=FakeBitrixOAuth(oauth_client))
+
+    result = _exec(
+        tool,
+        {"task_id": 139, "task_title": "Проверить", "close_now": True, "overall_status": "unconfirmed"},
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+
+    assert result.status == ToolStatus.ERROR
+    assert "d:13" in store._drafts
+    assert "d:13" in store._confirming
+    assert result.data["mutation_outcome"] == "unknown"
+
+
+def test_close_draft_recovers_claimed_close_after_fresh_read_proves_task_closed():
+    store = FakeTaskDraftStore()
+
+    async def reserve_unknown_outcome() -> None:
+        await store.save_task_draft(
+            "d:13",
+            {
+                "_draft_type": TASK_CLOSE_DRAFT_TYPE,
+                "task_id": 139,
+                "task_title": "Проверить камеры",
+                "overall_status": "unconfirmed",
+                "unconfirmed_items": ["результат не указан"],
+            },
+        )
+        draft = store._drafts["d:13"]
+        claimed = await store.claim_task_draft(
+            "d:13",
+            expected_draft_id=str(draft["_draft_id"]),
+            expected_version=int(draft["_draft_version"]),
+            expected_type=TASK_CLOSE_DRAFT_TYPE,
+        )
+        assert claimed is not None
+
+    anyio.run(reserve_unknown_outcome)
+    read_client = _TaskDetailClient(
+        {
+            "ID": "139",
+            "TITLE": "Проверить камеры",
+            "DESCRIPTION": "Проверить камеры",
+            "STATUS": "5",
+            "CLOSED_DATE": "2026-07-20T12:00:00+03:00",
+        }
+    )
+    read_client.call = AsyncMock()
+    tool = TaskCloseDraftTool(
+        store=store,
+        read_client=read_client,
+        bitrix_oauth=FakeBitrixOAuth(read_client),
+    )
+
+    result = _exec(tool, {"task_id": 139}, user_id=13, dialog_key="d:13", dialog_id="chat4321")
+
+    assert result.status == ToolStatus.OK
+    assert result.data["status"] == "recovered_closed_draft"
+    read_client.call.assert_not_awaited()
+    assert "d:13" not in store._confirming
+    assert store._drafts["d:13"]["already_closed"] is True
+    assert store._drafts["d:13"]["_closed_from_chat"] is True
+
+
+def test_close_draft_claimed_recovery_rejects_unverified_caller_already_closed():
+    store = FakeTaskDraftStore()
+
+    async def reserve_unknown_outcome() -> None:
+        await store.save_task_draft(
+            "d:13",
+            {
+                "_draft_type": TASK_CLOSE_DRAFT_TYPE,
+                "task_id": 139,
+                "task_title": "Проверить камеры",
+                "overall_status": "unconfirmed",
+                "unconfirmed_items": ["результат не указан"],
+            },
+        )
+        draft = store._drafts["d:13"]
+        assert await store.claim_task_draft(
+            "d:13",
+            expected_draft_id=str(draft["_draft_id"]),
+            expected_version=int(draft["_draft_version"]),
+            expected_type=TASK_CLOSE_DRAFT_TYPE,
+        )
+
+    anyio.run(reserve_unknown_outcome)
+    tool = TaskCloseDraftTool(store=store)
+
+    result = _exec(
+        tool,
+        {"task_id": 139, "already_closed": True},
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="chat4321",
+    )
+
+    assert result.status == ToolStatus.ERROR
+    assert "fresh current-user Bitrix status proof" in result.error
+    assert "d:13" in store._confirming
+
+
+def test_task_draft_claim_token_fences_stale_finalizer():
+    store = FakeTaskDraftStore()
+
+    async def run() -> None:
+        await store.save_task_draft(
+            "d:13",
+            {"_draft_type": TASK_CLOSE_DRAFT_TYPE, "task_id": 139},
+        )
+        draft = store._drafts["d:13"]
+        first = await store.claim_expired_task_draft(
+            "d:13",
+            expected_draft_id=str(draft["_draft_id"]),
+            expected_version=int(draft["_draft_version"]),
+            expected_type=TASK_CLOSE_DRAFT_TYPE,
+        )
+        assert first is not None
+        second = await store.reclaim_stale_finalizing_task_draft(
+            "d:13",
+            expected_draft_id=str(draft["_draft_id"]),
+            expected_version=int(draft["_draft_version"]),
+            expected_type=TASK_CLOSE_DRAFT_TYPE,
+        )
+        assert second is not None
+        await store.delete_task_draft(
+            "d:13",
+            status="finalized",
+            expected_draft_id=str(draft["_draft_id"]),
+            expected_version=int(draft["_draft_version"]),
+            expected_claim_token=str(first["_draft_claim_token"]),
+        )
+        assert "d:13" in store._drafts
+        await store.delete_task_draft(
+            "d:13",
+            status="finalized",
+            expected_draft_id=str(draft["_draft_id"]),
+            expected_version=int(draft["_draft_version"]),
+            expected_claim_token=str(second["_draft_claim_token"]),
+        )
+        assert "d:13" not in store._drafts
+
+    anyio.run(run)
+
+
+def test_stale_confirming_claim_moves_to_durable_attention_and_invalidates_token():
+    store = FakeTaskDraftStore()
+
+    async def run() -> None:
+        await store.save_task_draft(
+            "d:13",
+            {
+                "_draft_type": TASK_CLOSE_DRAFT_TYPE,
+                "task_id": 139,
+                "_force_stale_claim": True,
+            },
+        )
+        draft = store._drafts["d:13"]
+        claimed = await store.claim_task_draft(
+            "d:13",
+            expected_draft_id=str(draft["_draft_id"]),
+            expected_version=int(draft["_draft_version"]),
+            expected_type=TASK_CLOSE_DRAFT_TYPE,
+        )
+        assert claimed is not None
+        assert await renew_exact_draft_claim(store, dialog_key="d:13", draft=claimed)
+        resolved = await resolve_unknown_draft_claim(
+            store,
+            dialog_key="d:13",
+            expected_type=TASK_CLOSE_DRAFT_TYPE,
+        )
+        assert resolved is not None
+        assert resolved["_draft_resolution_status"] == "attention"
+        assert not await renew_exact_draft_claim(store, dialog_key="d:13", draft=claimed)
+        assert "d:13" not in store._confirming
+
+    anyio.run(run)
 
 
 def test_close_draft_structures_problem_types_and_mobile_blocks():

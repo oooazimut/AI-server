@@ -36,14 +36,34 @@ class DraftQueueStore(FakePortalSearchIndex):
     async def get_task_draft(self, dialog_key: str, *, ttl_minutes: int | None = None) -> dict | None:
         return self._drafts.get(dialog_key)
 
-    async def delete_task_draft(self, dialog_key: str) -> None:
+    async def delete_task_draft(
+        self,
+        dialog_key: str,
+        *,
+        status: str = "cancelled",
+        expected_draft_id: str = "",
+        expected_version: int | None = None,
+        expected_claim_token: str = "",
+    ) -> None:
         self._drafts.pop(dialog_key, None)
 
-    def list_task_drafts(self, *, draft_type: str = "", limit: int = 100) -> list[dict]:
+    def list_task_drafts(
+        self,
+        *,
+        draft_type: str = "",
+        limit: int = 100,
+        expired_only: bool = False,
+    ) -> list[dict]:
         result = []
         for dialog_key, params in self._drafts.items():
             if draft_type and params.get("_draft_type") != draft_type:
                 continue
+            expires_at = str(params.get("_draft_expires_at") or "")
+            if expired_only and expires_at:
+                parsed_expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                now = datetime.now(parsed_expiry.tzinfo or MOSCOW_TZ)
+                if parsed_expiry > now:
+                    continue
             result.append({"dialog_key": dialog_key, "params": dict(params), "created_at": "2026-07-12T19:00:00+03:00"})
         return result[:limit]
 
@@ -69,12 +89,23 @@ class RecordingBitrix:
 
 
 class RecordingOAuthClient:
-    def __init__(self, *, fail_close: bool = False) -> None:
+    def __init__(self, *, fail_close: bool = False, task_closed: bool = False) -> None:
         self.fail_close = fail_close
+        self.task_closed = task_closed
         self.calls: list[tuple[str, dict]] = []
 
     async def call(self, method: str, payload: dict):
         self.calls.append((method, payload))
+        if method == "tasks.task.get":
+            return {
+                "result": {
+                    "task": {
+                        "ID": str(payload["taskId"]),
+                        "STATUS": "5" if self.task_closed else "3",
+                        "CLOSED_DATE": "2026-07-12T11:00:00+03:00" if self.task_closed else "",
+                    }
+                }
+            }
         if self.fail_close and method in {"tasks.task.complete", "tasks.task.approve"}:
             raise BitrixApiError(method, "ACCESS_DENIED", "oauth denied")
         return {"result": True}
@@ -316,6 +347,7 @@ def test_auto_close_direct_queue_preserves_partial_existing_draft(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     store = DraftQueueStore()
     bitrix = RecordingBitrix()
+    oauth = RecordingOAuth(RecordingOAuthClient())
     store._drafts["dialog:231:user:231"] = {
         "_draft_type": "task_close",
         "task_id": 8875,
@@ -340,6 +372,7 @@ def test_auto_close_direct_queue_preserves_partial_existing_draft(monkeypatch):
     stats = anyio.run(
         lambda: auto_close_direct_task_close_reports(
             bitrix=bitrix,
+            bitrix_oauth=oauth,
             store=store,
             settings=get_settings(),
             now=datetime(2026, 7, 12, 20, 1, tzinfo=MOSCOW_TZ),
@@ -389,12 +422,81 @@ def test_auto_close_open_draft_uses_oauth_user_first(monkeypatch):
     assert stats.oauth_closed == 1
     assert stats.system_fallback_closed == 0
     assert oauth.user_ids == [231]
-    assert oauth_client.calls == [("tasks.task.complete", {"taskId": 8875})]
+    assert oauth_client.calls == [
+        ("tasks.task.get", {"taskId": 8875, "select": ["ID", "STATUS", "CLOSED_DATE"]}),
+        ("tasks.task.complete", {"taskId": 8875}),
+    ]
     assert [method for method, _ in bitrix.calls] == ["task.item.getfiles", "task.item.addfile"]
     assert "dialog:231:user:231" not in store._drafts
 
 
-def test_auto_close_open_draft_falls_back_to_system_webhook_when_oauth_missing(monkeypatch):
+def test_expired_started_draft_finalizes_after_15_minutes_without_waiting_for_20(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    store = DraftQueueStore()
+    bitrix = RecordingBitrix()
+    oauth_client = RecordingOAuthClient(task_closed=True)
+    store._drafts["dialog:231:user:231"] = {
+        "_draft_type": "task_close",
+        "_draft_expires_at": "2020-01-01T00:00:00+03:00",
+        "task_id": 8875,
+        "task_title": "Check cameras",
+        "already_closed": True,
+        "completion_summary": "Two cameras checked.",
+        "overall_status": "unconfirmed",
+        "missing_fields": ["archive screenshot"],
+    }
+
+    stats = anyio.run(
+        lambda: auto_close_direct_task_close_reports(
+            bitrix=bitrix,
+            bitrix_oauth=RecordingOAuth(oauth_client),
+            store=store,
+            settings=get_settings(),
+            now=datetime(2026, 7, 12, 12, 0, tzinfo=MOSCOW_TZ),
+        )
+    )
+
+    assert stats.due is False
+    assert stats.reports_written == 1
+    assert oauth_client.calls == [
+        ("tasks.task.get", {"taskId": 8875, "select": ["ID", "STATUS", "CLOSED_DATE"]})
+    ]
+    assert "dialog:231:user:231" not in store._drafts
+    report_text = base64.b64decode(bitrix.calls[-1][1]["fileParameters"]["CONTENT"]).decode("utf-8")
+    assert "Two cameras checked." in report_text
+    assert "unknown: archive screenshot" in report_text
+
+
+def test_20_hour_does_not_cut_short_an_active_15_minute_draft(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    store = DraftQueueStore()
+    bitrix = RecordingBitrix()
+    store._drafts["dialog:231:user:231"] = {
+        "_draft_type": "task_close",
+        "_draft_expires_at": "2099-01-01T00:00:00+03:00",
+        "task_id": 8875,
+        "task_title": "Check cameras",
+        "already_closed": True,
+        "overall_status": "unconfirmed",
+    }
+
+    stats = anyio.run(
+        lambda: auto_close_direct_task_close_reports(
+            bitrix=bitrix,
+            bitrix_oauth=RecordingOAuth(RecordingOAuthClient()),
+            store=store,
+            settings=get_settings(),
+            now=datetime(2026, 7, 12, 20, 1, tzinfo=MOSCOW_TZ),
+        )
+    )
+
+    assert stats.due is True
+    assert stats.reports_written == 0
+    assert bitrix.calls == []
+    assert "dialog:231:user:231" in store._drafts
+
+
+def test_auto_close_open_draft_never_falls_back_to_system_webhook_when_oauth_missing(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     store = DraftQueueStore()
     bitrix = RecordingBitrix()
@@ -420,13 +522,9 @@ def test_auto_close_open_draft_falls_back_to_system_webhook_when_oauth_missing(m
 
     assert stats.open_drafts == 1
     assert stats.oauth_closed == 0
-    assert stats.system_fallback_closed == 1
-    assert stats.admin_notifications == 1
-    assert [method for method, _ in bitrix.calls] == ["tasks.task.complete", "task.item.getfiles", "task.item.addfile"]
-    report_text = base64.b64decode(bitrix.calls[2][1]["fileParameters"]["CONTENT"]).decode("utf-8")
-    assert "Auto-close used system webhook fallback" in report_text
-    assert "OAuth token for Bitrix user #231 is not linked" in report_text
-    assert bitrix.messages[0][0] == "1"
-    assert "Автозакрытие задачи выполнено системным webhook." in bitrix.messages[0][1]
-    assert "OAuth token for Bitrix user #231 is not linked" in bitrix.messages[0][1]
-    assert "dialog:231:user:231" not in store._drafts
+    assert stats.system_fallback_closed == 0
+    assert stats.admin_notifications == 0
+    assert stats.errors and "BitrixOAuthTokenMissing" in stats.errors[0]
+    assert bitrix.calls == []
+    assert bitrix.messages == []
+    assert "dialog:231:user:231" in store._drafts
