@@ -705,6 +705,19 @@ def _format_portal_search_answer(data: dict[str, Any], *, portal_base_url: str =
     return "\n".join(lines)
 
 
+def _draft_confirmation_suffix(data: dict[str, Any]) -> str:
+    candidates = [data]
+    for key in ("draft", "params", "pending_task_draft"):
+        value = data.get(key)
+        if isinstance(value, dict):
+            candidates.append(value)
+    for item in candidates:
+        code = str(item.get("_draft_confirmation_code") or "").strip()
+        if code:
+            return f"\n\nВажно: текстовое подтверждение не действует. Отправьте только число: {code}"
+    return ""
+
+
 def _format_project_create_draft_answer(data: dict[str, Any]) -> str:
     preview = data.get("preview") if isinstance(data.get("preview"), dict) else {}
     params = data.get("params") if isinstance(data.get("params"), dict) else {}
@@ -725,7 +738,7 @@ def _format_project_create_draft_answer(data: dict[str, Any]) -> str:
     if description:
         lines.append(f"Описание: {description}")
     lines.extend(["", "Если всё верно, напишите: да, создай проект."])
-    return "\n".join(lines)
+    return "\n".join(lines) + _draft_confirmation_suffix(data)
 
 
 def _format_project_create_confirm_answer(data: dict[str, Any], *, portal_base_url: str = "") -> str:
@@ -932,7 +945,7 @@ def _format_task_create_draft_answer(data: dict[str, Any]) -> str:
             "Если всё верно, напишите: да, создай.",
         ]
     )
-    return "\n".join(lines)
+    return "\n".join(lines) + _draft_confirmation_suffix(data)
 
 
 def _format_task_create_requires_project_answer(data: dict[str, Any]) -> str:
@@ -1080,7 +1093,7 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
     lines.append(
         'Внести изменения (укажите пункт или подпункт и нужную информацию) или напишите: "да, закрывай как есть".'
     )
-    return "\n".join(lines)
+    return "\n".join(lines) + _draft_confirmation_suffix(data)
 
 
 def _task_close_status_prompt(status: str) -> str:
@@ -1440,7 +1453,7 @@ def _format_calendar_event_draft_answer(data: dict[str, Any]) -> str:
         lines.append(f"Описание: {description}")
     lines.append("")
     lines.append("Если всё верно, напишите: да, добавь в календарь.")
-    return "\n".join(lines)
+    return "\n".join(lines) + _draft_confirmation_suffix(data)
 
 
 def _format_calendar_event_confirm_answer(data: dict[str, Any]) -> str:
@@ -1950,10 +1963,11 @@ def _common_draft_confirm_decision(
     context: dict[str, Any],
     tool_definitions: list[dict[str, Any]] | None,
 ) -> BitrixLLMDecision | None:
-    if not _is_draft_confirm_request(_strip_command_prefix(request).casefold()):
-        return None
     draft = context.get("pending_task_draft") if isinstance(context, dict) else None
     if not isinstance(draft, dict) or not draft:
+        return None
+    expected_code = str(draft.get("_draft_confirmation_code") or "").strip()
+    if not expected_code or _strip_command_prefix(request).strip() != expected_code:
         return None
 
     draft_type = _text(draft.get("_draft_type")) or "task_create"

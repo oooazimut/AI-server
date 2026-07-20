@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -20,9 +21,11 @@ from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.orchestrators.tools.call_specialist import CallSpecialistTool
 
-PLAN_SCHEMA = "t0006.plan.v1"
+PLAN_SCHEMA = "t0007.plan.v1"
 FINAL_SCHEMA = "t0006.final.v1"
-REPAIRABLE_PLAN_REJECTIONS = frozenset({"INVALID_JSON", "PLAN_SCHEMA_MISMATCH", "PLAN_BINDING_MISMATCH"})
+REPAIRABLE_PLAN_REJECTIONS = frozenset(
+    {"INVALID_JSON", "PLAN_SCHEMA_MISMATCH", "PLAN_BINDING_MISMATCH", "NON_EXECUTION_PLAN_INVALID"}
+)
 
 
 class PlanAuthoritativeLLM(Protocol):
@@ -71,7 +74,9 @@ class DeepSeekPlanService:
                 "subtasks": [
                     {
                         "subtask_id": "unique",
+                        "segment_id": "explicit segment id or null",
                         "specialist_id": "catalog id",
+                        "capability": "catalog capability id",
                         "request": "bounded request",
                     }
                 ],
@@ -146,7 +151,9 @@ class PlanRejected(ValueError):
 @dataclass(frozen=True)
 class Subtask:
     subtask_id: str
+    segment_id: str | None
     specialist_id: str
+    capability: str
     request: str
 
 
@@ -162,12 +169,42 @@ def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _constraints(request: str, catalog: dict[str, Any]) -> dict[str, Any]:
+def _explicit_segments(request: str, catalog: dict[str, Any]) -> list[dict[str, str]]:
+    """Extract narrow, explicit `Agent: request` / `Agent, request` bindings."""
+    aliases = {
+        "bitrix": "bitrix24",
+        "битрикс": "bitrix24",
+        "bitrix24": "bitrix24",
+        "логист": "logistics",
+        "logistics": "logistics",
+    }
+    aliases = {name: target for name, target in aliases.items() if target in catalog}
+    segments: list[dict[str, str]] = []
+    for index, part in enumerate((item.strip() for item in re.split(r"[;\n]+", request)), start=1):
+        if not part:
+            continue
+        match = re.match(r"^\s*([A-Za-zА-Яа-яЁё0-9_]+)\s*[:,]\s*(.+?)\s*$", part, flags=re.DOTALL)
+        if match is None:
+            continue
+        specialist_id = aliases.get(match.group(1).casefold())
+        if specialist_id is not None:
+            segments.append(
+                {"segment_id": f"segment-{index}", "specialist_id": specialist_id, "request": match.group(2)}
+            )
+    return segments
+
+
+def _constraints(
+    request: str, catalog: dict[str, Any], *, pending_specialist: str | None = None
+) -> dict[str, Any]:
     text = request.casefold()
     only_bitrix = "только bitrix" in text or "только битрикс" in text
     return {
         "only_source": "bitrix24" if only_bitrix else None,
         "allowed_specialists": sorted(catalog),
+        "capability_catalog": catalog,
+        "explicit_segments": _explicit_segments(request, catalog),
+        "pending_specialist": pending_specialist or None,
         "max_subtasks": 8,
         "max_round_trips": 3,
     }
@@ -202,24 +239,48 @@ def _decode_plan(raw: str, *, plan_id: str, request: str, constraints: dict[str,
         or (state != "CLARIFICATION_REQUIRED" and clarification is not None)
     ):
         raise PlanRejected("NON_EXECUTION_PLAN_INVALID")
+    expected_segments = {item["segment_id"]: item for item in constraints.get("explicit_segments", [])}
     seen: set[str] = set()
+    seen_segments: set[str] = set()
     subtasks: list[Subtask] = []
     for item in items:
-        if not isinstance(item, dict) or set(item) != {"subtask_id", "specialist_id", "request"}:
+        if not isinstance(item, dict) or set(item) != {
+            "subtask_id",
+            "segment_id",
+            "specialist_id",
+            "capability",
+            "request",
+        }:
             raise PlanRejected("SUBTASK_SCHEMA_MISMATCH")
         subtask_id = item["subtask_id"]
+        segment_id = item["segment_id"]
         specialist_id = item["specialist_id"]
+        capability = item["capability"]
         subrequest = item["request"]
         if not isinstance(subtask_id, str) or not subtask_id or subtask_id in seen:
             raise PlanRejected("SUBTASK_ID_INVALID")
+        if segment_id is not None and (not isinstance(segment_id, str) or segment_id in seen_segments):
+            raise PlanRejected("SEGMENT_BINDING_INVALID")
         if not isinstance(specialist_id, str) or specialist_id not in constraints["allowed_specialists"]:
             raise PlanRejected("FORBIDDEN_SPECIALIST")
         if constraints["only_source"] and specialist_id != "bitrix24":
             raise PlanRejected("SOURCE_RESTRICTION_VIOLATION")
+        available = set((constraints["capability_catalog"].get(specialist_id) or {}).get("capabilities", []))
+        if not isinstance(capability, str) or capability not in available:
+            raise PlanRejected("FORBIDDEN_CAPABILITY")
         if not isinstance(subrequest, str) or not subrequest.strip():
             raise PlanRejected("SUBTASK_REQUEST_INVALID")
+        if expected_segments:
+            expected = expected_segments.get(segment_id or "")
+            if expected is None or expected["specialist_id"] != specialist_id or expected["request"] != subrequest:
+                raise PlanRejected("SEGMENT_BINDING_INVALID")
+            seen_segments.add(segment_id)
+        elif segment_id is not None:
+            raise PlanRejected("SEGMENT_BINDING_INVALID")
         seen.add(subtask_id)
-        subtasks.append(Subtask(subtask_id, specialist_id, subrequest))
+        subtasks.append(Subtask(subtask_id, segment_id, specialist_id, capability, subrequest))
+    if expected_segments and seen_segments != set(expected_segments):
+        raise PlanRejected("SEGMENT_COMPLETENESS_FAILED")
     return Plan(plan_id, state, clarification, subtasks)
 
 
@@ -272,11 +333,28 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
         call = self._tool_registry.get("call_specialist")
         if not isinstance(call, CallSpecialistTool):
             return {}
-        return {
-            agent_id: {"description": str(manifest.handoff_description or manifest.name)}
-            for agent_id, manifest in call._manifests.items()
-            if agent_id in call._specialists
-        }
+        catalog: dict[str, dict[str, Any]] = {}
+        for agent_id, manifest in call._manifests.items():
+            specialist = call._specialists.get(agent_id)
+            if specialist is None:
+                continue
+            tools: list[dict[str, str]] = []
+            definitions = getattr(specialist, "tool_definitions", None)
+            if callable(definitions):
+                for definition in definitions():
+                    if isinstance(definition, dict):
+                        tool_id = str(definition.get("name") or "").strip()
+                        if tool_id:
+                            tools.append({"id": tool_id, "description": str(definition.get("description") or "")})
+            tool_ids = {item["id"] for item in tools}
+            catalog[agent_id] = {
+                "description": str(manifest.handoff_description or manifest.name),
+                "capabilities": sorted(set(manifest.capabilities) | tool_ids),
+                "tools": tools,
+                "allowed_actions": sorted(manifest.allowed_actions),
+                "approval_required": sorted(manifest.approval_required),
+            }
+        return catalog
 
     async def _load_authoritative_pending_specialist(self, task: AgentTask) -> tuple[AgentTask, str | None]:
         """Load dialog continuation only from durable KV, never inbound context."""
@@ -323,97 +401,58 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                 await self._publish_result(task, result)
                 return result
             catalog = self._catalog()
-            constraints = _constraints(task.request, catalog)
-            plan_id = f"plan-{uuid.uuid4().hex}"
             pending_specialist = str(task.context.get("pending_specialist") or "").strip()
+            constraints = _constraints(task.request, catalog, pending_specialist=pending_specialist)
+            plan_id = f"plan-{uuid.uuid4().hex}"
             deterministic_route: str | None = None
             planner_usages: list[ModelUsageRecord] = []
             planner_rejections: list[str] = []
             planner_attempt_audit: list[dict[str, Any]] = []
             plan: Plan | None = None
-            if pending_specialist:
-                # A pending specialist is durable dialog state, not an LLM routing
-                # suggestion.  Bind the continuation to the inbound request and
-                # let normal plan validation fail closed if the catalog changed.
-                raw = json.dumps(
-                    {
-                        "schema_version": PLAN_SCHEMA,
-                        "plan_id": plan_id,
-                        "request_hash": _hash(task.request),
-                        "state": "EXECUTE",
-                        "clarification": None,
-                        "max_rounds": 1,
-                        "subtasks": [
-                            {
-                                "subtask_id": f"pending-{uuid.uuid4().hex}",
-                                "specialist_id": pending_specialist,
-                                "request": task.request,
-                            }
-                        ],
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                usage = ModelUsageRecord(
-                    agent_id=self.manifest.id,
-                    provider="internal",
-                    model="pending-specialist-state-machine",
-                    status="not_used",
-                    notes=["No model call: continued the dialog-bound pending specialist."],
-                )
+            for attempt in range(1, 3):
+                call_constraints = {
+                    **constraints,
+                    "plan_id": plan_id,
+                    "request_hash": _hash(task.request),
+                }
+                if planner_rejections:
+                    call_constraints.update(
+                        {
+                            "repair_reason": planner_rejections[-1],
+                            "repair_attempt": attempt,
+                        }
+                    )
+                try:
+                    raw, usage = await self._planner.plan(
+                        manifest=self.manifest,
+                        task=task,
+                        catalog=catalog,
+                        constraints=call_constraints,
+                    )
+                except Exception:
+                    if attempt == 1:
+                        raise
+                    reason = "MODEL_REPAIR_UNAVAILABLE"
+                    planner_rejections.append(reason)
+                    planner_attempt_audit.append({"attempt": attempt, "status": "error", "rejection": reason})
+                    break
                 planner_usages.append(usage)
-                deterministic_route = "pending_specialist"
                 response_hash = _hash(raw)
+                attempt_audit = {
+                    "attempt": attempt,
+                    "response_hash": response_hash,
+                    "status": "accepted",
+                }
+                planner_attempt_audit.append(attempt_audit)
                 try:
                     plan = _decode_plan(raw, plan_id=plan_id, request=task.request, constraints=constraints)
                 except PlanRejected as exc:
-                    planner_rejections.append(str(exc))
-            else:
-                for attempt in range(1, 3):
-                    call_constraints = {
-                        **constraints,
-                        "plan_id": plan_id,
-                        "request_hash": _hash(task.request),
-                    }
-                    if planner_rejections:
-                        call_constraints.update(
-                            {
-                                "repair_reason": planner_rejections[-1],
-                                "repair_attempt": attempt,
-                            }
-                        )
-                    try:
-                        raw, usage = await self._planner.plan(
-                            manifest=self.manifest,
-                            task=task,
-                            catalog=catalog,
-                            constraints=call_constraints,
-                        )
-                    except Exception:
-                        if attempt == 1:
-                            raise
-                        reason = "MODEL_REPAIR_UNAVAILABLE"
-                        planner_rejections.append(reason)
-                        planner_attempt_audit.append({"attempt": attempt, "status": "error", "rejection": reason})
-                        break
-                    planner_usages.append(usage)
-                    response_hash = _hash(raw)
-                    attempt_audit = {
-                        "attempt": attempt,
-                        "response_hash": response_hash,
-                        "status": "accepted",
-                    }
-                    planner_attempt_audit.append(attempt_audit)
-                    try:
-                        plan = _decode_plan(raw, plan_id=plan_id, request=task.request, constraints=constraints)
-                    except PlanRejected as exc:
-                        reason = str(exc)
-                        attempt_audit.update({"status": "rejected", "rejection": reason})
-                        planner_rejections.append(reason)
-                        if attempt == 1 and reason in REPAIRABLE_PLAN_REJECTIONS:
-                            continue
-                    break
+                    reason = str(exc)
+                    attempt_audit.update({"status": "rejected", "rejection": reason})
+                    planner_rejections.append(reason)
+                    if attempt == 1 and reason in REPAIRABLE_PLAN_REJECTIONS:
+                        continue
+                break
             if plan is None:
                 reason = planner_rejections[-1] if planner_rejections else "MODEL_PLAN_UNAVAILABLE"
                 metadata = {

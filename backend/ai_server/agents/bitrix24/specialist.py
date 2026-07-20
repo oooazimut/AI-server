@@ -308,6 +308,28 @@ class Bitrix24Specialist(BaseSpecialist):
         tool_call: Any,
         task: AgentTask,
     ) -> tuple[ToolResult | None, Any | None, list[Any]]:
+        confirmation_tools = {
+            "task_create_confirm",
+            "task_close_confirm",
+            "calendar_event_confirm",
+            "project_create_confirm",
+        }
+        is_admin_confirm = tool_call.name == "task_close_control_update" and str(
+            (tool_call.args or {}).get("operation") or ""
+        ) == "confirm"
+        if tool_call.name in confirmation_tools or is_admin_confirm:
+            draft = task.context.get("pending_task_draft") if isinstance(task.context, dict) else None
+            expected_code = str((draft or {}).get("_draft_confirmation_code") or "").strip()
+            if not expected_code or str(task.request or "").strip() != expected_code:
+                return (
+                    ToolResult(
+                        status=ToolStatus.DENIED,
+                        tool=tool_call.name,
+                        error="Draft confirmation requires the exact displayed numeric code.",
+                    ),
+                    None,
+                    [],
+                )
         if tool_call.name == "task_create_draft":
             args = _draft_args_with_metadata(
                 _task_create_args_with_actor_label(dict(tool_call.args or {}), task),
@@ -682,8 +704,10 @@ def _format_admin_change_draft_answer(data: dict[str, Any]) -> str:
     field = str(draft.get("field") or draft.get("action") or "настройка")
     target = str(draft.get("target_user_name") or draft.get("target_user_id") or "").strip()
     subject = f"{field} ({target})" if target else field
-    return (
+    answer = (
         f"Подготовлен черновик изменения: {subject}; "
         f"было — {draft.get('old_value')!s}, станет — {draft.get('new_value')!s}. "
         "Черновик действует 15 минут. Подтвердите или отмените изменение."
     )
+    code = str(draft.get("_draft_confirmation_code") or "").strip()
+    return f"{answer}\n\nДля подтверждения отправьте только число: {code}" if code else answer

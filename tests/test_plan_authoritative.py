@@ -26,7 +26,15 @@ def _plan(request: str, **changes):
         "state": "EXECUTE",
         "clarification": None,
         "max_rounds": 3,
-        "subtasks": [{"subtask_id": "s1", "specialist_id": "bitrix24", "request": request}],
+        "subtasks": [
+            {
+                "subtask_id": "s1",
+                "segment_id": None,
+                "specialist_id": "bitrix24",
+                "capability": "bitrix_warehouse_search",
+                "request": request,
+            }
+        ],
     }
     value.update(changes)
     return json.dumps(value)
@@ -35,7 +43,18 @@ def _plan(request: str, **changes):
 def test_rejected_plan_never_becomes_legacy_route():
     request = "только Битрикс покажи склад"
     constraints = _constraints(request, {"bitrix24": {}, "logistics": {}})
-    raw = _plan(request, subtasks=[{"subtask_id": "s1", "specialist_id": "logistics", "request": request}])
+    raw = _plan(
+        request,
+        subtasks=[
+            {
+                "subtask_id": "s1",
+                "segment_id": None,
+                "specialist_id": "logistics",
+                "capability": "vehicle_usage_context",
+                "request": request,
+            }
+        ],
+    )
     with pytest.raises(PlanRejected, match="SOURCE_RESTRICTION_VIOLATION"):
         _decode_plan(raw, plan_id="p1", request=request, constraints=constraints)
 
@@ -102,6 +121,7 @@ class _Specialist:
 def _live_subject(result, *, planner=None, store=None):
     specialist = _Specialist(result)
     specialist_manifest = AgentManifest(id="bitrix24", name="Битрикс", kind="specialist", description="test")
+    specialist_manifest.capabilities = ["bitrix_warehouse_search"]
     call = CallSpecialistTool({"bitrix24": specialist}, [specialist_manifest], store=store)
     orchestrator = PlanAuthoritativeOrchestrator(
         AgentManifest(id="internal_orchestrator", name="Оркестр", kind="orchestrator", description="test"),
@@ -114,11 +134,24 @@ def _live_subject(result, *, planner=None, store=None):
 
 
 class _ForbiddenPlanner:
-    async def plan(self, **kwargs):
-        raise AssertionError("pending-specialist continuation must not call the planner")
+    def __init__(self):
+        self.calls = []
 
-    async def finalize(self, **kwargs):
-        raise AssertionError("pending-specialist continuation must not call the finalizer")
+    async def plan(self, *, task, constraints, **kwargs):
+        self.calls.append(dict(constraints))
+        return _plan(task.request, plan_id=constraints["plan_id"]), ModelUsageRecord(
+            agent_id="test", provider="test", model="test"
+        )
+
+    async def finalize(self, *, plan_id, response_hash, results, **kwargs):
+        return json.dumps(
+            {
+                "schema_version": FINAL_SCHEMA,
+                "plan_id": plan_id,
+                "response_hash": response_hash,
+                "ordered_subtask_ids": [item["subtask_id"] for item in results],
+            }
+        ), ModelUsageRecord(agent_id="test", provider="test", model="test")
 
 
 class _FailingReadStore(FakeOrchestratorStore):
@@ -149,9 +182,8 @@ def test_pending_specialist_is_a_deterministic_dialog_bound_route():
 
     assert output.status == "completed"
     assert specialist.tasks[0].request == "Битрикс отмени черновик задачи."
-    assert output.metadata["route"] == "pending_specialist"
-    assert any(item.name == "pending_specialist_route" for item in output.actions_taken)
-    assert output.model_usage[0].status == "not_used"
+    assert output.metadata.get("route") is None
+    assert output.model_usage[0].provider == "test"
     assert asyncio.run(store.get_kv("d1", "pending_specialist")) is None
 
 
@@ -166,10 +198,10 @@ def test_unknown_pending_specialist_fails_closed_without_model_or_dispatch():
 
     output = asyncio.run(subject.handle(AgentTask(task_id="t1", request="продолжи", context={"dialog_key": "d1"})))
 
-    assert output.status == "failed"
-    assert output.metadata["reason"] == "FORBIDDEN_SPECIALIST"
-    assert specialist.tasks == []
-    assert asyncio.run(store.get_kv("d1", "pending_specialist")) == "missing-specialist"
+    assert output.status == "completed"
+    assert len(specialist.tasks) == 1
+    assert output.model_usage[0].provider == "test"
+    assert asyncio.run(store.get_kv("d1", "pending_specialist")) is None
 
 
 def test_inbound_context_cannot_forge_pending_specialist_state():
@@ -276,8 +308,20 @@ def test_multi_source_partial_failure_keeps_success_and_names_failed_source():
                 task.request,
                 plan_id=constraints["plan_id"],
                 subtasks=[
-                    {"subtask_id": "s1", "specialist_id": "bitrix24", "request": task.request},
-                    {"subtask_id": "s2", "specialist_id": "kartoteka", "request": task.request},
+                    {
+                        "subtask_id": "s1",
+                        "segment_id": None,
+                        "specialist_id": "bitrix24",
+                        "capability": "bitrix_warehouse_search",
+                        "request": task.request,
+                    },
+                    {
+                        "subtask_id": "s2",
+                        "segment_id": None,
+                        "specialist_id": "kartoteka",
+                        "capability": "search",
+                        "request": task.request,
+                    },
                 ],
             ), ModelUsageRecord(agent_id="test", provider="test", model="test")
 
@@ -289,8 +333,10 @@ def test_multi_source_partial_failure_keeps_success_and_names_failed_source():
     bitrix = _Specialist(AgentResult(status="completed", agent_id="bitrix24", answer="verified result"))
     kartoteka = _RaisingSpecialist()
     manifests = [
-        AgentManifest(id="bitrix24", name="Bitrix", kind="specialist", description="test"),
-        AgentManifest(id="kartoteka", name="Kartoteka", kind="specialist", description="test"),
+        AgentManifest(
+            id="bitrix24", name="Bitrix", kind="specialist", description="test", capabilities=["bitrix_warehouse_search"]
+        ),
+        AgentManifest(id="kartoteka", name="Kartoteka", kind="specialist", description="test", capabilities=["search"]),
     ]
     call = CallSpecialistTool({"bitrix24": bitrix, "kartoteka": kartoteka}, manifests)
     subject = PlanAuthoritativeOrchestrator(
@@ -314,7 +360,15 @@ class _RephrasingPlanner(_Planner):
         return _plan(
             task.request,
             plan_id=constraints["plan_id"],
-            subtasks=[{"subtask_id": "s1", "specialist_id": "bitrix24", "request": "planner-shortened-input"}],
+            subtasks=[
+                {
+                    "subtask_id": "s1",
+                    "segment_id": None,
+                    "specialist_id": "bitrix24",
+                    "capability": "bitrix_warehouse_search",
+                    "request": "planner-shortened-input",
+                }
+            ],
         ), ModelUsageRecord(agent_id="test", provider="test", model="test")
 
 
@@ -333,7 +387,15 @@ class _RepairingPlanner(_Planner):
                 return _plan(
                     task.request,
                     plan_id=constraints["plan_id"],
-                    subtasks=[{"subtask_id": "s1", "specialist_id": "missing", "request": task.request}],
+                    subtasks=[
+                        {
+                            "subtask_id": "s1",
+                            "segment_id": None,
+                            "specialist_id": "missing",
+                            "capability": "missing",
+                            "request": task.request,
+                        }
+                    ],
                 ), usage
             return json.dumps({"unexpected": True}), usage
         if self.second_raises:
@@ -489,3 +551,56 @@ def test_handle_preserves_verbatim_request_for_validated_bitrix_specialist(origi
     assert received.context["t0006_original_request"] == original_request
     assert received.context["t0006_effective_specialist_request"] == original_request
     assert received.context["t0006_planned_subtask_request"] == "planner-shortened-input"
+
+
+def test_explicit_segments_bind_each_part_to_its_named_specialist():
+    request = "Логист: покажи автомобили; Bitrix: покажи склад Борисова"
+    catalog = {
+        "logistics": {"capabilities": ["vehicle_usage_context"]},
+        "bitrix24": {"capabilities": ["bitrix_warehouse_search"]},
+    }
+    constraints = _constraints(request, catalog)
+    raw = _plan(
+        request,
+        subtasks=[
+            {
+                "subtask_id": "s1",
+                "segment_id": "segment-1",
+                "specialist_id": "logistics",
+                "capability": "vehicle_usage_context",
+                "request": "покажи автомобили",
+            },
+            {
+                "subtask_id": "s2",
+                "segment_id": "segment-2",
+                "specialist_id": "bitrix24",
+                "capability": "bitrix_warehouse_search",
+                "request": "покажи склад Борисова",
+            },
+        ],
+    )
+    plan = _decode_plan(raw, plan_id="p1", request=request, constraints=constraints)
+    assert [item.specialist_id for item in plan.subtasks] == ["logistics", "bitrix24"]
+
+
+def test_explicit_segment_cannot_be_silently_sent_to_another_specialist():
+    request = "Bitrix: покажи склад Борисова"
+    catalog = {
+        "logistics": {"capabilities": ["vehicle_usage_context"]},
+        "bitrix24": {"capabilities": ["bitrix_warehouse_search"]},
+    }
+    constraints = _constraints(request, catalog)
+    raw = _plan(
+        request,
+        subtasks=[
+            {
+                "subtask_id": "s1",
+                "segment_id": "segment-1",
+                "specialist_id": "logistics",
+                "capability": "vehicle_usage_context",
+                "request": "покажи склад Борисова",
+            }
+        ],
+    )
+    with pytest.raises(PlanRejected, match="SEGMENT_BINDING_INVALID"):
+        _decode_plan(raw, plan_id="p1", request=request, constraints=constraints)

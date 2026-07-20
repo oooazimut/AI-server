@@ -1530,12 +1530,13 @@ def test_bitrix_llm_routes_task_draft_confirmation_without_llm(monkeypatch):
             manifest=manifest,
             task=AgentTask(
                 task_id="t1",
-                request="да, создай",
+                    request="101",
                 user={"id": "15"},
                 context={
                     "dialog_id": "chat4321",
                     "pending_task_draft": {
-                        "fields": {"TITLE": "test", "RESPONSIBLE_ID": 15, "CREATED_BY": 15, "NO_DEADLINE": True}
+                            "fields": {"TITLE": "test", "RESPONSIBLE_ID": 15, "CREATED_BY": 15, "NO_DEADLINE": True},
+                            "_draft_confirmation_code": 101,
                     },
                 },
             ),
@@ -1577,12 +1578,13 @@ def test_bitrix_llm_routes_task_close_confirmation_without_llm(monkeypatch):
             manifest=manifest,
             task=AgentTask(
                 task_id="t1",
-                request="да, закрывай",
+                    request="101",
                 user={"id": "15"},
                 context={
                     "dialog_id": "chat4321",
-                    "pending_task_draft": {
-                        "_draft_type": "task_close",
+                        "pending_task_draft": {
+                            "_draft_type": "task_close",
+                            "_draft_confirmation_code": 101,
                         "task_id": 139,
                         "task_title": "Обучение сотрудников",
                     },
@@ -1602,7 +1604,7 @@ def test_bitrix_llm_routes_task_close_confirmation_without_llm(monkeypatch):
 @pytest.mark.parametrize(
     ("request_text", "operation", "source"),
     [
-        ("да, подтверждаю", "confirm", "draft_confirm_route"),
+        ("101", "confirm", "draft_confirm_route"),
         ("отмени черновик", "discard", "draft_discard_route"),
     ],
 )
@@ -1620,6 +1622,7 @@ def test_bitrix_llm_routes_admin_change_draft_without_llm(monkeypatch, request_t
                     "dialog_id": "chat1",
                     "pending_task_draft": {
                         "_draft_type": "admin_change",
+                        "_draft_confirmation_code": 101,
                         "action": "add_operator",
                         "target_user_id": 13,
                     },
@@ -2113,12 +2116,13 @@ def test_bitrix_llm_routes_calendar_confirmation_without_llm(monkeypatch):
             manifest=manifest,
             task=AgentTask(
                 task_id="t1",
-                request="да, добавь в календарь",
+                    request="101",
                 user={"id": "15"},
                 context={
                     "dialog_id": "chat4321",
-                    "pending_task_draft": {
-                        "_draft_type": "calendar_event",
+                        "pending_task_draft": {
+                            "_draft_type": "calendar_event",
+                            "_draft_confirmation_code": 101,
                         "title": "позвонить Борисову",
                         "start_iso": "2026-07-09T12:00:00+03:00",
                     },
@@ -2556,12 +2560,13 @@ def test_bitrix_llm_routes_project_confirmation_without_llm(monkeypatch):
             manifest=manifest,
             task=AgentTask(
                 task_id="t1",
-                request="да, создай проект",
+                    request="101",
                 user={"id": "15"},
                 context={
                     "dialog_id": "chat4321",
-                    "pending_task_draft": {
-                        "_draft_type": "project_create",
+                        "pending_task_draft": {
+                            "_draft_type": "project_create",
+                            "_draft_confirmation_code": 101,
                         "method": "sonet_group.create",
                         "params": {"fields": {"NAME": "Кулинич Валерий"}},
                     },
