@@ -13,6 +13,7 @@ from tests.fakes import FakeTaskDraftStore
 class FakeBitrixUserClient:
     def __init__(self, users: list[dict]) -> None:
         self.users = {int(user["ID"]): user for user in users}
+        self.get_user_calls: list[int] = []
 
     async def list_all_users(
         self, *, filter_: dict | None = None, select: list[str] | None = None, limit: int | None = None
@@ -30,51 +31,142 @@ class FakeBitrixUserClient:
         return users[:limit]
 
     async def get_user(self, user_id: int):
+        self.get_user_calls.append(int(user_id))
         return self.users.get(int(user_id))
+
+
+def _admin_client(*users: dict) -> FakeBitrixUserClient:
+    return FakeBitrixUserClient(
+        [
+            {"ID": 1, "NAME": "Ada", "LAST_NAME": "Admin", "ACTIVE": True, "IS_ADMIN": True},
+            *users,
+        ]
+    )
+
+
+class CurrentUserOAuth:
+    def __init__(self, client: FakeBitrixUserClient) -> None:
+        self.client = client
+
+    async def client_for_user(self, user_id: int):
+        return self.client
+
+
+def _update_tool(store: FakeTaskDraftStore, client: FakeBitrixUserClient) -> TaskCloseControlUpdateTool:
+    return TaskCloseControlUpdateTool(store=store, user_client=client, bitrix_oauth=CurrentUserOAuth(client))
 
 
 def test_task_close_control_admin_adds_operator_without_controlling_operator() -> None:
     store = FakeTaskDraftStore()
-    tool = TaskCloseControlUpdateTool(store=store)
+    client = _admin_client({"ID": 13, "NAME": "Olga", "LAST_NAME": "Operator", "ACTIVE": True})
+    tool = _update_tool(store, client)
 
-    result = asyncio.run(
+    prepared = asyncio.run(
         tool.execute(
-            {"action": "add_operator", "target_user_id": 13, "_actor_is_admin": True},
+            {
+                "action": "add_operator",
+                "target_user_id": 13,
+                "_actor_is_admin": True,
+                "_original_request": "Add Olga as an operator",
+                "_draft_user_id": 1,
+                "_draft_specialist": "bitrix24",
+            },
             user_id=1,
+            dialog_key="d:1",
             dialog_id="1",
         )
     )
 
-    assert result.status == ToolStatus.OK
-    assert result.data["operator_user_ids"] == [13]
-    assert result.data["controlled_user_ids"] == []
+    assert prepared.status == ToolStatus.OK
+    assert prepared.data["requires_confirmation"] is True
+    assert prepared.data["draft"]["_draft_type"] == "admin_change"
+    assert prepared.data["draft"]["old_value"] is False
+    assert prepared.data["draft"]["new_value"] is True
+    assert prepared.data["draft"]["_original_request"] == "Add Olga as an operator"
+    assert prepared.data["draft"]["_draft_user_id"] == 1
+    assert prepared.data["draft"]["_draft_specialist"] == "bitrix24"
+    assert store.task_close_operator_ids() == set()
+
+    confirmed = asyncio.run(tool.execute({"operation": "confirm"}, user_id=1, dialog_key="d:1", dialog_id="1"))
+
+    assert confirmed.status == ToolStatus.OK
+    assert confirmed.data["operator_user_ids"] == [13]
+    assert confirmed.data["controlled_user_ids"] == []
+    assert client.get_user_calls.count(1) == 2
 
 
-def test_task_close_control_operator_can_add_controlled_user() -> None:
+def test_task_close_control_operator_cannot_add_controlled_user() -> None:
     store = FakeTaskDraftStore()
     store.set_task_close_operators(operator_user_ids=[13], actor_user_id=1)
-    tool = TaskCloseControlUpdateTool(store=store)
+    client = FakeBitrixUserClient(
+        [
+            {"ID": 13, "NAME": "Olga", "LAST_NAME": "Operator", "ACTIVE": True, "IS_ADMIN": False},
+            {"ID": 15, "NAME": "Ivan", "LAST_NAME": "Worker", "ACTIVE": True},
+        ]
+    )
+    tool = _update_tool(store, client)
 
     result = asyncio.run(
-        tool.execute({"action": "add_controlled_user", "target_user_id": 15}, user_id=13, dialog_id="13")
+        tool.execute(
+            {"action": "add_controlled_user", "target_user_id": 15, "_actor_is_admin": True},
+            user_id=13,
+            dialog_key="d:13",
+            dialog_id="13",
+        )
     )
 
-    assert result.status == ToolStatus.OK
-    assert result.data["operator_user_ids"] == [13]
-    assert result.data["controlled_user_ids"] == [15]
+    assert result.status == ToolStatus.DENIED
+    assert store.task_close_controlled_user_ids() == set()
+    assert "d:13" not in store._drafts
 
 
 def test_task_close_control_operator_cannot_change_auto_close_time() -> None:
     store = FakeTaskDraftStore()
     store.set_task_close_operators(operator_user_ids=[13], actor_user_id=1)
-    tool = TaskCloseControlUpdateTool(store=store)
+    client = FakeBitrixUserClient(
+        [{"ID": 13, "NAME": "Olga", "LAST_NAME": "Operator", "ACTIVE": True, "IS_ADMIN": False}]
+    )
+    tool = _update_tool(store, client)
 
     result = asyncio.run(
-        tool.execute({"action": "set_auto_close_time", "auto_close_time": "19:30"}, user_id=13, dialog_id="13")
+        tool.execute(
+            {"action": "set_auto_close_time", "auto_close_time": "19:30"},
+            user_id=13,
+            dialog_key="d:13",
+            dialog_id="13",
+        )
     )
 
     assert result.status == ToolStatus.DENIED
     assert store.get_task_close_control_setting("auto_close_time") is None
+
+
+def test_task_close_control_uses_current_user_oauth_for_admin_proof() -> None:
+    store = FakeTaskDraftStore()
+    fallback = _admin_client()
+    oauth_client = FakeBitrixUserClient(
+        [{"ID": 1, "NAME": "Not", "LAST_NAME": "Admin", "ACTIVE": True, "IS_ADMIN": False}]
+    )
+
+    class FakeOAuth:
+        async def client_for_user(self, user_id: int):
+            assert user_id == 1
+            return oauth_client
+
+    tool = TaskCloseControlUpdateTool(store=store, user_client=fallback, bitrix_oauth=FakeOAuth())
+
+    result = asyncio.run(
+        tool.execute(
+            {"action": "set_auto_close_time", "auto_close_time": "19:30", "_actor_is_admin": True},
+            user_id=1,
+            dialog_key="d:1",
+        )
+    )
+
+    assert result.status == ToolStatus.DENIED
+    assert fallback.get_user_calls == []
+    assert oauth_client.get_user_calls == [1]
+    assert "d:1" not in store._drafts
 
 
 def test_task_close_control_regular_user_cannot_read_settings() -> None:
@@ -123,15 +215,17 @@ def test_task_close_control_get_returns_named_members_and_bitrix_users() -> None
 
 def test_task_close_control_admin_sets_time_and_control_start() -> None:
     store = FakeTaskDraftStore()
-    tool = TaskCloseControlUpdateTool(store=store)
+    tool = _update_tool(store, _admin_client())
 
     time_result = asyncio.run(
         tool.execute(
             {"action": "set_auto_close_time", "auto_close_time": "19:30", "_actor_is_admin": True},
             user_id=1,
+            dialog_key="d:1",
             dialog_id="1",
         )
     )
+    time_confirm = asyncio.run(tool.execute({"operation": "confirm"}, user_id=1, dialog_key="d:1", dialog_id="1"))
     start_result = asyncio.run(
         tool.execute(
             {
@@ -140,26 +234,126 @@ def test_task_close_control_admin_sets_time_and_control_start() -> None:
                 "_actor_is_admin": True,
             },
             user_id=1,
+            dialog_key="d:1",
             dialog_id="1",
         )
     )
+    start_confirm = asyncio.run(tool.execute({"operation": "confirm"}, user_id=1, dialog_key="d:1", dialog_id="1"))
 
     assert time_result.status == ToolStatus.OK
+    assert time_confirm.status == ToolStatus.OK
     assert start_result.status == ToolStatus.OK
-    assert start_result.data["auto_close_time"] == "19:30"
-    assert start_result.data["control_enabled_from"] == "2026-07-12T00:00:00+03:00"
+    assert start_confirm.status == ToolStatus.OK
+    assert start_confirm.data["auto_close_time"] == "19:30"
+    assert start_confirm.data["control_enabled_from"] == "2026-07-12T00:00:00+03:00"
 
 
 def test_task_close_control_rejects_invalid_time() -> None:
     store = FakeTaskDraftStore()
-    tool = TaskCloseControlUpdateTool(store=store)
+    tool = _update_tool(store, _admin_client())
 
     result = asyncio.run(
         tool.execute(
             {"action": "set_auto_close_time", "auto_close_time": "25:99", "_actor_is_admin": True},
             user_id=1,
+            dialog_key="d:1",
             dialog_id="1",
         )
     )
 
     assert result.status == ToolStatus.INVALID_TOOL_CALL
+
+
+def test_task_close_control_discard_does_not_mutate_settings() -> None:
+    store = FakeTaskDraftStore()
+    tool = _update_tool(store, _admin_client())
+    prepared = asyncio.run(
+        tool.execute(
+            {"action": "set_auto_close_time", "auto_close_time": "19:30"},
+            user_id=1,
+            dialog_key="d:1",
+        )
+    )
+
+    discarded = asyncio.run(tool.execute({"operation": "discard"}, user_id=1, dialog_key="d:1"))
+
+    assert prepared.status == ToolStatus.OK
+    assert discarded.status == ToolStatus.OK
+    assert discarded.data["discarded"] is True
+    assert store.get_task_close_control_setting("auto_close_time") is None
+
+
+def test_task_close_control_resolves_exact_name_and_rejects_ambiguity() -> None:
+    store = FakeTaskDraftStore()
+    client = _admin_client(
+        {"ID": 13, "NAME": "Ivan", "LAST_NAME": "Petrov", "ACTIVE": True},
+        {"ID": 14, "NAME": "Ivan", "LAST_NAME": "Petrov", "ACTIVE": True},
+    )
+    tool = _update_tool(store, client)
+
+    result = asyncio.run(
+        tool.execute(
+            {"action": "add_operator", "target_user_name": "Petrov Ivan"},
+            user_id=1,
+            dialog_key="d:1",
+        )
+    )
+
+    assert result.status == ToolStatus.AMBIGUOUS
+    assert [item["user_id"] for item in result.data["matches"]] == [13, 14]
+    assert store.task_close_operator_ids() == set()
+
+
+def test_task_close_control_confirm_revalidates_admin_and_fails_closed() -> None:
+    store = FakeTaskDraftStore()
+    client = _admin_client({"ID": 13, "NAME": "Olga", "LAST_NAME": "Operator", "ACTIVE": True})
+    tool = _update_tool(store, client)
+    prepared = asyncio.run(tool.execute({"action": "add_operator", "target_user_id": 13}, user_id=1, dialog_key="d:1"))
+    client.users[1]["IS_ADMIN"] = False
+
+    confirmed = asyncio.run(tool.execute({"operation": "confirm"}, user_id=1, dialog_key="d:1"))
+
+    assert prepared.status == ToolStatus.OK
+    assert confirmed.status == ToolStatus.DENIED
+    assert store.task_close_operator_ids() == set()
+    assert "d:1" in store._drafts
+
+
+def test_task_close_control_confirm_rejects_concurrent_setting_change() -> None:
+    store = FakeTaskDraftStore()
+    tool = _update_tool(store, _admin_client())
+    prepared = asyncio.run(
+        tool.execute(
+            {"action": "set_auto_close_time", "auto_close_time": "19:30"},
+            user_id=1,
+            dialog_key="d:1",
+        )
+    )
+    store.set_task_close_control_setting(key="auto_close_time", value="18:00", updated_by=99)
+
+    confirmed = asyncio.run(tool.execute({"operation": "confirm"}, user_id=1, dialog_key="d:1"))
+
+    assert prepared.status == ToolStatus.OK
+    assert confirmed.status == ToolStatus.ERROR
+    assert store.get_task_close_control_setting("auto_close_time")["value"] == "18:00"
+    assert "d:1" in store._drafts
+    assert "d:1" not in store._confirming
+
+
+def test_task_close_control_confirm_refuses_an_already_claimed_draft() -> None:
+    store = FakeTaskDraftStore()
+    tool = _update_tool(store, _admin_client())
+    prepared = asyncio.run(
+        tool.execute(
+            {"action": "set_auto_close_time", "auto_close_time": "19:30"},
+            user_id=1,
+            dialog_key="d:1",
+        )
+    )
+    store._confirming.add("d:1")
+
+    confirmed = asyncio.run(tool.execute({"operation": "confirm"}, user_id=1, dialog_key="d:1"))
+
+    assert prepared.status == ToolStatus.OK
+    assert confirmed.status == ToolStatus.ERROR
+    assert store.get_task_close_control_setting("auto_close_time") is None

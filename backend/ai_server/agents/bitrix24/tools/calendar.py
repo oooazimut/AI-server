@@ -6,6 +6,15 @@ from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from ai_server.agents.bitrix24.ports import TaskDraftStorePort
+from ai_server.agents.bitrix24.tools.draft_lifecycle import (
+    attach_draft_metadata,
+    bitrix_mutation_outcome,
+    claim_exact_draft,
+    discard_exact_draft,
+    release_exact_draft,
+    renew_exact_draft_claim,
+    resolve_unknown_draft_claim,
+)
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
@@ -167,8 +176,9 @@ class CalendarEventDraftTool:
                 error=f"calendar_event_draft called outside contract: {'; '.join(draft.contract_errors)}",
                 data=draft.as_action_details(),
             )
-        await self._store.save_task_draft(dialog_key, draft.payload)
-        return ToolResult(status=ToolStatus.OK, tool=self.name, data={"draft": draft.payload, "preview": draft.preview})
+        payload = attach_draft_metadata(draft.payload, source_args=args, user_id=user_id)
+        await self._store.save_task_draft(dialog_key, payload)
+        return ToolResult(status=ToolStatus.OK, tool=self.name, data={"draft": payload, "preview": draft.preview})
 
 
 class CalendarEventConfirmTool:
@@ -213,6 +223,21 @@ class CalendarEventConfirmTool:
                 error="calendar_event_confirm requires dialog_key",
             )
         draft = await self._store.get_task_draft(dialog_key, ttl_minutes=self._draft_ttl_minutes)
+        if not draft:
+            unresolved = await resolve_unknown_draft_claim(
+                self._store, dialog_key=dialog_key, expected_type=CALENDAR_EVENT_DRAFT_TYPE
+            )
+            if unresolved is not None:
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool=self.name,
+                    error="calendar creation outcome requires durable audit before retry",
+                    data={
+                        "mutation_outcome": "unknown",
+                        "resolution_status": unresolved.get("_draft_resolution_status"),
+                        "draft_id": unresolved.get("_draft_id"),
+                    },
+                )
         if not draft or draft.get("_draft_type") != CALENDAR_EVENT_DRAFT_TYPE:
             return ToolResult(
                 status=ToolStatus.NOT_FOUND,
@@ -241,28 +266,60 @@ class CalendarEventConfirmTool:
                     error="Bitrix OAuth is required for calendar event creation.",
                     data={"draft": draft},
                 )
+            claimed = None
             try:
                 oauth_client = await self._bitrix_oauth.client_for_user(user_id)
+                claimed = await claim_exact_draft(
+                    self._store, dialog_key=dialog_key, draft=draft, expected_type=CALENDAR_EVENT_DRAFT_TYPE
+                )
+                if claimed is None:
+                    return ToolResult(
+                        status=ToolStatus.DENIED,
+                        tool=self.name,
+                        error="calendar draft changed, expired, or is already being confirmed",
+                    )
+                if not await renew_exact_draft_claim(self._store, dialog_key=dialog_key, draft=claimed):
+                    return ToolResult(status=ToolStatus.DENIED, tool=self.name, error="calendar draft claim was lost")
                 result = await _execute_calendar_event_create(oauth_client.call, sanitized, draft)
             except BitrixOAuthTokenMissing as exc:
+                if claimed is not None:
+                    await release_exact_draft(self._store, dialog_key=dialog_key, draft=claimed)
                 return ToolResult(
                     status=ToolStatus.NOT_CONFIGURED, tool=self.name, error=str(exc), data={"draft": draft}
                 )
-            except (BitrixApiError, BitrixConfigError) as exc:
+            except BitrixConfigError as exc:
+                if claimed is not None:
+                    await release_exact_draft(self._store, dialog_key=dialog_key, draft=claimed)
                 return ToolResult(
-                    status=ToolStatus.NOT_CONFIGURED if isinstance(exc, BitrixConfigError) else ToolStatus.ERROR,
+                    status=ToolStatus.NOT_CONFIGURED,
                     tool=self.name,
                     error=str(exc),
-                    data={"draft": draft},
+                    data={"draft": draft, "mutation_outcome": "not_started"},
+                )
+            except BitrixApiError as exc:
+                outcome = bitrix_mutation_outcome(exc)
+                if claimed is not None and outcome == "rejected":
+                    await release_exact_draft(self._store, dialog_key=dialog_key, draft=claimed)
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool=self.name,
+                    error=str(exc),
+                    data={"draft": draft, "mutation_outcome": outcome},
                 )
             except Exception as exc:
                 return ToolResult(
                     status=ToolStatus.ERROR,
                     tool=self.name,
                     error=f"{type(exc).__name__}: {exc}",
-                    data={"draft": draft},
+                    data={"draft": draft, "mutation_outcome": "unknown"},
                 )
-            await self._store.delete_task_draft(dialog_key)
+            await self._store.delete_task_draft(
+                dialog_key,
+                status="confirmed",
+                expected_draft_id=str(claimed.get("_draft_id") or ""),
+                expected_version=optional_int(claimed.get("_draft_version")),
+                expected_claim_token=str(claimed.get("_draft_claim_token") or ""),
+            )
             return ToolResult(status=ToolStatus.OK, tool=self.name, data={**result, "draft": draft})
 
         if self._write_client is None:
@@ -272,13 +329,33 @@ class CalendarEventConfirmTool:
                 error="write_client is not configured",
                 data={"draft": draft},
             )
+        claimed = await claim_exact_draft(
+            self._store, dialog_key=dialog_key, draft=draft, expected_type=CALENDAR_EVENT_DRAFT_TYPE
+        )
+        if claimed is None:
+            return ToolResult(
+                status=ToolStatus.DENIED,
+                tool=self.name,
+                error="calendar draft changed, expired, or is already being confirmed",
+            )
         try:
+            if not await renew_exact_draft_claim(self._store, dialog_key=dialog_key, draft=claimed):
+                return ToolResult(status=ToolStatus.DENIED, tool=self.name, error="calendar draft claim was lost")
             result = await _execute_calendar_event_create(self._write_client.call, sanitized, draft)
         except Exception as exc:
             return ToolResult(
-                status=ToolStatus.ERROR, tool=self.name, error=f"{type(exc).__name__}: {exc}", data={"draft": draft}
+                status=ToolStatus.ERROR,
+                tool=self.name,
+                error=f"{type(exc).__name__}: {exc}",
+                data={"draft": draft, "mutation_outcome": "unknown"},
             )
-        await self._store.delete_task_draft(dialog_key)
+        await self._store.delete_task_draft(
+            dialog_key,
+            status="confirmed",
+            expected_draft_id=str(claimed.get("_draft_id") or ""),
+            expected_version=optional_int(claimed.get("_draft_version")),
+            expected_claim_token=str(claimed.get("_draft_claim_token") or ""),
+        )
         return ToolResult(status=ToolStatus.OK, tool=self.name, data={**result, "draft": draft})
 
 
@@ -304,7 +381,14 @@ class CalendarEventDiscardTool:
         dialog_id: str | None = None,
     ) -> ToolResult:
         if dialog_key:
-            await self._store.delete_task_draft(dialog_key)
+            draft = await self._store.get_task_draft(dialog_key)
+            if isinstance(draft, dict) and draft.get("_draft_type") == CALENDAR_EVENT_DRAFT_TYPE:
+                await discard_exact_draft(
+                    self._store,
+                    dialog_key=dialog_key,
+                    draft=draft,
+                    expected_type=CALENDAR_EVENT_DRAFT_TYPE,
+                )
         return ToolResult(status=ToolStatus.OK, tool=self.name, data={"discarded": bool(dialog_key)})
 
 

@@ -73,6 +73,41 @@ class CallSpecialistTool:
             },
         )
 
+    async def _persist_pending_state(
+        self,
+        *,
+        dialog_key: str | None,
+        specialist_id: str,
+        specialist_status: str,
+    ) -> ToolResult | None:
+        if self._store is None or not dialog_key:
+            return None
+        try:
+            if specialist_status in ("needs_clarification", "needs_human"):
+                await self._store.set_kv(dialog_key, "pending_specialist", specialist_id)
+                transition = "set"
+            else:
+                await self._store.delete_kv(dialog_key, "pending_specialist")
+                transition = "clear"
+        except Exception:
+            logger.exception("CallSpecialistTool: KV update failed for dialog_key=%s", dialog_key)
+            return ToolResult(
+                status=ToolStatus.ERROR,
+                tool=self.name,
+                error="pending specialist state transition failed",
+                data={
+                    "specialist": specialist_id,
+                    "status": "failed",
+                    "reason": "PENDING_STATE_WRITE_FAILED",
+                    "state_transition": "failed",
+                },
+            )
+        return ToolResult(
+            status=ToolStatus.OK,
+            tool=self.name,
+            data={"state_transition": transition},
+        )
+
     async def execute(
         self,
         args: dict[str, Any],
@@ -117,14 +152,13 @@ class CallSpecialistTool:
             except Exception:
                 logger.exception("CallSpecialistTool: schedule_fn failed for %s", specialist_id)
 
-        if self._store and dialog_key:
-            try:
-                if sr.status in ("needs_clarification", "needs_human"):
-                    await self._store.set_kv(dialog_key, "pending_specialist", specialist_id)
-                else:
-                    await self._store.delete_kv(dialog_key, "pending_specialist")
-            except Exception:
-                logger.exception("CallSpecialistTool: KV update failed for dialog_key=%s", dialog_key)
+        state_result = await self._persist_pending_state(
+            dialog_key=dialog_key,
+            specialist_id=specialist_id,
+            specialist_status=str(sr.status),
+        )
+        if state_result is not None and state_result.status == ToolStatus.ERROR:
+            return state_result
 
         return ToolResult(
             status=ToolStatus.OK,
@@ -142,7 +176,9 @@ class CallSpecialistTool:
 
     async def execute_with_task(self, args: dict[str, Any], *, task: AgentTask) -> ToolResult:
         specialist_id = str(args.get("specialist_id") or "").strip()
-        request = str(args.get("request") or "").strip()
+        planned_request = str(args.get("request") or "").strip()
+        original_request = str(task.context.get("t0006_original_request") or "").strip()
+        request = original_request or planned_request
 
         specialist = self._specialists.get(specialist_id)
         if specialist is None:
@@ -153,7 +189,18 @@ class CallSpecialistTool:
             )
 
         dialog_key = str(task.context.get("dialog_key") or "") or None
-        sub_task = task.model_copy(update={"request": request})
+        sub_task = task.model_copy(
+            update={
+                "request": request,
+                "context": {
+                    **task.context,
+                    "t0006_effective_specialist_request": request,
+                    "t0006_planned_subtask_request": str(
+                        task.context.get("t0006_planned_subtask_request") or planned_request
+                    ),
+                },
+            }
+        )
         try:
             sr = await specialist.handle(sub_task)
         except Exception as exc:
@@ -167,14 +214,13 @@ class CallSpecialistTool:
             except Exception:
                 logger.exception("CallSpecialistTool: schedule_fn failed for %s", specialist_id)
 
-        if self._store and dialog_key:
-            try:
-                if sr.status in ("needs_clarification", "needs_human"):
-                    await self._store.set_kv(dialog_key, "pending_specialist", specialist_id)
-                else:
-                    await self._store.delete_kv(dialog_key, "pending_specialist")
-            except Exception:
-                logger.exception("CallSpecialistTool: KV update failed for dialog_key=%s", dialog_key)
+        state_result = await self._persist_pending_state(
+            dialog_key=dialog_key,
+            specialist_id=specialist_id,
+            specialist_status=str(sr.status),
+        )
+        if state_result is not None and state_result.status == ToolStatus.ERROR:
+            return state_result
 
         return ToolResult(
             status=ToolStatus.OK,

@@ -92,10 +92,19 @@ _LLM_TOOL_NAMES = frozenset(
 
 _FAST_RETURN_READ_TOOLS = frozenset(
     {
+        "portal_search",
         "bitrix_warehouse_search",
         "bitrix_my_tasks",
         "bitrix_task_search",
         "bitrix_project_search",
+    }
+)
+
+_FAST_RETURN_TASK_CREATE_TOOLS = frozenset(
+    {
+        "task_create_confirm",
+        "task_draft_discard",
+        "project_create_discard",
     }
 )
 
@@ -153,6 +162,7 @@ class Bitrix24Specialist(BaseSpecialist):
         bitrix_llm: BitrixAgentLLM | None = None,
         scheduler: SchedulerPort | None = None,
         bitrix_store: Any | None = None,
+        orchestrator_store: Any | None = None,
         settings: Settings | None = None,
         specialist_result_publisher: Any | None = None,
         conversation_trace: Any | None = None,
@@ -164,6 +174,17 @@ class Bitrix24Specialist(BaseSpecialist):
                 portal_search=portal_search_index,
                 bitrix_files=bitrix_client,
                 bitrix_oauth=bitrix_oauth,
+                state_store=orchestrator_store,
+                live_fallback_enabled=bitrix_oauth is not None,
+                index_max_age_seconds=max(
+                    900,
+                    (
+                        _settings.search_delta_interval_seconds * 4
+                        if _settings.search_background_periodic_delta_enabled
+                        else _settings.search_background_metadata_interval_seconds * 2
+                    ),
+                ),
+                index_freshness_path=_settings.search_background_state_path,
             ),
             BitrixWarehouseSearchTool(
                 client=bitrix_client,
@@ -188,7 +209,12 @@ class Bitrix24Specialist(BaseSpecialist):
                 dry_run=_settings.agent_dry_run,
                 oauth_required_for_writes=_settings.bitrix_oauth_required_for_writes,
             ),
-            TaskCreateDraftTool(store=bitrix_store),
+            TaskCreateDraftTool(
+                store=bitrix_store,
+                project_client=bitrix_client,
+                portal_search=portal_search_index,
+                bitrix_oauth=bitrix_oauth,
+            ),
             TaskCreateConfirmTool(
                 store=bitrix_store,
                 write_client=bitrix_client,
@@ -214,7 +240,11 @@ class Bitrix24Specialist(BaseSpecialist):
                 settings=_settings,
             ),
             TaskCloseControlGetTool(store=bitrix_store, user_client=bitrix_client),
-            TaskCloseControlUpdateTool(store=bitrix_store, user_client=bitrix_client),
+            TaskCloseControlUpdateTool(
+                store=bitrix_store,
+                user_client=bitrix_client,
+                bitrix_oauth=bitrix_oauth,
+            ),
             CalendarEventDraftTool(store=bitrix_store),
             CalendarEventConfirmTool(
                 store=bitrix_store,
@@ -279,21 +309,37 @@ class Bitrix24Specialist(BaseSpecialist):
         task: AgentTask,
     ) -> tuple[ToolResult | None, Any | None, list[Any]]:
         if tool_call.name == "task_create_draft":
-            args = _task_create_args_with_actor_label(dict(tool_call.args or {}), task)
+            args = _draft_args_with_metadata(
+                _task_create_args_with_actor_label(dict(tool_call.args or {}), task),
+                task,
+            )
             tool_call = SimpleNamespace(
                 name=tool_call.name,
                 args=args,
                 summary=getattr(tool_call, "summary", ""),
             )
         elif tool_call.name == "calendar_event_draft":
-            args = _calendar_event_args_with_actor_label(dict(tool_call.args or {}), task)
+            args = _draft_args_with_metadata(
+                _calendar_event_args_with_actor_label(dict(tool_call.args or {}), task),
+                task,
+            )
             tool_call = SimpleNamespace(
                 name=tool_call.name,
                 args=args,
                 summary=getattr(tool_call, "summary", ""),
             )
         elif tool_call.name == "project_create_draft":
-            args = _project_create_args_with_actor_context(dict(tool_call.args or {}), task)
+            args = _draft_args_with_metadata(
+                _project_create_args_with_actor_context(dict(tool_call.args or {}), task),
+                task,
+            )
+            tool_call = SimpleNamespace(
+                name=tool_call.name,
+                args=args,
+                summary=getattr(tool_call, "summary", ""),
+            )
+        elif tool_call.name == "task_close_draft":
+            args = _draft_args_with_metadata(dict(tool_call.args or {}), task)
             tool_call = SimpleNamespace(
                 name=tool_call.name,
                 args=args,
@@ -307,7 +353,9 @@ class Bitrix24Specialist(BaseSpecialist):
                 summary=getattr(tool_call, "summary", ""),
             )
         elif tool_call.name in {"task_close_control_get", "task_close_control_update"}:
-            args = _args_with_actor_admin_context(dict(tool_call.args or {}), task, settings=self._settings_for_qc)
+            args = _args_with_actor_admin_context(dict(tool_call.args or {}), task)
+            if tool_call.name == "task_close_control_update":
+                args = _draft_args_with_metadata(args, task)
             tool_call = SimpleNamespace(
                 name=tool_call.name,
                 args=args,
@@ -326,13 +374,18 @@ class Bitrix24Specialist(BaseSpecialist):
     ) -> dict[str, Any] | None:
         if result is None or approvals:
             return None
-        if tool_call.name not in _FAST_RETURN_READ_TOOLS:
+        if tool_call.name not in _FAST_RETURN_READ_TOOLS and tool_call.name not in _FAST_RETURN_TASK_CREATE_TOOLS:
             return None
         if _is_ambiguous_read_result(tool_call.name, result):
             return None
         if result.status == ToolStatus.OK:
+            reason = (
+                "task_create_tool_success"
+                if tool_call.name in _FAST_RETURN_TASK_CREATE_TOOLS
+                else "read_only_tool_success"
+            )
             return {
-                "fast_return_reason": "read_only_tool_success",
+                "fast_return_reason": reason,
                 "terminal_tool": tool_call.name,
                 "tool_status": str(result.status),
             }
@@ -458,17 +511,32 @@ def _tool_context_status(value: object) -> str:
 
 
 def _task_create_args_with_actor_label(args: dict[str, Any], task: AgentTask) -> dict[str, Any]:
-    if str(args.get("responsible_name") or args.get("responsible_label") or "").strip():
-        return args
     user_id = optional_int(task.user.id)
     responsible_id = optional_int(args.get("responsible_id"))
     responsible_self = _truthy(args.get("responsible_self"))
     if not responsible_self and (user_id is None or responsible_id != user_id):
         return args
     label = _current_user_label(task)
-    if label:
-        return {**args, "responsible_name": label}
-    return args
+    if not label:
+        return args
+    updated = dict(args)
+    if not str(updated.get("responsible_name") or updated.get("responsible_label") or "").strip():
+        updated["responsible_name"] = label
+    if not any(updated.get(key) for key in ("group_id", "project_name", "group_name")):
+        updated["project_name"] = _personal_project_name(label)
+        updated["_default_personal_project"] = True
+    return updated
+
+
+def _personal_project_name(label: str) -> str:
+    parts = [part for part in compact_user_label(label).split() if part]
+    if len(parts) >= 2:
+        return f"{parts[0]} {parts[1]}"
+    return label.strip()
+
+
+def compact_user_label(label: str) -> str:
+    return re.sub(r"\s+", " ", str(label or "")).strip()
 
 
 def _calendar_event_args_with_actor_label(args: dict[str, Any], task: AgentTask) -> dict[str, Any]:
@@ -507,14 +575,19 @@ def _warehouse_request_implies_stock(request: str) -> bool:
 def _args_with_actor_admin_context(
     args: dict[str, Any],
     task: AgentTask,
-    *,
-    settings: Settings | None = None,
 ) -> dict[str, Any]:
     profile = _current_user_profile(task)
-    user_id = optional_int(task.user.id)
-    configured_admin_ids = set(settings.resolved_task_close_control_admin_user_ids if settings is not None else [])
-    actor_is_admin = bool(profile.get("is_admin")) or bool(user_id is not None and user_id in configured_admin_ids)
+    actor_is_admin = bool(profile.get("is_admin"))
     return {**args, "_actor_is_admin": actor_is_admin}
+
+
+def _draft_args_with_metadata(args: dict[str, Any], task: AgentTask) -> dict[str, Any]:
+    return {
+        **args,
+        "_original_request": str(task.request or ""),
+        "_draft_user_id": optional_int(task.user.id) if task.user.id is not None else None,
+        "_draft_specialist": "bitrix24",
+    }
 
 
 def _current_user_label(task: AgentTask) -> str:
@@ -589,4 +662,28 @@ def _enforce_task_close_response(result: AgentResult, *, settings: Settings | No
             return result.model_copy(update={"status": "completed", "answer": answer})
         if action.name == "task_close_discard":
             return result.model_copy(update={"status": "completed", "answer": "Черновик закрытия задачи удалён."})
+        if action.name == "task_close_control_update":
+            operation = str(data.get("operation") or "")
+            if operation == "prepare":
+                return result.model_copy(
+                    update={"status": "needs_human", "answer": _format_admin_change_draft_answer(data)}
+                )
+            if operation == "discard":
+                return result.model_copy(
+                    update={"status": "completed", "answer": "Черновик изменения настроек удалён."}
+                )
+            if operation == "confirm":
+                return result.model_copy(update={"status": "completed", "answer": "Изменение настроек подтверждено."})
     return result
+
+
+def _format_admin_change_draft_answer(data: dict[str, Any]) -> str:
+    draft = data.get("draft") if isinstance(data.get("draft"), dict) else {}
+    field = str(draft.get("field") or draft.get("action") or "настройка")
+    target = str(draft.get("target_user_name") or draft.get("target_user_id") or "").strip()
+    subject = f"{field} ({target})" if target else field
+    return (
+        f"Подготовлен черновик изменения: {subject}; "
+        f"было — {draft.get('old_value')!s}, станет — {draft.get('new_value')!s}. "
+        "Черновик действует 15 минут. Подтвердите или отмените изменение."
+    )

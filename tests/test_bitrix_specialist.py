@@ -2,9 +2,12 @@ import asyncio
 import json
 from datetime import date
 
+import pytest
+
 import ai_server.agents.bitrix24.llm as bitrix_llm
 from ai_server.agents.bitrix24 import Bitrix24Specialist, BitrixLLMDecision, BitrixLLMService, BitrixLLMToolCall
 from ai_server.agents.bitrix24.llm import ALLOWED_TOOL_NAMES
+from ai_server.agents.bitrix24.tools.project_create import ProjectCreateDiscardTool
 from ai_server.agents.bitrix24.tools.task_close import TaskCloseDraftTool
 from ai_server.agents.bitrix24.tools.task_close_control import TaskCloseControlUpdateTool
 from ai_server.agents.bitrix24.tools.task_create import TaskCreateDraftTool
@@ -15,10 +18,33 @@ from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import get_settings
 from ai_server.skills import SkillStore
 from ai_server.tools.bitrix_policy import decide_bitrix_method_policy
-from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, FakeTaskDraftStore, RecordingLLMClient
+from tests.fakes import (
+    FakeBitrixLLM,
+    FakeEmbeddingProvider,
+    FakePortalSearchIndex,
+    FakeTaskDraftStore,
+    RecordingLLMClient,
+)
 
 
-def _bitrix_specialist(*, tools=None, llm=None, settings=None) -> Bitrix24Specialist:
+def _writable_profile(user_id: int = 13) -> dict:
+    return {
+        "status": "ok",
+        "data": {
+            "user_id": user_id,
+            "profile": {
+                "id": user_id,
+                "label": "Иванов Иван",
+                "active": True,
+                "is_admin": False,
+                "user_type": "employee",
+                "work_position": "Монтажник",
+            },
+        },
+    }
+
+
+def _bitrix_specialist(*, tools=None, llm=None, settings=None, conversation_trace=None) -> Bitrix24Specialist:
     manifest = get_agent_manifest("bitrix24")
     retriever = HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider())
     return Bitrix24Specialist(
@@ -29,7 +55,16 @@ def _bitrix_specialist(*, tools=None, llm=None, settings=None) -> Bitrix24Specia
         bitrix_user_client=tools.make_user_client() if tools is not None else None,
         llm=llm or FakeBitrixLLM(),
         settings=settings,
+        conversation_trace=conversation_trace,
     )
+
+
+class _RecordingConversationTrace:
+    def __init__(self) -> None:
+        self.events = []
+
+    async def record_timing(self, **kwargs):
+        self.events.append(kwargs)
 
 
 def _bitrix_read_tool_definitions() -> list[dict]:
@@ -190,6 +225,47 @@ def test_bitrix_specialist_searches_my_open_tasks():
     assert result.status == "completed"
     assert tools.my_tasks_calls[0] == {"status": "open", "limit": 10}
     assert "Проверить камеру" in result.answer
+
+
+def test_bitrix_specialist_fast_returns_portal_search_result_and_traces_tool():
+    trace = _RecordingConversationTrace()
+    tools = FakeResolverTools(
+        portal_search_result=ToolResult(
+            status="ok",
+            tool="portal_search",
+            data={
+                "query": "dogovor azimut",
+                "items": [{"title": "DOGOVOR Azimut", "path": "Dogovora/Azimut.docx"}],
+            },
+        )
+    )
+    llm = FakeBitrixLLM(
+        tool_call_steps=[
+            [BitrixLLMToolCall(name="portal_search", args={"query": "dogovor azimut", "limit": 10})],
+            [BitrixLLMToolCall(name="portal_search", args={"query": "dogovor azimut", "limit": 10})],
+        ],
+        final_answer="Nashel dogovor Azimut.",
+    )
+
+    result = asyncio.run(
+        _bitrix_specialist(tools=tools, llm=llm, conversation_trace=trace).handle(
+            AgentTask(task_id="t1", request="Bitrix find dogovor Azimut", user={"id": "1"})
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.answer == "Nashel dogovor Azimut."
+    assert len(llm.decide_calls) == 1
+    assert tools.portal_search_calls == [{"query": "dogovor azimut", "limit": 10}]
+    fast_return = [action for action in result.actions_taken if action.name == "bitrix_fast_return"]
+    assert fast_return
+    assert fast_return[0].details["terminal_tool"] == "portal_search"
+    tool_events = [event for event in trace.events if event["stage"] == "tool_execute"]
+    assert len(tool_events) == 1
+    assert tool_events[0]["tool"] == "portal_search"
+    assert tool_events[0]["details"]["tool"] == "portal_search"
+    assert tool_events[0]["details"]["tool_result_tool"] == "portal_search"
+    assert tool_events[0]["details"]["tool_result_status"] == "ok"
 
 
 def test_bitrix_specialist_treats_show_warehouse_as_stock_request():
@@ -424,6 +500,49 @@ def test_bitrix_llm_decide_routes_disk_scan_to_file_portal_search(monkeypatch):
         "scope": "files",
         "limit": 10,
     }
+
+
+def test_bitrix_llm_decide_routes_document_show_all_with_bounded_limit(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t1", request="Битрикс, покажи все документы по договору Азимут.", user={"id": "1"}),
+            retrieval_hits=[],
+            tool_definitions=_bitrix_read_tool_definitions(),
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["portal_search"]
+    assert result.decision.tool_calls[0].args == {
+        "query": "договор Азимут",
+        "scope": "documents",
+        "limit": 50,
+        "show_all": True,
+    }
+
+
+def test_bitrix_llm_decide_routes_document_next_page_without_rewriting_query(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t1", request="Покажи следующие результаты документов.", user={"id": "1"}),
+            retrieval_hits=[],
+            tool_definitions=_bitrix_read_tool_definitions(),
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["portal_search"]
+    assert result.decision.tool_calls[0].args == {"continuation": "next"}
 
 
 def test_bitrix_llm_decide_routes_task_text_search_even_when_model_answers_from_history(monkeypatch):
@@ -774,7 +893,13 @@ def test_bitrix_specialist_injects_admin_context_for_task_close_control_tool(mon
 
     class TaskCloseControlTools:
         def agent_tools(self):
-            return [TaskCloseControlUpdateTool(store=store)]
+            client = self.make_user_client()
+
+            class OAuth:
+                async def client_for_user(self, user_id: int):
+                    return client
+
+            return [TaskCloseControlUpdateTool(store=store, user_client=client, bitrix_oauth=OAuth())]
 
         def make_user_client(self):
             class UserClient:
@@ -794,23 +919,38 @@ def test_bitrix_specialist_injects_admin_context_for_task_close_control_tool(mon
 
     result = asyncio.run(
         _bitrix_specialist(tools=TaskCloseControlTools(), llm=llm).handle(
-            AgentTask(task_id="t1", request="добавь 13 оператором контроля закрытия задач", user={"id": "1"})
+            AgentTask(
+                task_id="t1",
+                request="добавь 13 оператором контроля закрытия задач",
+                user={"id": "1"},
+                context={"dialog_key": "d:1"},
+            )
         )
     )
 
-    assert result.status == "completed"
-    assert store.task_close_operator_ids() == {13}
+    assert result.status == "needs_human"
+    assert store.task_close_operator_ids() == set()
     assert store.task_close_controlled_user_ids() == set()
+    assert store._drafts["d:1"]["_draft_type"] == "admin_change"
+    assert store._drafts["d:1"]["_original_request"] == "добавь 13 оператором контроля закрытия задач"
+    assert store._drafts["d:1"]["_draft_user_id"] == 1
+    assert store._drafts["d:1"]["_draft_specialist"] == "bitrix24"
 
 
-def test_bitrix_specialist_uses_configured_task_close_control_admin_ids(monkeypatch):
+def test_bitrix_specialist_does_not_elevate_configured_task_close_control_admin_ids(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("BITRIX_TASK_CLOSE_CONTROL_ADMIN_USER_IDS", "1")
     store = FakeTaskDraftStore()
 
     class TaskCloseControlTools:
         def agent_tools(self):
-            return [TaskCloseControlUpdateTool(store=store)]
+            client = self.make_user_client()
+
+            class OAuth:
+                async def client_for_user(self, user_id: int):
+                    return client
+
+            return [TaskCloseControlUpdateTool(store=store, user_client=client, bitrix_oauth=OAuth())]
 
         def make_user_client(self):
             class UserClient:
@@ -834,12 +974,17 @@ def test_bitrix_specialist_uses_configured_task_close_control_admin_ids(monkeypa
 
     result = asyncio.run(
         _bitrix_specialist(tools=TaskCloseControlTools(), llm=llm, settings=get_settings()).handle(
-            AgentTask(task_id="t1", request="добавь 13 оператором контроля закрытия задач", user={"id": "1"})
+            AgentTask(
+                task_id="t1",
+                request="добавь 13 оператором контроля закрытия задач",
+                user={"id": "1"},
+                context={"dialog_key": "d:1"},
+            )
         )
     )
 
     assert result.status == "completed"
-    assert store.task_close_operator_ids() == {13}
+    assert store.task_close_operator_ids() == set()
     assert store.task_close_controlled_user_ids() == set()
 
 
@@ -1004,6 +1149,120 @@ def test_bitrix_specialist_task_create_draft_saves_to_store():
     assert draft_fields["DEADLINE"]
 
 
+def test_bitrix_specialist_build_wires_portal_snapshot_into_task_draft_tool():
+    store = FakeTaskDraftStore()
+    index = FakePortalSearchIndex()
+    oauth = object()
+
+    specialist = Bitrix24Specialist.build(
+        get_agent_manifest("bitrix24"),
+        bitrix_store=store,
+        portal_search_index=index,
+        bitrix_oauth=oauth,
+        settings=get_settings(),
+    )
+
+    tool = specialist._tool_registry["task_create_draft"]
+    assert isinstance(tool, TaskCreateDraftTool)
+    assert tool._portal_search is index
+    assert tool._bitrix_oauth is oauth
+
+
+def test_bitrix_specialist_project_discard_fast_returns_first_linked_result():
+    store = FakeTaskDraftStore()
+    asyncio.run(
+        store.save_task_draft(
+            "d:9",
+            {
+                "_draft_type": "project_create",
+                "params": {"fields": {"NAME": "Иванов Иван"}},
+                "after_project_create_task_draft": {
+                    "params": {"_draft_type": "task_create", "fields": {"TITLE": "Тест"}},
+                },
+            },
+        )
+    )
+    client = RecordingLLMClient("not-json")
+    specialist = Bitrix24Specialist(
+        get_agent_manifest("bitrix24"),
+        agent_tools=[ProjectCreateDiscardTool(store=store)],
+        draft_store=store,
+        llm=BitrixLLMService(client, settings=get_settings()),
+        settings=get_settings(),
+    )
+
+    result = asyncio.run(
+        specialist.handle(
+            AgentTask(
+                task_id="t1",
+                request="Битрикс отмени черновик задачи.",
+                user={"id": "9"},
+                context={"dialog_key": "d:9", "dialog_id": "chat9"},
+            )
+        )
+    )
+
+    discard_actions = [action for action in result.actions_taken if action.name == "project_create_discard"]
+    assert client.calls == []
+    assert len(discard_actions) == 1
+    assert result.status == "completed"
+    assert result.answer == "Черновик проекта и связанной задачи удалён."
+    assert result.metadata["fast_return"] is True
+    assert result.metadata["terminal_tool"] == "project_create_discard"
+    assert "d:9" not in store._drafts
+
+
+def test_bitrix_specialist_exact_release_task_draft_is_deterministic_and_persisted():
+    store = FakeTaskDraftStore()
+    client = RecordingLLMClient("not-json")
+
+    class _UserClient:
+        async def get_user(self, user_id: int):
+            return {
+                "ID": str(user_id),
+                "NAME": "Иван",
+                "LAST_NAME": "Иванов",
+                "ACTIVE": "Y",
+                "IS_ADMIN": "N",
+                "USER_TYPE": "employee",
+                "WORK_POSITION": "Монтажник",
+            }
+
+        async def search_projects(self, query: str, *, limit: int = 10):
+            assert query == "Иванов Иван"
+            return [{"ID": "43", "NAME": "Иванов Иван", "PROJECT": "Y"}]
+
+    user_client = _UserClient()
+    specialist = Bitrix24Specialist(
+        get_agent_manifest("bitrix24"),
+        retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
+        agent_tools=[TaskCreateDraftTool(store=store, project_client=user_client)],
+        bitrix_user_client=user_client,
+        llm=BitrixLLMService(client, settings=get_settings()),
+    )
+
+    result = asyncio.run(
+        specialist.handle(
+            AgentTask(
+                task_id="t1",
+                request=(
+                    "Битрикс создай задачу на меня: подготовить тестовый отчет. "
+                    "Не создавай сразу, только покажи черновик для подтверждения."
+                ),
+                user={"id": "9"},
+                context={"dialog_key": "d:9", "dialog_id": "chat9"},
+            )
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert all(phrase in result.answer for phrase in ("Черновик задачи", "Срок", "Если всё верно"))
+    assert store._drafts["d:9"]["_draft_type"] == "task_create"
+    assert store._drafts["d:9"]["fields"]["TITLE"] == "подготовить тестовый отчет"
+    assert store._drafts["d:9"]["fields"]["RESPONSIBLE_ID"] == 9
+
+
 def test_bitrix_specialist_enforces_structured_task_close_draft_response():
     store = FakeTaskDraftStore()
     specialist = Bitrix24Specialist(
@@ -1081,11 +1340,16 @@ def test_bitrix_specialist_task_create_draft_uses_current_user_profile_label():
         async def get_user(self, user_id: int):
             return {"ID": str(user_id), "NAME": "Дмитрий", "LAST_NAME": "Кулинич"}
 
+        async def search_projects(self, query: str, *, limit: int = 10):
+            assert query == "Кулинич Дмитрий"
+            return [{"ID": "43", "NAME": "Кулинич Дмитрий", "PROJECT": "Y"}]
+
+    user_client = _FakeUserClient()
     specialist = Bitrix24Specialist(
         get_agent_manifest("bitrix24"),
         retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
-        agent_tools=[TaskCreateDraftTool(store=store)],
-        bitrix_user_client=_FakeUserClient(),
+        agent_tools=[TaskCreateDraftTool(store=store, project_client=user_client)],
+        bitrix_user_client=user_client,
         llm=llm,
     )
 
@@ -1102,7 +1366,10 @@ def test_bitrix_specialist_task_create_draft_uses_current_user_profile_label():
 
     assert result.status == "needs_human"
     preview = llm.compose_calls[0]["tool_results"][0].data["preview"]
+    fields = llm.compose_calls[0]["tool_results"][0].data["params"]["fields"]
     assert preview["responsible"] == "Кулинич Дмитрий"
+    assert preview["project"] == "Кулинич Дмитрий"
+    assert fields["GROUP_ID"] == 43
     assert "текущий пользователь" not in preview["responsible"]
 
 
@@ -1332,6 +1599,45 @@ def test_bitrix_llm_routes_task_close_confirmation_without_llm(monkeypatch):
     assert [call.name for call in result.decision.tool_calls] == ["task_close_confirm"]
 
 
+@pytest.mark.parametrize(
+    ("request_text", "operation", "source"),
+    [
+        ("да, подтверждаю", "confirm", "draft_confirm_route"),
+        ("отмени черновик", "discard", "draft_discard_route"),
+    ],
+)
+def test_bitrix_llm_routes_admin_change_draft_without_llm(monkeypatch, request_text, operation, source):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request=request_text,
+                user={"id": "1"},
+                context={
+                    "dialog_id": "chat1",
+                    "pending_task_draft": {
+                        "_draft_type": "admin_change",
+                        "action": "add_operator",
+                        "target_user_id": 13,
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=[
+                {"name": "task_close_control_update", "description": "", "parameters": {}},
+            ],
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": source}
+    assert [call.name for call in result.decision.tool_calls] == ["task_close_control_update"]
+    assert result.decision.tool_calls[0].args == {"operation": operation}
+
+
 def test_bitrix_llm_routes_task_close_start_to_draft_without_llm(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient('{"status":"completed","answer":"","tool_calls":[{"name":"none","args":{}}]}')
@@ -1362,6 +1668,7 @@ def test_bitrix_llm_routes_task_close_start_to_draft_without_llm(monkeypatch):
     assert [call.name for call in result.decision.tool_calls] == ["task_close_draft"]
     args = result.decision.tool_calls[0].args
     assert args["task_id"] == 8899
+    assert args["close_now"] is True
     assert args["overall_status"] == "unconfirmed"
     assert args["unconfirmed_items"] == ["результат выполнения не указан"]
     assert "что сделано по задаче" in args["missing_fields"]
@@ -1948,15 +2255,115 @@ def test_bitrix_llm_does_not_treat_preview_request_as_task_draft_discard(monkeyp
                     "Не создавай сразу, только покажи черновик для подтверждения."
                 ),
                 user={"id": "13"},
-                context={"dialog_id": "chat4321"},
+                context={"dialog_id": "chat4321", "bitrix_current_user_profile": _writable_profile()},
             ),
             retrieval_hits=[],
             tool_definitions=tool_definitions,
         )
     )
 
-    assert len(client.calls) == 1
+    assert len(client.calls) == 0
+    assert result.raw == {"source": "task_create_draft_route"}
     assert [call.name for call in result.decision.tool_calls] == ["task_create_draft"]
+    assert result.decision.tool_calls[0].args == {
+        "title": "подготовить тестовый отчет",
+        "responsible_self": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("request_text", "expected_title"),
+    [
+        ("Создай задачу на меня: проверить камеры.", "проверить камеры"),
+        ("Поставьте задачу для меня: подготовить акт! Только покажи черновик.", "подготовить акт"),
+        ("Создать задачу: сверить остатки. Не создавай сразу.", "сверить остатки"),
+    ],
+)
+def test_bitrix_llm_routes_unambiguous_self_task_draft_without_llm(monkeypatch, request_text, expected_title):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient("not-json")
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request=request_text,
+                user={"id": "13"},
+                context={"dialog_id": "chat4321", "bitrix_current_user_profile": _writable_profile()},
+            ),
+            retrieval_hits=[],
+            tool_definitions=[{"name": "task_create_draft", "description": "", "parameters": {}}],
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_create_draft_route"}
+    assert result.decision.tool_calls[0].args == {"title": expected_title, "responsible_self": True}
+
+
+def test_bitrix_llm_routes_unambiguous_project_self_task_draft_without_llm(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient("not-json")
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request="Создай задачу в проекте Ларгус-2 на меня: проверить документы.",
+                user={"id": "13"},
+                context={"dialog_id": "chat4321", "bitrix_current_user_profile": _writable_profile()},
+            ),
+            retrieval_hits=[],
+            tool_definitions=[{"name": "task_create_draft", "description": "", "parameters": {}}],
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "task_create_draft_route"}
+    assert result.decision.tool_calls[0].args == {
+        "title": "проверить документы",
+        "responsible_self": True,
+        "project_name": "Ларгус-2",
+    }
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Создай задачу на меня: подготовить документы для проекта Ларгус-2.",
+        "Создай задачу для Коверги Дмитрия: проверить документы.",
+        "Создай задачу: проверить документы, назначь Иванова исполнителем.",
+        "Создай задачу: поручи Иванову проверить документы.",
+        "Создай задачу: проверить документы, ответственный Иванов.",
+        "Создай задачу на меня без сформулированного заголовка",
+    ],
+)
+def test_bitrix_llm_leaves_lookup_dependent_or_incomplete_task_drafts_to_model(monkeypatch, request_text):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient(
+        json.dumps({"status": "needs_clarification", "answer": "Уточните детали.", "confidence": 0.5, "tool_calls": []})
+    )
+    service = BitrixLLMService(client, settings=get_settings())
+
+    asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request=request_text,
+                user={"id": "13"},
+                context={"dialog_id": "chat4321", "bitrix_current_user_profile": _writable_profile()},
+            ),
+            retrieval_hits=[],
+            tool_definitions=[{"name": "task_create_draft", "description": "", "parameters": {}}],
+        )
+    )
+
+    assert len(client.calls) == 1
 
 
 def test_bitrix_llm_decide_routes_task_close_draft_discard_without_llm(monkeypatch):
@@ -2091,6 +2498,37 @@ def test_bitrix_llm_decide_routes_project_draft_discard_without_llm(monkeypatch)
     assert result.decision.tool_calls[0].args == {}
 
 
+def test_bitrix_llm_uses_active_project_draft_type_when_cancel_text_says_task(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient("{}")
+    service = BitrixLLMService(client, settings=get_settings())
+    tool_definitions = [
+        {"name": "task_draft_discard", "description": "", "parameters": {}},
+        {"name": "project_create_discard", "description": "", "parameters": {}},
+        {"name": "none", "description": "", "parameters": {}},
+    ]
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request="Битрикс отмени черновик задачи.",
+                user={"id": "13"},
+                context={
+                    "dialog_id": "chat4321",
+                    "pending_task_draft": {"_draft_type": "project_create", "params": {"fields": {"NAME": "Тест"}}},
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=tool_definitions,
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["project_create_discard"]
+
+
 def test_bitrix_llm_routes_project_confirmation_without_llm(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient(
@@ -2210,6 +2648,56 @@ def test_bitrix_llm_compose_formats_project_create_confirm_with_project_link(mon
     assert "/company/personal/user/" not in result.answer
 
 
+def test_bitrix_llm_compose_formats_project_create_confirm_with_followup_task(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="да, создай проект", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="project_create_confirm",
+                    data={
+                        "result": {"result": 777},
+                        "params": {"fields": {"NAME": "Кулинич Валерий"}},
+                        "followup_task_draft": {
+                            "params": {
+                                "fields": {
+                                    "TITLE": "проверить IP-камеру",
+                                    "RESPONSIBLE_ID": 13,
+                                    "GROUP_ID": 777,
+                                    "DEADLINE": "2026-07-20T19:00:00+03:00",
+                                    "DESCRIPTION": "Краткое содержание: проверить IP-камеру",
+                                }
+                            },
+                            "preview": {
+                                "title": "проверить IP-камеру",
+                                "responsible": "Кулинич Валерий",
+                                "project": "Кулинич Валерий",
+                                "deadline": "20.07.2026 19:00 МСК",
+                                "description": "Краткое содержание: проверить IP-камеру",
+                            },
+                        },
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert "Проект создан:" in result.answer
+    assert "Черновик задачи:" in result.answer
+    assert "Проект: Кулинич Валерий" in result.answer
+    assert "Если всё верно, напишите: да, создай." in result.answer
+
+
 def test_bitrix_llm_compose_formats_project_create_discard_without_llm(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
@@ -2227,6 +2715,30 @@ def test_bitrix_llm_compose_formats_project_create_discard_without_llm(monkeypat
     assert client.calls == []
     assert result.status == "completed"
     assert result.answer == "Черновик проекта удалён."
+
+
+def test_bitrix_llm_compose_mentions_linked_task_when_project_draft_is_discarded(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="отмени черновик задачи", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="project_create_discard",
+                    data={"discarded": True, "linked_task": True},
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.answer == "Черновик проекта и связанной задачи удалён."
 
 
 def test_bitrix_llm_compose_formats_task_draft_without_profile_links(monkeypatch):
@@ -3129,6 +3641,56 @@ def test_bitrix_llm_compose_formats_portal_search_document_with_snippet(monkeypa
     assert "(ID:" not in result.answer
 
 
+def test_bitrix_llm_compose_formats_portal_search_range_total_and_next_page(monkeypatch):
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client=client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="покажи следующие результаты документов", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="portal_search",
+                    data={
+                        "query": "договор",
+                        "scope": "documents",
+                        "limit": 10,
+                        "offset": 10,
+                        "total": 25,
+                        "range_start": 11,
+                        "range_end": 20,
+                        "remaining": 5,
+                        "pages": 3,
+                        "has_more": True,
+                        "results": [
+                            {
+                                "entity_type": "disk_file",
+                                "entity_id": "77",
+                                "title": "Договор.pdf",
+                                "body": "",
+                                "url": "/disk/77",
+                                "score": 42,
+                                "metadata": {},
+                            }
+                        ],
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert "11. " in result.answer
+    assert "Показаны результаты 11-20 из 25" in result.answer
+    assert "Осталось: 5" in result.answer
+    assert "Страниц: 3" in result.answer
+    assert "следующие результаты" in result.answer
+
+
 def test_bitrix_llm_compose_formats_warehouse_products_with_links_and_more(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("BITRIX_REST_WEBHOOK_URL", "https://asutp-expert.bitrix24.ru/rest/1/token/")
@@ -3291,11 +3853,17 @@ def test_bitrix_skills_and_knowledge_loaded():
 class _FakePortalSearchTool:
     name = "portal_search"
 
+    def __init__(self, result: ToolResult | None = None, calls: list | None = None):
+        self._result = result or ToolResult(status="not_configured", tool="portal_search")
+        self._calls = calls
+
     def definition(self):
         return ToolDefinition(name="portal_search", description="", parameters={})
 
     async def execute(self, args, *, user_id=None, dialog_key=None, dialog_id=None):
-        return ToolResult(status="not_configured", tool="portal_search", data={"args": args})
+        if self._calls is not None:
+            self._calls.append(args)
+        return self._result
 
 
 class _FakeBitrixApiTool:
@@ -3363,6 +3931,7 @@ class FakeResolverTools:
         *,
         bitrix_api_result: ToolResult | None = None,
         my_tasks_result: ToolResult | None = None,
+        portal_search_result: ToolResult | None = None,
         task_search_result: ToolResult | None = None,
         project_search_result: ToolResult | None = None,
         warehouse_result: ToolResult | None = None,
@@ -3373,9 +3942,10 @@ class FakeResolverTools:
         self.task_search_calls: list = []
         self.project_search_calls: list = []
         self.warehouse_calls: list = []
+        self.portal_search_calls: list = []
         self._raw_user = raw_user
         self._tools = [
-            _FakePortalSearchTool(),
+            _FakePortalSearchTool(portal_search_result, self.portal_search_calls),
             _FakeMyTasksTool(
                 my_tasks_result or ToolResult(status="not_configured", tool="bitrix_my_tasks"),
                 self.my_tasks_calls,

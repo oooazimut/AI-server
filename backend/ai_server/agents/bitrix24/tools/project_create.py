@@ -4,6 +4,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ai_server.agents.bitrix24.ports import TaskDraftStorePort
+from ai_server.agents.bitrix24.tools.draft_lifecycle import (
+    attach_draft_metadata,
+    bitrix_mutation_outcome,
+    claim_exact_draft,
+    discard_exact_draft,
+    release_exact_draft,
+    renew_exact_draft_claim,
+    resolve_unknown_draft_claim,
+)
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
@@ -168,11 +177,12 @@ class ProjectCreateDraftTool:
                 error="project_create_draft requires dialog_key",
                 data=draft.as_action_details(),
             )
-        await self._store.save_task_draft(dialog_key, draft.params)
+        params = attach_draft_metadata(draft.params, source_args=args, user_id=user_id)
+        await self._store.save_task_draft(dialog_key, params)
         return ToolResult(
             status=ToolStatus.OK,
             tool=self.name,
-            data={"params": draft.params, "preview": draft.preview, "notes": draft.notes},
+            data={"params": params, "preview": draft.preview, "notes": draft.notes},
         )
 
 
@@ -216,6 +226,21 @@ class ProjectCreateConfirmTool:
                 status=ToolStatus.INVALID_TOOL_CALL, tool=self.name, error="project_create_confirm requires dialog_key"
             )
         draft = await self._store.get_task_draft(dialog_key, ttl_minutes=self._draft_ttl_minutes)
+        if not draft:
+            unresolved = await resolve_unknown_draft_claim(
+                self._store, dialog_key=dialog_key, expected_type=PROJECT_CREATE_DRAFT_TYPE
+            )
+            if unresolved is not None:
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool=self.name,
+                    error="project creation outcome requires durable audit before retry",
+                    data={
+                        "mutation_outcome": "unknown",
+                        "resolution_status": unresolved.get("_draft_resolution_status"),
+                        "draft_id": unresolved.get("_draft_id"),
+                    },
+                )
         if not draft or draft.get("_draft_type") != PROJECT_CREATE_DRAFT_TYPE:
             return ToolResult(
                 status=ToolStatus.NOT_FOUND,
@@ -247,46 +272,107 @@ class ProjectCreateConfirmTool:
                     error="Bitrix OAuth is required for project creation.",
                     data={"params": sanitized},
                 )
+            claimed = None
             try:
                 oauth_client = await self._bitrix_oauth.client_for_user(user_id)
+                claimed = await claim_exact_draft(
+                    self._store, dialog_key=dialog_key, draft=draft, expected_type=PROJECT_CREATE_DRAFT_TYPE
+                )
+                if claimed is None:
+                    return ToolResult(
+                        status=ToolStatus.DENIED,
+                        tool=self.name,
+                        error="project draft changed, expired, or is already being confirmed",
+                    )
+                if not await renew_exact_draft_claim(self._store, dialog_key=dialog_key, draft=claimed):
+                    return ToolResult(status=ToolStatus.DENIED, tool=self.name, error="project draft claim was lost")
                 result = await oauth_client.call("sonet_group.create", sanitized)
             except BitrixOAuthTokenMissing as exc:
+                if claimed is not None:
+                    await release_exact_draft(self._store, dialog_key=dialog_key, draft=claimed)
                 return ToolResult(
                     status=ToolStatus.NOT_CONFIGURED, tool=self.name, error=str(exc), data={"params": sanitized}
                 )
-            except (BitrixApiError, BitrixConfigError) as exc:
+            except BitrixConfigError as exc:
+                if claimed is not None:
+                    await release_exact_draft(self._store, dialog_key=dialog_key, draft=claimed)
                 return ToolResult(
-                    status=ToolStatus.NOT_CONFIGURED if isinstance(exc, BitrixConfigError) else ToolStatus.ERROR,
+                    status=ToolStatus.NOT_CONFIGURED,
                     tool=self.name,
                     error=str(exc),
-                    data={"params": sanitized},
+                    data={"params": sanitized, "mutation_outcome": "not_started"},
+                )
+            except BitrixApiError as exc:
+                outcome = bitrix_mutation_outcome(exc)
+                if claimed is not None and outcome == "rejected":
+                    await release_exact_draft(self._store, dialog_key=dialog_key, draft=claimed)
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool=self.name,
+                    error=str(exc),
+                    data={"params": sanitized, "mutation_outcome": outcome},
                 )
             except Exception as exc:
                 return ToolResult(
                     status=ToolStatus.ERROR,
                     tool=self.name,
                     error=f"{type(exc).__name__}: {exc}",
-                    data={"params": sanitized},
+                    data={"params": sanitized, "mutation_outcome": "unknown"},
                 )
-            await self._store.delete_task_draft(dialog_key)
+            followup_task_draft = await _replace_with_followup_task_draft(
+                self._store,
+                dialog_key=dialog_key,
+                project_draft=claimed,
+                project_create_result=result,
+            )
             return ToolResult(
-                status=ToolStatus.OK, tool=self.name, data={"result": result, "params": sanitized, "draft": draft}
+                status=ToolStatus.OK,
+                tool=self.name,
+                data=_project_confirm_data(
+                    result=result,
+                    params=sanitized,
+                    draft=draft,
+                    followup_task_draft=followup_task_draft,
+                ),
             )
 
         if self._write_client is None:
             return ToolResult(status=ToolStatus.NOT_CONFIGURED, tool=self.name, error="write_client is not configured")
+        claimed = await claim_exact_draft(
+            self._store, dialog_key=dialog_key, draft=draft, expected_type=PROJECT_CREATE_DRAFT_TYPE
+        )
+        if claimed is None:
+            return ToolResult(
+                status=ToolStatus.DENIED,
+                tool=self.name,
+                error="project draft changed, expired, or is already being confirmed",
+            )
         try:
+            if not await renew_exact_draft_claim(self._store, dialog_key=dialog_key, draft=claimed):
+                return ToolResult(status=ToolStatus.DENIED, tool=self.name, error="project draft claim was lost")
             result = await self._write_client.call("sonet_group.create", sanitized)
         except Exception as exc:
             return ToolResult(
                 status=ToolStatus.ERROR,
                 tool=self.name,
                 error=f"{type(exc).__name__}: {exc}",
-                data={"params": sanitized},
+                data={"params": sanitized, "mutation_outcome": "unknown"},
             )
-        await self._store.delete_task_draft(dialog_key)
+        followup_task_draft = await _replace_with_followup_task_draft(
+            self._store,
+            dialog_key=dialog_key,
+            project_draft=claimed,
+            project_create_result=result,
+        )
         return ToolResult(
-            status=ToolStatus.OK, tool=self.name, data={"result": result, "params": sanitized, "draft": draft}
+            status=ToolStatus.OK,
+            tool=self.name,
+            data=_project_confirm_data(
+                result=result,
+                params=sanitized,
+                draft=draft,
+                followup_task_draft=followup_task_draft,
+            ),
         )
 
 
@@ -311,9 +397,22 @@ class ProjectCreateDiscardTool:
         dialog_key: str | None = None,
         dialog_id: str | None = None,
     ) -> ToolResult:
+        linked_task = False
         if dialog_key:
-            await self._store.delete_task_draft(dialog_key)
-        return ToolResult(status=ToolStatus.OK, tool=self.name, data={"discarded": bool(dialog_key)})
+            draft = await self._store.get_task_draft(dialog_key)
+            linked_task = isinstance(draft, dict) and isinstance(draft.get("after_project_create_task_draft"), dict)
+            if isinstance(draft, dict) and draft.get("_draft_type") == PROJECT_CREATE_DRAFT_TYPE:
+                await discard_exact_draft(
+                    self._store,
+                    dialog_key=dialog_key,
+                    draft=draft,
+                    expected_type=PROJECT_CREATE_DRAFT_TYPE,
+                )
+        return ToolResult(
+            status=ToolStatus.OK,
+            tool=self.name,
+            data={"discarded": bool(dialog_key), "linked_task": linked_task},
+        )
 
 
 def _draft_preview(fields: dict[str, Any], *, personal_for_self: bool) -> dict[str, str]:
@@ -323,6 +422,89 @@ def _draft_preview(fields: dict[str, Any], *, personal_for_self: bool) -> dict[s
         "visibility": "открытый" if fields.get("OPENED") == "Y" else "закрытый",
         "description": compact_text(str(fields.get("DESCRIPTION") or "")),
     }
+
+
+async def _replace_with_followup_task_draft(
+    store: TaskDraftStorePort,
+    *,
+    dialog_key: str,
+    project_draft: dict[str, Any],
+    project_create_result: object,
+) -> dict[str, Any] | None:
+    followup_task_draft = _followup_task_draft(project_draft, project_create_result)
+    await store.delete_task_draft(
+        dialog_key,
+        status="confirmed",
+        expected_draft_id=str(project_draft.get("_draft_id") or ""),
+        expected_version=optional_int(project_draft.get("_draft_version")),
+        expected_claim_token=str(project_draft.get("_draft_claim_token") or ""),
+    )
+    if followup_task_draft is None:
+        return None
+    followup_task_draft["params"] = attach_draft_metadata(
+        followup_task_draft["params"],
+        source_args=project_draft,
+        user_id=optional_int(project_draft.get("_draft_user_id")),
+    )
+    await store.save_task_draft(dialog_key, followup_task_draft["params"])
+    return followup_task_draft
+
+
+def _project_confirm_data(
+    *,
+    result: object,
+    params: dict[str, Any],
+    draft: dict[str, Any],
+    followup_task_draft: dict[str, Any] | None,
+) -> dict[str, Any]:
+    data = {"result": result, "params": params, "draft": draft}
+    if followup_task_draft is not None:
+        data["followup_task_draft"] = followup_task_draft
+    return data
+
+
+def _followup_task_draft(project_draft: dict[str, Any], project_create_result: object) -> dict[str, Any] | None:
+    followup = project_draft.get("after_project_create_task_draft")
+    if not isinstance(followup, dict):
+        return None
+    params = followup.get("params") if isinstance(followup.get("params"), dict) else {}
+    fields = params.get("fields") if isinstance(params.get("fields"), dict) else {}
+    if not fields:
+        return None
+    project_id = _created_project_id(project_create_result)
+    if project_id is None:
+        return None
+    project_name = compact_text(str(followup.get("project_name") or ""))
+    task_fields = dict(fields)
+    task_fields["GROUP_ID"] = project_id
+    preview = dict(followup.get("preview")) if isinstance(followup.get("preview"), dict) else {}
+    if project_name:
+        preview["project"] = project_name
+    return {
+        "params": {"fields": task_fields},
+        "preview": preview,
+        "project_id": project_id,
+        "project_name": project_name,
+    }
+
+
+def _created_project_id(value: object) -> int | None:
+    direct = optional_int(value)
+    if direct is not None:
+        return direct
+    if not isinstance(value, dict):
+        return None
+    candidates: list[object] = [value.get("id"), value.get("ID"), value.get("group_id"), value.get("GROUP_ID")]
+    nested = value.get("result")
+    if isinstance(nested, dict):
+        candidates.extend([nested.get("id"), nested.get("ID"), nested.get("group_id"), nested.get("GROUP_ID")])
+    else:
+        candidates.append(nested)
+    for candidate in candidates:
+        project_id = optional_int(candidate)
+        if project_id is not None:
+            return project_id
+    return None
 
 
 def _same_personal_project_name(name: str, actor_name: str) -> bool:

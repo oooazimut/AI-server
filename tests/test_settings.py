@@ -65,6 +65,17 @@ def test_bitrix_oauth_bot_settings_can_be_loaded(monkeypatch):
     assert settings.bitrix_bot_oauth_user_id == 9
 
 
+def test_bitrix_draft_ttl_defaults_to_fifteen_minutes_and_allows_override(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.delenv("BITRIX_TASK_DRAFT_TTL_MINUTES", raising=False)
+
+    assert get_settings().bitrix_task_draft_ttl_minutes == 15
+
+    monkeypatch.setenv("BITRIX_TASK_DRAFT_TTL_MINUTES", "23")
+
+    assert get_settings().bitrix_task_draft_ttl_minutes == 23
+
+
 def test_task_close_control_worker_settings(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.delenv("BITRIX_TASK_CLOSE_CONTROL_WORKER_ENABLED", raising=False)
@@ -135,6 +146,21 @@ def test_diagnost_can_be_disabled(monkeypatch):
     settings = get_settings()
 
     assert settings.diagnost_enabled is False
+
+
+def test_diagnost_trace_is_on_and_feedback_is_off_by_default(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.delenv("DIAGNOST_FEEDBACK_ENABLED", raising=False)
+    monkeypatch.delenv("DIAGNOST_TRACE_SNAPSHOT_ENABLED", raising=False)
+    monkeypatch.delenv("CONVERSATION_TRACE_ENABLED", raising=False)
+    monkeypatch.delenv("LEARNING_EVENTS_ENABLED", raising=False)
+
+    settings = get_settings()
+
+    assert settings.diagnost_feedback_enabled is False
+    assert settings.diagnost_trace_snapshot_enabled is True
+    assert settings.conversation_trace_enabled is True
+    assert settings.learning_events_enabled is False
 
 
 def test_bitrix_oauth_urls_are_resolved(monkeypatch):

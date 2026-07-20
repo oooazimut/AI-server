@@ -20,7 +20,6 @@ from ai_server.integrations.bitrix.task_close_control import (
 )
 from ai_server.integrations.bitrix.task_close_direct_queue import (
     TASK_CLOSE_DIRECT_STATUS_ACTIVE,
-    TASK_CLOSE_DIRECT_STATUS_PENDING,
     direct_close_state_key,
 )
 from ai_server.integrations.bitrix.task_close_reports import task_close_report_state_key
@@ -33,7 +32,7 @@ from ai_server.workers.bitrix.search_webhook_indexer import (
     prepare_search_webhook_job,
     process_search_webhook_job,
 )
-from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, FakePortalSearchIndex
+from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, FakeOrchestratorStore, FakePortalSearchIndex
 
 
 def _create_index() -> FakePortalSearchIndex:
@@ -84,6 +83,28 @@ class _FakeBitrixOAuth:
     async def client_for_user(self, user_id: int):
         self.user_ids.append(user_id)
         return self.client
+
+
+class _FakeLiveBitrixFiles(_FakeBitrixFiles):
+    def __init__(self, *, fail_live: bool = False) -> None:
+        super().__init__(allowed_files=set(range(1, 1000)))
+        self.fail_live = fail_live
+        self.live_calls: list[tuple[str, int | None]] = []
+
+    async def list_disk_storages(self, *, limit: int | None = None):
+        self.live_calls.append(("list_disk_storages", limit))
+        if self.fail_live:
+            raise RuntimeError("live unavailable")
+        return [{"ID": 1, "NAME": "Shared", "ROOT_OBJECT_ID": 100}]
+
+    async def list_disk_folder_children_all(self, *, folder_id: int, filter_=None, limit: int | None = None):
+        self.live_calls.append(("list_disk_folder_children_all", folder_id))
+        if self.fail_live:
+            raise RuntimeError("live unavailable")
+        return [
+            {"ID": 501, "NAME": "invoice alpha.pdf", "TYPE": "file", "DETAIL_URL": "/disk/501"},
+            {"ID": 502, "NAME": "unrelated.txt", "TYPE": "file", "DETAIL_URL": "/disk/502"},
+        ]
 
 
 def test_portal_search_index_searches_old_schema():
@@ -144,6 +165,197 @@ def test_portal_search_tool_filters_inaccessible_documents():
     assert [item["entity_id"] for item in result.data["results"]] == ["101"]
     assert result.data["access_checked"] is True
     assert result.data["access_filtered_count"] == 1
+
+
+def test_portal_search_tool_paginates_dialog_bound_results_without_duplicates():
+    import asyncio
+
+    index = FakePortalSearchIndex()
+    allowed = set(range(1, 13))
+    for item_id in sorted(allowed):
+        index.upsert_item(
+            entity_type="disk_file",
+            entity_id=item_id,
+            title=f"alpha document {item_id:02d}",
+            metadata={"disk_object_id": item_id},
+        )
+    store = FakeOrchestratorStore()
+    tool = PortalSearchTool(
+        portal_search=index,
+        bitrix_files=_FakeBitrixFiles(allowed_files=allowed),
+        state_store=store,
+    )
+
+    first = asyncio.run(tool.execute({"query": "alpha", "scope": "documents"}, dialog_key="dialog-1"))
+    second = asyncio.run(tool.execute({"continuation": "next"}, dialog_key="dialog-1"))
+
+    first_ids = [item["entity_id"] for item in first.data["results"]]
+    second_ids = [item["entity_id"] for item in second.data["results"]]
+    assert first.status == "ok"
+    assert second.status == "ok"
+    assert first.data["total"] == second.data["total"] == 12
+    assert first.data["range_start"] == 1
+    assert first.data["range_end"] == 10
+    assert first.data["remaining"] == 2
+    assert first.data["pages"] == 2
+    assert second.data["offset"] == 10
+    assert second.data["range_start"] == 11
+    assert second.data["range_end"] == 12
+    assert second.data["has_more"] is False
+    assert set(first_ids).isdisjoint(second_ids)
+
+
+def test_portal_search_tool_show_all_is_bounded_to_fifty():
+    import asyncio
+
+    index = FakePortalSearchIndex()
+    allowed = set(range(1, 56))
+    for item_id in sorted(allowed):
+        index.upsert_item(
+            entity_type="disk_file",
+            entity_id=item_id,
+            title=f"alpha document {item_id:02d}",
+            metadata={"disk_object_id": item_id},
+        )
+    tool = PortalSearchTool(portal_search=index, bitrix_files=_FakeBitrixFiles(allowed_files=allowed))
+
+    result = asyncio.run(tool.execute({"query": "alpha", "scope": "documents", "show_all": True}))
+
+    assert result.status == "ok"
+    assert result.data["limit"] == 50
+    assert result.data["shown"] == 50
+    assert result.data["total"] == 55
+    assert result.data["remaining"] == 5
+
+
+def test_portal_search_missing_index_uses_current_user_live_search_and_updates_index():
+    import asyncio
+
+    index = FakePortalSearchIndex(exists=False)
+    fallback = _FakeBitrixFiles()
+    live = _FakeLiveBitrixFiles()
+    oauth = _FakeBitrixOAuth(live)
+    tool = PortalSearchTool(
+        portal_search=index,
+        bitrix_files=fallback,
+        bitrix_oauth=oauth,
+        live_fallback_enabled=True,
+        index_max_age_seconds=1,
+    )
+
+    result = asyncio.run(tool.execute({"query": "invoice alpha", "scope": "documents"}, user_id=13))
+
+    assert result.status == "ok"
+    assert result.data["index_state"] == "missing"
+    assert result.data["source_mode"] == "bitrix_live_current_user"
+    assert result.data["access_actor"] == "oauth_current_user"
+    assert result.data["stale_results_suppressed"] == 0
+    assert [item["entity_id"] for item in result.data["results"]] == ["501"]
+    assert result.data["results"][0]["source"] == "bitrix_live_current_user"
+    assert fallback.calls == []
+    assert oauth.user_ids == [13]
+    assert live.live_calls
+    assert index.get_item(entity_type="disk_file", entity_id="501") is not None
+
+
+def test_portal_search_stale_index_suppresses_snapshot_when_current_user_live_check_fails():
+    import asyncio
+    from dataclasses import replace
+
+    class _StaleIndex(FakePortalSearchIndex):
+        def stats(self):
+            return replace(super().stats(), last_indexed_at="2000-01-01T00:00:00+00:00")
+
+    index = _StaleIndex()
+    index.upsert_item(
+        entity_type="disk_file",
+        entity_id=101,
+        title="alpha stale document",
+        metadata={"disk_object_id": 101},
+    )
+    live = _FakeLiveBitrixFiles(fail_live=True)
+    tool = PortalSearchTool(
+        portal_search=index,
+        bitrix_oauth=_FakeBitrixOAuth(live),
+        live_fallback_enabled=True,
+        index_max_age_seconds=1,
+    )
+
+    result = asyncio.run(tool.execute({"query": "alpha", "scope": "documents"}, user_id=13))
+
+    assert result.status == "error"
+    assert result.data["index_state"] == "stale"
+    assert result.data["stale_results_suppressed"] == 1
+    assert result.data["results"] == []
+    assert "live verification failed" in result.error
+
+
+def test_portal_search_uses_durable_indexer_success_instead_of_item_max_timestamp(tmp_path):
+    import asyncio
+    import json
+    from datetime import UTC, datetime
+
+    state_path = tmp_path / "search-indexer-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "last_metadata_sync_at": datetime.now(UTC).isoformat(),
+                "last_delta_sync_at": None,
+                "consecutive_errors": 0,
+                "last_error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    tool = PortalSearchTool(
+        portal_search=_create_index(),
+        bitrix_files=_FakeBitrixFiles(),
+        index_max_age_seconds=3600,
+        index_freshness_path=state_path,
+    )
+
+    result = asyncio.run(tool.execute({"query": "транзит договор", "scope": "documents"}))
+
+    assert result.status == "ok"
+    assert result.data["index_state"] == "fresh"
+    assert result.data["index_freshness_source"] == "indexer_state:last_metadata_sync_at"
+    assert result.data["source_mode"] == "bitrix_postgresql"
+
+
+def test_portal_search_indexer_without_success_stays_stale_after_live_item_refresh(tmp_path):
+    import asyncio
+    import json
+
+    index = _create_index()
+    state_path = tmp_path / "search-indexer-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "last_metadata_sync_at": None,
+                "last_delta_sync_at": None,
+                "consecutive_errors": 0,
+                "last_error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    live = _FakeLiveBitrixFiles()
+    tool = PortalSearchTool(
+        portal_search=index,
+        bitrix_oauth=_FakeBitrixOAuth(live),
+        live_fallback_enabled=True,
+        index_max_age_seconds=3600,
+        index_freshness_path=state_path,
+    )
+
+    first = asyncio.run(tool.execute({"query": "invoice alpha", "scope": "documents"}, user_id=13))
+    second = asyncio.run(tool.execute({"query": "invoice alpha", "scope": "documents"}, user_id=13))
+
+    assert first.status == second.status == "ok"
+    assert first.data["index_state"] == second.data["index_state"] == "stale"
+    assert first.data["index_freshness_source"] == "indexer_state_missing_success"
+    assert second.data["index_freshness_source"] == "indexer_state_missing_success"
+    assert first.data["source_mode"] == second.data["source_mode"] == "bitrix_live_current_user"
 
 
 def test_portal_search_tool_uses_oauth_client_for_document_access_check():
@@ -381,7 +593,12 @@ def test_portal_metadata_sync_queues_controlled_direct_closed_tasks(monkeypatch)
         value="2026-07-12T00:00:00+03:00",
         updated_by=1,
     )
-    index.upsert_task_close_controlled_user(user_id=13, active=True, updated_by=1)
+    index.upsert_task_close_controlled_user(
+        user_id=13,
+        active=True,
+        updated_by=1,
+        controlled_from="2026-07-12T12:15:00+03:00",
+    )
 
     class DirectClosedBitrix(FakePortalBitrix):
         async def list_all_tasks(self, **kwargs):
@@ -426,15 +643,16 @@ def test_portal_metadata_sync_queues_controlled_direct_closed_tasks(monkeypatch)
     late_event = index.get_task_close_control_event(task_id=402, close_event_key=late_key)
     assert early_event is not None
     assert late_event is not None
-    assert early_event["decision"] == TASK_CLOSE_DECISION_CONTROLLED
+    assert early_event["decision"] == TASK_CLOSE_DECISION_IGNORED_BEFORE_START
     assert late_event["decision"] == TASK_CLOSE_DECISION_CONTROLLED
+    assert early_event["payload"]["controlled_from"] == "2026-07-12T12:15:00+03:00"
+    assert early_event["payload"]["effective_control_start"] == "2026-07-12T12:15:00+03:00"
 
     early_state = index.get_task_close_processing_state(task_id=401, state_key=direct_close_state_key(early_key))
     late_state = index.get_task_close_processing_state(task_id=402, state_key=direct_close_state_key(late_key))
-    assert early_state is not None
+    assert early_state is None
     assert late_state is not None
-    assert early_state["status"] == TASK_CLOSE_DIRECT_STATUS_ACTIVE
-    assert late_state["status"] == TASK_CLOSE_DIRECT_STATUS_PENDING
+    assert late_state["status"] == TASK_CLOSE_DIRECT_STATUS_ACTIVE
 
 
 def test_portal_metadata_sync_keeps_uncontrolled_direct_close_ignored_after_user_added(monkeypatch):
@@ -491,7 +709,12 @@ def test_portal_metadata_sync_ignores_direct_close_before_control_start(monkeypa
         value="2026-07-12T00:00:00+03:00",
         updated_by=1,
     )
-    index.upsert_task_close_controlled_user(user_id=13, active=True, updated_by=1)
+    index.upsert_task_close_controlled_user(
+        user_id=13,
+        active=True,
+        updated_by=1,
+        controlled_from="2026-07-12T00:00:00+03:00",
+    )
 
     class OldDirectClosedBitrix(FakePortalBitrix):
         async def list_all_tasks(self, **kwargs):

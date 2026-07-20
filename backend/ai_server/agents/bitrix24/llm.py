@@ -215,6 +215,14 @@ class BitrixLLMService:
                 raw={"source": "task_close_start_route"},
             )
 
+        local_decision = _common_task_create_draft_decision(task.request, task.context, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "task_create_draft_route"),
+                raw={"source": "task_create_draft_route"},
+            )
+
         local_decision = _common_calendar_event_draft_decision(task.request, tool_definitions)
         if local_decision is not None:
             return BitrixLLMDecisionResult(
@@ -388,15 +396,22 @@ def _direct_task_create_response(
                 model_usage=_local_model_usage(agent_id, "project_create_draft_response"),
             )
         if result.tool == "project_create_confirm":
+            confirm_data = result.data if isinstance(result.data, dict) else {}
+            has_followup_task = isinstance(confirm_data.get("followup_task_draft"), dict)
             return BitrixLLMFinalResult(
-                status="completed",
+                status="needs_human" if has_followup_task else "completed",
                 answer=_format_project_create_confirm_answer(result.data, portal_base_url=portal_base_url),
                 model_usage=_local_model_usage(agent_id, "project_create_confirm_response"),
             )
         if result.tool == "project_create_discard":
+            data = result.data if isinstance(result.data, dict) else {}
             return BitrixLLMFinalResult(
                 status="completed",
-                answer="Черновик проекта удалён.",
+                answer=(
+                    "Черновик проекта и связанной задачи удалён."
+                    if data.get("linked_task")
+                    else "Черновик проекта удалён."
+                ),
                 model_usage=_local_model_usage(agent_id, "project_create_discard_response"),
             )
         if result.tool == "task_create_draft":
@@ -660,8 +675,9 @@ def _format_portal_search_answer(data: dict[str, Any], *, portal_base_url: str =
     if not items:
         return title.replace(":", " не найдены.")
 
+    offset = _int_value(data.get("offset")) or 0
     lines = [title]
-    for index, item in enumerate(items, start=1):
+    for index, item in enumerate(items, start=offset + 1):
         if not isinstance(item, dict):
             continue
         label = _portal_item_link(
@@ -674,9 +690,18 @@ def _format_portal_search_answer(data: dict[str, Any], *, portal_base_url: str =
         if snippet:
             lines.append(f"   Фрагмент: {snippet}")
 
-    limit = _int_value(data.get("limit")) or len(items)
-    if len(items) >= limit:
-        lines.append(f"Показаны первые {len(items)} результатов. Если нужно, можно уточнить запрос.")
+    shown = len(items)
+    total = _int_value(data.get("total")) or shown
+    range_start = _int_value(data.get("range_start")) or (offset + 1 if shown else 0)
+    range_end = _int_value(data.get("range_end")) or (offset + shown)
+    remaining = _int_value(data.get("remaining")) or max(0, total - range_end)
+    pages = _int_value(data.get("pages")) or 1
+    if total:
+        lines.append(
+            f"Показаны результаты {range_start}-{range_end} из {total}. Осталось: {remaining}. Страниц: {pages}."
+        )
+    if bool(data.get("has_more")):
+        lines.append("Чтобы продолжить тот же поиск, попросите показать следующие результаты.")
     return "\n".join(lines)
 
 
@@ -712,7 +737,11 @@ def _format_project_create_confirm_answer(data: dict[str, Any], *, portal_base_u
     name = _text(fields.get("NAME")) or _text(draft_fields.get("NAME")) or "проект"
     project_id = _created_project_id(data.get("result"))
     label = _project_link(name, project_id, portal_base_url=portal_base_url)
-    return f"Проект создан: {label}."
+    answer = f"Проект создан: {label}."
+    followup = data.get("followup_task_draft") if isinstance(data.get("followup_task_draft"), dict) else {}
+    if followup:
+        answer = f"{answer}\n\n{_format_task_create_draft_answer(followup)}"
+    return answer
 
 
 def _portal_search_title(*, scope: str, query: str) -> str:
@@ -876,6 +905,8 @@ def _ru_position_word(count: int) -> str:
 
 
 def _format_task_create_draft_answer(data: dict[str, Any]) -> str:
+    if data.get("requires_project_creation"):
+        return _format_task_create_requires_project_answer(data)
     preview = data.get("preview") if isinstance(data.get("preview"), dict) else {}
     params = data.get("params") if isinstance(data.get("params"), dict) else {}
     fields = params.get("fields") if isinstance(params.get("fields"), dict) else {}
@@ -899,6 +930,54 @@ def _format_task_create_draft_answer(data: dict[str, Any]) -> str:
             f"Описание: {description}",
             "",
             "Если всё верно, напишите: да, создай.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _format_task_create_requires_project_answer(data: dict[str, Any]) -> str:
+    project_name = _text(data.get("missing_project_name")) or "личный проект"
+    project_draft = data.get("project_draft") if isinstance(data.get("project_draft"), dict) else {}
+    project_preview = project_draft.get("preview") if isinstance(project_draft.get("preview"), dict) else {}
+    task_draft = data.get("pending_task_draft") if isinstance(data.get("pending_task_draft"), dict) else {}
+    task_preview = task_draft.get("preview") if isinstance(task_draft.get("preview"), dict) else {}
+    task_params = task_draft.get("params") if isinstance(task_draft.get("params"), dict) else {}
+    task_fields = task_params.get("fields") if isinstance(task_params.get("fields"), dict) else {}
+
+    title = _text(task_preview.get("title")) or _text(task_fields.get("TITLE")) or "задача"
+    responsible = _text(task_preview.get("responsible")) or "указанный сотрудник"
+    deadline = _text(task_preview.get("deadline")) or _deadline_label_from_fields(task_fields)
+    description = _clean_task_description(
+        _text(task_preview.get("description"))
+        or _text(task_fields.get("DESCRIPTION"))
+        or f"Краткое содержание: {title}"
+    )
+    project_type = _text(project_preview.get("type")) or "личный проект"
+    visibility = _text(project_preview.get("visibility"))
+    project_description = _text(project_preview.get("description"))
+
+    lines = [
+        f"Личный проект «{project_name}» не найден.",
+        "Сначала нужно создать проект, затем я подготовлю задачу в нём.",
+        "",
+        "Черновик проекта:",
+        f"Название: {project_name}",
+        f"Тип: {project_type}",
+    ]
+    if visibility:
+        lines.append(f"Открытость: {visibility}")
+    if project_description:
+        lines.append(f"Описание: {project_description}")
+    lines.extend(
+        [
+            "",
+            "После создания проекта будет подготовлен черновик задачи:",
+            f"Название: {title}",
+            f"Ответственный: {responsible}",
+            f"Срок: {deadline}",
+            f"Описание: {description}",
+            "",
+            "Если всё верно, напишите: да, создай проект.",
         ]
     )
     return "\n".join(lines)
@@ -1561,6 +1640,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "For task closing draft updates, keep the four blocks isolated: block 1/task points only records each work item status (completed/not done/unconfirmed), block 2 only records used materials/equipment, block 3 only records the user's overall status and reasons, and block 4 only records additional information. Ignore extra text inside the wrong block and never move it to another block. "
         "If permission_context.pending_task_draft._draft_type is calendar_event and the current user explicitly confirms calendar creation, call calendar_event_confirm. "
         "If permission_context.pending_task_draft._draft_type is project_create and the current user explicitly confirms project creation, call project_create_confirm. "
+        "If permission_context.pending_task_draft._draft_type is admin_change, confirm with task_close_control_update operation=confirm and cancel with operation=discard. "
         "If the current user explicitly cancels or rejects a task creation draft, call task_draft_discard. "
         "If the current user explicitly cancels or rejects a task closing draft, call task_close_discard. "
         "If the current user explicitly cancels or rejects a calendar event draft, call calendar_event_discard. "
@@ -1703,6 +1783,11 @@ _CALENDAR_REMINDER_TITLE_CUTOFF_RE = re.compile(
     r"\s+(?:не\s+добавляй|только\s+покажи|покажи\s+черновик|создай\s+черновик|для\s+подтверждения)\b.*",
     re.IGNORECASE | re.DOTALL,
 )
+_TASK_CREATE_TITLE_CUTOFF_RE = re.compile(
+    r"(?:[.?!]\s*|\s+)(?:не\s+создавай|не\s+добавляй|только\s+покажи|покажи\s+черновик|"
+    r"создай\s+черновик|для\s+подтверждения)\b.*",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _common_draft_discard_decision(
@@ -1722,9 +1807,15 @@ def _common_draft_discard_decision(
             "task_close": "task_close_discard",
             "calendar_event": "calendar_event_discard",
             "project_create": "project_create_discard",
+            "admin_change": "task_close_control_update",
         }.get(draft_type)
         if tool_name and _draft_discard_tool_available(tool_definitions, tool_name):
-            return _discard_decision_tool(tool_name, f"deterministic Bitrix {draft_type} draft discard routing")
+            args = {"operation": "discard"} if draft_type == "admin_change" else None
+            return _discard_decision_tool(
+                tool_name,
+                f"deterministic Bitrix {draft_type} draft discard routing",
+                args=args,
+            )
         return None
 
     fallback_tool = _draft_discard_tool_from_text(lowered)
@@ -1756,7 +1847,12 @@ def _is_draft_discard_request(lowered_request: str) -> bool:
     return any(marker in lowered_request for marker in ("отмени", "отменить", "удали", "удалить"))
 
 
-def _discard_decision_tool(name: str, summary: str) -> BitrixLLMDecision:
+def _discard_decision_tool(
+    name: str,
+    summary: str,
+    *,
+    args: dict[str, Any] | None = None,
+) -> BitrixLLMDecision:
     return BitrixLLMDecision(
         status="completed",
         answer="",
@@ -1764,11 +1860,89 @@ def _discard_decision_tool(name: str, summary: str) -> BitrixLLMDecision:
         tool_calls=[
             BitrixLLMToolCall(
                 name=name,
-                args={},
+                args=args or {},
                 summary=summary,
             )
         ],
     )
+
+
+def _common_task_create_draft_decision(
+    request: str,
+    context: dict[str, Any],
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    """Route an unambiguous self-assigned task draft without model variance.
+
+    Named assignees remain with the model/tool loop.  The task draft tool already
+    resolves an exact project name through its bounded Bitrix lookup, so an
+    unambiguous current-user project task is deterministic too.
+    """
+
+    if not _draft_discard_tool_available(tool_definitions, "task_create_draft"):
+        return None
+    if _write_profile_from_bitrix_profile(context.get("bitrix_current_user_profile")) not in {
+        "member_write",
+        "full_bitrix_write",
+    }:
+        return None
+    args = _simple_self_task_draft_args(_strip_command_prefix(request))
+    if args is None:
+        return None
+    return BitrixLLMDecision(
+        status="completed",
+        answer="",
+        confidence=0.95,
+        tool_calls=[
+            BitrixLLMToolCall(
+                name="task_create_draft",
+                args=args,
+                summary="deterministic Bitrix current-user task draft routing",
+            )
+        ],
+    )
+
+
+def _simple_self_task_draft_args(request: str) -> dict[str, Any] | None:
+    lowered = request.casefold()
+    if "задач" not in lowered:
+        return None
+    if not re.search(r"\b(?:создай|создайте|создать|поставь|поставьте|поставить)\s+задач", lowered):
+        return None
+    assignment_markers = ("назнач", "поруч", "исполнител", "ответственн")
+    if any(marker in lowered for marker in assignment_markers):
+        return None
+
+    match = re.search(
+        r"\bзадач[ауи]?\b(?P<between>[^:]{0,80}):\s*(?P<title>.+)", request, flags=re.IGNORECASE | re.DOTALL
+    )
+    if match is None:
+        return None
+    between = match.group("between")
+    project_match = re.fullmatch(
+        r"\s*в\s+проекте\s+(?P<project>.+?)\s+(?:на|для)\s+меня\s*",
+        between,
+        flags=re.IGNORECASE,
+    )
+    if project_match is None and "проект" in lowered:
+        return None
+    if (
+        project_match is None
+        and between.strip()
+        and not re.fullmatch(r"\s*(?:на|для)\s+меня\s*", between, flags=re.IGNORECASE)
+    ):
+        return None
+    title = _TASK_CREATE_TITLE_CUTOFF_RE.split(match.group("title"), maxsplit=1)[0]
+    title = title.strip(" \t\r\n\"'«».,!?;:-")
+    if not title:
+        return None
+    args: dict[str, Any] = {"title": title, "responsible_self": True}
+    if project_match is not None:
+        project_name = project_match.group("project").strip(" \t\r\n\"'«».,!?;:-")
+        if not project_name:
+            return None
+        args["project_name"] = project_name
+    return args
 
 
 def _common_draft_confirm_decision(
@@ -1788,12 +1962,18 @@ def _common_draft_confirm_decision(
         "task_close": "task_close_confirm",
         "calendar_event": "calendar_event_confirm",
         "project_create": "project_create_confirm",
+        "admin_change": "task_close_control_update",
     }.get(draft_type)
     if not tool_name:
         return None
     if not _draft_discard_tool_available(tool_definitions, tool_name):
         return None
-    return _confirm_decision_tool(tool_name, f"deterministic Bitrix {draft_type} draft confirm routing")
+    args = {"operation": "confirm"} if draft_type == "admin_change" else None
+    return _confirm_decision_tool(
+        tool_name,
+        f"deterministic Bitrix {draft_type} draft confirm routing",
+        args=args,
+    )
 
 
 def _is_draft_confirm_request(lowered_request: str) -> bool:
@@ -1811,7 +1991,12 @@ def _is_draft_confirm_request(lowered_request: str) -> bool:
     )
 
 
-def _confirm_decision_tool(name: str, summary: str) -> BitrixLLMDecision:
+def _confirm_decision_tool(
+    name: str,
+    summary: str,
+    *,
+    args: dict[str, Any] | None = None,
+) -> BitrixLLMDecision:
     return BitrixLLMDecision(
         status="completed",
         answer="",
@@ -1819,7 +2004,7 @@ def _confirm_decision_tool(name: str, summary: str) -> BitrixLLMDecision:
         tool_calls=[
             BitrixLLMToolCall(
                 name=name,
-                args={},
+                args=args or {},
                 summary=summary,
             )
         ],
@@ -1848,6 +2033,7 @@ def _common_task_close_start_decision(
                 name="task_close_draft",
                 args={
                     "task_id": task_id,
+                    "close_now": True,
                     "overall_status": "unconfirmed",
                     "unconfirmed_items": ["результат выполнения не указан"],
                     "missing_fields": [
@@ -2774,13 +2960,43 @@ def _common_read_decision(request: str, tool_definitions: list[dict[str, Any]] |
 
 def _common_document_read_args(request: str) -> dict[str, Any] | None:
     lowered = request.casefold()
+    if _looks_like_document_continuation(lowered):
+        return {"continuation": "next"}
     if not _looks_like_document_search_request(lowered):
         return None
     query = _clean_document_query(request)
     if not query:
         return None
     scope = "files" if _looks_like_file_or_disk_scope(lowered) else "documents"
-    return {"query": query, "scope": scope, "limit": _extract_document_limit(lowered) or 10}
+    show_all = _looks_like_document_show_all(lowered)
+    return {
+        "query": query,
+        "scope": scope,
+        "limit": 50 if show_all else (_extract_document_limit(lowered) or 10),
+        **({"show_all": True} if show_all else {}),
+    }
+
+
+def _looks_like_document_continuation(lowered: str) -> bool:
+    if any(marker in lowered for marker in ("задач", "проект", "склад", "товар")):
+        return False
+    has_continuation = any(marker in lowered for marker in ("следующ", "дальше", "продолж"))
+    has_target = any(marker in lowered for marker in ("результат", "документ", "файл"))
+    return has_continuation and has_target
+
+
+def _looks_like_document_show_all(lowered: str) -> bool:
+    return any(
+        marker in lowered
+        for marker in (
+            "покажи все",
+            "покажи всё",
+            "выведи все",
+            "выведи всё",
+            "все документы",
+            "все файлы",
+        )
+    )
 
 
 def _looks_like_document_search_request(lowered: str) -> bool:
@@ -2796,7 +3012,7 @@ def _extract_document_limit(lowered: str) -> int | None:
     if not match:
         return None
     try:
-        return max(1, min(int(match.group(1)), 30))
+        return max(1, min(int(match.group(1)), 50))
     except ValueError:
         return None
 
@@ -2804,7 +3020,7 @@ def _extract_document_limit(lowered: str) -> int | None:
 def _clean_document_query(request: str) -> str:
     text = _clean_read_query(request)
     text = re.sub(
-        r"\b(?:покажи|найди|найти|выведи|ищи|список|последн(?:ие|их)?|первые)\b",
+        r"\b(?:покажи|найди|найти|выведи|ищи|список|последн(?:ие|их)?|первые|все|всё)\b",
         " ",
         text,
         flags=re.IGNORECASE,
@@ -2823,6 +3039,7 @@ def _clean_document_query(request: str) -> str:
         "договоры": "договор",
         "договора": "договор",
         "договоров": "договор",
+        "договору": "договор",
         "счета": "счет",
         "счёта": "счет",
         "счетов": "счет",

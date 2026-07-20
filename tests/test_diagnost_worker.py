@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 import anyio
 
 from ai_server.models import AgentResult, AgentTask, UserContext
-from ai_server.workers.diagnost.event_worker import run_diagnost_event_worker
+from ai_server.workers.diagnost.event_worker import _trace_incident_reasons, run_diagnost_event_worker
 
 
 def _make_task(task_id: str = "task-1") -> AgentTask:
@@ -19,9 +19,10 @@ def _make_result(status: str = "completed", confidence: float = 0.9) -> AgentRes
     return AgentResult(status=status, agent_id="internal_orchestrator", answer="тест", confidence=confidence)
 
 
-def _msg(task: AgentTask, result: AgentResult, msg_id: str = "msg-1") -> dict:
+def _msg(task: AgentTask, result: AgentResult, msg_id: str = "msg-1", *, source: str = "orchestrator") -> dict:
     return {
         "_id": msg_id,
+        "source": source,
         "task": task.model_dump(),
         "result": result.model_dump(),
     }
@@ -144,7 +145,7 @@ def test_worker_uses_recipient_id_for_feedback_prompt():
     store.save_incident = AsyncMock()
     store.create_pending_feedback = AsyncMock()
 
-    _run_one(queue, store)
+    _run_one(queue, store, feedback_enabled=True)
 
     store.create_pending_feedback.assert_awaited_once_with(
         "task-feedback",
@@ -152,6 +153,84 @@ def test_worker_uses_recipient_id_for_feedback_prompt():
         "chat4321",
         channel="bitrix24_chat",
     )
+
+
+def test_worker_does_not_schedule_feedback_by_default():
+    task = AgentTask(
+        task_id="task-no-feedback",
+        request="test",
+        user=UserContext(id="1", channel="bitrix24_chat"),
+        context={"recipient_id": "chat1"},
+    )
+    queue = AsyncMock()
+    queue.claim_next = AsyncMock(side_effect=[_msg(task, _make_result()), None, None])
+    queue.ack = AsyncMock()
+    store = AsyncMock()
+    store.save_event = AsyncMock()
+    store.create_pending_feedback = AsyncMock()
+
+    _run_one(queue, store)
+
+    store.create_pending_feedback.assert_not_called()
+
+
+def test_trace_incidents_cover_delivery_and_latency():
+    task = AgentTask(
+        task_id="task-trace",
+        request="test",
+        context={"channel_id": "bitrix24", "recipient_id": "chat1"},
+    )
+    result = _make_result()
+    trace = [
+        {"trace_type": "outbound_message", "send_status": "error"},
+        {"trace_type": "timing_step", "stage": "handle_total", "elapsed_ms": 120001},
+    ]
+
+    assert _trace_incident_reasons(task, result, trace, high_latency_ms=120000) == [
+        "outbound_failed",
+        "high_latency",
+    ]
+
+
+def test_trace_incident_detects_missing_outbound():
+    task = AgentTask(
+        task_id="task-missing",
+        request="test",
+        context={"channel_id": "bitrix24", "recipient_id": "chat1"},
+    )
+
+    assert _trace_incident_reasons(task, _make_result(), [], high_latency_ms=120000) == ["missing_outbound"]
+
+
+def test_trace_incident_detects_unknown_outbound_outcome():
+    task = _make_task()
+    trace = [{"trace_type": "outbound_message", "send_status": "unknown"}]
+
+    assert _trace_incident_reasons(task, _make_result(), trace, high_latency_ms=120000) == ["outbound_unknown"]
+
+
+def test_outbound_delivery_event_creates_unknown_incident_from_terminal_trace():
+    task = _make_task("task-outbound-unknown")
+    result = _make_result()
+    queue = AsyncMock()
+    queue.claim_next = AsyncMock(side_effect=[_msg(task, result, source="outbound_delivery"), None, None, None])
+    queue.ack = AsyncMock()
+    store = AsyncMock()
+    store.save_event = AsyncMock()
+    store.save_trace_snapshot = AsyncMock()
+    store.save_incident = AsyncMock()
+    trace = AsyncMock()
+    trace.by_task = AsyncMock(return_value=[{"trace_type": "outbound_message", "send_status": "unknown"}])
+
+    _run_one(
+        queue,
+        store,
+        conversation_trace=trace,
+        trace_snapshot_enabled=True,
+        trace_settle_seconds=0,
+    )
+
+    store.save_incident.assert_awaited_once_with("task-outbound-unknown", reason="outbound_unknown")
 
 
 def test_worker_skips_malformed_message():

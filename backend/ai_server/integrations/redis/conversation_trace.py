@@ -116,6 +116,7 @@ class RedisConversationTrace:
         body: str,
         status: str,
         error: str = "",
+        delivery_id: str = "",
     ) -> None:
         if not self.enabled:
             return
@@ -129,6 +130,7 @@ class RedisConversationTrace:
                 "body": body,
                 "send_status": status,
                 "send_error": error,
+                "delivery_id": delivery_id,
             }
         )
 

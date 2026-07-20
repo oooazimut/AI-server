@@ -55,6 +55,7 @@ class SpecialistDeps:
     specialist_result_publisher: Any = None  # ResultPublisherPort | None (specialists, not diagnost)
     conversation_trace: Any = None  # RedisConversationTrace | None
     dialog_guard: Any = None  # RedisDialogGuard | None
+    outbound_queue: Any = None  # RedisOutboundQueue | None
 
     def as_build_kwargs(self) -> dict[str, Any]:
         """All non-None fields — pass to any agent build() method."""

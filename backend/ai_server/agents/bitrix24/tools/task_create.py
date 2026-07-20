@@ -5,6 +5,19 @@ from datetime import datetime, time, timedelta
 from typing import Any
 
 from ai_server.agents.bitrix24.ports import TaskDraftStorePort
+from ai_server.agents.bitrix24.tools.bitrix_api import _normalize_project_name
+from ai_server.agents.bitrix24.tools.draft_lifecycle import (
+    attach_draft_metadata,
+    bitrix_mutation_outcome,
+    claim_exact_draft,
+    discard_exact_draft,
+    release_exact_draft,
+    renew_exact_draft_claim,
+    resolve_unknown_draft_claim,
+)
+from ai_server.agents.bitrix24.tools.project_create import build_project_create_draft_from_args
+from ai_server.agents.bitrix24.tools.read_client import resolve_current_user_read_client
+from ai_server.agents.bitrix24.tools.tasks import _search_projects_snapshot
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
@@ -14,6 +27,7 @@ from ai_server.utils import MOSCOW_TZ, compact_text, optional_int, unique
 
 DEFAULT_TASK_DEADLINE_WORKING_DAYS = 3
 DEFAULT_TASK_DEADLINE_HOUR = 19
+TASK_CREATE_DRAFT_TYPE = "task_create"
 
 
 @dataclass(frozen=True)
@@ -92,7 +106,7 @@ def build_task_create_draft_from_args(args: dict[str, Any], *, user_id: int | No
         fields["NO_DEADLINE"] = True
 
     return BitrixTaskCreateDraft(
-        params={"fields": fields} if fields else {},
+        params={"_draft_type": TASK_CREATE_DRAFT_TYPE, "fields": fields} if fields else {},
         summary=_summary(title=title, responsible_id=responsible_id, deadline=deadline, group_id=group_id),
         preview=_draft_preview(fields, responsible_label=responsible_label, project_label=project_label)
         if fields
@@ -105,8 +119,17 @@ def build_task_create_draft_from_args(args: dict[str, Any], *, user_id: int | No
 class TaskCreateDraftTool:
     name = "task_create_draft"
 
-    def __init__(self, store: TaskDraftStorePort) -> None:
+    def __init__(
+        self,
+        store: TaskDraftStorePort,
+        project_client: Any | None = None,
+        portal_search: Any | None = None,
+        bitrix_oauth: BitrixOAuthService | None = None,
+    ) -> None:
         self._store = store
+        self._project_client = project_client
+        self._portal_search = portal_search
+        self._bitrix_oauth = bitrix_oauth
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -145,7 +168,29 @@ class TaskCreateDraftTool:
         dialog_key: str | None = None,
         dialog_id: str | None = None,
     ) -> ToolResult:
-        draft = build_task_create_draft_from_args(args, user_id=user_id)
+        resolved_args, project_note, project_error = await _args_with_resolved_project(
+            args,
+            project_client=self._project_client,
+            portal_search=self._portal_search,
+            bitrix_oauth=self._bitrix_oauth,
+            user_id=user_id,
+        )
+        if project_error is not None:
+            if (
+                project_error.status == ToolStatus.NOT_FOUND
+                and project_error.data.get("allow_personal_project_creation") is True
+            ):
+                project_create_result = await _prepare_missing_default_personal_project(
+                    store=self._store,
+                    args=resolved_args,
+                    user_id=user_id,
+                    dialog_key=dialog_key,
+                    dialog_id=dialog_id,
+                )
+                if project_create_result is not None:
+                    return project_create_result
+            return project_error
+        draft = build_task_create_draft_from_args(resolved_args, user_id=user_id)
         if not draft.is_ready:
             return ToolResult(
                 status=ToolStatus.CONTRACT_VIOLATION,
@@ -153,16 +198,23 @@ class TaskCreateDraftTool:
                 error=f"task_create_draft called outside contract: {'; '.join(draft.contract_errors)}",
                 data=draft.as_action_details(),
             )
+        stored_params = attach_draft_metadata(dict(draft.params), source_args=resolved_args, user_id=user_id)
+        resolved_project = resolved_args.get("_resolved_project")
+        if isinstance(resolved_project, dict):
+            stored_params["_resolved_project"] = dict(resolved_project)
         if dialog_key:
-            await self._store.save_task_draft(dialog_key, draft.params)
+            await self._store.save_task_draft(dialog_key, stored_params)
+        notes = list(draft.notes)
+        if project_note:
+            notes.append(project_note)
         return ToolResult(
             status=ToolStatus.OK,
             tool=self.name,
             data={
                 "summary": draft.summary,
-                "params": draft.params,
+                "params": stored_params,
                 "preview": draft.preview,
-                "notes": draft.notes,
+                "notes": notes,
             },
         )
 
@@ -214,12 +266,26 @@ class TaskCreateConfirmTool:
             )
         draft_params = await self._store.get_task_draft(dialog_key, ttl_minutes=self._draft_ttl_minutes)
         if not draft_params:
+            unresolved = await resolve_unknown_draft_claim(
+                self._store, dialog_key=dialog_key, expected_type=TASK_CREATE_DRAFT_TYPE
+            )
+            if unresolved is not None:
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool=self.name,
+                    error="task creation outcome requires durable audit before retry",
+                    data={
+                        "mutation_outcome": "unknown",
+                        "resolution_status": unresolved.get("_draft_resolution_status"),
+                        "draft_id": unresolved.get("_draft_id"),
+                    },
+                )
             return ToolResult(
                 status=ToolStatus.NOT_FOUND,
                 tool=self.name,
                 error="no pending task draft found for this dialog",
             )
-        if draft_params.get("_draft_type") not in (None, "task_create"):
+        if draft_params.get("_draft_type") not in (None, TASK_CREATE_DRAFT_TYPE):
             return ToolResult(
                 status=ToolStatus.NOT_FOUND,
                 tool=self.name,
@@ -232,7 +298,9 @@ class TaskCreateConfirmTool:
                 tool=self.name,
                 data={"params": draft_params},
             )
-        sanitized = apply_write_policy("tasks.task.add", draft_params)
+        write_params = {key: value for key, value in draft_params.items() if not str(key).startswith("_")}
+        sanitized = apply_write_policy("tasks.task.add", write_params)
+        project_reference = draft_params.get("_resolved_project")
 
         if self._oauth_required_for_writes:
             context_error = _write_context_error(user_id=user_id, dialog_id=dialog_id)
@@ -250,22 +318,56 @@ class TaskCreateConfirmTool:
                     error="Bitrix OAuth is required for task creation.",
                     data={"params": sanitized},
                 )
+            claimed = None
             try:
                 oauth_client = await self._bitrix_oauth.client_for_user(user_id)
+                project_error = await _validate_resolved_project_reference(oauth_client, project_reference)
+                if project_error is not None:
+                    return ToolResult(
+                        status=project_error.status,
+                        tool=self.name,
+                        error=project_error.error,
+                        data={"params": sanitized},
+                    )
+                claimed = await claim_exact_draft(
+                    self._store, dialog_key=dialog_key, draft=draft_params, expected_type=TASK_CREATE_DRAFT_TYPE
+                )
+                if claimed is None:
+                    return ToolResult(
+                        status=ToolStatus.DENIED,
+                        tool=self.name,
+                        error="task draft changed, expired, or is already being confirmed",
+                    )
+                if not await renew_exact_draft_claim(self._store, dialog_key=dialog_key, draft=claimed):
+                    return ToolResult(status=ToolStatus.DENIED, tool=self.name, error="task draft claim was lost")
                 result = await oauth_client.call("tasks.task.add", sanitized)
             except BitrixOAuthTokenMissing as exc:
+                if claimed is not None:
+                    await release_exact_draft(self._store, dialog_key=dialog_key, draft=claimed)
                 return ToolResult(
                     status=ToolStatus.NOT_CONFIGURED,
                     tool=self.name,
                     error=str(exc),
                     data={"params": sanitized},
                 )
-            except (BitrixApiError, BitrixConfigError) as exc:
+            except BitrixConfigError as exc:
+                if claimed is not None:
+                    await release_exact_draft(self._store, dialog_key=dialog_key, draft=claimed)
                 return ToolResult(
-                    status=ToolStatus.NOT_CONFIGURED if isinstance(exc, BitrixConfigError) else ToolStatus.ERROR,
+                    status=ToolStatus.NOT_CONFIGURED,
                     tool=self.name,
                     error=str(exc),
-                    data={"params": sanitized},
+                    data={"params": sanitized, "mutation_outcome": "not_started"},
+                )
+            except BitrixApiError as exc:
+                outcome = bitrix_mutation_outcome(exc)
+                if claimed is not None and outcome == "rejected":
+                    await release_exact_draft(self._store, dialog_key=dialog_key, draft=claimed)
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool=self.name,
+                    error=str(exc),
+                    data={"params": sanitized, "mutation_outcome": outcome},
                 )
             except Exception as exc:
                 return ToolResult(
@@ -274,7 +376,13 @@ class TaskCreateConfirmTool:
                     error=f"{type(exc).__name__}: {exc}",
                     data={"params": sanitized},
                 )
-            await self._store.delete_task_draft(dialog_key)
+            await self._store.delete_task_draft(
+                dialog_key,
+                status="confirmed",
+                expected_draft_id=str(claimed.get("_draft_id") or ""),
+                expected_version=optional_int(claimed.get("_draft_version")),
+                expected_claim_token=str(claimed.get("_draft_claim_token") or ""),
+            )
             return ToolResult(
                 status=ToolStatus.OK,
                 tool=self.name,
@@ -287,15 +395,42 @@ class TaskCreateConfirmTool:
                 tool=self.name,
                 error="write_client is not configured",
             )
+        claimed = None
         try:
+            project_error = await _validate_resolved_project_reference(self._write_client, project_reference)
+            if project_error is not None:
+                return ToolResult(
+                    status=project_error.status,
+                    tool=self.name,
+                    error=project_error.error,
+                    data={"params": sanitized, "mutation_outcome": "unknown"},
+                )
+            claimed = await claim_exact_draft(
+                self._store, dialog_key=dialog_key, draft=draft_params, expected_type=TASK_CREATE_DRAFT_TYPE
+            )
+            if claimed is None:
+                return ToolResult(
+                    status=ToolStatus.DENIED,
+                    tool=self.name,
+                    error="task draft changed, expired, or is already being confirmed",
+                )
+            if not await renew_exact_draft_claim(self._store, dialog_key=dialog_key, draft=claimed):
+                return ToolResult(status=ToolStatus.DENIED, tool=self.name, error="task draft claim was lost")
             result = await self._write_client.call("tasks.task.add", sanitized)
         except Exception as exc:
             return ToolResult(
                 status=ToolStatus.ERROR,
                 tool=self.name,
                 error=f"{type(exc).__name__}: {exc}",
+                data={"mutation_outcome": "unknown"},
             )
-        await self._store.delete_task_draft(dialog_key)
+        await self._store.delete_task_draft(
+            dialog_key,
+            status="confirmed",
+            expected_draft_id=str(claimed.get("_draft_id") or ""),
+            expected_version=optional_int(claimed.get("_draft_version")),
+            expected_claim_token=str(claimed.get("_draft_claim_token") or ""),
+        )
         return ToolResult(
             status=ToolStatus.OK,
             tool=self.name,
@@ -325,12 +460,303 @@ class TaskDraftDiscardTool:
         dialog_id: str | None = None,
     ) -> ToolResult:
         if dialog_key:
-            await self._store.delete_task_draft(dialog_key)
+            draft = await self._store.get_task_draft(dialog_key)
+            if isinstance(draft, dict) and draft.get("_draft_type") in (None, TASK_CREATE_DRAFT_TYPE):
+                await discard_exact_draft(
+                    self._store,
+                    dialog_key=dialog_key,
+                    draft=draft,
+                    expected_type=TASK_CREATE_DRAFT_TYPE,
+                )
         return ToolResult(
             status=ToolStatus.OK,
             tool=self.name,
             data={"discarded": bool(dialog_key)},
         )
+
+
+async def _args_with_resolved_project(
+    args: dict[str, Any],
+    *,
+    project_client: Any | None,
+    portal_search: Any | None,
+    bitrix_oauth: BitrixOAuthService | None,
+    user_id: int | None,
+) -> tuple[dict[str, Any], str, ToolResult | None]:
+    resolved_args = dict(args or {})
+    if optional_int(resolved_args.get("group_id")) is not None:
+        return resolved_args, "", None
+    project_name = compact_text(str(resolved_args.get("project_name") or resolved_args.get("group_name") or ""))
+    default_personal_project = _truthy(resolved_args.get("_default_personal_project"))
+    if not project_name:
+        return resolved_args, "", None
+
+    read_client = project_client
+    if bitrix_oauth is not None:
+        read_client, _access_actor, access_error = await resolve_current_user_read_client(
+            TaskCreateDraftTool.name,
+            fallback_client=project_client,
+            bitrix_oauth=bitrix_oauth,
+            user_id=user_id,
+        )
+        if access_error is not None:
+            return resolved_args, "", access_error
+
+    snapshot_projects = _search_projects_snapshot(portal_search, project_name, limit=10)
+    if snapshot_projects is not None:
+        exact_snapshot = _matching_projects(snapshot_projects, project_name)
+        if len(exact_snapshot) == 1:
+            return _bind_resolved_project(resolved_args, project=exact_snapshot[0], project_name=project_name)
+        if len(exact_snapshot) > 1:
+            return (
+                resolved_args,
+                "",
+                _project_resolution_error(
+                    f"exact indexed Bitrix project is ambiguous: {project_name}",
+                    resolved_args,
+                ),
+            )
+
+    if read_client is None:
+        label = "default personal project" if default_personal_project else "explicit project"
+        return (
+            resolved_args,
+            "",
+            _project_resolution_error(
+                f"{label} requires Bitrix project resolver",
+                resolved_args,
+            ),
+        )
+    try:
+        projects = await read_client.search_projects(project_name, limit=10)
+    except BitrixConfigError as exc:
+        return (
+            resolved_args,
+            "",
+            _project_resolution_error(
+                str(exc),
+                resolved_args,
+                status=ToolStatus.NOT_CONFIGURED,
+            ),
+        )
+    except BitrixApiError as exc:
+        return (
+            resolved_args,
+            "",
+            _project_resolution_error(
+                str(exc),
+                resolved_args,
+                status=ToolStatus.ERROR,
+            ),
+        )
+    except Exception as exc:
+        return (
+            resolved_args,
+            "",
+            _project_resolution_error(
+                f"{type(exc).__name__}: {exc}",
+                resolved_args,
+                status=ToolStatus.ERROR,
+            ),
+        )
+    exact_projects = _matching_projects(projects, project_name)
+    if len(exact_projects) != 1:
+        label = "personal Bitrix project" if default_personal_project else "exact Bitrix project"
+        resolution = "not found" if not exact_projects else "ambiguous"
+        return (
+            resolved_args,
+            "",
+            _project_resolution_error(
+                f"{label} {resolution}: {project_name}",
+                resolved_args,
+                allow_personal_project_creation=default_personal_project and not exact_projects,
+            ),
+        )
+    return _bind_resolved_project(resolved_args, project=exact_projects[0], project_name=project_name)
+
+
+def _bind_resolved_project(
+    resolved_args: dict[str, Any],
+    *,
+    project: dict[str, Any],
+    project_name: str,
+) -> tuple[dict[str, Any], str, ToolResult | None]:
+    project_id = optional_int(project.get("ID") or project.get("id"))
+    if project_id is None:
+        return (
+            resolved_args,
+            "",
+            _project_resolution_error(
+                f"Bitrix project has no numeric ID: {project_name}",
+                resolved_args,
+            ),
+        )
+    resolved_name = compact_text(str(project.get("NAME") or project.get("name") or project_name))
+    resolved_args["group_id"] = project_id
+    resolved_args["project_name"] = resolved_name or project_name
+    resolved_args["_resolved_project"] = {"id": project_id, "name": resolved_args["project_name"]}
+    return resolved_args, f"Точный проект: {resolved_args['project_name']} (#{project_id}).", None
+
+
+def _project_resolution_error(
+    error: str,
+    args: dict[str, Any],
+    *,
+    status: ToolStatus = ToolStatus.NOT_FOUND,
+    allow_personal_project_creation: bool = False,
+) -> ToolResult:
+    return ToolResult(
+        status=status,
+        tool=TaskCreateDraftTool.name,
+        error=error,
+        data={
+            "args": args,
+            "allow_personal_project_creation": allow_personal_project_creation,
+        },
+    )
+
+
+async def _validate_resolved_project_reference(client: Any, reference: object) -> ToolResult | None:
+    if not isinstance(reference, dict):
+        return None
+    project_id = optional_int(reference.get("id"))
+    project_name = compact_text(str(reference.get("name") or ""))
+    if project_id is None or not project_name:
+        return _project_validation_error(
+            ToolStatus.NOT_FOUND,
+            "stored task draft has an invalid resolved project reference",
+        )
+    try:
+        projects = await client.search_projects(project_name, limit=10)
+    except BitrixConfigError as exc:
+        return _project_validation_error(
+            ToolStatus.NOT_CONFIGURED,
+            f"resolved Bitrix project validation failed: {exc}",
+        )
+    except BitrixApiError as exc:
+        return _project_validation_error(
+            ToolStatus.ERROR,
+            f"resolved Bitrix project validation failed: {exc}",
+        )
+    except Exception as exc:
+        return _project_validation_error(
+            ToolStatus.ERROR,
+            f"resolved Bitrix project validation failed: {type(exc).__name__}: {exc}",
+        )
+    exact = _matching_projects(projects, project_name)
+    if len(exact) != 1:
+        return _project_validation_error(
+            ToolStatus.NOT_FOUND,
+            f"resolved Bitrix project is missing, renamed, or ambiguous: {project_name}",
+        )
+    live_id = optional_int(exact[0].get("ID") or exact[0].get("id"))
+    if live_id != project_id:
+        return _project_validation_error(
+            ToolStatus.NOT_FOUND,
+            f"resolved Bitrix project identity changed: {project_name}",
+        )
+    return None
+
+
+def _project_validation_error(status: ToolStatus, error: str) -> ToolResult:
+    return ToolResult(status=status, tool=TaskCreateConfirmTool.name, error=error)
+
+
+async def _prepare_missing_default_personal_project(
+    *,
+    store: TaskDraftStorePort,
+    args: dict[str, Any],
+    user_id: int | None,
+    dialog_key: str | None,
+    dialog_id: str | None,
+) -> ToolResult | None:
+    if not _truthy(args.get("_default_personal_project")):
+        return None
+    project_name = compact_text(str(args.get("project_name") or args.get("group_name") or ""))
+    if not project_name:
+        return None
+    if user_id is None:
+        return ToolResult(
+            status=ToolStatus.DENIED,
+            tool=TaskCreateDraftTool.name,
+            error="Bitrix project creation denied: current Bitrix user_id is missing.",
+        )
+    if not str(dialog_id or "").strip():
+        return ToolResult(
+            status=ToolStatus.DENIED,
+            tool=TaskCreateDraftTool.name,
+            error="Bitrix project creation denied: current Bitrix dialog_id is missing.",
+        )
+    if not dialog_key:
+        return ToolResult(
+            status=ToolStatus.INVALID_TOOL_CALL,
+            tool=TaskCreateDraftTool.name,
+            error="task_create_draft requires dialog_key to prepare a missing personal project",
+        )
+
+    task_draft = build_task_create_draft_from_args(args, user_id=user_id)
+    if not task_draft.is_ready:
+        return ToolResult(
+            status=ToolStatus.CONTRACT_VIOLATION,
+            tool=TaskCreateDraftTool.name,
+            error=f"task_create_draft called outside contract: {'; '.join(task_draft.contract_errors)}",
+            data=task_draft.as_action_details(),
+        )
+
+    actor_name = compact_text(str(args.get("responsible_name") or args.get("responsible_label") or project_name))
+    project_draft = build_project_create_draft_from_args(
+        {"name": project_name, "personal_for_self": True},
+        user_id=user_id,
+        actor_name=actor_name,
+        actor_is_admin=False,
+    )
+    if not project_draft.is_ready:
+        return ToolResult(
+            status=ToolStatus.CONTRACT_VIOLATION,
+            tool=TaskCreateDraftTool.name,
+            error=f"project_create_draft called outside contract: {'; '.join(project_draft.contract_errors)}",
+            data=project_draft.as_action_details(),
+        )
+
+    stored_project_draft = dict(project_draft.params)
+    stored_project_draft["after_project_create_task_draft"] = {
+        "params": task_draft.params,
+        "preview": task_draft.preview,
+        "project_name": project_name,
+    }
+    await store.save_task_draft(dialog_key, stored_project_draft)
+    return ToolResult(
+        status=ToolStatus.OK,
+        tool=TaskCreateDraftTool.name,
+        data={
+            "requires_project_creation": True,
+            "missing_project_name": project_name,
+            "project_draft": {
+                "params": project_draft.params,
+                "preview": project_draft.preview,
+                "notes": project_draft.notes,
+            },
+            "pending_task_draft": {
+                "params": task_draft.params,
+                "preview": task_draft.preview,
+                "notes": task_draft.notes,
+            },
+        },
+    )
+
+
+def _matching_projects(projects: object, project_name: str) -> list[dict[str, Any]]:
+    if not isinstance(projects, list):
+        return []
+    normalized = _normalize_project_name(project_name)
+    exact: list[dict[str, Any]] = []
+    for project in projects:
+        if not isinstance(project, dict):
+            continue
+        name = compact_text(str(project.get("NAME") or project.get("name") or ""))
+        if _normalize_project_name(name) == normalized:
+            exact.append(project)
+    return exact
 
 
 def _deadline_from_args(args: dict[str, Any]) -> tuple[str | None, str, bool, str]:

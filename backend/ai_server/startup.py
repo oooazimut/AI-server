@@ -23,6 +23,7 @@ from .integrations.redis.agent_queue import RedisAgentQueue
 from .integrations.redis.conversation_trace import RedisConversationTrace
 from .integrations.redis.dialog_guard import RedisDialogGuard
 from .integrations.redis.event_queue import RedisEventQueue
+from .integrations.redis.outbound_queue import RedisOutboundQueue
 from .llm import build_orchestrator_llm_client
 from .orchestrators.internal import InternalOrchestrator
 from .orchestrators.orchestrator_llm import OrchestratorLLMService
@@ -48,6 +49,10 @@ def _make_agent_queue(settings: Settings) -> RedisAgentQueue:
 
 def _make_conversation_trace(settings: Settings) -> RedisConversationTrace:
     return RedisConversationTrace(settings.redis_url, settings=settings)
+
+
+def _make_outbound_queue(settings: Settings) -> RedisOutboundQueue:
+    return RedisOutboundQueue(settings.redis_url)
 
 
 def _make_dialog_guard(settings: Settings) -> RedisDialogGuard:
@@ -110,6 +115,7 @@ async def lifespan(app: FastAPI):
     )
     webhook_event_queue = _make_event_queue(settings)
     conversation_trace = _make_conversation_trace(settings)
+    outbound_queue = _make_outbound_queue(settings)
     dialog_guard = _make_dialog_guard(settings)
     pto_store = await _make_pto_store(settings)
     orchestrator_store = await _make_orchestrator_store(settings)
@@ -123,6 +129,7 @@ async def lifespan(app: FastAPI):
     app.state.portal_search_indexer = portal_search_indexer
     app.state.webhook_event_queue = webhook_event_queue
     app.state.conversation_trace = conversation_trace
+    app.state.outbound_queue = outbound_queue
     app.state.dialog_guard = dialog_guard
     app.state.webhook_event_status = {
         "enabled": True,
@@ -298,3 +305,4 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         scheduler.stop()
+        await outbound_queue.close()
