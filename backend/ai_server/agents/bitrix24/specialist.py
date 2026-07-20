@@ -177,9 +177,14 @@ class Bitrix24Specialist(BaseSpecialist):
                 state_store=orchestrator_store,
                 live_fallback_enabled=bitrix_oauth is not None,
                 index_max_age_seconds=max(
-                    3600,
-                    _settings.search_background_metadata_interval_seconds * 2,
+                    900,
+                    (
+                        _settings.search_delta_interval_seconds * 4
+                        if _settings.search_background_periodic_delta_enabled
+                        else _settings.search_background_metadata_interval_seconds * 2
+                    ),
                 ),
+                index_freshness_path=_settings.search_background_state_path,
             ),
             BitrixWarehouseSearchTool(
                 client=bitrix_client,

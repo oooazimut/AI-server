@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from ai_server.agents.bitrix24.tools.read_client import oauth_authorization_data, oauth_missing_error
@@ -37,6 +38,7 @@ class PortalSearchTool:
         state_store: Any | None = None,
         live_fallback_enabled: bool = False,
         index_max_age_seconds: int | None = None,
+        index_freshness_path: Path | None = None,
     ) -> None:
         self._portal_search = portal_search
         self._bitrix_files = bitrix_files
@@ -44,6 +46,7 @@ class PortalSearchTool:
         self._state_store = state_store
         self._live_fallback_enabled = live_fallback_enabled
         self._index_max_age_seconds = index_max_age_seconds
+        self._index_freshness_path = index_freshness_path
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -176,7 +179,11 @@ class PortalSearchTool:
             if access_error is not None:
                 return access_error
 
-        index_state, index_age_seconds = _index_state(stats, max_age_seconds=self._index_max_age_seconds)
+        index_state, index_age_seconds, index_freshness_source = _index_state(
+            stats,
+            max_age_seconds=self._index_max_age_seconds,
+            freshness_path=self._index_freshness_path,
+        )
         search_limit = _MAX_SEARCH_RESULTS if scope in _ACCESS_CHECKED_SCOPES else min(
             _MAX_SEARCH_RESULTS, max(limit + offset, limit)
         )
@@ -242,6 +249,7 @@ class PortalSearchTool:
                         "offset": offset,
                         "index_state": index_state,
                         "index_age_seconds": index_age_seconds,
+                        "index_freshness_source": index_freshness_source,
                         "access_checked": True,
                         "access_actor": access_actor,
                         "live_attempted": True,
@@ -295,6 +303,7 @@ class PortalSearchTool:
                 "index_path": str(stats.path),
                 "index_state": index_state,
                 "index_age_seconds": index_age_seconds,
+                "index_freshness_source": index_freshness_source,
                 "access_checked": scope in _ACCESS_CHECKED_SCOPES,
                 "access_actor": access_actor,
                 "access_filtered_count": access_filtered_count,
@@ -308,22 +317,63 @@ class PortalSearchTool:
         )
 
 
-def _index_state(stats: Any, *, max_age_seconds: int | None) -> tuple[str, int | None]:
+def _index_state(
+    stats: Any,
+    *,
+    max_age_seconds: int | None,
+    freshness_path: Path | None,
+) -> tuple[str, int | None, str]:
     if not bool(getattr(stats, "exists", False)):
-        return "missing", None
+        return "missing", None, "index_missing"
     if max_age_seconds is None:
-        return "fresh", None
-    value = str(getattr(stats, "last_indexed_at", None) or "").strip()
+        return "fresh", None, "freshness_not_required"
+    value = ""
+    source = "indexed_item_max"
+    if freshness_path is not None:
+        source = "indexer_state_missing_success"
+        try:
+            state = json.loads(freshness_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError):
+            return "stale", None, source
+        if not isinstance(state, dict):
+            return "stale", None, source
+        if int(state.get("consecutive_errors") or 0) > 0 or state.get("last_error"):
+            return "stale", None, "indexer_state_error"
+        candidates = [
+            ("last_delta_sync_at", state.get("last_delta_sync_at")),
+            ("last_metadata_sync_at", state.get("last_metadata_sync_at")),
+        ]
+        parsed_candidates: list[tuple[datetime, str]] = []
+        for key, candidate in candidates:
+            parsed = _parse_timestamp(candidate)
+            if parsed is not None:
+                parsed_candidates.append((parsed, key))
+        if not parsed_candidates:
+            return "stale", None, source
+        newest, key = max(parsed_candidates, key=lambda item: item[0])
+        value = newest.isoformat()
+        source = f"indexer_state:{key}"
+    else:
+        value = str(getattr(stats, "last_indexed_at", None) or "").strip()
     if not value:
-        return "stale", None
+        return "stale", None, source
+    parsed = _parse_timestamp(value)
+    if parsed is None:
+        return "stale", None, source
+    age = max(0, int((datetime.now(UTC) - parsed).total_seconds()))
+    return ("stale" if age > max_age_seconds else "fresh"), age, source
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    if not value:
+        return None
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=UTC)
-        age = max(0, int((datetime.now(UTC) - parsed.astimezone(UTC)).total_seconds()))
     except (TypeError, ValueError):
-        return "stale", None
-    return ("stale" if age > max_age_seconds else "fresh"), age
+        return None
+    return parsed.astimezone(UTC)
 
 
 def _stable_result_key(item: PortalSearchResult) -> tuple[int, str, str, str]:

@@ -300,6 +300,80 @@ def test_portal_search_stale_index_suppresses_snapshot_when_current_user_live_ch
     assert "live verification failed" in result.error
 
 
+def test_portal_search_uses_durable_indexer_success_instead_of_item_max_timestamp(tmp_path):
+    import asyncio
+    import json
+    from datetime import UTC, datetime
+
+    state_path = tmp_path / "search-indexer-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "last_metadata_sync_at": datetime.now(UTC).isoformat(),
+                "last_delta_sync_at": None,
+                "consecutive_errors": 0,
+                "last_error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    tool = PortalSearchTool(
+        portal_search=_create_index(),
+        bitrix_files=_FakeBitrixFiles(),
+        index_max_age_seconds=3600,
+        index_freshness_path=state_path,
+    )
+
+    result = asyncio.run(
+        tool.execute({"query": "транзит договор", "scope": "documents"})
+    )
+
+    assert result.status == "ok"
+    assert result.data["index_state"] == "fresh"
+    assert result.data["index_freshness_source"] == "indexer_state:last_metadata_sync_at"
+    assert result.data["source_mode"] == "bitrix_postgresql"
+
+
+def test_portal_search_indexer_without_success_stays_stale_after_live_item_refresh(tmp_path):
+    import asyncio
+    import json
+
+    index = _create_index()
+    state_path = tmp_path / "search-indexer-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "last_metadata_sync_at": None,
+                "last_delta_sync_at": None,
+                "consecutive_errors": 0,
+                "last_error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    live = _FakeLiveBitrixFiles()
+    tool = PortalSearchTool(
+        portal_search=index,
+        bitrix_oauth=_FakeBitrixOAuth(live),
+        live_fallback_enabled=True,
+        index_max_age_seconds=3600,
+        index_freshness_path=state_path,
+    )
+
+    first = asyncio.run(
+        tool.execute({"query": "invoice alpha", "scope": "documents"}, user_id=13)
+    )
+    second = asyncio.run(
+        tool.execute({"query": "invoice alpha", "scope": "documents"}, user_id=13)
+    )
+
+    assert first.status == second.status == "ok"
+    assert first.data["index_state"] == second.data["index_state"] == "stale"
+    assert first.data["index_freshness_source"] == "indexer_state_missing_success"
+    assert second.data["index_freshness_source"] == "indexer_state_missing_success"
+    assert first.data["source_mode"] == second.data["source_mode"] == "bitrix_live_current_user"
+
+
 def test_portal_search_tool_uses_oauth_client_for_document_access_check():
     import asyncio
 
