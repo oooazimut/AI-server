@@ -869,7 +869,7 @@ def test_bitrix_store_schema_name():
 
 def test_bitrix_store_task_draft_edit_preserves_identity_and_original_expiry():
     store = PostgresBitrixAgentStore("postgresql://fake")
-    created_at = datetime(2026, 7, 20, 10, 0, tzinfo=UTC)
+    created_at = datetime.now(UTC)
     expires_at = created_at + timedelta(minutes=15)
     active_cursor = AsyncMock()
     active_cursor.fetchone = AsyncMock(
