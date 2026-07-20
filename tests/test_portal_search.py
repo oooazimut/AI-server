@@ -257,6 +257,7 @@ def test_portal_search_missing_index_uses_current_user_live_search_and_updates_i
     assert result.data["index_state"] == "missing"
     assert result.data["source_mode"] == "bitrix_live_current_user"
     assert result.data["access_actor"] == "oauth_current_user"
+    assert result.data["stale_results_suppressed"] == 0
     assert [item["entity_id"] for item in result.data["results"]] == ["501"]
     assert result.data["results"][0]["source"] == "bitrix_live_current_user"
     assert fallback.calls == []

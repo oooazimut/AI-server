@@ -221,6 +221,8 @@ class PortalSearchTool:
         stale_results_suppressed = 0
         source_mode = "bitrix_postgresql"
         if live_results:
+            if live_required:
+                stale_results_suppressed = len(results)
             results = live_results
             source_mode = "bitrix_live_current_user"
         elif live_required:
