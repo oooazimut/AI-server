@@ -1257,7 +1257,7 @@ def test_bitrix_specialist_exact_release_task_draft_is_deterministic_and_persist
 
     assert client.calls == []
     assert result.status == "needs_human"
-    assert all(phrase in result.answer for phrase in ("Черновик задачи", "Срок", "Если всё верно"))
+    assert all(phrase in result.answer for phrase in ("Черновик задачи", "Срок", "да, подтверждаю создание задачи"))
     assert store._drafts["d:9"]["_draft_type"] == "task_create"
     assert store._drafts["d:9"]["fields"]["TITLE"] == "подготовить тестовый отчет"
     assert store._drafts["d:9"]["fields"]["RESPONSIBLE_ID"] == 9
@@ -1530,13 +1530,12 @@ def test_bitrix_llm_routes_task_draft_confirmation_without_llm(monkeypatch):
             manifest=manifest,
             task=AgentTask(
                 task_id="t1",
-                    request="101",
+                    request="Да, подтверждаю создание задачи",
                 user={"id": "15"},
                 context={
                     "dialog_id": "chat4321",
                     "pending_task_draft": {
                             "fields": {"TITLE": "test", "RESPONSIBLE_ID": 15, "CREATED_BY": 15, "NO_DEADLINE": True},
-                            "_draft_confirmation_code": 101,
                     },
                 },
             ),
@@ -1578,13 +1577,12 @@ def test_bitrix_llm_routes_task_close_confirmation_without_llm(monkeypatch):
             manifest=manifest,
             task=AgentTask(
                 task_id="t1",
-                    request="101",
+                    request="Да, закрываю задачу как есть",
                 user={"id": "15"},
                 context={
                     "dialog_id": "chat4321",
                         "pending_task_draft": {
                             "_draft_type": "task_close",
-                            "_draft_confirmation_code": 101,
                         "task_id": 139,
                         "task_title": "Обучение сотрудников",
                     },
@@ -1604,7 +1602,7 @@ def test_bitrix_llm_routes_task_close_confirmation_without_llm(monkeypatch):
 @pytest.mark.parametrize(
     ("request_text", "operation", "source"),
     [
-        ("101", "confirm", "draft_confirm_route"),
+        ("Да, подтверждаю изменение настройки", "confirm", "draft_confirm_route"),
         ("отмени черновик", "discard", "draft_discard_route"),
     ],
 )
@@ -1622,7 +1620,6 @@ def test_bitrix_llm_routes_admin_change_draft_without_llm(monkeypatch, request_t
                     "dialog_id": "chat1",
                     "pending_task_draft": {
                         "_draft_type": "admin_change",
-                        "_draft_confirmation_code": 101,
                         "action": "add_operator",
                         "target_user_id": 13,
                     },
@@ -2116,13 +2113,12 @@ def test_bitrix_llm_routes_calendar_confirmation_without_llm(monkeypatch):
             manifest=manifest,
             task=AgentTask(
                 task_id="t1",
-                    request="101",
+                    request="Да, подтверждаю создание записи в календаре",
                 user={"id": "15"},
                 context={
                     "dialog_id": "chat4321",
                         "pending_task_draft": {
                             "_draft_type": "calendar_event",
-                            "_draft_confirmation_code": 101,
                         "title": "позвонить Борисову",
                         "start_iso": "2026-07-09T12:00:00+03:00",
                     },
@@ -2184,6 +2180,29 @@ def test_bitrix_llm_decide_routes_simple_reminder_to_calendar_draft(monkeypatch)
         "date_iso": "2026-07-11",
         "description": "Позвонить Борисову",
     }
+
+
+def test_bitrix_llm_routes_calendar_time_followup_using_orchestrator_history(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setattr(bitrix_llm, "_moscow_today", lambda: date(2026, 7, 10))
+    client = RecordingLLMClient('{"status":"completed","answer":"must not be used","tool_calls":[]}')
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t1", request="12 часов дня", user={"id": "13"}),
+            retrieval_hits=[],
+            dialog_history=[
+                {"role": "user", "content": "Напомни мне завтра позвонить Борисову"},
+                {"role": "assistant", "content": "Уточните время"},
+            ],
+            tool_definitions=[{"name": "calendar_event_draft", "description": "", "parameters": {}}],
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "calendar_reminder_route"}
+    assert result.decision.tool_calls[0].args["title"] == "Позвонить Борисову"
+    assert result.decision.tool_calls[0].args["date_iso"] == "2026-07-11"
 
 
 def test_bitrix_llm_decide_routes_task_draft_discard_without_llm(monkeypatch):
@@ -2560,13 +2579,12 @@ def test_bitrix_llm_routes_project_confirmation_without_llm(monkeypatch):
             manifest=manifest,
             task=AgentTask(
                 task_id="t1",
-                    request="101",
+                    request="Да, подтверждаю создание проекта",
                 user={"id": "15"},
                 context={
                     "dialog_id": "chat4321",
                         "pending_task_draft": {
                             "_draft_type": "project_create",
-                            "_draft_confirmation_code": 101,
                         "method": "sonet_group.create",
                         "params": {"fields": {"NAME": "Кулинич Валерий"}},
                     },
@@ -2617,7 +2635,7 @@ def test_bitrix_llm_compose_formats_project_create_draft(monkeypatch):
     assert "Название: Кулинич Валерий" in result.answer
     assert "Тип: личный проект" in result.answer
     assert "Открытость: открытый" in result.answer
-    assert "Если всё верно" in result.answer
+    assert "да, подтверждаю создание проекта" in result.answer
 
 
 def test_bitrix_llm_compose_formats_project_create_confirm_with_project_link(monkeypatch):
@@ -2700,7 +2718,7 @@ def test_bitrix_llm_compose_formats_project_create_confirm_with_followup_task(mo
     assert "Проект создан:" in result.answer
     assert "Черновик задачи:" in result.answer
     assert "Проект: Кулинич Валерий" in result.answer
-    assert "Если всё верно, напишите: да, создай." in result.answer
+    assert "да, подтверждаю создание задачи" in result.answer
 
 
 def test_bitrix_llm_compose_formats_project_create_discard_without_llm(monkeypatch):
@@ -2927,7 +2945,7 @@ def test_bitrix_llm_compose_formats_structured_task_close_draft(monkeypatch):
     assert "4. Дополнительная информация" in result.answer
     assert "4.1 вернуться завтра" in result.answer
     assert "4.2 проверить доступ" in result.answer
-    assert "да, закрывай как есть" in result.answer
+    assert "да, закрываю задачу как есть" in result.answer
     assert "[URL" not in result.answer
 
 

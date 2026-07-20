@@ -19,6 +19,7 @@ from ai_server.agents.specialist_llm_shared import (
     retrieval_context,
     skills_context,
 )
+from ai_server.agents.bitrix24.draft_confirmation import draft_confirmation_phrase, matches_draft_confirmation
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
 from ai_server.retrieval import RetrievalHit
@@ -223,7 +224,7 @@ class BitrixLLMService:
                 raw={"source": "task_create_draft_route"},
             )
 
-        local_decision = _common_calendar_event_draft_decision(task.request, tool_definitions)
+        local_decision = _common_calendar_event_draft_decision(task.request, dialog_history, tool_definitions)
         if local_decision is not None:
             return BitrixLLMDecisionResult(
                 decision=local_decision,
@@ -706,16 +707,17 @@ def _format_portal_search_answer(data: dict[str, Any], *, portal_base_url: str =
 
 
 def _draft_confirmation_suffix(data: dict[str, Any]) -> str:
-    candidates = [data]
+    candidates: list[dict[str, Any]] = []
     for key in ("draft", "params", "pending_task_draft"):
         value = data.get(key)
         if isinstance(value, dict):
             candidates.append(value)
+    candidates.append(data)
     for item in candidates:
-        code = str(item.get("_draft_confirmation_code") or "").strip()
-        if code:
-            return f"\n\nВажно: текстовое подтверждение не действует. Отправьте только число: {code}"
-    return ""
+        draft_type = _text(item.get("_draft_type"))
+        if draft_type:
+            return f"\n\nДля подтверждения отправьте фразу: «{draft_confirmation_phrase(draft_type)}»."
+    return f"\n\nДля подтверждения отправьте фразу: «{draft_confirmation_phrase('task_create')}»."
 
 
 def _format_project_create_draft_answer(data: dict[str, Any]) -> str:
@@ -737,8 +739,8 @@ def _format_project_create_draft_answer(data: dict[str, Any]) -> str:
         lines.append(f"Открытость: {visibility}")
     if description:
         lines.append(f"Описание: {description}")
-    lines.extend(["", "Если всё верно, напишите: да, создай проект."])
-    return "\n".join(lines) + _draft_confirmation_suffix(data)
+    lines.extend(["", "Черновик действует 15 минут."])
+    return "\n".join(lines) + _draft_confirmation_suffix({**data, "_draft_type": "project_create"})
 
 
 def _format_project_create_confirm_answer(data: dict[str, Any], *, portal_base_url: str = "") -> str:
@@ -942,10 +944,10 @@ def _format_task_create_draft_answer(data: dict[str, Any]) -> str:
             f"Срок: {deadline}",
             f"Описание: {description}",
             "",
-            "Если всё верно, напишите: да, создай.",
+            "Черновик действует 15 минут.",
         ]
     )
-    return "\n".join(lines) + _draft_confirmation_suffix(data)
+    return "\n".join(lines) + _draft_confirmation_suffix({**data, "_draft_type": "task_create"})
 
 
 def _format_task_create_requires_project_answer(data: dict[str, Any]) -> str:
@@ -990,7 +992,7 @@ def _format_task_create_requires_project_answer(data: dict[str, Any]) -> str:
             f"Срок: {deadline}",
             f"Описание: {description}",
             "",
-            "Если всё верно, напишите: да, создай проект.",
+            "Черновик действует 15 минут.",
         ]
     )
     return "\n".join(lines)
@@ -1090,10 +1092,8 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
         lines.extend(f"4.{index} {item}" for index, item in enumerate(additional_items, start=1))
         lines.append(f"4.{len(additional_items) + 1} Еще информация - ... ???")
     lines.append("")
-    lines.append(
-        'Внести изменения (укажите пункт или подпункт и нужную информацию) или напишите: "да, закрывай как есть".'
-    )
-    return "\n".join(lines) + _draft_confirmation_suffix(data)
+    lines.append("Внести изменения (укажите пункт или подпункт и нужную информацию) либо подтвердить закрытие.")
+    return "\n".join(lines) + _draft_confirmation_suffix({**data, "_draft_type": "task_close"})
 
 
 def _task_close_status_prompt(status: str) -> str:
@@ -1452,8 +1452,8 @@ def _format_calendar_event_draft_answer(data: dict[str, Any]) -> str:
     if description and not _is_generic_calendar_description(description):
         lines.append(f"Описание: {description}")
     lines.append("")
-    lines.append("Если всё верно, напишите: да, добавь в календарь.")
-    return "\n".join(lines) + _draft_confirmation_suffix(data)
+    lines.append("Черновик действует 15 минут.")
+    return "\n".join(lines) + _draft_confirmation_suffix({**data, "_draft_type": "calendar_event"})
 
 
 def _format_calendar_event_confirm_answer(data: dict[str, Any]) -> str:
@@ -1966,8 +1966,7 @@ def _common_draft_confirm_decision(
     draft = context.get("pending_task_draft") if isinstance(context, dict) else None
     if not isinstance(draft, dict) or not draft:
         return None
-    expected_code = str(draft.get("_draft_confirmation_code") or "").strip()
-    if not expected_code or _strip_command_prefix(request).strip() != expected_code:
+    if not matches_draft_confirmation(_strip_command_prefix(request), draft):
         return None
 
     draft_type = _text(draft.get("_draft_type")) or "task_create"
@@ -2857,13 +2856,14 @@ def _first_int(text: str) -> int | None:
 
 def _common_calendar_event_draft_decision(
     request: str,
+    dialog_history: list[dict[str, str]] | None,
     tool_definitions: list[dict[str, Any]] | None,
 ) -> BitrixLLMDecision | None:
     available_tools = {str(tool.get("name") or "") for tool in tool_definitions or []}
     if tool_definitions is not None and "calendar_event_draft" not in available_tools:
         return None
 
-    args = _simple_calendar_reminder_args(_strip_command_prefix(request))
+    args = _simple_calendar_reminder_args(_calendar_request_with_history(request, dialog_history))
     if args is None:
         return None
     return BitrixLLMDecision(
@@ -2878,6 +2878,20 @@ def _common_calendar_event_draft_decision(
             )
         ],
     )
+
+
+def _calendar_request_with_history(request: str, dialog_history: list[dict[str, str]] | None) -> str:
+    """Join a short time/title reply to its still-active calendar request."""
+    current = _strip_command_prefix(request)
+    if "напомни" in current.casefold():
+        return current
+    for item in reversed(dialog_history or []):
+        if not isinstance(item, dict) or str(item.get("role") or "") != "user":
+            continue
+        previous = str(item.get("content") or "").strip()
+        if "напомни" in previous.casefold():
+            return f"{previous}. {current}"
+    return current
 
 
 def _simple_calendar_reminder_args(request: str) -> dict[str, Any] | None:

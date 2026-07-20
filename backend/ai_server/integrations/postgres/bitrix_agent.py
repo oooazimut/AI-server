@@ -396,7 +396,6 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
             original_request = str(draft_params.get("_original_request") or "")
             now = datetime.now(UTC)
             transition = "created"
-            confirmation_code: int
             if active and active["status"] == "active" and active["expires_at"] <= now:
                 await db.execute(
                     """
@@ -429,10 +428,6 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                 version = int(active["version"] or 1) + 1
                 transition = "edited"
                 initial_request = str(active["original_request"] or original_request)
-                try:
-                    confirmation_code = int(json.loads(str(active["params_json"])).get("_draft_confirmation_code"))
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    confirmation_code = 101
             else:
                 draft_id = str(uuid.uuid4())
                 created_at = min(promoted_created_at, now) if promoted_created_at is not None else now
@@ -441,19 +436,6 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                     expires_at = created_at + timedelta(minutes=15)
                 version = 1
                 initial_request = original_request
-                local_now = now.astimezone(MOSCOW_TZ)
-                day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(UTC)
-                day_end = day_start + timedelta(days=1)
-                count_cursor = await db.execute(
-                    """
-                    SELECT COUNT(*) AS draft_count
-                    FROM bitrix24.interactive_drafts
-                    WHERE dialog_key = %s AND created_at >= %s AND created_at < %s
-                    """,
-                    (dialog_key, day_start, day_end),
-                )
-                count_row = await count_cursor.fetchone()
-                confirmation_code = 101 + int((count_row or {}).get("draft_count") or 0)
             stored_params = {
                 **draft_params,
                 "_draft_id": draft_id,
@@ -462,7 +444,6 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                 "_draft_created_at": created_at.isoformat(),
                 "_draft_expires_at": expires_at.isoformat(),
                 "_draft_version": version,
-                "_draft_confirmation_code": confirmation_code,
             }
             if initial_request:
                 stored_params["_original_request"] = initial_request

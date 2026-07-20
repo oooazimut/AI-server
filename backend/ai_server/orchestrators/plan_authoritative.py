@@ -58,6 +58,7 @@ class DeepSeekPlanService:
             "plan_id": constraints["plan_id"],
             "request": task.request,
             "request_hash": constraints["request_hash"],
+            "dialog_history": list(task.context.get("dialog_history") or []),
             "capability_catalog": catalog,
             "hard_constraints": {
                 key: value
@@ -97,7 +98,11 @@ class DeepSeekPlanService:
             messages=[
                 {
                     "role": "system",
-                    "content": "Return only strict JSON. You are an untrusted planner; do not call tools or compose a user answer.",
+                    "content": (
+                        "Return only strict JSON. You are an untrusted planner; do not call tools or compose a user answer. "
+                        "Use dialog_history when the current request answers a clarification. For a calendar reminder, "
+                        "do not ask for a missing time: use 12:00 Moscow; keep an already stated date and title."
+                    ),
                 },
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
@@ -170,7 +175,7 @@ def _hash(value: str) -> str:
 
 
 def _explicit_segments(request: str, catalog: dict[str, Any]) -> list[dict[str, str]]:
-    """Extract narrow, explicit `Agent: request` / `Agent, request` bindings."""
+    """Extract explicit named segments, including natural voice-style repetitions."""
     aliases = {
         "bitrix": "bitrix24",
         "битрикс": "bitrix24",
@@ -191,7 +196,32 @@ def _explicit_segments(request: str, catalog: dict[str, Any]) -> list[dict[str, 
             segments.append(
                 {"segment_id": f"segment-{index}", "specialist_id": specialist_id, "request": match.group(2)}
             )
-    return segments
+    if len(segments) >= 2:
+        return segments
+
+    # Voice transcription commonly removes the colon/semicolon between two
+    # explicitly named agents. Split only on a known agent name followed by a
+    # verb-like word, so an ordinary mention of a specialist stays untouched.
+    names = "|".join(re.escape(name) for name in sorted(aliases, key=len, reverse=True))
+    matches = list(
+        re.finditer(
+            rf"(?<![\w-])(?P<name>{names})(?=\s+(?:покажи|найди|создай|проверь|выведи|дай|расскажи)\b)",
+            request,
+            flags=re.IGNORECASE,
+        )
+    )
+    if len(matches) < 2:
+        return segments
+    voice_segments: list[dict[str, str]] = []
+    for index, match in enumerate(matches, start=1):
+        end = matches[index].start() if index < len(matches) else len(request)
+        body = request[match.end() : end].strip(" ,;:-")
+        specialist_id = aliases.get(match.group("name").casefold())
+        if specialist_id and body:
+            voice_segments.append(
+                {"segment_id": f"segment-{index}", "specialist_id": specialist_id, "request": body}
+            )
+    return voice_segments or segments
 
 
 def _constraints(
@@ -368,6 +398,19 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             task = task.model_copy(update={"context": {**context, "pending_specialist": str(pending)}})
         return task, None
 
+    async def _load_authoritative_dialog_history(self, task: AgentTask) -> AgentTask:
+        """The planner must see its own earlier clarification, not only specialist history."""
+        dialog_key = str(task.context.get("dialog_key") or "")
+        if self.store is None or not dialog_key or not hasattr(self.store, "load_turns"):
+            return task
+        history = await self.store.load_turns(dialog_key, limit=12)  # type: ignore[attr-defined]
+        return task.model_copy(update={"context": {**task.context, "dialog_history": list(history)}})
+
+    async def _append_authoritative_dialog_turn(self, task: AgentTask, answer: str) -> None:
+        dialog_key = str(task.context.get("dialog_key") or "")
+        if self.store is not None and dialog_key and answer and hasattr(self.store, "append_turn"):
+            await self.store.append_turn(dialog_key, task.request, answer)  # type: ignore[attr-defined]
+
     async def handle(self, task: AgentTask) -> AgentResult:
         started = time.monotonic()
         dialog_key = str(task.context.get("dialog_key") or "")
@@ -379,6 +422,7 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
         try:
             try:
                 task, _ = await self._load_authoritative_pending_specialist(task)
+                task = await self._load_authoritative_dialog_history(task)
             except Exception:
                 usage = ModelUsageRecord(
                     agent_id=self.manifest.id,
@@ -486,6 +530,7 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             result = result.model_copy(
                 update={"metadata": {**result.metadata, "total_ms": round((time.monotonic() - started) * 1000, 1)}}
             )
+            await self._append_authoritative_dialog_turn(task, result.answer)
             await self._send_to_channel(task, result)
             await self._publish_result(task, result)
             return result
@@ -589,6 +634,7 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                         # original, validated dialog-bound request.
                         "t0006_original_request": task.request,
                         "t0006_planned_subtask_request": subtask.request,
+                        "t0007_explicit_segment_request": subtask.request if subtask.segment_id else "",
                     }
                 }
             )

@@ -583,6 +583,19 @@ def test_explicit_segments_bind_each_part_to_its_named_specialist():
     assert [item.specialist_id for item in plan.subtasks] == ["logistics", "bitrix24"]
 
 
+def test_voice_style_explicit_segments_bind_each_named_specialist_without_punctuation():
+    request = "Логист покажи машины Битрикс покажи склад Борисова"
+    catalog = {
+        "logistics": {"capabilities": ["vehicle_usage_context"]},
+        "bitrix24": {"capabilities": ["bitrix_warehouse_search"]},
+    }
+    segments = _constraints(request, catalog)["explicit_segments"]
+    assert segments == [
+        {"segment_id": "segment-1", "specialist_id": "logistics", "request": "покажи машины"},
+        {"segment_id": "segment-2", "specialist_id": "bitrix24", "request": "покажи склад Борисова"},
+    ]
+
+
 def test_explicit_segment_cannot_be_silently_sent_to_another_specialist():
     request = "Bitrix: покажи склад Борисова"
     catalog = {

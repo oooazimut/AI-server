@@ -220,10 +220,14 @@ class BaseSpecialist:
         # Load per-specialist dialog history from agent's own PG schema (if configured),
         # otherwise fall back to the shared history passed via task.context.
         dialog_key: str = task.context.get("dialog_key") or ""
+        shared_history = list(task.context.get("dialog_history") or [])
         if self.store is not None and dialog_key:
-            dialog_history: list[dict] = await self.store.load_turns(dialog_key, limit=20)
+            specialist_history: list[dict] = await self.store.load_turns(dialog_key, limit=20)
+            # The orchestrator may have asked the preceding question before a
+            # specialist was ever called. Preserve that context for this turn.
+            dialog_history = [*shared_history, *specialist_history][-20:]
         else:
-            dialog_history = list(task.context.get("dialog_history") or [])
+            dialog_history = shared_history
 
         available_skills = (
             self.skill_store.list_skills_with_content(self.manifest) if self.skill_store is not None else []

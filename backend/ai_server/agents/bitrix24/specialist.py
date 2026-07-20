@@ -13,6 +13,7 @@ from ai_server.agents.bitrix24.llm import (
     _format_task_close_draft_answer,
     llm_failure_result,
 )
+from ai_server.agents.bitrix24.draft_confirmation import draft_confirmation_phrase, matches_draft_confirmation
 from ai_server.agents.bitrix24.ports import ProposalStorePort, TaskDraftStorePort
 from ai_server.agents.bitrix24.quality_control import (
     TASK_QUALITY_WEBHOOK_EVENTS,
@@ -319,13 +320,12 @@ class Bitrix24Specialist(BaseSpecialist):
         ) == "confirm"
         if tool_call.name in confirmation_tools or is_admin_confirm:
             draft = task.context.get("pending_task_draft") if isinstance(task.context, dict) else None
-            expected_code = str((draft or {}).get("_draft_confirmation_code") or "").strip()
-            if not expected_code or str(task.request or "").strip() != expected_code:
+            if not matches_draft_confirmation(str(task.request or ""), draft):
                 return (
                     ToolResult(
                         status=ToolStatus.DENIED,
                         tool=tool_call.name,
-                        error="Draft confirmation requires the exact displayed numeric code.",
+                        error=f"Draft confirmation requires the exact phrase: {draft_confirmation_phrase((draft or {}).get('_draft_type'))}.",
                     ),
                     None,
                     [],
@@ -709,5 +709,4 @@ def _format_admin_change_draft_answer(data: dict[str, Any]) -> str:
         f"было — {draft.get('old_value')!s}, станет — {draft.get('new_value')!s}. "
         "Черновик действует 15 минут. Подтвердите или отмените изменение."
     )
-    code = str(draft.get("_draft_confirmation_code") or "").strip()
-    return f"{answer}\n\nДля подтверждения отправьте только число: {code}" if code else answer
+    return f"{answer}\n\nДля подтверждения отправьте фразу: «{draft_confirmation_phrase(draft.get('_draft_type'))}»."
