@@ -1650,7 +1650,10 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                     metadata=safe_json(row["metadata_json"]),
                 )
             )
-        return sorted(scored, key=lambda item: (-item.score, item.entity_type, item.title))[:limit]
+        return sorted(
+            scored,
+            key=lambda item: (-item.score, item.entity_type, item.title.casefold(), item.entity_id),
+        )[:limit]
 
     def disk_delta_folder_candidates(
         self,

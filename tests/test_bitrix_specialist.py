@@ -502,6 +502,49 @@ def test_bitrix_llm_decide_routes_disk_scan_to_file_portal_search(monkeypatch):
     }
 
 
+def test_bitrix_llm_decide_routes_document_show_all_with_bounded_limit(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t1", request="Битрикс, покажи все документы по договору Азимут.", user={"id": "1"}),
+            retrieval_hits=[],
+            tool_definitions=_bitrix_read_tool_definitions(),
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["portal_search"]
+    assert result.decision.tool_calls[0].args == {
+        "query": "договор Азимут",
+        "scope": "documents",
+        "limit": 50,
+        "show_all": True,
+    }
+
+
+def test_bitrix_llm_decide_routes_document_next_page_without_rewriting_query(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t1", request="Покажи следующие результаты документов.", user={"id": "1"}),
+            retrieval_hits=[],
+            tool_definitions=_bitrix_read_tool_definitions(),
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["portal_search"]
+    assert result.decision.tool_calls[0].args == {"continuation": "next"}
+
+
 def test_bitrix_llm_decide_routes_task_text_search_even_when_model_answers_from_history(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient(
@@ -3596,6 +3639,56 @@ def test_bitrix_llm_compose_formats_portal_search_document_with_snippet(monkeypa
     assert "Фрагмент:" in result.answer
     assert "Транзит-Экспресс" in result.answer
     assert "(ID:" not in result.answer
+
+
+def test_bitrix_llm_compose_formats_portal_search_range_total_and_next_page(monkeypatch):
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client=client, settings=get_settings())
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="покажи следующие результаты документов", user={"id": "13"}),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[]),
+            tool_results=[
+                ToolResult(
+                    status="ok",
+                    tool="portal_search",
+                    data={
+                        "query": "договор",
+                        "scope": "documents",
+                        "limit": 10,
+                        "offset": 10,
+                        "total": 25,
+                        "range_start": 11,
+                        "range_end": 20,
+                        "remaining": 5,
+                        "pages": 3,
+                        "has_more": True,
+                        "results": [
+                            {
+                                "entity_type": "disk_file",
+                                "entity_id": "77",
+                                "title": "Договор.pdf",
+                                "body": "",
+                                "url": "/disk/77",
+                                "score": 42,
+                                "metadata": {},
+                            }
+                        ],
+                    },
+                )
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert "11. " in result.answer
+    assert "Показаны результаты 11-20 из 25" in result.answer
+    assert "Осталось: 5" in result.answer
+    assert "Страниц: 3" in result.answer
+    assert "следующие результаты" in result.answer
 
 
 def test_bitrix_llm_compose_formats_warehouse_products_with_links_and_more(monkeypatch):

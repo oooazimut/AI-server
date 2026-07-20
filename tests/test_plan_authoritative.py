@@ -261,6 +261,46 @@ def test_handle_preserves_approval_and_needs_human_state():
     assert [item.name for item in output.actions_requiring_approval] == ["write"]
 
 
+def test_multi_source_partial_failure_keeps_success_and_names_failed_source():
+    class _MultiPlanner(_Planner):
+        async def plan(self, *, task, constraints, **kwargs):
+            return _plan(
+                task.request,
+                plan_id=constraints["plan_id"],
+                subtasks=[
+                    {"subtask_id": "s1", "specialist_id": "bitrix24", "request": task.request},
+                    {"subtask_id": "s2", "specialist_id": "kartoteka", "request": task.request},
+                ],
+            ), ModelUsageRecord(agent_id="test", provider="test", model="test")
+
+    class _RaisingSpecialist:
+        async def handle(self, task):
+            raise RuntimeError("injected source failure")
+
+    planner = _MultiPlanner()
+    bitrix = _Specialist(AgentResult(status="completed", agent_id="bitrix24", answer="verified result"))
+    kartoteka = _RaisingSpecialist()
+    manifests = [
+        AgentManifest(id="bitrix24", name="Bitrix", kind="specialist", description="test"),
+        AgentManifest(id="kartoteka", name="Kartoteka", kind="specialist", description="test"),
+    ]
+    call = CallSpecialistTool({"bitrix24": bitrix, "kartoteka": kartoteka}, manifests)
+    subject = PlanAuthoritativeOrchestrator(
+        AgentManifest(id="internal_orchestrator", name="Orchestrator", kind="orchestrator", description="test"),
+        agent_tools=[call],
+        planner=planner,
+        llm=planner,
+    )
+
+    output = asyncio.run(subject.handle(AgentTask(task_id="t1", request="find across sources")))
+
+    assert output.status == "completed"
+    assert "Источник bitrix24: verified result" in output.answer
+    assert "Источник kartoteka: не завершил обработку" in output.answer
+    assert [item["specialist_id"] for item in output.metadata["branches"]] == ["bitrix24", "kartoteka"]
+    assert [item["status"] for item in output.metadata["branches"]] == ["completed", "error"]
+
+
 class _RephrasingPlanner(_Planner):
     async def plan(self, *, task, constraints, **kwargs):
         return _plan(

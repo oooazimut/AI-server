@@ -472,12 +472,34 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
         for item, value in zip(plan.subtasks, completed, strict=True):
             if isinstance(value, Exception):
                 attempt_id = f"attempt-{uuid.uuid4().hex}"
-                facts.append({"subtask_id": item.subtask_id, "attempt_id": attempt_id, "status": "failed", "answer": "Специалист не завершил обработку."})
+                facts.append(
+                    {
+                        "subtask_id": item.subtask_id,
+                        "specialist_id": item.specialist_id,
+                        "attempt_id": attempt_id,
+                        "status": "failed",
+                        "answer": f"Источник {item.specialist_id}: не завершил обработку.",
+                    }
+                )
                 actions.append(ActionRecord(name="call_specialist", status="error", details={**base_meta, "subtask_id": item.subtask_id, "attempt_id": attempt_id, "specialist_id": item.specialist_id}))
                 continue
             _, attempt_id, tool = value
             data = tool.data if isinstance(tool.data, dict) else {}
-            facts.append({"subtask_id": item.subtask_id, "attempt_id": attempt_id, "status": str(data.get("status") or tool.status), "answer": str(data.get("answer") or tool.error or "")})
+            branch_status = str(data.get("status") or tool.status)
+            branch_answer = str(data.get("answer") or tool.error or "").strip()
+            if len(plan.subtasks) > 1:
+                if branch_status in {"error", "failed"}:
+                    branch_answer = "не завершил обработку."
+                branch_answer = f"Источник {item.specialist_id}: {branch_answer or 'не вернул результат.'}"
+            facts.append(
+                {
+                    "subtask_id": item.subtask_id,
+                    "specialist_id": item.specialist_id,
+                    "attempt_id": attempt_id,
+                    "status": branch_status,
+                    "answer": branch_answer,
+                }
+            )
             for raw_approval in data.get("actions_requiring_approval", []):
                 if isinstance(raw_approval, dict):
                     approvals.append(ActionRecord.model_validate(raw_approval))

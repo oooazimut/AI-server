@@ -675,8 +675,9 @@ def _format_portal_search_answer(data: dict[str, Any], *, portal_base_url: str =
     if not items:
         return title.replace(":", " не найдены.")
 
+    offset = _int_value(data.get("offset")) or 0
     lines = [title]
-    for index, item in enumerate(items, start=1):
+    for index, item in enumerate(items, start=offset + 1):
         if not isinstance(item, dict):
             continue
         label = _portal_item_link(
@@ -689,9 +690,19 @@ def _format_portal_search_answer(data: dict[str, Any], *, portal_base_url: str =
         if snippet:
             lines.append(f"   Фрагмент: {snippet}")
 
-    limit = _int_value(data.get("limit")) or len(items)
-    if len(items) >= limit:
-        lines.append(f"Показаны первые {len(items)} результатов. Если нужно, можно уточнить запрос.")
+    shown = len(items)
+    total = _int_value(data.get("total")) or shown
+    range_start = _int_value(data.get("range_start")) or (offset + 1 if shown else 0)
+    range_end = _int_value(data.get("range_end")) or (offset + shown)
+    remaining = _int_value(data.get("remaining")) or max(0, total - range_end)
+    pages = _int_value(data.get("pages")) or 1
+    if total:
+        lines.append(
+            f"Показаны результаты {range_start}-{range_end} из {total}. "
+            f"Осталось: {remaining}. Страниц: {pages}."
+        )
+    if bool(data.get("has_more")):
+        lines.append("Чтобы продолжить тот же поиск, попросите показать следующие результаты.")
     return "\n".join(lines)
 
 
@@ -2946,13 +2957,43 @@ def _common_read_decision(request: str, tool_definitions: list[dict[str, Any]] |
 
 def _common_document_read_args(request: str) -> dict[str, Any] | None:
     lowered = request.casefold()
+    if _looks_like_document_continuation(lowered):
+        return {"continuation": "next"}
     if not _looks_like_document_search_request(lowered):
         return None
     query = _clean_document_query(request)
     if not query:
         return None
     scope = "files" if _looks_like_file_or_disk_scope(lowered) else "documents"
-    return {"query": query, "scope": scope, "limit": _extract_document_limit(lowered) or 10}
+    show_all = _looks_like_document_show_all(lowered)
+    return {
+        "query": query,
+        "scope": scope,
+        "limit": 50 if show_all else (_extract_document_limit(lowered) or 10),
+        **({"show_all": True} if show_all else {}),
+    }
+
+
+def _looks_like_document_continuation(lowered: str) -> bool:
+    if any(marker in lowered for marker in ("задач", "проект", "склад", "товар")):
+        return False
+    has_continuation = any(marker in lowered for marker in ("следующ", "дальше", "продолж"))
+    has_target = any(marker in lowered for marker in ("результат", "документ", "файл"))
+    return has_continuation and has_target
+
+
+def _looks_like_document_show_all(lowered: str) -> bool:
+    return any(
+        marker in lowered
+        for marker in (
+            "покажи все",
+            "покажи всё",
+            "выведи все",
+            "выведи всё",
+            "все документы",
+            "все файлы",
+        )
+    )
 
 
 def _looks_like_document_search_request(lowered: str) -> bool:
@@ -2968,7 +3009,7 @@ def _extract_document_limit(lowered: str) -> int | None:
     if not match:
         return None
     try:
-        return max(1, min(int(match.group(1)), 30))
+        return max(1, min(int(match.group(1)), 50))
     except ValueError:
         return None
 
@@ -2976,7 +3017,7 @@ def _extract_document_limit(lowered: str) -> int | None:
 def _clean_document_query(request: str) -> str:
     text = _clean_read_query(request)
     text = re.sub(
-        r"\b(?:покажи|найди|найти|выведи|ищи|список|последн(?:ие|их)?|первые)\b",
+        r"\b(?:покажи|найди|найти|выведи|ищи|список|последн(?:ие|их)?|первые|все|всё)\b",
         " ",
         text,
         flags=re.IGNORECASE,
@@ -2995,6 +3036,7 @@ def _clean_document_query(request: str) -> str:
         "договоры": "договор",
         "договора": "договор",
         "договоров": "договор",
+        "договору": "договор",
         "счета": "счет",
         "счёта": "счет",
         "счетов": "счет",

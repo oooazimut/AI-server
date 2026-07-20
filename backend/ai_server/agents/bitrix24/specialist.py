@@ -162,6 +162,7 @@ class Bitrix24Specialist(BaseSpecialist):
         bitrix_llm: BitrixAgentLLM | None = None,
         scheduler: SchedulerPort | None = None,
         bitrix_store: Any | None = None,
+        orchestrator_store: Any | None = None,
         settings: Settings | None = None,
         specialist_result_publisher: Any | None = None,
         conversation_trace: Any | None = None,
@@ -173,6 +174,12 @@ class Bitrix24Specialist(BaseSpecialist):
                 portal_search=portal_search_index,
                 bitrix_files=bitrix_client,
                 bitrix_oauth=bitrix_oauth,
+                state_store=orchestrator_store,
+                live_fallback_enabled=bitrix_oauth is not None,
+                index_max_age_seconds=max(
+                    3600,
+                    _settings.search_background_metadata_interval_seconds * 2,
+                ),
             ),
             BitrixWarehouseSearchTool(
                 client=bitrix_client,

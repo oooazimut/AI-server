@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
+import math
+from datetime import UTC, datetime
 from typing import Any
 
 from ai_server.agents.bitrix24.tools.read_client import oauth_authorization_data, oauth_missing_error
 from ai_server.integrations.bitrix.oauth import BitrixOAuthError, BitrixOAuthService, BitrixOAuthTokenMissing
+from ai_server.integrations.bitrix.portal_search.types import PortalSearchResult
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
 from ai_server.tools.bitrix_ports import BitrixFileDownloadPort
 from ai_server.tools.bitrix_search import PortalSearchPort, entity_types_for_scope, format_portal_search_results
@@ -12,6 +16,14 @@ from ai_server.utils import optional_int
 _DENIED_AGENT_SCOPES = {"", "all", "tasks"}
 _ACCESS_CHECKED_SCOPES = {"documents", "files"}
 _DOCUMENT_ENTITY_TYPES = {"disk_file", "task_attachment"}
+_PAGINATION_FIELD = "portal_search_page"
+_DEFAULT_PAGE_SIZE = 10
+_SHOW_ALL_LIMIT = 50
+_MAX_SEARCH_RESULTS = 500
+_LIVE_MAX_STORAGES = 20
+_LIVE_MAX_FOLDERS = 50
+_LIVE_MAX_ITEMS = 500
+_LIVE_MAX_DEPTH = 5
 
 
 class PortalSearchTool:
@@ -22,10 +34,16 @@ class PortalSearchTool:
         portal_search: PortalSearchPort | None = None,
         bitrix_files: BitrixFileDownloadPort | None = None,
         bitrix_oauth: BitrixOAuthService | None = None,
+        state_store: Any | None = None,
+        live_fallback_enabled: bool = False,
+        index_max_age_seconds: int | None = None,
     ) -> None:
         self._portal_search = portal_search
         self._bitrix_files = bitrix_files
         self._bitrix_oauth = bitrix_oauth
+        self._state_store = state_store
+        self._live_fallback_enabled = live_fallback_enabled
+        self._index_max_age_seconds = index_max_age_seconds
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -52,9 +70,12 @@ class PortalSearchTool:
                             "stock",
                         ],
                     },
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 30},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": _SHOW_ALL_LIMIT},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "show_all": {"type": "boolean"},
+                    "continuation": {"type": "string", "enum": ["next"]},
                 },
-                "required": ["query"],
+                "anyOf": [{"required": ["query"]}, {"required": ["continuation"]}],
             },
         )
 
@@ -70,9 +91,31 @@ class PortalSearchTool:
             return ToolResult(
                 status=ToolStatus.NOT_CONFIGURED, tool="portal_search", error="PortalSearchIndex is not injected"
             )
-        query = str(args.get("query") or "").strip()
-        scope = str(args.get("scope") or "all").strip().lower()
-        limit = max(1, min(int(args.get("limit") or 10), 30))
+        continuation = str(args.get("continuation") or "").strip().lower()
+        page_state: dict[str, Any] | None = None
+        if continuation:
+            if continuation != "next":
+                return ToolResult(
+                    status=ToolStatus.INVALID_TOOL_CALL,
+                    tool=self.name,
+                    error=f"unknown continuation: {continuation}",
+                )
+            page_state = await _load_pagination_state(self._state_store, dialog_key=dialog_key)
+            if page_state is None:
+                return ToolResult(
+                    status=ToolStatus.INVALID_TOOL_CALL,
+                    tool=self.name,
+                    error="portal_search continuation requires an active dialog-bound result page.",
+                )
+
+        query = str((page_state or {}).get("query") or args.get("query") or "").strip()
+        scope = str((page_state or {}).get("scope") or args.get("scope") or "all").strip().lower()
+        show_all = bool(args.get("show_all")) and page_state is None
+        requested_limit = (page_state or {}).get("limit") or args.get("limit") or _DEFAULT_PAGE_SIZE
+        limit = max(1, min(int(requested_limit), _SHOW_ALL_LIMIT))
+        if show_all:
+            limit = _SHOW_ALL_LIMIT
+        offset = max(0, int((page_state or {}).get("next_offset") or args.get("offset") or 0))
         if not query:
             return ToolResult(status=ToolStatus.INVALID_TOOL_CALL, tool="portal_search", error="query is required")
         if scope in _DENIED_AGENT_SCOPES:
@@ -92,7 +135,9 @@ class PortalSearchTool:
             )
 
         stats = self._portal_search.stats()
-        if not stats.exists:
+        if not stats.exists and not (
+            scope in _ACCESS_CHECKED_SCOPES and self._live_fallback_enabled
+        ):
             return ToolResult(
                 status=ToolStatus.NOT_CONFIGURED,
                 tool="portal_search",
@@ -100,6 +145,7 @@ class PortalSearchTool:
                     "query": query,
                     "scope": scope,
                     "limit": limit,
+                    "offset": offset,
                     "index_path": str(stats.path),
                     "message": "Local portal search index is missing. Run cutover var import or indexing first.",
                 },
@@ -130,8 +176,15 @@ class PortalSearchTool:
             if access_error is not None:
                 return access_error
 
-        search_limit = min(100, max(limit, limit * 3)) if scope in _ACCESS_CHECKED_SCOPES else limit
-        results = self._portal_search.search(query, entity_types=entity_types, limit=search_limit)
+        index_state, index_age_seconds = _index_state(stats, max_age_seconds=self._index_max_age_seconds)
+        search_limit = _MAX_SEARCH_RESULTS if scope in _ACCESS_CHECKED_SCOPES else min(
+            _MAX_SEARCH_RESULTS, max(limit + offset, limit)
+        )
+        results = (
+            self._portal_search.search(query, entity_types=entity_types, limit=search_limit)
+            if stats.exists
+            else []
+        )
         access_filtered_count = 0
         if scope in _ACCESS_CHECKED_SCOPES:
             checked_results = []
@@ -141,11 +194,86 @@ class PortalSearchTool:
                     continue
                 if await _document_item_is_accessible(access_client, item):
                     checked_results.append(item)
-                    if len(checked_results) >= limit:
-                        break
                 else:
                     access_filtered_count += 1
             results = checked_results
+
+        live_attempted = False
+        live_error = ""
+        live_results: list[PortalSearchResult] = []
+        live_required = index_state in {"missing", "stale"}
+        live_useful = live_required or not results
+        if (
+            scope in _ACCESS_CHECKED_SCOPES
+            and self._live_fallback_enabled
+            and live_useful
+            and access_client is not None
+            and access_actor == "oauth_current_user"
+        ):
+            live_attempted = True
+            try:
+                live_results = await _search_live_disk_current_user(access_client, query=query)
+            except Exception as exc:
+                live_error = f"{type(exc).__name__}: {exc}"
+            else:
+                _update_index_from_live_results(self._portal_search, live_results)
+
+        stale_results_suppressed = 0
+        source_mode = "bitrix_postgresql"
+        if live_results:
+            results = live_results
+            source_mode = "bitrix_live_current_user"
+        elif live_required:
+            if live_attempted and not live_error:
+                source_mode = "bitrix_live_current_user"
+            stale_results_suppressed = len(results)
+            results = []
+            if live_error:
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool=self.name,
+                    error="portal_search current-user live verification failed; stale or missing index results were suppressed.",
+                    data={
+                        "query": query,
+                        "scope": scope,
+                        "limit": limit,
+                        "offset": offset,
+                        "index_state": index_state,
+                        "index_age_seconds": index_age_seconds,
+                        "access_checked": True,
+                        "access_actor": access_actor,
+                        "live_attempted": True,
+                        "live_error": live_error,
+                        "stale_results_suppressed": stale_results_suppressed,
+                        "results": [],
+                    },
+                )
+
+        results = sorted(results, key=_stable_result_key)
+        total = len(results)
+        page = results[offset : offset + limit]
+        shown = len(page)
+        next_offset = offset + shown
+        has_more = next_offset < total
+        remaining = max(0, total - next_offset)
+        pages = math.ceil(total / limit) if total else 0
+        output_results = []
+        for result in page:
+            item = result.as_dict()
+            item["source"] = source_mode
+            output_results.append(item)
+
+        if has_more:
+            await _save_pagination_state(
+                self._state_store,
+                dialog_key=dialog_key,
+                query=query,
+                scope=scope,
+                limit=limit,
+                next_offset=next_offset,
+            )
+        else:
+            await _clear_pagination_state(self._state_store, dialog_key=dialog_key)
         return ToolResult(
             status=ToolStatus.OK,
             tool="portal_search",
@@ -153,13 +281,191 @@ class PortalSearchTool:
                 "query": query,
                 "scope": scope,
                 "limit": limit,
+                "offset": offset,
+                "total": total,
+                "shown": shown,
+                "range_start": offset + 1 if shown else 0,
+                "range_end": next_offset,
+                "remaining": remaining,
+                "pages": pages,
+                "has_more": has_more,
+                "next_offset": next_offset if has_more else None,
                 "index_path": str(stats.path),
+                "index_state": index_state,
+                "index_age_seconds": index_age_seconds,
                 "access_checked": scope in _ACCESS_CHECKED_SCOPES,
                 "access_actor": access_actor,
                 "access_filtered_count": access_filtered_count,
-                "summary": format_portal_search_results(results, query=query),
-                "results": [result.as_dict() for result in results],
+                "source_mode": source_mode,
+                "live_attempted": live_attempted,
+                "live_error": live_error,
+                "stale_results_suppressed": stale_results_suppressed,
+                "summary": format_portal_search_results(page, query=query),
+                "results": output_results,
             },
+        )
+
+
+def _index_state(stats: Any, *, max_age_seconds: int | None) -> tuple[str, int | None]:
+    if not bool(getattr(stats, "exists", False)):
+        return "missing", None
+    if max_age_seconds is None:
+        return "fresh", None
+    value = str(getattr(stats, "last_indexed_at", None) or "").strip()
+    if not value:
+        return "stale", None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        age = max(0, int((datetime.now(UTC) - parsed.astimezone(UTC)).total_seconds()))
+    except (TypeError, ValueError):
+        return "stale", None
+    return ("stale" if age > max_age_seconds else "fresh"), age
+
+
+def _stable_result_key(item: PortalSearchResult) -> tuple[int, str, str, str]:
+    return (-int(item.score), str(item.entity_type), str(item.title).casefold(), str(item.entity_id))
+
+
+async def _load_pagination_state(store: Any | None, *, dialog_key: str | None) -> dict[str, Any] | None:
+    if store is None or not dialog_key:
+        return None
+    raw = await store.get_kv(dialog_key, _PAGINATION_FIELD)
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        await store.delete_kv(dialog_key, _PAGINATION_FIELD)
+        return None
+    if not isinstance(value, dict) or not value.get("query") or not value.get("scope"):
+        await store.delete_kv(dialog_key, _PAGINATION_FIELD)
+        return None
+    return value
+
+
+async def _save_pagination_state(
+    store: Any | None,
+    *,
+    dialog_key: str | None,
+    query: str,
+    scope: str,
+    limit: int,
+    next_offset: int,
+) -> None:
+    if store is None or not dialog_key:
+        return
+    value = json.dumps(
+        {"query": query, "scope": scope, "limit": limit, "next_offset": next_offset},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if len(value) <= 256:
+        await store.set_kv(dialog_key, _PAGINATION_FIELD, value)
+    else:
+        await store.delete_kv(dialog_key, _PAGINATION_FIELD)
+
+
+async def _clear_pagination_state(store: Any | None, *, dialog_key: str | None) -> None:
+    if store is not None and dialog_key:
+        await store.delete_kv(dialog_key, _PAGINATION_FIELD)
+
+
+async def _search_live_disk_current_user(
+    client: Any,
+    *,
+    query: str,
+) -> list[PortalSearchResult]:
+    list_storages = getattr(client, "list_disk_storages", None)
+    list_children = getattr(client, "list_disk_folder_children_all", None)
+    if not callable(list_storages) or not callable(list_children):
+        raise RuntimeError("current-user Bitrix client does not support live disk search")
+
+    storages = await list_storages(limit=_LIVE_MAX_STORAGES)
+    terms = [term for term in query.casefold().split() if term]
+    queue: list[tuple[int, str, str, int]] = []
+    for storage in storages:
+        root_id = optional_int(storage.get("ROOT_OBJECT_ID") or storage.get("rootObjectId"))
+        if root_id is None:
+            continue
+        storage_name = str(storage.get("NAME") or storage.get("name") or f"Disk #{root_id}")
+        queue.append((root_id, storage_name, storage_name, 0))
+
+    matches: list[PortalSearchResult] = []
+    visited: set[int] = set()
+    seen_objects: set[str] = set()
+    folders_scanned = 0
+    items_seen = 0
+    while queue and folders_scanned < _LIVE_MAX_FOLDERS and items_seen < _LIVE_MAX_ITEMS:
+        folder_id, storage_name, path, depth = queue.pop(0)
+        if folder_id in visited:
+            continue
+        visited.add(folder_id)
+        folders_scanned += 1
+        children = await list_children(
+            folder_id=folder_id,
+            limit=min(100, _LIVE_MAX_ITEMS - items_seen),
+        )
+        for child in children:
+            items_seen += 1
+            item_id = child.get("ID") or child.get("id")
+            if item_id is None:
+                continue
+            object_key = str(item_id)
+            if object_key in seen_objects:
+                continue
+            seen_objects.add(object_key)
+            name = str(child.get("NAME") or child.get("name") or f"Object #{item_id}")
+            item_type = str(child.get("TYPE") or child.get("type") or "").casefold()
+            child_path = f"{path}/{name}"
+            if item_type == "folder":
+                child_id = optional_int(item_id)
+                if child_id is not None and depth < _LIVE_MAX_DEPTH:
+                    queue.append((child_id, storage_name, child_path, depth + 1))
+                continue
+            searchable = f"{name} {child_path}".casefold()
+            if terms and not all(term in searchable for term in terms):
+                continue
+            metadata = {
+                "type": item_type or "file",
+                "path": child_path,
+                "storage_name": storage_name,
+                "parent_id": folder_id,
+                "disk_object_id": item_id,
+                "live_current_user_verified": True,
+            }
+            matches.append(
+                PortalSearchResult(
+                    entity_type="disk_file",
+                    entity_id=str(item_id),
+                    title=name,
+                    body=f"Disk: {storage_name}\nPath: {child_path}",
+                    url=str(child.get("DETAIL_URL") or child.get("detailUrl") or ""),
+                    score=max(1, sum(10 for term in terms if term in name.casefold())),
+                    metadata=metadata,
+                )
+            )
+            if len(matches) >= _MAX_SEARCH_RESULTS:
+                return sorted(matches, key=_stable_result_key)
+            if items_seen >= _LIVE_MAX_ITEMS:
+                break
+    return sorted(matches, key=_stable_result_key)
+
+
+def _update_index_from_live_results(index: Any, results: list[PortalSearchResult]) -> None:
+    upsert = getattr(index, "upsert_item", None)
+    if not callable(upsert):
+        return
+    for item in results:
+        upsert(
+            entity_type=item.entity_type,
+            entity_id=item.entity_id,
+            title=item.title,
+            body=item.body,
+            url=item.url,
+            metadata=item.metadata,
+            preserve_content=True,
         )
 
 
