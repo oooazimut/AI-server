@@ -471,12 +471,12 @@ class TaskCloseDraftTool:
         else:
             draft_status = "new_draft"
 
-        draft.payload.update(attach_draft_metadata(draft.payload, source_args={**(existing or {}), **args}, user_id=user_id))
+        draft.payload.update(
+            attach_draft_metadata(draft.payload, source_args={**(existing or {}), **args}, user_id=user_id)
+        )
         await self._store.save_task_draft(dialog_key, draft.payload)
         stored = await self._store.get_task_draft(dialog_key)
-        should_close_now = _truthy(enriched_args.get("close_now")) and not _truthy(
-            enriched_args.get("already_closed")
-        )
+        should_close_now = _truthy(enriched_args.get("close_now")) and not _truthy(enriched_args.get("already_closed"))
         if should_close_now:
             if not isinstance(stored, dict):
                 return ToolResult(
@@ -752,9 +752,7 @@ class TaskCloseConfirmTool:
                     close_call=oauth_client.call,
                     report_call=self._write_client.call if self._write_client is not None else None,
                     draft=draft,
-                    claim_guard=lambda: renew_exact_draft_claim(
-                        self._store, dialog_key=dialog_key, draft=claimed
-                    ),
+                    claim_guard=lambda: renew_exact_draft_claim(self._store, dialog_key=dialog_key, draft=claimed),
                 )
             except BitrixOAuthTokenMissing as exc:
                 if claimed is not None:
@@ -819,9 +817,7 @@ class TaskCloseConfirmTool:
                 close_call=self._write_client.call,
                 report_call=self._write_client.call,
                 draft=draft,
-                claim_guard=lambda: renew_exact_draft_claim(
-                    self._store, dialog_key=dialog_key, draft=claimed
-                ),
+                claim_guard=lambda: renew_exact_draft_claim(self._store, dialog_key=dialog_key, draft=claimed),
             )
         except Exception as exc:
             return ToolResult(

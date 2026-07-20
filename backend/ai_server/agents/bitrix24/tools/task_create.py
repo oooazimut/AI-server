@@ -508,45 +508,69 @@ async def _args_with_resolved_project(
         if len(exact_snapshot) == 1:
             return _bind_resolved_project(resolved_args, project=exact_snapshot[0], project_name=project_name)
         if len(exact_snapshot) > 1:
-            return resolved_args, "", _project_resolution_error(
-                f"exact indexed Bitrix project is ambiguous: {project_name}",
+            return (
                 resolved_args,
+                "",
+                _project_resolution_error(
+                    f"exact indexed Bitrix project is ambiguous: {project_name}",
+                    resolved_args,
+                ),
             )
 
     if read_client is None:
         label = "default personal project" if default_personal_project else "explicit project"
-        return resolved_args, "", _project_resolution_error(
-            f"{label} requires Bitrix project resolver",
+        return (
             resolved_args,
+            "",
+            _project_resolution_error(
+                f"{label} requires Bitrix project resolver",
+                resolved_args,
+            ),
         )
     try:
         projects = await read_client.search_projects(project_name, limit=10)
     except BitrixConfigError as exc:
-        return resolved_args, "", _project_resolution_error(
-            str(exc),
+        return (
             resolved_args,
-            status=ToolStatus.NOT_CONFIGURED,
+            "",
+            _project_resolution_error(
+                str(exc),
+                resolved_args,
+                status=ToolStatus.NOT_CONFIGURED,
+            ),
         )
     except BitrixApiError as exc:
-        return resolved_args, "", _project_resolution_error(
-            str(exc),
+        return (
             resolved_args,
-            status=ToolStatus.ERROR,
+            "",
+            _project_resolution_error(
+                str(exc),
+                resolved_args,
+                status=ToolStatus.ERROR,
+            ),
         )
     except Exception as exc:
-        return resolved_args, "", _project_resolution_error(
-            f"{type(exc).__name__}: {exc}",
+        return (
             resolved_args,
-            status=ToolStatus.ERROR,
+            "",
+            _project_resolution_error(
+                f"{type(exc).__name__}: {exc}",
+                resolved_args,
+                status=ToolStatus.ERROR,
+            ),
         )
     exact_projects = _matching_projects(projects, project_name)
     if len(exact_projects) != 1:
         label = "personal Bitrix project" if default_personal_project else "exact Bitrix project"
         resolution = "not found" if not exact_projects else "ambiguous"
-        return resolved_args, "", _project_resolution_error(
-            f"{label} {resolution}: {project_name}",
+        return (
             resolved_args,
-            allow_personal_project_creation=default_personal_project and not exact_projects,
+            "",
+            _project_resolution_error(
+                f"{label} {resolution}: {project_name}",
+                resolved_args,
+                allow_personal_project_creation=default_personal_project and not exact_projects,
+            ),
         )
     return _bind_resolved_project(resolved_args, project=exact_projects[0], project_name=project_name)
 
@@ -559,9 +583,13 @@ def _bind_resolved_project(
 ) -> tuple[dict[str, Any], str, ToolResult | None]:
     project_id = optional_int(project.get("ID") or project.get("id"))
     if project_id is None:
-        return resolved_args, "", _project_resolution_error(
-            f"Bitrix project has no numeric ID: {project_name}",
+        return (
             resolved_args,
+            "",
+            _project_resolution_error(
+                f"Bitrix project has no numeric ID: {project_name}",
+                resolved_args,
+            ),
         )
     resolved_name = compact_text(str(project.get("NAME") or project.get("name") or project_name))
     resolved_args["group_id"] = project_id

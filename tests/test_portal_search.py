@@ -186,12 +186,8 @@ def test_portal_search_tool_paginates_dialog_bound_results_without_duplicates():
         state_store=store,
     )
 
-    first = asyncio.run(
-        tool.execute({"query": "alpha", "scope": "documents"}, dialog_key="dialog-1")
-    )
-    second = asyncio.run(
-        tool.execute({"continuation": "next"}, dialog_key="dialog-1")
-    )
+    first = asyncio.run(tool.execute({"query": "alpha", "scope": "documents"}, dialog_key="dialog-1"))
+    second = asyncio.run(tool.execute({"continuation": "next"}, dialog_key="dialog-1"))
 
     first_ids = [item["entity_id"] for item in first.data["results"]]
     second_ids = [item["entity_id"] for item in second.data["results"]]
@@ -223,9 +219,7 @@ def test_portal_search_tool_show_all_is_bounded_to_fifty():
         )
     tool = PortalSearchTool(portal_search=index, bitrix_files=_FakeBitrixFiles(allowed_files=allowed))
 
-    result = asyncio.run(
-        tool.execute({"query": "alpha", "scope": "documents", "show_all": True})
-    )
+    result = asyncio.run(tool.execute({"query": "alpha", "scope": "documents", "show_all": True}))
 
     assert result.status == "ok"
     assert result.data["limit"] == 50
@@ -249,9 +243,7 @@ def test_portal_search_missing_index_uses_current_user_live_search_and_updates_i
         index_max_age_seconds=1,
     )
 
-    result = asyncio.run(
-        tool.execute({"query": "invoice alpha", "scope": "documents"}, user_id=13)
-    )
+    result = asyncio.run(tool.execute({"query": "invoice alpha", "scope": "documents"}, user_id=13))
 
     assert result.status == "ok"
     assert result.data["index_state"] == "missing"
@@ -289,9 +281,7 @@ def test_portal_search_stale_index_suppresses_snapshot_when_current_user_live_ch
         index_max_age_seconds=1,
     )
 
-    result = asyncio.run(
-        tool.execute({"query": "alpha", "scope": "documents"}, user_id=13)
-    )
+    result = asyncio.run(tool.execute({"query": "alpha", "scope": "documents"}, user_id=13))
 
     assert result.status == "error"
     assert result.data["index_state"] == "stale"
@@ -324,9 +314,7 @@ def test_portal_search_uses_durable_indexer_success_instead_of_item_max_timestam
         index_freshness_path=state_path,
     )
 
-    result = asyncio.run(
-        tool.execute({"query": "транзит договор", "scope": "documents"})
-    )
+    result = asyncio.run(tool.execute({"query": "транзит договор", "scope": "documents"}))
 
     assert result.status == "ok"
     assert result.data["index_state"] == "fresh"
@@ -360,12 +348,8 @@ def test_portal_search_indexer_without_success_stays_stale_after_live_item_refre
         index_freshness_path=state_path,
     )
 
-    first = asyncio.run(
-        tool.execute({"query": "invoice alpha", "scope": "documents"}, user_id=13)
-    )
-    second = asyncio.run(
-        tool.execute({"query": "invoice alpha", "scope": "documents"}, user_id=13)
-    )
+    first = asyncio.run(tool.execute({"query": "invoice alpha", "scope": "documents"}, user_id=13))
+    second = asyncio.run(tool.execute({"query": "invoice alpha", "scope": "documents"}, user_id=13))
 
     assert first.status == second.status == "ok"
     assert first.data["index_state"] == second.data["index_state"] == "stale"

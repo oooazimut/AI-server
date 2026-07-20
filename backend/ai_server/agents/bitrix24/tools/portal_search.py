@@ -138,9 +138,7 @@ class PortalSearchTool:
             )
 
         stats = self._portal_search.stats()
-        if not stats.exists and not (
-            scope in _ACCESS_CHECKED_SCOPES and self._live_fallback_enabled
-        ):
+        if not stats.exists and not (scope in _ACCESS_CHECKED_SCOPES and self._live_fallback_enabled):
             return ToolResult(
                 status=ToolStatus.NOT_CONFIGURED,
                 tool="portal_search",
@@ -184,13 +182,13 @@ class PortalSearchTool:
             max_age_seconds=self._index_max_age_seconds,
             freshness_path=self._index_freshness_path,
         )
-        search_limit = _MAX_SEARCH_RESULTS if scope in _ACCESS_CHECKED_SCOPES else min(
-            _MAX_SEARCH_RESULTS, max(limit + offset, limit)
+        search_limit = (
+            _MAX_SEARCH_RESULTS
+            if scope in _ACCESS_CHECKED_SCOPES
+            else min(_MAX_SEARCH_RESULTS, max(limit + offset, limit))
         )
         results = (
-            self._portal_search.search(query, entity_types=entity_types, limit=search_limit)
-            if stats.exists
-            else []
+            self._portal_search.search(query, entity_types=entity_types, limit=search_limit) if stats.exists else []
         )
         access_filtered_count = 0
         if scope in _ACCESS_CHECKED_SCOPES:

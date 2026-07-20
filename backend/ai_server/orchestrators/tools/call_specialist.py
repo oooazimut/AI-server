@@ -189,16 +189,18 @@ class CallSpecialistTool:
             )
 
         dialog_key = str(task.context.get("dialog_key") or "") or None
-        sub_task = task.model_copy(update={
-            "request": request,
-            "context": {
-                **task.context,
-                "t0006_effective_specialist_request": request,
-                "t0006_planned_subtask_request": str(
-                    task.context.get("t0006_planned_subtask_request") or planned_request
-                ),
-            },
-        })
+        sub_task = task.model_copy(
+            update={
+                "request": request,
+                "context": {
+                    **task.context,
+                    "t0006_effective_specialist_request": request,
+                    "t0006_planned_subtask_request": str(
+                        task.context.get("t0006_planned_subtask_request") or planned_request
+                    ),
+                },
+            }
+        )
         try:
             sr = await specialist.handle(sub_task)
         except Exception as exc:

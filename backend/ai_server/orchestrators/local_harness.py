@@ -4,6 +4,7 @@ DeepSeek supplies text only.  This module hashes, parses and validates its stric
 JSON plan before a deterministic fixture executor may be reached.  It deliberately
 has no network or persistent-service dependency.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -51,7 +52,14 @@ def source_constraints(request: str, *, clarification_resolved: bool = False) ->
     allowed = [capability for capability in requested if not (only_bitrix and capability == "delivery")]
     tokens = ["".join(char for char in token if char.isalpha()) for token in text.split()]
     known_names = KNOWN_ENTITY_FORMS
-    possible_typo = next((token for token in tokens if token and token not in known_names and difflib.get_close_matches(token, known_names, n=1, cutoff=0.70)), None)
+    possible_typo = next(
+        (
+            token
+            for token in tokens
+            if token and token not in known_names and difflib.get_close_matches(token, known_names, n=1, cutoff=0.70)
+        ),
+        None,
+    )
     ambiguous = next((token for token in tokens if token in AMBIGUOUS_LABELS), None)
     if ambiguous and (any(char.isdigit() for char in text) or "смородин" in text):
         ambiguous = None
@@ -62,10 +70,23 @@ def source_constraints(request: str, *, clarification_resolved: bool = False) ->
         clarification_reason = "ambiguous_entity_label"
     elif "активн" in text and "задач" in text:
         clarification_reason = "active_task_conflict"
-    return {"allowed_capabilities": allowed, "only_source": "bitrix" if only_bitrix else None, "max_subtasks": 8, "max_round_trips": 3, "clarification_required": clarification_reason}
+    return {
+        "allowed_capabilities": allowed,
+        "only_source": "bitrix" if only_bitrix else None,
+        "max_subtasks": 8,
+        "max_round_trips": 3,
+        "clarification_required": clarification_reason,
+    }
 
 
-def planner_prompt(*, plan_id: str, request: str, dialog_history: list[dict[str, str]], fixture_mode: str = "normal", clarification_resolved: bool = False) -> dict[str, Any]:
+def planner_prompt(
+    *,
+    plan_id: str,
+    request: str,
+    dialog_history: list[dict[str, str]],
+    fixture_mode: str = "normal",
+    clarification_resolved: bool = False,
+) -> dict[str, Any]:
     constraints = source_constraints(request, clarification_resolved=clarification_resolved)
     return {
         "schema_version": PLAN_SCHEMA,
@@ -95,7 +116,12 @@ def final_prompt(*, plan_id: str, response_hash: str, request: str, results: lis
         "response_hash": response_hash,
         "request": request,
         "executor_results": [asdict(result) for result in results],
-        "required_response": {"schema_version": FINAL_SCHEMA, "plan_id": plan_id, "response_hash": response_hash, "ordered_subtask_ids": ["all executed ids exactly once"]},
+        "required_response": {
+            "schema_version": FINAL_SCHEMA,
+            "plan_id": plan_id,
+            "response_hash": response_hash,
+            "ordered_subtask_ids": ["all executed ids exactly once"],
+        },
     }
 
 
@@ -158,7 +184,11 @@ def decode_plan(raw: str, *, plan_id: str, request: str, clarification_resolved:
     required = {"schema_version", "plan_id", "request_hash", "state", "clarification", "max_rounds", "subtasks"}
     if not isinstance(data, dict) or set(data) != required:
         raise PlanValidationError("PLAN_SCHEMA_MISMATCH")
-    if data["schema_version"] != PLAN_SCHEMA or data["plan_id"] != plan_id or data["request_hash"] != sha256_text(request):
+    if (
+        data["schema_version"] != PLAN_SCHEMA
+        or data["plan_id"] != plan_id
+        or data["request_hash"] != sha256_text(request)
+    ):
         raise PlanValidationError("PLAN_BINDING_MISMATCH")
     state = data["state"]
     if state not in {"EXECUTE", "CLARIFICATION_REQUIRED", "CATALOG", "NOT_SUPPORTED"}:
@@ -174,7 +204,11 @@ def decode_plan(raw: str, *, plan_id: str, request: str, clarification_resolved:
         raise PlanValidationError("SUBTASK_COUNT_INVALID")
     if state == "EXECUTE" and not subtasks_raw:
         raise PlanValidationError("EXECUTE_WITHOUT_SUBTASK")
-    if state != "EXECUTE" and (subtasks_raw or (state == "CLARIFICATION_REQUIRED" and not clarification) or (state != "CLARIFICATION_REQUIRED" and clarification is not None)):
+    if state != "EXECUTE" and (
+        subtasks_raw
+        or (state == "CLARIFICATION_REQUIRED" and not clarification)
+        or (state != "CLARIFICATION_REQUIRED" and clarification is not None)
+    ):
         raise PlanValidationError("NON_EXECUTION_PLAN_INVALID")
     constraints = source_constraints(request, clarification_resolved=clarification_resolved)
     if constraints["clarification_required"] and state != "CLARIFICATION_REQUIRED":
@@ -191,7 +225,12 @@ def decode_plan(raw: str, *, plan_id: str, request: str, clarification_resolved:
             raise PlanValidationError("UNKNOWN_CAPABILITY")
         if capability not in constraints["allowed_capabilities"]:
             raise PlanValidationError("FORBIDDEN_CAPABILITY")
-        if not isinstance(payload, dict) or set(payload) != {"query"} or not isinstance(payload["query"], str) or not payload["query"].strip():
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"query"}
+            or not isinstance(payload["query"], str)
+            or not payload["query"].strip()
+        ):
             raise PlanValidationError("SUBTASK_INPUT_INVALID")
         seen.add(subtask_id)
         subtasks.append(PlanSubtask(subtask_id, capability, payload))
@@ -206,7 +245,11 @@ def decode_final(raw: str, *, plan: ExecutionPlan, response_hash: str, results: 
     required = {"schema_version", "plan_id", "response_hash", "ordered_subtask_ids"}
     if not isinstance(data, dict) or set(data) != required:
         raise PlanValidationError("FINAL_SCHEMA_MISMATCH")
-    if data["schema_version"] != FINAL_SCHEMA or data["plan_id"] != plan.plan_id or data["response_hash"] != response_hash:
+    if (
+        data["schema_version"] != FINAL_SCHEMA
+        or data["plan_id"] != plan.plan_id
+        or data["response_hash"] != response_hash
+    ):
         raise PlanValidationError("FINAL_BINDING_MISMATCH")
     executed = {item.subtask_id for item in results}
     ordered = data["ordered_subtask_ids"]
@@ -225,13 +268,32 @@ class LocalOrchestratorHarness:
         self.executor_calls: list[dict[str, str]] = []
         self.pending: dict[str, tuple[str, str, str]] = {}
 
-    async def run_case(self, case_id: str, request: str, planner_response: str | None, final_response: str | None = None, *, fixture_mode: str = "normal", dialog_history: list[dict[str, str]] | None = None, task_id: str | None = None, plan_id: str | None = None, clarification_resolved: bool = False) -> HarnessResult:
+    async def run_case(
+        self,
+        case_id: str,
+        request: str,
+        planner_response: str | None,
+        final_response: str | None = None,
+        *,
+        fixture_mode: str = "normal",
+        dialog_history: list[dict[str, str]] | None = None,
+        task_id: str | None = None,
+        plan_id: str | None = None,
+        clarification_resolved: bool = False,
+    ) -> HarnessResult:
         started = time.monotonic()
         task_id = task_id or f"T0006-S03-{case_id}-{uuid.uuid4().hex[:8]}"
         plan_id = plan_id or f"plan-{uuid.uuid4().hex}"
         response_hash = sha256_text(planner_response or "")
-        task = AgentTask(task_id=task_id, request=request, user={"id": "u1"}, context={"dialog_key": f"chat:local:user:{case_id}"})
-        correlation = {"task_id": task.task_id, "partition": agent_queue_partition_key({"payload": task.model_dump()}), "plan_id": plan_id, "response_hash": response_hash}
+        task = AgentTask(
+            task_id=task_id, request=request, user={"id": "u1"}, context={"dialog_key": f"chat:local:user:{case_id}"}
+        )
+        correlation = {
+            "task_id": task.task_id,
+            "partition": agent_queue_partition_key({"payload": task.model_dump()}),
+            "plan_id": plan_id,
+            "response_hash": response_hash,
+        }
         result = HarnessResult(case_id, task_id, "FAILED", [], None, correlation_ids=correlation)
         if planner_response is None:
             result.plan_validation = {"status": "REJECTED", "reason": "MODEL_PLAN_UNAVAILABLE"}
@@ -240,7 +302,9 @@ class LocalOrchestratorHarness:
             return result
         result.model_calls = 1
         try:
-            plan = decode_plan(planner_response, plan_id=plan_id, request=request, clarification_resolved=clarification_resolved)
+            plan = decode_plan(
+                planner_response, plan_id=plan_id, request=request, clarification_resolved=clarification_resolved
+            )
         except PlanValidationError as error:
             result.plan_validation = {"status": "REJECTED", "reason": str(error)}
             result.notes.append("Rejected plan made zero executor calls.")
@@ -265,7 +329,14 @@ class LocalOrchestratorHarness:
             return result
         for round_no in range(1, plan.max_rounds + 1):
             branch_offset = (round_no - 1) * len(plan.subtasks)
-            current = list(await asyncio.gather(*(self._execute(plan, response_hash, item, fixture_mode, branch_offset + index + 1) for index, item in enumerate(plan.subtasks))))
+            current = list(
+                await asyncio.gather(
+                    *(
+                        self._execute(plan, response_hash, item, fixture_mode, branch_offset + index + 1)
+                        for index, item in enumerate(plan.subtasks)
+                    )
+                )
+            )
             result.branches.extend(current)
             if not all(item.status == "not_mine" for item in current):
                 break
@@ -277,7 +348,9 @@ class LocalOrchestratorHarness:
         else:
             result.model_calls += 1
             try:
-                result.final_response = decode_final(final_response, plan=plan, response_hash=response_hash, results=result.branches)
+                result.final_response = decode_final(
+                    final_response, plan=plan, response_hash=response_hash, results=result.branches
+                )
                 result.final_validation = {"status": "ACCEPT"}
                 result.verdict = "PASS" if all(item.status == "ok" for item in result.branches) else "PARTIAL"
             except PlanValidationError as error:
@@ -286,30 +359,86 @@ class LocalOrchestratorHarness:
         result.latency_ms = round((time.monotonic() - started) * 1000)
         return result
 
-    async def resume(self, task_id: str, user_answer: str, planner_response: str, final_response: str | None = None, *, plan_id: str | None = None) -> HarnessResult:
+    async def resume(
+        self,
+        task_id: str,
+        user_answer: str,
+        planner_response: str,
+        final_response: str | None = None,
+        *,
+        plan_id: str | None = None,
+    ) -> HarnessResult:
         case_id, request, fixture_mode = self.pending.pop(task_id)
         continuation_request = f"{request}\nОтвет пользователя: {user_answer}"
-        return await self.run_case(case_id, continuation_request, planner_response, final_response, fixture_mode=fixture_mode, dialog_history=[{"role": "user", "content": request}, {"role": "user", "content": user_answer}], task_id=task_id, plan_id=plan_id, clarification_resolved=True)
+        return await self.run_case(
+            case_id,
+            continuation_request,
+            planner_response,
+            final_response,
+            fixture_mode=fixture_mode,
+            dialog_history=[{"role": "user", "content": request}, {"role": "user", "content": user_answer}],
+            task_id=task_id,
+            plan_id=plan_id,
+            clarification_resolved=True,
+        )
 
-    async def _execute(self, plan: ExecutionPlan, response_hash: str, subtask: PlanSubtask, fixture_mode: str, index: int) -> BranchResult:
+    async def _execute(
+        self, plan: ExecutionPlan, response_hash: str, subtask: PlanSubtask, fixture_mode: str, index: int
+    ) -> BranchResult:
         await asyncio.sleep(0)
         executor = CATALOG[subtask.capability]["executor"]
         attempt_id = f"{plan.plan_id}:attempt:{index}"
-        self.executor_calls.append({"plan_id": plan.plan_id, "response_hash": response_hash, "subtask_id": subtask.subtask_id, "attempt_id": attempt_id, "executor": executor})
+        self.executor_calls.append(
+            {
+                "plan_id": plan.plan_id,
+                "response_hash": response_hash,
+                "subtask_id": subtask.subtask_id,
+                "attempt_id": attempt_id,
+                "executor": executor,
+            }
+        )
         query = subtask.input["query"].casefold()
         if fixture_mode == "timeout":
-            return BranchResult(executor, "timeout", "scripted local adapter timeout", attempt_id, plan.plan_id, response_hash, subtask.subtask_id)
+            return BranchResult(
+                executor,
+                "timeout",
+                "scripted local adapter timeout",
+                attempt_id,
+                plan.plan_id,
+                response_hash,
+                subtask.subtask_id,
+            )
         if fixture_mode == "not_mine":
-            return BranchResult(executor, "not_mine", "scripted executor says not mine", attempt_id, plan.plan_id, response_hash, subtask.subtask_id)
+            return BranchResult(
+                executor,
+                "not_mine",
+                "scripted executor says not mine",
+                attempt_id,
+                plan.plan_id,
+                response_hash,
+                subtask.subtask_id,
+            )
         if fixture_mode == "one_error" and index == 2:
-            return BranchResult(executor, "error", "scripted local adapter failure", attempt_id, plan.plan_id, response_hash, subtask.subtask_id)
+            return BranchResult(
+                executor,
+                "error",
+                "scripted local adapter failure",
+                attempt_id,
+                plan.plan_id,
+                response_hash,
+                subtask.subtask_id,
+            )
         if executor == "logistics":
             answer = "scripted delivery: route requires confirmation"
         elif subtask.capability == "contents_stock":
             answer = "scripted contents (not Bitrix facts): cable=12, fasteners=20"
         else:
             item = next((record for name, record in WAREHOUSES.items() if name in query), None)
-            answer = f"{item['title']} (id {item['id']}, active {item['active']})" if item else "not present in cleaned warehouse fixture"
+            answer = (
+                f"{item['title']} (id {item['id']}, active {item['active']})"
+                if item
+                else "not present in cleaned warehouse fixture"
+            )
         status = "ok" if "not present" not in answer else "not_found"
         return BranchResult(executor, status, answer, attempt_id, plan.plan_id, response_hash, subtask.subtask_id)
 

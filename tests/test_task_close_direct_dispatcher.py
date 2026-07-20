@@ -221,9 +221,7 @@ def test_dispatcher_queues_direct_close_draft_without_contacting_bitrix(monkeypa
     assert stats.messages_queued == 1
     assert bitrix.messages == []
     assert len(outbox.items) == 1
-    assert outbox.items[0]["delivery_key"] == (
-        "task_close_direct:8877:closed_at:2026-07-12T12:00:00+03:00:draft"
-    )
+    assert outbox.items[0]["delivery_key"] == ("task_close_direct:8877:closed_at:2026-07-12T12:00:00+03:00:draft")
     assert outbox.items[0]["task"]["task_id"].startswith("task-close-direct:8877:")
     state = store.get_task_close_processing_state(
         task_id=8877,
@@ -516,9 +514,7 @@ def test_expired_started_draft_finalizes_after_15_minutes_without_waiting_for_20
 
     assert stats.due is False
     assert stats.reports_written == 1
-    assert oauth_client.calls == [
-        ("tasks.task.get", {"taskId": 8875, "select": ["ID", "STATUS", "CLOSED_DATE"]})
-    ]
+    assert oauth_client.calls == [("tasks.task.get", {"taskId": 8875, "select": ["ID", "STATUS", "CLOSED_DATE"]})]
     assert "dialog:231:user:231" not in store._drafts
     report_text = base64.b64decode(bitrix.calls[-1][1]["fileParameters"]["CONTENT"]).decode("utf-8")
     assert "Two cameras checked." in report_text

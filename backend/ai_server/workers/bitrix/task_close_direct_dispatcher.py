@@ -301,11 +301,7 @@ async def auto_close_direct_task_close_reports(
             stats.skipped += 1
             continue
         row_status = str(row.get("status") or "active")
-        claim_name = (
-            "reclaim_stale_finalizing_task_draft"
-            if row_status == "finalizing"
-            else "claim_expired_task_draft"
-        )
+        claim_name = "reclaim_stale_finalizing_task_draft" if row_status == "finalizing" else "claim_expired_task_draft"
         claim = getattr(store, claim_name, None)
         claimed = None
         if callable(claim):

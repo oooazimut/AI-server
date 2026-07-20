@@ -123,9 +123,7 @@ class PostgresDiagnostStore(PostgresAgentSchema):
     async def cancel_pending_feedback(self) -> int:
         """Prevent old unsent prompts from resurfacing while feedback is disabled."""
         async with await self._connect() as db:
-            cur = await db.execute(
-                "UPDATE diagnost.pending_feedback SET status = 'cancelled' WHERE status = 'pending'"
-            )
+            cur = await db.execute("UPDATE diagnost.pending_feedback SET status = 'cancelled' WHERE status = 'pending'")
             return int(cur.rowcount or 0)
 
     async def save_event(self, task: AgentTask, result: AgentResult, *, source: str = "orchestrator") -> None:

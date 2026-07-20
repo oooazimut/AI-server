@@ -669,7 +669,9 @@ def _enforce_task_close_response(result: AgentResult, *, settings: Settings | No
                     update={"status": "needs_human", "answer": _format_admin_change_draft_answer(data)}
                 )
             if operation == "discard":
-                return result.model_copy(update={"status": "completed", "answer": "Черновик изменения настроек удалён."})
+                return result.model_copy(
+                    update={"status": "completed", "answer": "Черновик изменения настроек удалён."}
+                )
             if operation == "confirm":
                 return result.model_copy(update={"status": "completed", "answer": "Изменение настроек подтверждено."})
     return result

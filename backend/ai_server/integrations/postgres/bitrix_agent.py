@@ -201,8 +201,7 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                 """
             )
             db.execute(
-                "ALTER TABLE bitrix24.task_close_controlled_users "
-                "ADD COLUMN IF NOT EXISTS controlled_from TIMESTAMPTZ"
+                "ALTER TABLE bitrix24.task_close_controlled_users ADD COLUMN IF NOT EXISTS controlled_from TIMESTAMPTZ"
             )
             db.execute(
                 """
@@ -422,9 +421,7 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                     )
                 active_type = str(active["draft_type"] or "")
                 if active_type != draft_type:
-                    raise RuntimeError(
-                        f"ACTIVE_DRAFT_CONFLICT:{active['draft_id']}:{active_type}:{draft_type}"
-                    )
+                    raise RuntimeError(f"ACTIVE_DRAFT_CONFLICT:{active['draft_id']}:{active_type}:{draft_type}")
                 draft_id = str(active["draft_id"])
                 created_at = active["created_at"]
                 expires_at = active["expires_at"]
@@ -784,7 +781,13 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                     (draft_id, dialog_key, transition, payload_json, actor_user_id)
                 VALUES (%s, %s, %s, %s, %s)
                 """,
-                (draft_id, dialog_key, "processed" if status == "active" else "expired", payload_json, claimed["user_id"]),
+                (
+                    draft_id,
+                    dialog_key,
+                    "processed" if status == "active" else "expired",
+                    payload_json,
+                    claimed["user_id"],
+                ),
             )
             if status == "active":
                 await db.execute(
@@ -1027,6 +1030,7 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                 """,
                 (dialog_key, expected_draft_id, expected_draft_id),
             )
+
     # ------------------------------------------------------------------
     # Bitrix task close control state
     # ------------------------------------------------------------------

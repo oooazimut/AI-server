@@ -1265,9 +1265,7 @@ class FakeTaskDraftStore:
         expected_claim_token: str = "",
     ) -> None:
         current = self._drafts.get(dialog_key)
-        identity_matches = not expected_draft_id or (
-            current and str(current.get("_draft_id")) == expected_draft_id
-        )
+        identity_matches = not expected_draft_id or (current and str(current.get("_draft_id")) == expected_draft_id)
         version_matches = expected_version is None or (
             current and int(current.get("_draft_version") or 0) == expected_version
         )
@@ -1363,9 +1361,7 @@ class FakeTaskDraftStore:
         )
         return saved
 
-    def upsert_task_close_operator(
-        self, *, user_id: int, active: bool = True, updated_by: int | None = None
-    ) -> None:
+    def upsert_task_close_operator(self, *, user_id: int, active: bool = True, updated_by: int | None = None) -> None:
         if active:
             self._task_close_operators.add(int(user_id))
         else:

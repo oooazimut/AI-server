@@ -698,8 +698,7 @@ def _format_portal_search_answer(data: dict[str, Any], *, portal_base_url: str =
     pages = _int_value(data.get("pages")) or 1
     if total:
         lines.append(
-            f"Показаны результаты {range_start}-{range_end} из {total}. "
-            f"Осталось: {remaining}. Страниц: {pages}."
+            f"Показаны результаты {range_start}-{range_end} из {total}. Осталось: {remaining}. Страниц: {pages}."
         )
     if bool(data.get("has_more")):
         lines.append("Чтобы продолжить тот же поиск, попросите показать следующие результаты.")
@@ -1914,7 +1913,9 @@ def _simple_self_task_draft_args(request: str) -> dict[str, Any] | None:
     if any(marker in lowered for marker in assignment_markers):
         return None
 
-    match = re.search(r"\bзадач[ауи]?\b(?P<between>[^:]{0,80}):\s*(?P<title>.+)", request, flags=re.IGNORECASE | re.DOTALL)
+    match = re.search(
+        r"\bзадач[ауи]?\b(?P<between>[^:]{0,80}):\s*(?P<title>.+)", request, flags=re.IGNORECASE | re.DOTALL
+    )
     if match is None:
         return None
     between = match.group("between")
@@ -1925,8 +1926,10 @@ def _simple_self_task_draft_args(request: str) -> dict[str, Any] | None:
     )
     if project_match is None and "проект" in lowered:
         return None
-    if project_match is None and between.strip() and not re.fullmatch(
-        r"\s*(?:на|для)\s+меня\s*", between, flags=re.IGNORECASE
+    if (
+        project_match is None
+        and between.strip()
+        and not re.fullmatch(r"\s*(?:на|для)\s+меня\s*", between, flags=re.IGNORECASE)
     ):
         return None
     title = _TASK_CREATE_TITLE_CUTOFF_RE.split(match.group("title"), maxsplit=1)[0]

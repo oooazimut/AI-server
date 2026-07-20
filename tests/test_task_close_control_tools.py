@@ -87,9 +87,7 @@ def test_task_close_control_admin_adds_operator_without_controlling_operator() -
     assert prepared.data["draft"]["_draft_specialist"] == "bitrix24"
     assert store.task_close_operator_ids() == set()
 
-    confirmed = asyncio.run(
-        tool.execute({"operation": "confirm"}, user_id=1, dialog_key="d:1", dialog_id="1")
-    )
+    confirmed = asyncio.run(tool.execute({"operation": "confirm"}, user_id=1, dialog_key="d:1", dialog_id="1"))
 
     assert confirmed.status == ToolStatus.OK
     assert confirmed.data["operator_user_ids"] == [13]
@@ -240,9 +238,7 @@ def test_task_close_control_admin_sets_time_and_control_start() -> None:
             dialog_id="1",
         )
     )
-    start_confirm = asyncio.run(
-        tool.execute({"operation": "confirm"}, user_id=1, dialog_key="d:1", dialog_id="1")
-    )
+    start_confirm = asyncio.run(tool.execute({"operation": "confirm"}, user_id=1, dialog_key="d:1", dialog_id="1"))
 
     assert time_result.status == ToolStatus.OK
     assert time_confirm.status == ToolStatus.OK
@@ -312,9 +308,7 @@ def test_task_close_control_confirm_revalidates_admin_and_fails_closed() -> None
     store = FakeTaskDraftStore()
     client = _admin_client({"ID": 13, "NAME": "Olga", "LAST_NAME": "Operator", "ACTIVE": True})
     tool = _update_tool(store, client)
-    prepared = asyncio.run(
-        tool.execute({"action": "add_operator", "target_user_id": 13}, user_id=1, dialog_key="d:1")
-    )
+    prepared = asyncio.run(tool.execute({"action": "add_operator", "target_user_id": 13}, user_id=1, dialog_key="d:1"))
     client.users[1]["IS_ADMIN"] = False
 
     confirmed = asyncio.run(tool.execute({"operation": "confirm"}, user_id=1, dialog_key="d:1"))

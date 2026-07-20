@@ -338,9 +338,7 @@ def test_confirm_tool_creates_task():
 
     assert result.status == ToolStatus.OK
     assert result.data["result"]["task"]["id"] == 777
-    write_client.call.assert_awaited_once_with(
-        "tasks.task.add", {"fields": {"TITLE": "Задача", "RESPONSIBLE_ID": 9}}
-    )
+    write_client.call.assert_awaited_once_with("tasks.task.add", {"fields": {"TITLE": "Задача", "RESPONSIBLE_ID": 9}})
     assert "d:1" not in store._drafts
 
 

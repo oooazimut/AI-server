@@ -400,9 +400,7 @@ class ProjectCreateDiscardTool:
         linked_task = False
         if dialog_key:
             draft = await self._store.get_task_draft(dialog_key)
-            linked_task = isinstance(draft, dict) and isinstance(
-                draft.get("after_project_create_task_draft"), dict
-            )
+            linked_task = isinstance(draft, dict) and isinstance(draft.get("after_project_create_task_draft"), dict)
             if isinstance(draft, dict) and draft.get("_draft_type") == PROJECT_CREATE_DRAFT_TYPE:
                 await discard_exact_draft(
                     self._store,
@@ -444,7 +442,9 @@ async def _replace_with_followup_task_draft(
     if followup_task_draft is None:
         return None
     followup_task_draft["params"] = attach_draft_metadata(
-        followup_task_draft["params"], source_args=project_draft, user_id=optional_int(project_draft.get("_draft_user_id"))
+        followup_task_draft["params"],
+        source_args=project_draft,
+        user_id=optional_int(project_draft.get("_draft_user_id")),
     )
     await store.save_task_draft(dialog_key, followup_task_draft["params"])
     return followup_task_draft

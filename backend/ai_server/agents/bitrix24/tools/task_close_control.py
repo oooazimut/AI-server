@@ -174,7 +174,9 @@ class TaskCloseControlUpdateTool:
             await self._store.save_task_draft(dialog_key, prepared)
             stored = await self._store.get_task_draft(dialog_key, ttl_minutes=_DRAFT_TTL_MINUTES)
         except Exception as exc:
-            return ToolResult(status=ToolStatus.ERROR, tool=self.name, error=f"Could not save admin change draft: {exc}")
+            return ToolResult(
+                status=ToolStatus.ERROR, tool=self.name, error=f"Could not save admin change draft: {exc}"
+            )
         return ToolResult(
             status=ToolStatus.OK,
             tool=self.name,
@@ -201,13 +203,17 @@ class TaskCloseControlUpdateTool:
             return admin_error
         draft = await self._store.get_task_draft(dialog_key, ttl_minutes=_DRAFT_TTL_MINUTES)
         if not isinstance(draft, dict) or draft.get("_draft_type") != _DRAFT_TYPE:
-            return ToolResult(status=ToolStatus.NOT_FOUND, tool=self.name, error="Active admin change draft was not found")
+            return ToolResult(
+                status=ToolStatus.NOT_FOUND, tool=self.name, error="Active admin change draft was not found"
+            )
         draft_user_id = optional_int(draft.get("_draft_user_id") or draft.get("actor_user_id"))
         if draft_user_id is not None and draft_user_id != user_id:
             return _denied(self.name, user_id=user_id, reason="This admin change draft belongs to another user.")
         action = str(draft.get("action") or "")
         if action not in _CHANGE_ACTIONS:
-            return ToolResult(status=ToolStatus.INVALID_TOOL_CALL, tool=self.name, error="Admin change draft is invalid")
+            return ToolResult(
+                status=ToolStatus.INVALID_TOOL_CALL, tool=self.name, error="Admin change draft is invalid"
+            )
         draft_id = str(draft.get("_draft_id") or "")
         draft_version = optional_int(draft.get("_draft_version"))
         if not draft_id or draft_version is None:
@@ -226,7 +232,9 @@ class TaskCloseControlUpdateTool:
                     actor_user_id=user_id,
                 )
             except Exception:
-                return ToolResult(status=ToolStatus.ERROR, tool=self.name, error="Could not apply the reviewed admin change")
+                return ToolResult(
+                    status=ToolStatus.ERROR, tool=self.name, error="Could not apply the reviewed admin change"
+                )
             outcome_status = str((outcome or {}).get("status") or "") if isinstance(outcome, dict) else ""
             if outcome_status == "conflict":
                 return ToolResult(
@@ -288,7 +296,9 @@ class TaskCloseControlUpdateTool:
             apply_error = _apply_change(self._store, draft=draft, actor_user_id=user_id)
         except Exception:
             await _release_draft_claim(release, dialog_key=dialog_key, draft=draft)
-            return ToolResult(status=ToolStatus.ERROR, tool=self.name, error="Could not apply the reviewed admin change")
+            return ToolResult(
+                status=ToolStatus.ERROR, tool=self.name, error="Could not apply the reviewed admin change"
+            )
         if apply_error is not None:
             await _release_draft_claim(release, dialog_key=dialog_key, draft=draft)
             return apply_error
@@ -325,7 +335,9 @@ class TaskCloseControlUpdateTool:
             return ToolResult(status=ToolStatus.INVALID_TOOL_CALL, tool=self.name, error="dialog_key is required")
         draft = await self._store.get_task_draft(dialog_key, ttl_minutes=_DRAFT_TTL_MINUTES)
         if not isinstance(draft, dict) or draft.get("_draft_type") != _DRAFT_TYPE:
-            return ToolResult(status=ToolStatus.NOT_FOUND, tool=self.name, error="Active admin change draft was not found")
+            return ToolResult(
+                status=ToolStatus.NOT_FOUND, tool=self.name, error="Active admin change draft was not found"
+            )
         draft_user_id = optional_int(draft.get("_draft_user_id") or draft.get("actor_user_id"))
         if draft_user_id is not None and draft_user_id != user_id:
             return _denied(self.name, user_id=user_id, reason="This admin change draft belongs to another user.")
@@ -418,10 +430,14 @@ class TaskCloseControlUpdateTool:
         try:
             raw_user = await user_client.get_user(target_user_id)
         except Exception:
-            return ToolResult(status=ToolStatus.ERROR, tool=self.name, error="Could not revalidate the target Bitrix user")
+            return ToolResult(
+                status=ToolStatus.ERROR, tool=self.name, error="Could not revalidate the target Bitrix user"
+            )
         profile = _compact_user(raw_user) if isinstance(raw_user, dict) else None
         if profile is None or not profile.get("active"):
-            return ToolResult(status=ToolStatus.NOT_FOUND, tool=self.name, error="Target Bitrix user is no longer active")
+            return ToolResult(
+                status=ToolStatus.NOT_FOUND, tool=self.name, error="Target Bitrix user is no longer active"
+            )
         return None
 
 
@@ -545,7 +561,9 @@ def _current_change_value(store: Any, draft: dict[str, Any]) -> object:
     field = str(draft.get("field") or "")
     target_user_id = optional_int(draft.get("target_user_id"))
     if field == "operator":
-        return bool(target_user_id is not None and target_user_id in set(_ids_from_store(store, "task_close_operator_ids")))
+        return bool(
+            target_user_id is not None and target_user_id in set(_ids_from_store(store, "task_close_operator_ids"))
+        )
     if field == "controlled_user":
         return bool(
             target_user_id is not None
@@ -584,7 +602,9 @@ def _apply_change(store: Any, *, draft: dict[str, Any], actor_user_id: int | Non
             value=str(draft.get("new_value") or ""),
             actor_user_id=actor_user_id,
         )
-    return ToolResult(status=ToolStatus.INVALID_TOOL_CALL, tool=TaskCloseControlUpdateTool.name, error="Invalid draft action")
+    return ToolResult(
+        status=ToolStatus.INVALID_TOOL_CALL, tool=TaskCloseControlUpdateTool.name, error="Invalid draft action"
+    )
 
 
 def _normalized_name(value: object) -> str:

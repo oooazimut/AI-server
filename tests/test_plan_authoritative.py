@@ -45,9 +45,13 @@ def test_final_can_only_order_executor_facts():
         {"subtask_id": "s1", "answer": "first"},
         {"subtask_id": "s2", "answer": "second"},
     ]
-    raw = json.dumps({"schema_version": FINAL_SCHEMA, "plan_id": "p1", "response_hash": "h", "ordered_subtask_ids": ["s2", "s1"]})
+    raw = json.dumps(
+        {"schema_version": FINAL_SCHEMA, "plan_id": "p1", "response_hash": "h", "ordered_subtask_ids": ["s2", "s1"]}
+    )
     assert PlanAuthoritativeOrchestrator._decode_final(raw, "p1", "h", facts) == "second; first"
-    invalid = json.dumps({"schema_version": FINAL_SCHEMA, "plan_id": "p1", "response_hash": "h", "ordered_subtask_ids": ["s1"]})
+    invalid = json.dumps(
+        {"schema_version": FINAL_SCHEMA, "plan_id": "p1", "response_hash": "h", "ordered_subtask_ids": ["s1"]}
+    )
     with pytest.raises(PlanRejected, match="FINAL_COMPLETENESS_FAILED"):
         PlanAuthoritativeOrchestrator._decode_final(invalid, "p1", "h", facts)
 
@@ -70,10 +74,19 @@ def test_live_factory_selects_plan_authoritative_runtime():
 
 class _Planner:
     async def plan(self, *, task, constraints, **kwargs):
-        return _plan(task.request, plan_id=constraints["plan_id"]), ModelUsageRecord(agent_id="test", provider="test", model="test")
+        return _plan(task.request, plan_id=constraints["plan_id"]), ModelUsageRecord(
+            agent_id="test", provider="test", model="test"
+        )
 
     async def finalize(self, *, plan_id, response_hash, results, **kwargs):
-        return json.dumps({"schema_version": FINAL_SCHEMA, "plan_id": plan_id, "response_hash": response_hash, "ordered_subtask_ids": [item["subtask_id"] for item in results]}), ModelUsageRecord(agent_id="test", provider="test", model="test")
+        return json.dumps(
+            {
+                "schema_version": FINAL_SCHEMA,
+                "plan_id": plan_id,
+                "response_hash": response_hash,
+                "ordered_subtask_ids": [item["subtask_id"] for item in results],
+            }
+        ), ModelUsageRecord(agent_id="test", provider="test", model="test")
 
 
 class _Specialist:
@@ -92,7 +105,10 @@ def _live_subject(result, *, planner=None, store=None):
     call = CallSpecialistTool({"bitrix24": specialist}, [specialist_manifest], store=store)
     orchestrator = PlanAuthoritativeOrchestrator(
         AgentManifest(id="internal_orchestrator", name="Оркестр", kind="orchestrator", description="test"),
-        agent_tools=[call], planner=planner or _Planner(), llm=planner or _Planner(), store=store,
+        agent_tools=[call],
+        planner=planner or _Planner(),
+        llm=planner or _Planner(),
+        store=store,
     )
     return orchestrator, specialist
 
@@ -128,9 +144,7 @@ def test_pending_specialist_is_a_deterministic_dialog_bound_route():
     )
 
     output = asyncio.run(
-        subject.handle(
-            AgentTask(task_id="t1", request="Битрикс отмени черновик задачи.", context={"dialog_key": "d1"})
-        )
+        subject.handle(AgentTask(task_id="t1", request="Битрикс отмени черновик задачи.", context={"dialog_key": "d1"}))
     )
 
     assert output.status == "completed"
@@ -150,9 +164,7 @@ def test_unknown_pending_specialist_fails_closed_without_model_or_dispatch():
         store=store,
     )
 
-    output = asyncio.run(
-        subject.handle(AgentTask(task_id="t1", request="продолжи", context={"dialog_key": "d1"}))
-    )
+    output = asyncio.run(subject.handle(AgentTask(task_id="t1", request="продолжи", context={"dialog_key": "d1"})))
 
     assert output.status == "failed"
     assert output.metadata["reason"] == "FORBIDDEN_SPECIALIST"
@@ -191,9 +203,7 @@ def test_pending_state_read_failure_stops_before_model_and_dispatch():
         store=store,
     )
 
-    output = asyncio.run(
-        subject.handle(AgentTask(task_id="t1", request="продолжи", context={"dialog_key": "d1"}))
-    )
+    output = asyncio.run(subject.handle(AgentTask(task_id="t1", request="продолжи", context={"dialog_key": "d1"})))
 
     assert output.status == "failed"
     assert output.metadata["reason"] == "PENDING_STATE_READ_FAILED"
@@ -210,9 +220,7 @@ def test_pending_specialist_needs_human_is_durably_preserved():
         store=store,
     )
 
-    output = asyncio.run(
-        subject.handle(AgentTask(task_id="t1", request="измени", context={"dialog_key": "d1"}))
-    )
+    output = asyncio.run(subject.handle(AgentTask(task_id="t1", request="измени", context={"dialog_key": "d1"})))
 
     assert output.status == "needs_human"
     assert asyncio.run(store.get_kv("d1", "pending_specialist")) == "bitrix24"
@@ -228,9 +236,7 @@ def test_pending_state_write_failure_is_a_controlled_failure(specialist_status):
         store=store,
     )
 
-    output = asyncio.run(
-        subject.handle(AgentTask(task_id="t1", request="продолжи", context={"dialog_key": "d1"}))
-    )
+    output = asyncio.run(subject.handle(AgentTask(task_id="t1", request="продолжи", context={"dialog_key": "d1"})))
 
     assert output.status == "failed"
     assert output.answer == "pending specialist state transition failed"
@@ -252,7 +258,9 @@ def test_handle_propagates_causal_ids_before_specialist_call():
 
 def test_handle_preserves_approval_and_needs_human_state():
     specialist_result = AgentResult(
-        status="needs_human", agent_id="bitrix24", answer="approval needed",
+        status="needs_human",
+        agent_id="bitrix24",
+        answer="approval needed",
         actions_requiring_approval=[ActionRecord(name="write", status="pending")],
     )
     subject, _ = _live_subject(specialist_result)
@@ -401,9 +409,7 @@ def test_repair_provider_error_fails_closed_and_preserves_first_attempt_audit():
         "PLAN_SCHEMA_MISMATCH",
         "MODEL_REPAIR_UNAVAILABLE",
     ]
-    assert output.metadata["planner_attempt_audit"][0]["response_hash"] == _hash(
-        json.dumps({"unexpected": True})
-    )
+    assert output.metadata["planner_attempt_audit"][0]["response_hash"] == _hash(json.dumps({"unexpected": True}))
     assert output.metadata["planner_attempt_audit"][1] == {
         "attempt": 2,
         "status": "error",
@@ -468,9 +474,15 @@ def test_semantic_plan_rejection_is_not_retried():
     ],
 )
 def test_handle_preserves_verbatim_request_for_validated_bitrix_specialist(original_request):
-    subject, specialist = _live_subject(AgentResult(status="completed", agent_id="bitrix24", answer="ready"), planner=_RephrasingPlanner())
+    subject, specialist = _live_subject(
+        AgentResult(status="completed", agent_id="bitrix24", answer="ready"), planner=_RephrasingPlanner()
+    )
 
-    asyncio.run(subject.handle(AgentTask(task_id="t1", request=original_request, context={"dialog_key": "d1", "dialog_id": "chat1"})))
+    asyncio.run(
+        subject.handle(
+            AgentTask(task_id="t1", request=original_request, context={"dialog_key": "d1", "dialog_id": "chat1"})
+        )
+    )
 
     received = specialist.tasks[0]
     assert received.request == original_request

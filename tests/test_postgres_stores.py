@@ -716,17 +716,17 @@ def test_bitrix_store_lists_task_close_drafts(monkeypatch):
     rows = [
         {
             "dialog_key": "dialog:231:user:231",
-                "params_json": json.dumps({"_draft_type": "task_close", "task_id": 8875}),
-                "status": "active",
-                "created_at": "2026-07-12T19:00:00+03:00",
-                "updated_at": "2026-07-12T19:00:00+03:00",
+            "params_json": json.dumps({"_draft_type": "task_close", "task_id": 8875}),
+            "status": "active",
+            "created_at": "2026-07-12T19:00:00+03:00",
+            "updated_at": "2026-07-12T19:00:00+03:00",
         },
         {
             "dialog_key": "dialog:231:user:231:task-create",
-                "params_json": json.dumps({"_draft_type": "task_create", "title": "skip"}),
-                "status": "active",
-                "created_at": "2026-07-12T19:01:00+03:00",
-                "updated_at": "2026-07-12T19:01:00+03:00",
+            "params_json": json.dumps({"_draft_type": "task_create", "title": "skip"}),
+            "status": "active",
+            "created_at": "2026-07-12T19:01:00+03:00",
+            "updated_at": "2026-07-12T19:01:00+03:00",
         },
     ]
     factory, conn = _sync_conn_factory(rows=rows)
@@ -736,11 +736,11 @@ def test_bitrix_store_lists_task_close_drafts(monkeypatch):
 
     assert result == [
         {
-                "dialog_key": "dialog:231:user:231",
-                "params": {"_draft_type": "task_close", "task_id": 8875},
-                "status": "active",
-                "created_at": "2026-07-12T19:00:00+03:00",
-                "updated_at": "2026-07-12T19:00:00+03:00",
+            "dialog_key": "dialog:231:user:231",
+            "params": {"_draft_type": "task_close", "task_id": 8875},
+            "status": "active",
+            "created_at": "2026-07-12T19:00:00+03:00",
+            "updated_at": "2026-07-12T19:00:00+03:00",
         }
     ]
     sql, params = conn.calls[0]
