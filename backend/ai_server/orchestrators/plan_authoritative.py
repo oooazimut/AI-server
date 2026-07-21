@@ -19,7 +19,7 @@ from typing import Any, Protocol
 from ai_server.agents.bitrix24.draft_confirmation import matches_draft_confirmation
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ModelUsageRecord, ToolResult
-from ai_server.orchestrators.conversation_reference import resolve_conversation_reference
+from ai_server.orchestrators.conversation_reference import bind_conversation_parts, resolve_conversation_reference
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.orchestrators.tools.call_specialist import CallSpecialistTool
 
@@ -31,6 +31,7 @@ REPAIRABLE_PLAN_REJECTIONS = frozenset(
         "PLAN_SCHEMA_MISMATCH",
         "PLAN_BINDING_MISMATCH",
         "NON_EXECUTION_PLAN_INVALID",
+        "SEGMENT_BINDING_INVALID",
         "DUPLICATE_SUBTASK",
         "WAREHOUSE_SEGMENT_INCOMPLETE",
     }
@@ -263,9 +264,7 @@ def _explicit_segments(request: str, catalog: dict[str, Any]) -> list[dict[str, 
         body = request[match.end() : end].strip(" ,;:-")
         specialist_id = aliases.get(match.group("name").casefold())
         if specialist_id and body:
-            voice_segments.append(
-                {"segment_id": f"segment-{index}", "specialist_id": specialist_id, "request": body}
-            )
+            voice_segments.append({"segment_id": f"segment-{index}", "specialist_id": specialist_id, "request": body})
     return voice_segments or segments
 
 
@@ -310,7 +309,11 @@ def _required_warehouse_labels(request: str, catalog: dict[str, Any]) -> list[st
 
 
 def _constraints(
-    request: str, catalog: dict[str, Any], *, pending_specialist: str | None = None
+    request: str,
+    catalog: dict[str, Any],
+    *,
+    pending_specialist: str | None = None,
+    conversation_reference_error: str | None = None,
 ) -> dict[str, Any]:
     text = request.casefold()
     only_bitrix = "только bitrix" in text or "только битрикс" in text
@@ -321,6 +324,7 @@ def _constraints(
         "explicit_segments": _explicit_segments(request, catalog),
         "required_warehouse_labels": _required_warehouse_labels(request, catalog),
         "pending_specialist": pending_specialist or None,
+        "conversation_reference_error": conversation_reference_error or None,
         "max_subtasks": 8,
         "max_round_trips": 3,
     }
@@ -355,6 +359,8 @@ def _decode_plan(raw: str, *, plan_id: str, request: str, constraints: dict[str,
         or (state != "CLARIFICATION_REQUIRED" and clarification is not None)
     ):
         raise PlanRejected("NON_EXECUTION_PLAN_INVALID")
+    if constraints.get("conversation_reference_error") and state != "CLARIFICATION_REQUIRED":
+        raise PlanRejected("CONVERSATION_REFERENCE_VIOLATION")
     expected_segments = {item["segment_id"]: item for item in constraints.get("explicit_segments", [])}
     seen: set[str] = set()
     seen_segments: set[str] = set()
@@ -592,25 +598,10 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
 
     async def handle(self, task: AgentTask) -> AgentResult:
         started = time.monotonic()
-        reference = await resolve_conversation_reference(task, self.store)
-        if reference.error:
-            result = self._terminal(
-                task,
-                "needs_clarification",
-                reference.error,
-                ModelUsageRecord(
-                    agent_id=self.manifest.id,
-                    provider="internal",
-                    model="conversation-reference",
-                    status="not_used",
-                    notes=["No model call: explicit numbered conversation reference was not found."],
-                ),
-                {"reason": "UNKNOWN_CONVERSATION_REFERENCE", "route": "conversation_reference"},
-            )
-            await self._send_to_channel(task, result)
-            await self._publish_result(task, result)
-            return result
-        task = reference.task
+        # Reference failures deliberately still enter the mandatory Pro plan.
+        # The validated plan receives a fail-closed constraint and cannot
+        # dispatch a specialist for an unknown, expired or ambiguous branch.
+        task = (await resolve_conversation_reference(task, self.store)).task
         dialog_key = str(task.context.get("dialog_key") or "")
         active = False
         if self._dialog_guard is not None and dialog_key:
@@ -644,7 +635,12 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                 return result
             catalog = self._catalog()
             pending_specialist = str(task.context.get("pending_specialist") or "").strip()
-            constraints = _constraints(task.request, catalog, pending_specialist=pending_specialist)
+            constraints = _constraints(
+                task.request,
+                catalog,
+                pending_specialist=pending_specialist,
+                conversation_reference_error=str(task.context.get("conversation_reference_error") or "") or None,
+            )
             plan_id = f"plan-{uuid.uuid4().hex}"
             deterministic_route: str | None = None
             planner_usages: list[ModelUsageRecord] = []
@@ -781,7 +777,9 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             return AgentResult(
                 status="needs_clarification",
                 agent_id=self.manifest.id,
-                answer=plan.clarification or "Уточните запрос.",
+                answer=str(
+                    task.context.get("conversation_reference_error") or plan.clarification or "Уточните запрос."
+                ),
                 model_usage=list(planner_usages),
                 actions_taken=[ActionRecord(name="plan_validation", status="ok", details=base_meta)],
                 metadata=base_meta,
@@ -814,14 +812,18 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                 {**base_meta, "reason": "CALL_TOOL_UNAVAILABLE"},
             )
 
+        part_bindings = await bind_conversation_parts(task, self.store, [item.subtask_id for item in plan.subtasks])
+
         async def run(subtask: Subtask) -> tuple[Subtask, str, ToolResult]:
             # Correlation is created *before* reaching the specialist, so its
             # own trace and any durable result can be joined to this plan.
             attempt_id = f"attempt-{uuid.uuid4().hex}"
+            part = part_bindings.get(subtask.subtask_id, {})
             correlated_task = task.model_copy(
                 update={
                     "context": {
                         **task.context,
+                        **part,
                         "t0006_plan_id": plan.plan_id,
                         "t0006_response_hash": response_hash,
                         "t0006_subtask_id": subtask.subtask_id,
@@ -881,7 +883,11 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             if len(plan.subtasks) > 1:
                 if branch_status in {"error", "failed"}:
                     branch_answer = "не завершил обработку."
-                branch_answer = f"Источник {item.specialist_id}: {branch_answer or 'не вернул результат.'}"
+                part = part_bindings.get(item.subtask_id, {})
+                part_label = ""
+                if part:
+                    part_label = f"Диалог {task.context.get('conversation_number')}, часть {part['part']}: "
+                branch_answer = f"{part_label}Источник {item.specialist_id}: {branch_answer or 'не вернул результат.'}"
             facts.append(
                 {
                     "subtask_id": item.subtask_id,
@@ -889,6 +895,9 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                     "attempt_id": attempt_id,
                     "status": branch_status,
                     "answer": branch_answer,
+                    "terminal": bool(data.get("terminal")),
+                    "answer_is_final": bool(data.get("answer_is_final")),
+                    "safe_to_send": bool(data.get("safe_to_send")),
                 }
             )
             for raw_approval in data.get("actions_requiring_approval", []):
@@ -906,62 +915,33 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                     },
                 )
             )
-        single_verified_fact = (
-            not deterministic_route
-            and len(facts) == 1
-            and facts[0]["status"] == "completed"
-            and bool(str(facts[0]["answer"]).strip())
+        answer = (
+            "; ".join(str(item["answer"]).strip() for item in facts if str(item["answer"]).strip())
+            or "Не удалось получить подтверждённый результат специалистов."
+        )
+        usages = list(planner_usages)
+        verified_terminal = (
+            all(
+                item["status"] == "completed"
+                and bool(item["answer"].strip())
+                and item["terminal"]
+                and item["answer_is_final"]
+                and item["safe_to_send"]
+                for item in facts
+            )
             and not approvals
         )
-        if deterministic_route or single_verified_fact:
-            answer = (
-                "; ".join(str(item["answer"]).strip() for item in facts if str(item["answer"]).strip())
-                or "Не удалось получить подтверждённый результат специалистов."
+        actions.append(
+            ActionRecord(
+                name="final_validation",
+                status="deterministic",
+                details={
+                    **base_meta,
+                    "reason": "VALIDATED_PLAN_ORDER",
+                    "verified_terminal_facts": verified_terminal,
+                },
             )
-            usages = list(planner_usages)
-            if single_verified_fact:
-                actions.append(
-                    ActionRecord(
-                        name="final_validation",
-                        status="deterministic",
-                        details={**base_meta, "reason": "SINGLE_VERIFIED_SPECIALIST_RESULT"},
-                    )
-                )
-        else:
-            usages = list(planner_usages)
-            try:
-                raw_final, final_usage = await self._planner.finalize(
-                    manifest=self.manifest, task=task, plan_id=plan.plan_id, response_hash=response_hash, results=facts
-                )
-            except Exception:
-                answer = (
-                    "; ".join(str(item["answer"]).strip() for item in facts if str(item["answer"]).strip())
-                    or "Не удалось получить подтверждённый результат специалистов."
-                )
-                actions.append(
-                    ActionRecord(
-                        name="final_validation",
-                        status="fallback",
-                        details={**base_meta, "reason": "FINAL_MODEL_UNAVAILABLE"},
-                    )
-                )
-            else:
-                usages.append(final_usage)
-                try:
-                    answer = self._decode_final(raw_final, plan.plan_id, response_hash, facts)
-                except Exception as exc:
-                    reason = str(exc) if isinstance(exc, PlanRejected) else "FINAL_SCHEMA_INVALID"
-                    answer = (
-                        "; ".join(str(item["answer"]).strip() for item in facts if str(item["answer"]).strip())
-                        or "Не удалось получить подтверждённый результат специалистов."
-                    )
-                    actions.append(
-                        ActionRecord(
-                            name="final_validation",
-                            status="fallback",
-                            details={**base_meta, "reason": reason, "final_response_hash": _hash(raw_final)},
-                        )
-                    )
+        )
         branch_statuses = {str(item["status"]) for item in facts}
         if approvals or "needs_human" in branch_statuses:
             status = "needs_human"

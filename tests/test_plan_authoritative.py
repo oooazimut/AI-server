@@ -321,7 +321,9 @@ def test_new_calendar_request_reaches_pro_plan_despite_active_task_draft():
     )
 
     output = asyncio.run(
-        subject.handle(AgentTask(task_id="t1", request="Напомни мне завтра позвонить Борисову", context={"dialog_key": "d1"}))
+        subject.handle(
+            AgentTask(task_id="t1", request="Напомни мне завтра позвонить Борисову", context={"dialog_key": "d1"})
+        )
     )
 
     assert output.status == "completed"
@@ -436,6 +438,85 @@ def test_composite_plan_dispatches_each_validated_branch_not_the_whole_dialog_re
     assert [item.request for item in specialist.tasks] == ["покажи склад Борисова", "покажи склад Карасева"]
 
 
+def test_composite_result_is_assembled_in_validated_plan_order_without_a_final_model_call():
+    class CompositePlanner(_Planner):
+        def __init__(self):
+            self.final_calls = 0
+
+        async def plan(self, *, task, constraints, **kwargs):
+            return _plan(
+                task.request,
+                plan_id=constraints["plan_id"],
+                subtasks=[
+                    {
+                        "subtask_id": "s1",
+                        "segment_id": None,
+                        "specialist_id": "bitrix24",
+                        "capability": "bitrix_warehouse_search",
+                        "request": "first",
+                    },
+                    {
+                        "subtask_id": "s2",
+                        "segment_id": None,
+                        "specialist_id": "bitrix24",
+                        "capability": "bitrix_warehouse_search",
+                        "request": "second",
+                    },
+                ],
+            ), ModelUsageRecord(agent_id="test", provider="test", model="test")
+
+        async def finalize(self, **kwargs):
+            self.final_calls += 1
+            raise AssertionError("deterministic renderer must not call a final model")
+
+    planner = CompositePlanner()
+    subject, _ = _live_subject(AgentResult(status="completed", agent_id="bitrix24", answer="fact"), planner=planner)
+
+    output = asyncio.run(subject.handle(AgentTask(task_id="t1", request="two branches")))
+
+    assert output.status == "completed"
+    assert planner.final_calls == 0
+    assert output.model_usage == [ModelUsageRecord(agent_id="test", provider="test", model="test")]
+    assert (
+        next(action for action in output.actions_taken if action.name == "final_validation").details["reason"]
+        == "VALIDATED_PLAN_ORDER"
+    )
+
+
+def test_unknown_number_still_calls_pro_but_cannot_dispatch_a_specialist():
+    class ReferencePlanner(_Planner):
+        def __init__(self):
+            self.calls = 0
+
+        async def plan(self, *, task, constraints, **kwargs):
+            self.calls += 1
+            return _plan(
+                task.request,
+                plan_id=constraints["plan_id"],
+                state="CLARIFICATION_REQUIRED",
+                clarification="Укажите актуальный диалог.",
+                subtasks=[],
+            ), ModelUsageRecord(agent_id="test", provider="test", model="test")
+
+    store = FakeOrchestratorStore()
+    planner = ReferencePlanner()
+    subject, specialist = _live_subject(
+        AgentResult(status="completed", agent_id="bitrix24", answer="must not run"), planner=planner, store=store
+    )
+    task = AgentTask(
+        task_id="t1",
+        request="Покажи следующую страницу 999",
+        context={"dialog_key": "chat:4321:user:1", "base_dialog_key": "chat:4321:user:1"},
+    )
+
+    output = asyncio.run(subject.handle(task))
+
+    assert output.status == "needs_clarification"
+    assert planner.calls == 1
+    assert specialist.tasks == []
+    assert output.model_usage[0].provider == "test"
+
+
 def test_multi_source_partial_failure_keeps_success_and_names_failed_source():
     class _MultiPlanner(_Planner):
         async def plan(self, *, task, constraints, **kwargs):
@@ -469,7 +550,11 @@ def test_multi_source_partial_failure_keeps_success_and_names_failed_source():
     kartoteka = _RaisingSpecialist()
     manifests = [
         AgentManifest(
-            id="bitrix24", name="Bitrix", kind="specialist", description="test", capabilities=["bitrix_warehouse_search"]
+            id="bitrix24",
+            name="Bitrix",
+            kind="specialist",
+            description="test",
+            capabilities=["bitrix_warehouse_search"],
         ),
         AgentManifest(id="kartoteka", name="Kartoteka", kind="specialist", description="test", capabilities=["search"]),
     ]
@@ -638,7 +723,7 @@ def test_single_verified_specialist_skips_final_model_call():
     assert [usage.model for usage in output.model_usage] == ["test"]
     final_action = next(action for action in output.actions_taken if action.name == "final_validation")
     assert final_action.status == "deterministic"
-    assert final_action.details["reason"] == "SINGLE_VERIFIED_SPECIALIST_RESULT"
+    assert final_action.details["reason"] == "VALIDATED_PLAN_ORDER"
     assert len(specialist.tasks) == 1
 
 

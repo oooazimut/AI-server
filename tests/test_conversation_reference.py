@@ -1,7 +1,7 @@
 import asyncio
 
 from ai_server.models import AgentTask
-from ai_server.orchestrators.conversation_reference import resolve_conversation_reference
+from ai_server.orchestrators.conversation_reference import bind_conversation_parts, resolve_conversation_reference
 from ai_server.orchestrators.internal import _append_conversation_reference
 from tests.fakes import FakeOrchestratorStore
 
@@ -41,6 +41,39 @@ def test_short_continuation_needs_no_number_only_when_one_branch_is_active():
         await resolve_conversation_reference(_task("Покажи склад Карасева"), store)
         ambiguous = await resolve_conversation_reference(_task("Покажи следующую страницу"), store)
         assert "несколько активных" in ambiguous.error
+
+    asyncio.run(run())
+
+
+def test_continuation_accepts_plain_visible_number_at_the_end():
+    async def run():
+        store = FakeOrchestratorStore()
+        first = await resolve_conversation_reference(_task("Покажи склад Борисова"), store)
+
+        continued = await resolve_conversation_reference(_task("Покажи следующую страницу 101"), store)
+
+        assert continued.error == ""
+        assert continued.task.request == "Покажи следующую страницу"
+        assert continued.task.context["dialog_key"] == first.task.context["dialog_key"]
+
+    asyncio.run(run())
+
+
+def test_composite_dialog_requires_the_explicit_part_and_routes_it_to_its_own_key():
+    async def run():
+        store = FakeOrchestratorStore()
+        root = await resolve_conversation_reference(_task("Покажи склады Борисова и Карасева"), store)
+        bindings = await bind_conversation_parts(root.task, store, ["s1", "s2"])
+
+        assert bindings["s1"]["part"] == 1
+        assert bindings["s2"]["part"] == 2
+        ambiguous = await resolve_conversation_reference(_task("Покажи следующую страницу 101"), store)
+        assert "несколько частей" in ambiguous.error
+
+        selected = await resolve_conversation_reference(_task("Покажи следующую страницу 101 часть 2"), store)
+        assert selected.error == ""
+        assert selected.task.context["dialog_key"] == bindings["s2"]["dialog_key"]
+        assert selected.task.context["conversation_part"] == 2
 
     asyncio.run(run())
 
