@@ -8,6 +8,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
+from ai_server.agents.bitrix24.draft_confirmation import draft_confirmation_phrase, matches_draft_confirmation
 from ai_server.agents.specialist_llm_shared import (
     DIALOG_HISTORY_PROMPT_FRAGMENT,
     SKILLS_PROMPT_FRAGMENT,
@@ -19,7 +20,6 @@ from ai_server.agents.specialist_llm_shared import (
     retrieval_context,
     skills_context,
 )
-from ai_server.agents.bitrix24.draft_confirmation import draft_confirmation_phrase, matches_draft_confirmation
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import AgentManifest, AgentTask, ModelUsageRecord, ToolResult
 from ai_server.retrieval import RetrievalHit

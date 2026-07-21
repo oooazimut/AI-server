@@ -1596,12 +1596,12 @@ def test_bitrix_llm_routes_task_draft_confirmation_without_llm(monkeypatch):
             manifest=manifest,
             task=AgentTask(
                 task_id="t1",
-                    request="Да, подтверждаю создание задачи",
+                request="Да, подтверждаю создание задачи",
                 user={"id": "15"},
                 context={
                     "dialog_id": "chat4321",
                     "pending_task_draft": {
-                            "fields": {"TITLE": "test", "RESPONSIBLE_ID": 15, "CREATED_BY": 15, "NO_DEADLINE": True},
+                        "fields": {"TITLE": "test", "RESPONSIBLE_ID": 15, "CREATED_BY": 15, "NO_DEADLINE": True},
                     },
                 },
             ),
@@ -1643,12 +1643,12 @@ def test_bitrix_llm_routes_task_close_confirmation_without_llm(monkeypatch):
             manifest=manifest,
             task=AgentTask(
                 task_id="t1",
-                    request="Да, закрываю задачу как есть",
+                request="Да, закрываю задачу как есть",
                 user={"id": "15"},
                 context={
                     "dialog_id": "chat4321",
-                        "pending_task_draft": {
-                            "_draft_type": "task_close",
+                    "pending_task_draft": {
+                        "_draft_type": "task_close",
                         "task_id": 139,
                         "task_title": "Обучение сотрудников",
                     },
@@ -2179,12 +2179,12 @@ def test_bitrix_llm_routes_calendar_confirmation_without_llm(monkeypatch):
             manifest=manifest,
             task=AgentTask(
                 task_id="t1",
-                    request="Да, подтверждаю создание записи в календаре",
+                request="Да, подтверждаю создание записи в календаре",
                 user={"id": "15"},
                 context={
                     "dialog_id": "chat4321",
-                        "pending_task_draft": {
-                            "_draft_type": "calendar_event",
+                    "pending_task_draft": {
+                        "_draft_type": "calendar_event",
                         "title": "позвонить Борисову",
                         "start_iso": "2026-07-09T12:00:00+03:00",
                     },
@@ -2645,12 +2645,12 @@ def test_bitrix_llm_routes_project_confirmation_without_llm(monkeypatch):
             manifest=manifest,
             task=AgentTask(
                 task_id="t1",
-                    request="Да, подтверждаю создание проекта",
+                request="Да, подтверждаю создание проекта",
                 user={"id": "15"},
                 context={
                     "dialog_id": "chat4321",
-                        "pending_task_draft": {
-                            "_draft_type": "project_create",
+                    "pending_task_draft": {
+                        "_draft_type": "project_create",
                         "method": "sonet_group.create",
                         "params": {"fields": {"NAME": "Кулинич Валерий"}},
                     },
