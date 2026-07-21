@@ -480,6 +480,44 @@ def test_bitrix_llm_decide_routes_created_by_task_read_to_deterministic_tool(mon
     assert result.decision.tool_calls[0].args == {"scope": "created_by", "status": "active", "limit": 10}
 
 
+def test_bitrix_llm_routes_named_warehouse_next_page_from_its_visible_answer(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"must not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+    tools = _bitrix_read_tool_definitions() + [
+        ToolDefinition(name="bitrix_warehouse_search", description="", parameters={}).model_dump()
+    ]
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request="Покажи следующую страницу склада Борисова",
+                user={"id": "13"},
+            ),
+            retrieval_hits=[],
+            dialog_history=[
+                {
+                    "role": "assistant",
+                    "content": "Остатки по складу Борисов А.А. (Российская, 8):\nПоказаны позиции 1-50 из 97.",
+                }
+            ],
+            tool_definitions=tools,
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "warehouse_continuation_route"}
+    assert [call.name for call in result.decision.tool_calls] == ["bitrix_warehouse_search"]
+    assert result.decision.tool_calls[0].args == {
+        "query": "Борисов А.А.",
+        "include_products": True,
+        "product_limit": 50,
+        "product_offset": 50,
+    }
+
+
 def test_bitrix_llm_decide_routes_contract_documents_to_portal_search(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')

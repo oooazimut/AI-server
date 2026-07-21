@@ -232,6 +232,14 @@ class BitrixLLMService:
                 raw={"source": "calendar_reminder_route"},
             )
 
+        local_decision = _common_warehouse_continuation_decision(task.request, dialog_history, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "warehouse_continuation_route"),
+                raw={"source": "warehouse_continuation_route"},
+            )
+
         local_decision = _common_read_decision(task.request, tool_definitions)
         if local_decision is not None:
             return BitrixLLMDecisionResult(
@@ -2984,6 +2992,73 @@ def _common_read_decision(request: str, tool_definitions: list[dict[str, Any]] |
         return _local_decision_tool("bitrix_project_search", {"query": project_query, "limit": 10})
 
     return None
+
+
+def _common_warehouse_continuation_decision(
+    request: str,
+    dialog_history: list[dict[str, str]] | None,
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    """Route an explicitly named next warehouse page without another Bitrix LLM loop.
+
+    The route is deliberately narrow: it uses only a page that is already
+    visible in the same dialog history and only when the user repeats the
+    warehouse name.  Any uncertain case falls back to the existing model path.
+    """
+    available = {str(item.get("name") or "") for item in tool_definitions or []}
+    if "bitrix_warehouse_search" not in available:
+        return None
+    lowered = request.casefold()
+    if not any(marker in lowered for marker in ("следующ", "дальше", "продолж")) or "склад" not in lowered:
+        return None
+    requested_name = _warehouse_name_from_continuation(request)
+    if not requested_name:
+        return None
+    for item in reversed(dialog_history or []):
+        if str(item.get("role") or "") != "assistant":
+            continue
+        content = str(item.get("content") or "")
+        prior_name = _warehouse_name_from_answer(content)
+        page_end = _warehouse_page_end(content)
+        if prior_name and page_end is not None and _warehouse_names_match(requested_name, prior_name):
+            return _local_decision_tool(
+                "bitrix_warehouse_search",
+                {
+                    "query": prior_name,
+                    "include_products": True,
+                    "product_limit": 50,
+                    "product_offset": page_end,
+                },
+            )
+    return None
+
+
+def _warehouse_name_from_continuation(request: str) -> str:
+    match = re.search(r"\bсклад(?:а|е|у|ом)?\s+(?P<name>.+)$", request, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    value = re.sub(r"\b\d{3,}\b", " ", match.group("name"))
+    value = re.sub(r"\b(?:покажи|следующ\w*|страниц\w*|позици\w*)\b", " ", value, flags=re.IGNORECASE)
+    return compact_text(value).strip(" .,:;!?«»")
+
+
+def _warehouse_name_from_answer(answer: str) -> str:
+    match = re.search(r"(?:остатки\s+по|на)\s+складу\s+(?P<name>[^\n(]+)", answer, flags=re.IGNORECASE)
+    return compact_text(match.group("name")) if match else ""
+
+
+def _warehouse_page_end(answer: str) -> int | None:
+    match = re.search(r"показаны\s+(?:позиции|результаты)\s+\d+\s*[-–]\s*(\d+)\s+из\s+\d+", answer, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"показаны\s+первые\s+(\d+)\s+позиц", answer, flags=re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _warehouse_names_match(requested: str, prior: str) -> bool:
+    requested_words = [word for word in re.findall(r"[\wё]+", requested.casefold()) if len(word) >= 4]
+    prior_words = [word for word in re.findall(r"[\wё]+", prior.casefold()) if len(word) >= 4]
+    return bool(requested_words and prior_words and any(a[:5] == b[:5] for a in requested_words for b in prior_words))
 
 
 def _common_document_read_args(request: str) -> dict[str, Any] | None:
