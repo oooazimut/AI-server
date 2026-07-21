@@ -75,7 +75,9 @@ class PostgresOrchestratorStore(PostgresAgentSchema):
         now = datetime.now(UTC)
         expires_at = now + timedelta(minutes=ttl_minutes)
         async with await self._connect() as db:
-            await db.execute("DELETE FROM internal_orchestrator.replacement_candidates WHERE expires_at <= %s", (now.isoformat(),))
+            await db.execute(
+                "DELETE FROM internal_orchestrator.replacement_candidates WHERE expires_at <= %s", (now.isoformat(),)
+            )
             cur = await db.execute(
                 "SELECT request_text, draft_id, draft_type, created_at, expires_at "
                 "FROM internal_orchestrator.replacement_candidates WHERE dialog_key=%s",
@@ -83,7 +85,7 @@ class PostgresOrchestratorStore(PostgresAgentSchema):
             )
             current = await cur.fetchone()
             if current:
-                return {key: str(current[key]) for key in current.keys()}
+                return {key: str(current[key]) for key in current}
             await db.execute(
                 """
                 INSERT INTO internal_orchestrator.replacement_candidates
@@ -113,8 +115,10 @@ class PostgresOrchestratorStore(PostgresAgentSchema):
                 (dialog_key,),
             )
             row = await cur.fetchone()
-        return {key: str(row[key]) for key in row.keys()} if row else None
+        return {key: str(row[key]) for key in row} if row else None
 
     async def delete_replacement_candidate(self, dialog_key: str) -> None:
         async with await self._connect() as db:
-            await db.execute("DELETE FROM internal_orchestrator.replacement_candidates WHERE dialog_key=%s", (dialog_key,))
+            await db.execute(
+                "DELETE FROM internal_orchestrator.replacement_candidates WHERE dialog_key=%s", (dialog_key,)
+            )

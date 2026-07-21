@@ -2,9 +2,7 @@ from ai_server.agents.bitrix24.draft_confirmation import matches_draft_confirmat
 
 
 def test_voice_confirmation_ignores_comma_and_case():
-    assert matches_draft_confirmation(
-        "Да подтверждаю создание задачи", {"_draft_type": "task_create"}
-    )
+    assert matches_draft_confirmation("Да подтверждаю создание задачи", {"_draft_type": "task_create"})
 
 
 def test_voice_confirmation_allows_one_small_typo_but_not_bare_yes():

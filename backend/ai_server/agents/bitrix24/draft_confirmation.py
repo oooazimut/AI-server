@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from typing import Any
 
-
 _PHRASES = {
     "task_create": "да, подтверждаю создание задачи",
     "task_close": "да, закрываю задачу как есть",
@@ -85,7 +84,7 @@ def _character_distance(left: str, right: str) -> int:
     if abs(len(left) - len(right)) > 1:
         return 2
     if len(left) == len(right):
-        return sum(a != b for a, b in zip(left, right))
+        return sum(a != b for a, b in zip(left, right, strict=True))
     longer, shorter = (left, right) if len(left) > len(right) else (right, left)
     for index in range(len(longer)):
         if longer[:index] + longer[index + 1 :] == shorter:
