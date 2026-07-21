@@ -1,7 +1,7 @@
 import asyncio
 
 from ai_server.models import AgentTask
-from ai_server.orchestrators.conversation_reference import bind_conversation_parts, resolve_conversation_reference
+from ai_server.orchestrators.conversation_reference import resolve_conversation_reference
 from ai_server.orchestrators.internal import _append_conversation_reference
 from tests.fakes import FakeOrchestratorStore
 
@@ -59,21 +59,28 @@ def test_continuation_accepts_plain_visible_number_at_the_end():
     asyncio.run(run())
 
 
-def test_composite_dialog_requires_the_explicit_part_and_routes_it_to_its_own_key():
+def test_composite_dialog_keeps_one_root_and_never_requires_a_part_number():
     async def run():
         store = FakeOrchestratorStore()
         root = await resolve_conversation_reference(_task("Покажи склады Борисова и Карасева"), store)
-        bindings = await bind_conversation_parts(root.task, store, ["s1", "s2"])
+        continued = await resolve_conversation_reference(_task("Покажи следующую страницу склада Борисова 101"), store)
 
-        assert bindings["s1"]["part"] == 1
-        assert bindings["s2"]["part"] == 2
-        ambiguous = await resolve_conversation_reference(_task("Покажи следующую страницу 101"), store)
-        assert "несколько частей" in ambiguous.error
+        assert continued.error == ""
+        assert continued.task.context["dialog_key"] == root.task.context["dialog_key"]
+        assert "conversation_part" not in continued.task.context
 
-        selected = await resolve_conversation_reference(_task("Покажи следующую страницу 101 часть 2"), store)
-        assert selected.error == ""
-        assert selected.task.context["dialog_key"] == bindings["s2"]["dialog_key"]
-        assert selected.task.context["conversation_part"] == 2
+    asyncio.run(run())
+
+
+def test_legacy_part_reference_is_rejected_before_any_specialist_dispatch():
+    async def run():
+        store = FakeOrchestratorStore()
+        await resolve_conversation_reference(_task("Покажи склад Борисова"), store)
+
+        rejected = await resolve_conversation_reference(_task("101 часть 1 покажи остатки"), store)
+
+        assert "Части ответа больше не используются" in rejected.error
+        assert rejected.task.context["conversation_reference_dispatch_allowed"] is False
 
     asyncio.run(run())
 

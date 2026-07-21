@@ -20,7 +20,7 @@ from ai_server.agents.base import _trace_now_iso
 from ai_server.agents.bitrix24.draft_confirmation import matches_draft_confirmation
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ModelUsageRecord, ToolResult
-from ai_server.orchestrators.conversation_reference import bind_conversation_parts, resolve_conversation_reference
+from ai_server.orchestrators.conversation_reference import resolve_conversation_reference
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.orchestrators.tools.call_specialist import CallSpecialistTool
 
@@ -129,6 +129,11 @@ class DeepSeekPlanService:
                     }
                 ],
             },
+            "schema_contract": (
+                "Return exactly one JSON object with exactly these top-level keys: "
+                "schema_version, plan_id, request_hash, state, clarification, max_rounds, subtasks. "
+                "Do not add wrapper, explanation, markdown, or any other key."
+            ),
         }
         if repair_reason:
             payload["repair_instruction"] = {
@@ -147,6 +152,8 @@ class DeepSeekPlanService:
                     "role": "system",
                     "content": (
                         "Return only strict JSON. You are an untrusted planner; do not call tools or compose a user answer. "
+                        "Before sending, verify that the top-level keys are exactly the keys in required_response and that "
+                        "schema_version, plan_id, and request_hash exactly match their required_response values. "
                         "Use dialog_history when the current request answers a clarification. For a calendar reminder, "
                         "do not ask for a missing time: use 12:00 Moscow; keep an already stated date and title."
                     ),
@@ -622,7 +629,6 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             status="restricted" if task.context.get("conversation_reference_error") else "completed",
             details={
                 "conversation_number": task.context.get("conversation_number"),
-                "conversation_part": task.context.get("conversation_part"),
                 "dispatch_allowed": bool(task.context.get("conversation_reference_dispatch_allowed", True)),
             },
         )
@@ -901,19 +907,16 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                 {**base_meta, "reason": "CALL_TOOL_UNAVAILABLE"},
             )
 
-        part_bindings = await bind_conversation_parts(task, self.store, [item.subtask_id for item in plan.subtasks])
         dispatch_group = f"{plan.plan_id}:specialists"
 
         async def run(subtask: Subtask) -> tuple[Subtask, str, ToolResult]:
             # Correlation is created *before* reaching the specialist, so its
             # own trace and any durable result can be joined to this plan.
             attempt_id = f"attempt-{uuid.uuid4().hex}"
-            part = part_bindings.get(subtask.subtask_id, {})
             correlated_task = task.model_copy(
                 update={
                     "context": {
                         **task.context,
-                        **part,
                         "t0006_plan_id": plan.plan_id,
                         "t0006_response_hash": response_hash,
                         "t0006_subtask_id": subtask.subtask_id,
@@ -960,7 +963,6 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                     "parallel_group": dispatch_group,
                     "subtask_id": subtask.subtask_id,
                     "specialist_id": subtask.specialist_id,
-                    "conversation_part": part.get("part"),
                 },
             )
             return subtask, attempt_id, value
@@ -1003,11 +1005,7 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             if len(plan.subtasks) > 1:
                 if branch_status in {"error", "failed"}:
                     branch_answer = "не завершил обработку."
-                part = part_bindings.get(item.subtask_id, {})
-                part_label = ""
-                if part:
-                    part_label = f"Диалог {task.context.get('conversation_number')}, часть {part['part']}: "
-                branch_answer = f"{part_label}Источник {item.specialist_id}: {branch_answer or 'не вернул результат.'}"
+                branch_answer = f"Источник {item.specialist_id}: {branch_answer or 'не вернул результат.'}"
             facts.append(
                 {
                     "subtask_id": item.subtask_id,
