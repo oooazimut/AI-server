@@ -475,6 +475,114 @@ def test_bitrix_specialist_treats_show_warehouse_as_stock_request():
     assert tools.warehouse_calls == [{"query": "Борисов", "include_products": True, "product_limit": 50}]
 
 
+def test_bitrix_specialist_preserves_original_stock_intent_for_shortened_warehouse_subtask():
+    tools = FakeResolverTools(
+        warehouse_result=ToolResult(
+            status="ok",
+            tool="bitrix_warehouse_search",
+            data={
+                "matches": [{"id": "12", "title": "Борисов А.А."}],
+                "products": {"items": [], "total": 0, "limit": 50, "offset": 0},
+            },
+        )
+    )
+    llm = FakeBitrixLLM(
+        tool_call_steps=[
+            [BitrixLLMToolCall(name="bitrix_warehouse_search", args={"query": "Борисов"})],
+            [BitrixLLMToolCall(name="bitrix_warehouse_search", args={"query": "Борисов"})],
+        ],
+        final_answer="Остатки проверены.",
+    )
+
+    result = asyncio.run(
+        _bitrix_specialist(tools=tools, llm=llm).handle(
+            AgentTask(
+                task_id="t1",
+                request="Найти склад Борисова",
+                user={"id": "1"},
+                context={
+                    "t0006_original_request": "Покажи склад Борисова и Карасева",
+                    "t0006_planned_capability": "bitrix_warehouse_search",
+                },
+            )
+        )
+    )
+
+    assert result.status == "completed"
+    assert len(llm.decide_calls) == 1
+    assert tools.warehouse_calls == [{"query": "Борисов", "include_products": True, "product_limit": 50}]
+    assert result.metadata["fast_return"] is True
+
+
+def test_bitrix_specialist_does_not_accept_matches_only_as_terminal_for_original_stock_intent():
+    tools = FakeResolverTools(
+        warehouse_result=ToolResult(
+            status="ok",
+            tool="bitrix_warehouse_search",
+            data={"matches": [{"id": "12", "title": "Борисов А.А."}]},
+        )
+    )
+    llm = FakeBitrixLLM(
+        tool_call_steps=[
+            [BitrixLLMToolCall(name="bitrix_warehouse_search", args={"query": "Борисов"})],
+            [BitrixLLMToolCall(name="none")],
+        ],
+        final_answer="Нужны остатки.",
+    )
+
+    result = asyncio.run(
+        _bitrix_specialist(tools=tools, llm=llm).handle(
+            AgentTask(
+                task_id="t1",
+                request="Найти склад Борисова",
+                user={"id": "1"},
+                context={
+                    "t0006_original_request": "Покажи склад Борисова и Карасева",
+                    "t0006_planned_capability": "bitrix_warehouse_search",
+                },
+            )
+        )
+    )
+
+    assert result.status == "completed"
+    assert len(llm.decide_calls) == 2
+    assert tools.warehouse_calls == [{"query": "Борисов", "include_products": True, "product_limit": 50}]
+    assert "fast_return" not in result.metadata
+
+
+def test_bitrix_specialist_keeps_matches_only_terminal_for_plain_warehouse_lookup():
+    tools = FakeResolverTools(
+        warehouse_result=ToolResult(
+            status="ok",
+            tool="bitrix_warehouse_search",
+            data={"matches": [{"id": "12", "title": "Борисов А.А."}]},
+        )
+    )
+    llm = FakeBitrixLLM(
+        tool_call_steps=[
+            [BitrixLLMToolCall(name="bitrix_warehouse_search", args={"query": "Борисов"})],
+            [BitrixLLMToolCall(name="none")],
+        ],
+        final_answer="Найден склад Борисов А.А.",
+    )
+
+    result = asyncio.run(
+        _bitrix_specialist(tools=tools, llm=llm).handle(
+            AgentTask(
+                task_id="t1",
+                request="Найти склад Борисова",
+                user={"id": "1"},
+                context={"t0006_planned_capability": "bitrix_warehouse_search"},
+            )
+        )
+    )
+
+    assert result.status == "completed"
+    assert len(llm.decide_calls) == 1
+    assert tools.warehouse_calls == [{"query": "Борисов"}]
+    assert result.metadata["fast_return"] is True
+
+
 def test_show_all_warehouse_request_always_resets_product_page_to_first():
     args = _warehouse_args_with_default_products(
         {"query": "Ларгус 2", "include_products": True, "product_limit": 10, "product_offset": 50},
@@ -4013,6 +4121,110 @@ def test_bitrix_llm_compose_formats_warehouse_products_with_links_and_more(monke
     assert "Показаны первые 2 позиции из 3" in result.answer
     assert "product/1001" in result.answer
     assert "#1001" not in result.answer
+
+
+def test_bitrix_llm_compose_keeps_all_warehouse_results_from_one_specialist_branch(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    def warehouse_result(name: str, product_id: int) -> ToolResult:
+        return ToolResult(
+            status="ok",
+            tool="bitrix_warehouse_search",
+            data={
+                "matches": [{"id": product_id, "title": name, "address": "Российская,8"}],
+                "products": {
+                    "status": "ok",
+                    "items": [
+                        {
+                            "product_id": product_id,
+                            "product_name": f"Товар {name}",
+                            "amount": "1",
+                        }
+                    ],
+                    "limit": 50,
+                    "offset": 0,
+                    "available_items_with_names": 1,
+                    "has_more": False,
+                },
+            },
+        )
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="Покажи остатки склад Карасева и Борисова"),
+            decision=BitrixLLMDecision(status="completed", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[warehouse_result("Карасев А.В.", 101), warehouse_result("Борисов А.А.", 102)],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert "Остатки по складу Карасев А.В." in result.answer
+    assert "Остатки по складу Борисов А.А." in result.answer
+    assert result.answer.index("Карасев А.В.") < result.answer.index("Борисов А.А.")
+
+
+def test_bitrix_llm_multi_warehouse_compose_does_not_swallow_calendar_draft(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"should not be used"}')
+    service = BitrixLLMService(client, settings=get_settings())
+
+    def warehouse_result(name: str, product_id: int) -> ToolResult:
+        return ToolResult(
+            status="ok",
+            tool="bitrix_warehouse_search",
+            data={
+                "matches": [{"id": product_id, "title": name}],
+                "products": {
+                    "items": [{"product_id": product_id, "product_name": f"Товар {name}", "amount": "1"}],
+                    "limit": 50,
+                    "offset": 0,
+                    "available_items_with_names": 1,
+                    "has_more": False,
+                },
+            },
+        )
+
+    calendar_draft = ToolResult(
+        status="ok",
+        tool="calendar_event_draft",
+        data={
+            "draft": {
+                "_draft_type": "calendar_event",
+                "title": "Позвонить Борисову",
+                "start_iso": "2026-07-22T12:00:00+03:00",
+                "end_iso": "2026-07-22T12:30:00+03:00",
+            },
+            "preview": {
+                "title": "Позвонить Борисову",
+                "start": "22.07.2026 12:00 МСК",
+                "end": "22.07.2026 12:30 МСК",
+                "participants": "только текущий пользователь",
+                "reminder": "по настройкам календаря Bitrix",
+            },
+        },
+    )
+
+    result = asyncio.run(
+        service.compose(
+            task=AgentTask(task_id="t1", request="Покажи два склада и подготовь напоминание"),
+            decision=BitrixLLMDecision(status="needs_human", answer="", tool_calls=[BitrixLLMToolCall(name="none")]),
+            tool_results=[
+                warehouse_result("Карасев А.В.", 101),
+                warehouse_result("Борисов А.А.", 102),
+                calendar_draft,
+            ],
+            approval_actions=[],
+        )
+    )
+
+    assert client.calls == []
+    assert result.status == "needs_human"
+    assert "Черновик события календаря" in result.answer
+    assert "Позвонить Борисову" in result.answer
+    assert "Остатки по складу" not in result.answer
 
 
 def test_bitrix_llm_compose_marks_limit_sized_warehouse_page_as_complete_when_total_known(monkeypatch):

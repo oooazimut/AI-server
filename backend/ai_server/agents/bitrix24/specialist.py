@@ -455,7 +455,7 @@ class Bitrix24Specialist(BaseSpecialist):
         planned_tool = planned_capability if planned_capability in _LLM_TOOL_NAMES else ""
         if is_read_tool and planned_tool and planned_tool != tool_call.name:
             return None
-        if _is_ambiguous_read_result(tool_call.name, result):
+        if _is_incomplete_read_result(tool_call.name, result, task=task):
             return None
         if result.status == ToolStatus.OK:
             reason = "task_create_tool_success" if is_final_tool else "read_only_tool_success"
@@ -635,17 +635,18 @@ def _project_create_args_with_actor_context(args: dict[str, Any], task: AgentTas
 
 def _warehouse_args_with_default_products(args: dict[str, Any], task: AgentTask) -> dict[str, Any]:
     request = str(task.request or "")
+    original_request = str(task.context.get("t0006_original_request") or "")
     defaults = {**args, "product_limit": int(args.get("product_limit") or 50)}
     product_query = _warehouse_product_query(request)
     if product_query and not str(defaults.get("product_query") or "").strip():
         defaults["product_query"] = product_query
     if product_query:
         defaults["include_products"] = True
-    if _warehouse_request_resets_page(request):
+    if _warehouse_request_resets_page(request) or _warehouse_request_resets_page(original_request):
         return {**defaults, "include_products": True, "product_limit": 50, "product_offset": 0}
     if args.get("include_products") is True:
         return defaults
-    if _warehouse_request_implies_stock(request):
+    if _warehouse_request_implies_stock(request) or _warehouse_request_implies_stock(original_request):
         return {**defaults, "include_products": True}
     return defaults if product_query else args
 
@@ -750,13 +751,19 @@ def _is_oauth_authorization_result(result: ToolResult) -> bool:
     return bool(data.get("oauth_required") or isinstance(data.get("authorization"), dict))
 
 
-def _is_ambiguous_read_result(tool_name: str, result: ToolResult) -> bool:
+def _is_incomplete_read_result(tool_name: str, result: ToolResult, *, task: AgentTask) -> bool:
     if result.status != ToolStatus.OK:
         return False
     data = result.data if isinstance(result.data, dict) else {}
     if tool_name == "bitrix_warehouse_search":
         matches = data.get("matches")
         products = data.get("products")
+        request = str(task.request or "")
+        original_request = str(task.context.get("t0006_original_request") or "")
+        if (
+            _warehouse_request_implies_stock(request) or _warehouse_request_implies_stock(original_request)
+        ) and not isinstance(products, dict):
+            return True
         return isinstance(matches, list) and len(matches) > 1 and not isinstance(products, dict)
     if tool_name == "bitrix_project_search":
         items = data.get("items")

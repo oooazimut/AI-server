@@ -1,8 +1,11 @@
 import asyncio
+from datetime import datetime, timedelta
 
 from ai_server.models import AgentTask
+from ai_server.orchestrators import conversation_reference as conversation_reference_module
 from ai_server.orchestrators.conversation_reference import resolve_conversation_reference
 from ai_server.orchestrators.internal import _append_conversation_reference
+from ai_server.utils import MOSCOW_TZ
 from tests.fakes import FakeOrchestratorStore
 
 
@@ -125,3 +128,64 @@ def test_footer_places_number_last_and_rewrites_draft_confirmation_phrase():
     )
     assert "«101 подтвердить»" in rendered
     assert rendered.endswith("Диалог №101. Для продолжения: «101 следующая»")
+
+
+def test_visible_numbers_increment_during_day_and_restart_from_101_next_day(monkeypatch):
+    async def run():
+        store = FakeOrchestratorStore()
+        current = datetime(2026, 7, 21, 9, 0, tzinfo=MOSCOW_TZ)
+        monkeypatch.setattr(conversation_reference_module, "_now", lambda: current)
+
+        first = await resolve_conversation_reference(_task("Покажи склад Борисова"), store)
+        second = await resolve_conversation_reference(_task("Покажи склад Карасева"), store)
+
+        assert first.task.context["conversation_number"] == 101
+        assert second.task.context["conversation_number"] == 102
+        assert first.task.context["conversation_day"] == "20260721"
+
+        current = datetime(2026, 7, 22, 9, 0, tzinfo=MOSCOW_TZ)
+        next_day = await resolve_conversation_reference(_task("Покажи склад Ивашина"), store)
+
+        assert next_day.task.context["conversation_number"] == 101
+        assert next_day.task.context["conversation_day"] == "20260722"
+        assert next_day.task.context["dialog_key"] != first.task.context["dialog_key"]
+
+    asyncio.run(run())
+
+
+def test_read_branch_does_not_hide_numbered_active_draft_confirmation():
+    async def run():
+        store = FakeOrchestratorStore()
+        draft = await resolve_conversation_reference(_task("Напомни завтра позвонить Борисову"), store)
+        base_key = "chat:4321:user:1"
+        await store.set_kv(base_key, "conversation_reference_active_draft_branch", draft.task.context["dialog_key"])
+        await store.set_kv(base_key, "conversation_reference_active_draft_number", "101")
+
+        warehouse = await resolve_conversation_reference(_task("Покажи склад Карасева"), store)
+        confirmation = await resolve_conversation_reference(_task("101 подтвердить"), store)
+
+        assert warehouse.task.context["conversation_number"] == 102
+        assert warehouse.task.context["dialog_key"] != draft.task.context["dialog_key"]
+        assert confirmation.error == ""
+        assert confirmation.task.request == "подтвердить"
+        assert confirmation.task.context["conversation_number"] == 101
+        assert confirmation.task.context["dialog_key"] == draft.task.context["dialog_key"]
+        assert confirmation.task.context["conversation_reference_explicit"] is True
+
+    asyncio.run(run())
+
+
+def test_numbered_continuation_expires_after_fifteen_minutes(monkeypatch):
+    async def run():
+        store = FakeOrchestratorStore()
+        current = datetime(2026, 7, 21, 9, 0, tzinfo=MOSCOW_TZ)
+        monkeypatch.setattr(conversation_reference_module, "_now", lambda: current)
+        await resolve_conversation_reference(_task("Покажи склад Борисова"), store)
+
+        current += timedelta(minutes=16)
+        expired = await resolve_conversation_reference(_task("101 следующая страница"), store)
+
+        assert "не активен" in expired.error.casefold()
+        assert expired.task.context["conversation_reference_dispatch_allowed"] is False
+
+    asyncio.run(run())

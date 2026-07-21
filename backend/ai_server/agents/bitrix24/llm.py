@@ -354,6 +354,16 @@ def _direct_task_create_response(
     tool_results: list[ToolResult],
     portal_base_url: str = "",
 ) -> BitrixLLMFinalResult | None:
+    successful_results = [result for result in tool_results if result.status == "ok"]
+    warehouse_results = [result for result in successful_results if result.tool == "bitrix_warehouse_search"]
+    if len(warehouse_results) > 1 and len(warehouse_results) == len(successful_results):
+        return BitrixLLMFinalResult(
+            status="completed",
+            answer="\n\n".join(
+                _format_warehouse_answer(result.data, portal_base_url=portal_base_url) for result in warehouse_results
+            ),
+            model_usage=_local_model_usage(agent_id, "warehouse_multi_response"),
+        )
     for result in reversed(tool_results):
         if result.status == "denied" and result.tool in {
             "bitrix_warehouse_search",

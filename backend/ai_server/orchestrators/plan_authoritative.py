@@ -295,7 +295,9 @@ def _required_warehouse_labels(request: str, catalog: dict[str, Any]) -> list[st
     if "bitrix_warehouse_search" not in capabilities:
         return []
     text = _normalized_text(request)
-    match = re.search(r"\b(?:покажи|найди|выведи)\s+(?:мне\s+)?склад(?:ы)?\s+(.+)", text)
+    if not re.search(r"\b(?:покажи|найди|выведи)\b", text):
+        return []
+    match = re.search(r"\bсклад\w*\b\s+(.+)", text)
     if not match:
         return []
     tail = match.group(1)
@@ -310,6 +312,15 @@ def _required_warehouse_labels(request: str, catalog: dict[str, Any]) -> list[st
         "всё",
         "позиции",
         "остатки",
+        "остаток",
+        "наличие",
+        "товары",
+        "товаров",
+        "по",
+        "на",
+        "в",
+        "что",
+        "есть",
         "покажи",
         "найди",
         "выведи",

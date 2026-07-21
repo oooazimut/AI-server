@@ -405,6 +405,50 @@ def test_explicit_three_warehouse_request_requires_one_branch_per_label():
         _decode_plan(raw, plan_id="p1", request=request, constraints=constraints)
 
 
+@pytest.mark.parametrize(
+    ("user_text", "labels"),
+    [
+        ("Покажи склад Борисова и Карасева", ["борисова", "карасева"]),
+        ("Покажи остатки склад Карасева и Борисова", ["карасева", "борисова"]),
+        ("Покажи остатки по складам Борисова, Карасева и Ивашина", ["борисова", "карасева", "ивашина"]),
+    ],
+)
+def test_warehouse_wording_variants_require_one_validated_branch_per_label(user_text, labels):
+    constraints = _constraints(user_text, {"bitrix24": {"capabilities": ["bitrix_warehouse_search"]}})
+    assert constraints["required_warehouse_labels"] == labels
+
+    incomplete = _plan(
+        user_text,
+        subtasks=[
+            {
+                "subtask_id": "s1",
+                "segment_id": None,
+                "specialist_id": "bitrix24",
+                "capability": "bitrix_warehouse_search",
+                "request": f"Найти склад {labels[0]}",
+            }
+        ],
+    )
+    with pytest.raises(PlanRejected, match="WAREHOUSE_SEGMENT_INCOMPLETE"):
+        _decode_plan(incomplete, plan_id="p1", request=user_text, constraints=constraints)
+
+    complete = _plan(
+        user_text,
+        subtasks=[
+            {
+                "subtask_id": f"s{index}",
+                "segment_id": None,
+                "specialist_id": "bitrix24",
+                "capability": "bitrix_warehouse_search",
+                "request": f"Найти склад {label}",
+            }
+            for index, label in enumerate(labels, start=1)
+        ],
+    )
+    plan = _decode_plan(complete, plan_id="p1", request=user_text, constraints=constraints)
+    assert len(plan.subtasks) == len(labels)
+
+
 def test_composite_plan_dispatches_each_validated_branch_not_the_whole_dialog_request():
     class CompositePlanner(_Planner):
         async def plan(self, *, task, constraints, **kwargs):
@@ -436,6 +480,94 @@ def test_composite_plan_dispatches_each_validated_branch_not_the_whole_dialog_re
     asyncio.run(subject.handle(AgentTask(task_id="t1", request="склады Борисова и Карасева")))
 
     assert [item.request for item in specialist.tasks] == ["покажи склад Борисова", "покажи склад Карасева"]
+
+
+def test_three_warehouse_plan_dispatches_three_independent_virtual_branches():
+    labels = ["Борисова", "Карасева", "Ивашина"]
+
+    class ThreeWarehousePlanner(_Planner):
+        async def plan(self, *, task, constraints, **kwargs):
+            return _plan(
+                task.request,
+                plan_id=constraints["plan_id"],
+                subtasks=[
+                    {
+                        "subtask_id": f"warehouse-{index}",
+                        "segment_id": None,
+                        "specialist_id": "bitrix24",
+                        "capability": "bitrix_warehouse_search",
+                        "request": f"Найти склад {label}",
+                    }
+                    for index, label in enumerate(labels, start=1)
+                ],
+            ), ModelUsageRecord(agent_id="test", provider="test", model="test")
+
+    subject, specialist = _live_subject(
+        AgentResult(status="completed", agent_id="bitrix24", answer="warehouse page"),
+        planner=ThreeWarehousePlanner(),
+    )
+    output = asyncio.run(subject.handle(AgentTask(task_id="t1", request="Покажи склады Борисова, Карасева и Ивашина")))
+
+    assert len(specialist.tasks) == 3
+    assert {item.request for item in specialist.tasks} == {f"Найти склад {label}" for label in labels}
+    assert len(output.metadata["branches"]) == 3
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        ["Борисова", "Карасева"],
+        ["Борисова", "Карасева", "Ивашина"],
+    ],
+)
+def test_multi_warehouse_virtual_flow_keeps_every_result_in_one_answer(labels):
+    class WarehousePlanner(_Planner):
+        async def plan(self, *, task, constraints, **kwargs):
+            return _plan(
+                task.request,
+                plan_id=constraints["plan_id"],
+                subtasks=[
+                    {
+                        "subtask_id": f"warehouse-{index}",
+                        "segment_id": None,
+                        "specialist_id": "bitrix24",
+                        "capability": "bitrix_warehouse_search",
+                        "request": f"Найти склад {label}",
+                    }
+                    for index, label in enumerate(labels, start=1)
+                ],
+            ), ModelUsageRecord(agent_id="test", provider="test", model="test")
+
+    class WarehouseSpecialist:
+        def __init__(self):
+            self.tasks = []
+
+        async def handle(self, task):
+            self.tasks.append(task)
+            label = task.request.removeprefix("Найти склад ")
+            return AgentResult(status="completed", agent_id="bitrix24", answer=f"Остатки склада {label}")
+
+    specialist = WarehouseSpecialist()
+    manifest = AgentManifest(id="bitrix24", name="Битрикс", kind="specialist", description="test")
+    manifest.capabilities = ["bitrix_warehouse_search"]
+    call = CallSpecialistTool({"bitrix24": specialist}, [manifest])
+    planner = WarehousePlanner()
+    subject = PlanAuthoritativeOrchestrator(
+        AgentManifest(id="internal_orchestrator", name="Оркестр", kind="orchestrator", description="test"),
+        agent_tools=[call],
+        planner=planner,
+        llm=planner,
+    )
+
+    output = asyncio.run(
+        subject.handle(AgentTask(task_id="t1", request=f"Покажи склады {', '.join(labels[:-1])} и {labels[-1]}"))
+    )
+
+    assert output.status == "completed"
+    assert [task.request for task in specialist.tasks] == [f"Найти склад {label}" for label in labels]
+    for label in labels:
+        assert f"Остатки склада {label}" in output.answer
+    assert len(output.metadata["branches"]) == len(labels)
 
 
 def test_composite_result_is_assembled_in_validated_plan_order_without_a_final_model_call():
@@ -515,6 +647,28 @@ def test_unknown_number_still_calls_pro_but_cannot_dispatch_a_specialist():
     assert planner.calls == 1
     assert specialist.tasks == []
     assert output.model_usage[0].provider == "test"
+
+
+def test_numbered_warehouse_continuation_reaches_the_exact_original_branch():
+    store = FakeOrchestratorStore()
+    subject, specialist = _live_subject(
+        AgentResult(status="completed", agent_id="bitrix24", answer="warehouse page"),
+        store=store,
+    )
+    base_context = {"dialog_key": "chat:4321:user:1", "base_dialog_key": "chat:4321:user:1"}
+
+    asyncio.run(subject.handle(AgentTask(task_id="t1", request="Покажи склад Борисова", context=base_context)))
+    asyncio.run(subject.handle(AgentTask(task_id="t2", request="Покажи склад Карасева", context=base_context)))
+    asyncio.run(subject.handle(AgentTask(task_id="t3", request="101 следующая страница", context=base_context)))
+
+    first_branch = specialist.tasks[0].context["dialog_key"]
+    second_branch = specialist.tasks[1].context["dialog_key"]
+    continuation = specialist.tasks[2]
+    assert first_branch != second_branch
+    assert continuation.request == "следующая страница"
+    assert continuation.context["conversation_number"] == 101
+    assert continuation.context["dialog_key"] == first_branch
+    assert continuation.context["dialog_key"] != second_branch
 
 
 def test_trace_captures_pro_plan_parallel_specialists_and_deterministic_render():
@@ -868,6 +1022,69 @@ def test_voice_style_explicit_segments_bind_each_named_specialist_without_punctu
         {"segment_id": "segment-1", "specialist_id": "logistics", "request": "покажи машины"},
         {"segment_id": "segment-2", "specialist_id": "bitrix24", "request": "покажи склад Борисова"},
     ]
+
+
+def test_voice_style_logistics_and_bitrix_flow_dispatches_exact_parts_and_keeps_both_results():
+    request = "Логист покажи машины Битрикс покажи склад Борисова"
+
+    class VoiceCompositePlanner(_Planner):
+        async def plan(self, *, task, constraints, **kwargs):
+            return _plan(
+                task.request,
+                plan_id=constraints["plan_id"],
+                subtasks=[
+                    {
+                        "subtask_id": "logistics",
+                        "segment_id": "segment-1",
+                        "specialist_id": "logistics",
+                        "capability": "vehicle_usage_context",
+                        "request": "покажи машины",
+                    },
+                    {
+                        "subtask_id": "warehouse",
+                        "segment_id": "segment-2",
+                        "specialist_id": "bitrix24",
+                        "capability": "bitrix_warehouse_search",
+                        "request": "покажи склад Борисова",
+                    },
+                ],
+            ), ModelUsageRecord(agent_id="test", provider="test", model="test")
+
+    class RecordingSpecialist:
+        def __init__(self, agent_id, answer):
+            self.agent_id = agent_id
+            self.answer = answer
+            self.tasks = []
+
+        async def handle(self, task):
+            self.tasks.append(task)
+            return AgentResult(status="completed", agent_id=self.agent_id, answer=self.answer)
+
+    logistics = RecordingSpecialist("logistics", "Отчёт по машинам готов")
+    bitrix = RecordingSpecialist("bitrix24", "Остатки склада Борисова готовы")
+    logistics_manifest = AgentManifest(id="logistics", name="Логист", kind="specialist", description="test")
+    logistics_manifest.capabilities = ["vehicle_usage_context"]
+    bitrix_manifest = AgentManifest(id="bitrix24", name="Битрикс", kind="specialist", description="test")
+    bitrix_manifest.capabilities = ["bitrix_warehouse_search"]
+    call = CallSpecialistTool(
+        {"logistics": logistics, "bitrix24": bitrix},
+        [logistics_manifest, bitrix_manifest],
+    )
+    planner = VoiceCompositePlanner()
+    subject = PlanAuthoritativeOrchestrator(
+        AgentManifest(id="internal_orchestrator", name="Оркестр", kind="orchestrator", description="test"),
+        agent_tools=[call],
+        planner=planner,
+        llm=planner,
+    )
+
+    output = asyncio.run(subject.handle(AgentTask(task_id="t1", request=request)))
+
+    assert [task.request for task in logistics.tasks] == ["покажи машины"]
+    assert [task.request for task in bitrix.tasks] == ["покажи склад Борисова"]
+    assert "Отчёт по машинам готов" in output.answer
+    assert "Остатки склада Борисова готовы" in output.answer
+    assert len(output.metadata["branches"]) == 2
 
 
 def test_explicit_segment_cannot_be_silently_sent_to_another_specialist():

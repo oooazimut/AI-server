@@ -25,7 +25,7 @@ _SUFFIX = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _CONTINUATION = re.compile(
-    r"\b(?:следующ|продолж|подтверж|отмен|закрыва|измен|да\b|нет\b|покажи\s+ещ[её])",
+    r"\b(?:следующ|продолж|подтверж|подтверд|отмен|закрыва|измен|да\b|нет\b|покажи\s+ещ[её])",
     re.IGNORECASE,
 )
 _LEGACY_PART_REFERENCE = re.compile(r"\b\d{3,}\s*(?:[,.:;—–-]\s*|\s+)част(?:ь|и)\s+\d+\b", re.IGNORECASE)
