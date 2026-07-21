@@ -7,7 +7,7 @@ from urllib.parse import parse_qsl
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from ..integrations.bitrix.events import payload_event_type
+from ..integrations.bitrix.events import MESSAGE_EVENTS, payload_event_type
 from ..integrations.bitrix.portal_search import (
     PortalSearchIndex,
     entity_types_for_scope,
@@ -238,12 +238,19 @@ async def bitrix_events(
             payload,
             event_type=event_type,
         )
-        await request.app.state.conversation_trace.record_inbound(
+        await request.app.state.conversation_trace.record_ingress(
             event_id=event_id,
             event_type=event_type,
             payload=payload,
             inserted=inserted,
         )
+        if event_type in MESSAGE_EVENTS:
+            await request.app.state.conversation_trace.record_inbound(
+                event_id=event_id,
+                event_type=event_type,
+                payload=payload,
+                inserted=inserted,
+            )
         queue_status = request.app.state.webhook_event_queue_status
         queue_status["last_enqueued_at"] = now_ts()
         queue_status["last_enqueued_event_id"] = event_id

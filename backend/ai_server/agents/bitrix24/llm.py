@@ -8,6 +8,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
+from ai_server.agents.bitrix24.draft_confirmation import draft_confirmation_phrase, matches_draft_confirmation
 from ai_server.agents.specialist_llm_shared import (
     DIALOG_HISTORY_PROMPT_FRAGMENT,
     SKILLS_PROMPT_FRAGMENT,
@@ -223,12 +224,20 @@ class BitrixLLMService:
                 raw={"source": "task_create_draft_route"},
             )
 
-        local_decision = _common_calendar_event_draft_decision(task.request, tool_definitions)
+        local_decision = _common_calendar_event_draft_decision(task.request, dialog_history, tool_definitions)
         if local_decision is not None:
             return BitrixLLMDecisionResult(
                 decision=local_decision,
                 model_usage=_local_model_usage(manifest.id, "calendar_reminder_route"),
                 raw={"source": "calendar_reminder_route"},
+            )
+
+        local_decision = _common_warehouse_continuation_decision(task.request, dialog_history, tool_definitions)
+        if local_decision is not None:
+            return BitrixLLMDecisionResult(
+                decision=local_decision,
+                model_usage=_local_model_usage(manifest.id, "warehouse_continuation_route"),
+                raw={"source": "warehouse_continuation_route"},
             )
 
         local_decision = _common_read_decision(task.request, tool_definitions)
@@ -345,6 +354,16 @@ def _direct_task_create_response(
     tool_results: list[ToolResult],
     portal_base_url: str = "",
 ) -> BitrixLLMFinalResult | None:
+    successful_results = [result for result in tool_results if result.status == "ok"]
+    warehouse_results = [result for result in successful_results if result.tool == "bitrix_warehouse_search"]
+    if len(warehouse_results) > 1 and len(warehouse_results) == len(successful_results):
+        return BitrixLLMFinalResult(
+            status="completed",
+            answer="\n\n".join(
+                _format_warehouse_answer(result.data, portal_base_url=portal_base_url) for result in warehouse_results
+            ),
+            model_usage=_local_model_usage(agent_id, "warehouse_multi_response"),
+        )
     for result in reversed(tool_results):
         if result.status == "denied" and result.tool in {
             "bitrix_warehouse_search",
@@ -519,7 +538,8 @@ def _format_warehouse_answer(data: dict[str, Any], *, portal_base_url: str = "")
         return f"На складе {store_label} положительных остатков не найдено."
 
     lines = [f"Остатки по складу {store_label}:"]
-    for index, item in enumerate(items, start=1):
+    offset = _int_value(products.get("offset")) or 0
+    for index, item in enumerate(items, start=offset + 1):
         if not isinstance(item, dict):
             continue
         name = _text(item.get("product_name")) or "товар"
@@ -529,7 +549,6 @@ def _format_warehouse_answer(data: dict[str, Any], *, portal_base_url: str = "")
         lines.append(f"{index}. {title}{suffix}")
 
     total = _int_value(products.get("available_items_with_names")) or _int_value(products.get("available_items_seen"))
-    offset = _int_value(products.get("offset")) or 0
     shown = len(items)
     limit = _int_value(products.get("limit")) or shown
     if total:
@@ -705,6 +724,20 @@ def _format_portal_search_answer(data: dict[str, Any], *, portal_base_url: str =
     return "\n".join(lines)
 
 
+def _draft_confirmation_suffix(data: dict[str, Any]) -> str:
+    candidates: list[dict[str, Any]] = []
+    for key in ("draft", "params", "pending_task_draft"):
+        value = data.get(key)
+        if isinstance(value, dict):
+            candidates.append(value)
+    candidates.append(data)
+    for item in candidates:
+        draft_type = _text(item.get("_draft_type"))
+        if draft_type:
+            return f"\n\nДля подтверждения отправьте фразу: «{draft_confirmation_phrase(draft_type)}»."
+    return f"\n\nДля подтверждения отправьте фразу: «{draft_confirmation_phrase('task_create')}»."
+
+
 def _format_project_create_draft_answer(data: dict[str, Any]) -> str:
     preview = data.get("preview") if isinstance(data.get("preview"), dict) else {}
     params = data.get("params") if isinstance(data.get("params"), dict) else {}
@@ -724,8 +757,8 @@ def _format_project_create_draft_answer(data: dict[str, Any]) -> str:
         lines.append(f"Открытость: {visibility}")
     if description:
         lines.append(f"Описание: {description}")
-    lines.extend(["", "Если всё верно, напишите: да, создай проект."])
-    return "\n".join(lines)
+    lines.extend(["", "Черновик действует 15 минут."])
+    return "\n".join(lines) + _draft_confirmation_suffix({**data, "_draft_type": "project_create"})
 
 
 def _format_project_create_confirm_answer(data: dict[str, Any], *, portal_base_url: str = "") -> str:
@@ -929,10 +962,10 @@ def _format_task_create_draft_answer(data: dict[str, Any]) -> str:
             f"Срок: {deadline}",
             f"Описание: {description}",
             "",
-            "Если всё верно, напишите: да, создай.",
+            "Черновик действует 15 минут.",
         ]
     )
-    return "\n".join(lines)
+    return "\n".join(lines) + _draft_confirmation_suffix({**data, "_draft_type": "task_create"})
 
 
 def _format_task_create_requires_project_answer(data: dict[str, Any]) -> str:
@@ -977,7 +1010,7 @@ def _format_task_create_requires_project_answer(data: dict[str, Any]) -> str:
             f"Срок: {deadline}",
             f"Описание: {description}",
             "",
-            "Если всё верно, напишите: да, создай проект.",
+            "Черновик действует 15 минут.",
         ]
     )
     return "\n".join(lines)
@@ -1077,10 +1110,8 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
         lines.extend(f"4.{index} {item}" for index, item in enumerate(additional_items, start=1))
         lines.append(f"4.{len(additional_items) + 1} Еще информация - ... ???")
     lines.append("")
-    lines.append(
-        'Внести изменения (укажите пункт или подпункт и нужную информацию) или напишите: "да, закрывай как есть".'
-    )
-    return "\n".join(lines)
+    lines.append("Внести изменения (укажите пункт или подпункт и нужную информацию) либо подтвердить закрытие.")
+    return "\n".join(lines) + _draft_confirmation_suffix({**data, "_draft_type": "task_close"})
 
 
 def _task_close_status_prompt(status: str) -> str:
@@ -1439,8 +1470,8 @@ def _format_calendar_event_draft_answer(data: dict[str, Any]) -> str:
     if description and not _is_generic_calendar_description(description):
         lines.append(f"Описание: {description}")
     lines.append("")
-    lines.append("Если всё верно, напишите: да, добавь в календарь.")
-    return "\n".join(lines)
+    lines.append("Черновик действует 15 минут.")
+    return "\n".join(lines) + _draft_confirmation_suffix({**data, "_draft_type": "calendar_event"})
 
 
 def _format_calendar_event_confirm_answer(data: dict[str, Any]) -> str:
@@ -1617,7 +1648,7 @@ def _decision_system_prompt(instructions: str = "") -> str:
         "Произвольное создание проектов доступно только Bitrix-администратору. Личные проекты по умолчанию открытые и видимые. "
         "Для поиска складов, остатков и запросов вида 'найди склад Борисов' используй bitrix_warehouse_search, "
         "а не свободный bitrix_api. Если пользователь просит что есть на складе/остатки или говорит 'покажи склад <название>', передай include_products=true "
-        "и product_limit=10, если пользователь не попросил другое количество. Для следующих позиций используй product_offset. "
+        "и product_limit=50, если пользователь не попросил другое количество. Для следующих позиций используй product_offset. "
         "Не вызывай search.search: этот метод в текущем Bitrix недоступен. "
         "Для создания задачи используй task_create_draft. "
         "Для task_create_draft именно ты распознаёшь title, responsible_id/responsible_self, "
@@ -1950,10 +1981,14 @@ def _common_draft_confirm_decision(
     context: dict[str, Any],
     tool_definitions: list[dict[str, Any]] | None,
 ) -> BitrixLLMDecision | None:
-    if not _is_draft_confirm_request(_strip_command_prefix(request).casefold()):
-        return None
     draft = context.get("pending_task_draft") if isinstance(context, dict) else None
     if not isinstance(draft, dict) or not draft:
+        return None
+    if not matches_draft_confirmation(
+        _strip_command_prefix(request),
+        draft,
+        allow_short_command=bool(context.get("conversation_reference_explicit")),
+    ):
         return None
 
     draft_type = _text(draft.get("_draft_type")) or "task_create"
@@ -2843,13 +2878,14 @@ def _first_int(text: str) -> int | None:
 
 def _common_calendar_event_draft_decision(
     request: str,
+    dialog_history: list[dict[str, str]] | None,
     tool_definitions: list[dict[str, Any]] | None,
 ) -> BitrixLLMDecision | None:
     available_tools = {str(tool.get("name") or "") for tool in tool_definitions or []}
     if tool_definitions is not None and "calendar_event_draft" not in available_tools:
         return None
 
-    args = _simple_calendar_reminder_args(_strip_command_prefix(request))
+    args = _simple_calendar_reminder_args(_calendar_request_with_history(request, dialog_history))
     if args is None:
         return None
     return BitrixLLMDecision(
@@ -2864,6 +2900,20 @@ def _common_calendar_event_draft_decision(
             )
         ],
     )
+
+
+def _calendar_request_with_history(request: str, dialog_history: list[dict[str, str]] | None) -> str:
+    """Join a short time/title reply to its still-active calendar request."""
+    current = _strip_command_prefix(request)
+    if "напомни" in current.casefold():
+        return current
+    for item in reversed(dialog_history or []):
+        if not isinstance(item, dict) or str(item.get("role") or "") != "user":
+            continue
+        previous = str(item.get("content") or "").strip()
+        if "напомни" in previous.casefold():
+            return f"{previous}. {current}"
+    return current
 
 
 def _simple_calendar_reminder_args(request: str) -> dict[str, Any] | None:
@@ -2956,6 +3006,73 @@ def _common_read_decision(request: str, tool_definitions: list[dict[str, Any]] |
         return _local_decision_tool("bitrix_project_search", {"query": project_query, "limit": 10})
 
     return None
+
+
+def _common_warehouse_continuation_decision(
+    request: str,
+    dialog_history: list[dict[str, str]] | None,
+    tool_definitions: list[dict[str, Any]] | None,
+) -> BitrixLLMDecision | None:
+    """Route an explicitly named next warehouse page without another Bitrix LLM loop.
+
+    The route is deliberately narrow: it uses only a page that is already
+    visible in the same dialog history and only when the user repeats the
+    warehouse name.  Any uncertain case falls back to the existing model path.
+    """
+    available = {str(item.get("name") or "") for item in tool_definitions or []}
+    if "bitrix_warehouse_search" not in available:
+        return None
+    lowered = request.casefold()
+    if not any(marker in lowered for marker in ("следующ", "дальше", "продолж")) or "склад" not in lowered:
+        return None
+    requested_name = _warehouse_name_from_continuation(request)
+    if not requested_name:
+        return None
+    for item in reversed(dialog_history or []):
+        if str(item.get("role") or "") != "assistant":
+            continue
+        content = str(item.get("content") or "")
+        prior_name = _warehouse_name_from_answer(content)
+        page_end = _warehouse_page_end(content)
+        if prior_name and page_end is not None and _warehouse_names_match(requested_name, prior_name):
+            return _local_decision_tool(
+                "bitrix_warehouse_search",
+                {
+                    "query": prior_name,
+                    "include_products": True,
+                    "product_limit": 50,
+                    "product_offset": page_end,
+                },
+            )
+    return None
+
+
+def _warehouse_name_from_continuation(request: str) -> str:
+    match = re.search(r"\bсклад(?:а|е|у|ом)?\s+(?P<name>.+)$", request, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    value = re.sub(r"\b\d{3,}\b", " ", match.group("name"))
+    value = re.sub(r"\b(?:покажи|следующ\w*|страниц\w*|позици\w*)\b", " ", value, flags=re.IGNORECASE)
+    return compact_text(value).strip(" .,:;!?«»")
+
+
+def _warehouse_name_from_answer(answer: str) -> str:
+    match = re.search(r"(?:остатки\s+по|на)\s+складу\s+(?P<name>[^\n(]+)", answer, flags=re.IGNORECASE)
+    return compact_text(match.group("name")) if match else ""
+
+
+def _warehouse_page_end(answer: str) -> int | None:
+    match = re.search(r"показаны\s+(?:позиции|результаты)\s+\d+\s*[-–]\s*(\d+)\s+из\s+\d+", answer, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"показаны\s+первые\s+(\d+)\s+позиц", answer, flags=re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _warehouse_names_match(requested: str, prior: str) -> bool:
+    requested_words = [word for word in re.findall(r"[\wё]+", requested.casefold()) if len(word) >= 4]
+    prior_words = [word for word in re.findall(r"[\wё]+", prior.casefold()) if len(word) >= 4]
+    return bool(requested_words and prior_words and any(a[:5] == b[:5] for a in requested_words for b in prior_words))
 
 
 def _common_document_read_args(request: str) -> dict[str, Any] | None:

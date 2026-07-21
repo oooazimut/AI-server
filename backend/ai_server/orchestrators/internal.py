@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime
 from typing import Any
@@ -31,6 +32,30 @@ from ai_server.technical_footer import TechnicalFooterService, append_footer
 from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)
+
+_DRAFT_CONFIRMATION_LINE = re.compile(
+    r"\s*Для подтверждения отправьте фразу:\s*[«\"][^»\"]+[»\"]\.?",
+    re.IGNORECASE,
+)
+_NEXT_PAGE_HINT = re.compile(r"(?:можно\s+запросить|попросите\s+показать)\s+следующ", re.IGNORECASE)
+
+
+def _append_conversation_reference(message: str, task: AgentTask) -> str:
+    """Put the human-visible branch hint at the absolute end of every reply."""
+    number = task.context.get("conversation_number")
+    if number in (None, ""):
+        return message
+    visible = str(number)
+
+    rendered, confirmation_count = _DRAFT_CONFIRMATION_LINE.subn("", message)
+    rendered = rendered.rstrip()
+    if confirmation_count:
+        reference = f"Диалог №{visible}. Для подтверждения: «{visible} подтвердить»"
+    elif _NEXT_PAGE_HINT.search(rendered):
+        reference = f"Диалог №{visible}. Для продолжения: «{visible} следующая»"
+    else:
+        reference = f"Диалог №{visible}."
+    return f"{rendered}\n\n{reference}" if rendered else reference
 
 
 class InternalOrchestrator(BaseSpecialist):
@@ -398,6 +423,8 @@ class InternalOrchestrator(BaseSpecialist):
                 )
         answer = result.answer or ""
         body = append_footer(answer, footer) if answer else ""
+        if body:
+            body = _append_conversation_reference(body, task)
         if body:
             if self._dialog_guard is not None and await self._dialog_guard.task_is_stale(task):
                 logger.info(

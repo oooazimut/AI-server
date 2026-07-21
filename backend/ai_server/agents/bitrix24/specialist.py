@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from ai_server.agents.base import BaseSpecialist
+from ai_server.agents.bitrix24.draft_confirmation import draft_confirmation_phrase, matches_draft_confirmation
 from ai_server.agents.bitrix24.llm import (
     BitrixAgentLLM,
     BitrixLLMService,
@@ -97,20 +98,40 @@ _FAST_RETURN_READ_TOOLS = frozenset(
         "bitrix_my_tasks",
         "bitrix_task_search",
         "bitrix_project_search",
+        "task_close_control_get",
     }
 )
 
-_FAST_RETURN_TASK_CREATE_TOOLS = frozenset(
+_FAST_RETURN_FINAL_TOOLS = frozenset(
     {
+        "project_create_draft",
+        "project_create_confirm",
+        "project_create_discard",
+        "task_create_draft",
         "task_create_confirm",
         "task_draft_discard",
-        "project_create_discard",
+        "task_close_draft",
+        "task_close_confirm",
+        "task_close_discard",
+        "task_close_report_incident",
+        "task_close_control_update",
+        "calendar_event_draft",
+        "calendar_event_confirm",
+        "calendar_event_discard",
+    }
+)
+
+_FAST_RETURN_NEEDS_HUMAN_TOOLS = frozenset(
+    {
+        "project_create_draft",
+        "task_create_draft",
+        "task_close_draft",
+        "calendar_event_draft",
     }
 )
 
 
 class Bitrix24Specialist(BaseSpecialist):
-    max_steps = 7
     action_prefix = "bitrix"
 
     def __init__(
@@ -149,6 +170,32 @@ class Bitrix24Specialist(BaseSpecialist):
             result_publisher=result_publisher,
             conversation_trace=conversation_trace,
         )
+
+    async def get_active_draft(self, dialog_key: str) -> dict[str, Any] | None:
+        """Expose only the dialog-bound active draft to the orchestrator.
+
+        This is a local PostgreSQL read.  It lets the orchestrator protect an
+        existing write draft before a new unrelated request reaches a tool.
+        """
+        if not dialog_key or self._draft_store is None:
+            return None
+        return await self._draft_store.get_task_draft(
+            dialog_key,
+            ttl_minutes=self._settings_for_qc.bitrix_task_draft_ttl_minutes if self._settings_for_qc else None,
+        )
+
+    async def discard_active_draft(self, dialog_key: str, *, expected_draft_id: str) -> bool:
+        """Cancel exactly the protected draft, never a later replacement."""
+        draft = await self.get_active_draft(dialog_key)
+        if not draft or str(draft.get("_draft_id") or "") != expected_draft_id or self._draft_store is None:
+            return False
+        await self._draft_store.delete_task_draft(
+            dialog_key,
+            status="cancelled",
+            expected_draft_id=expected_draft_id,
+            expected_version=int(draft.get("_draft_version") or 0) or None,
+        )
+        return True
 
     @classmethod
     def build(
@@ -308,6 +355,32 @@ class Bitrix24Specialist(BaseSpecialist):
         tool_call: Any,
         task: AgentTask,
     ) -> tuple[ToolResult | None, Any | None, list[Any]]:
+        confirmation_tools = {
+            "task_create_confirm",
+            "task_close_confirm",
+            "calendar_event_confirm",
+            "project_create_confirm",
+        }
+        is_admin_confirm = (
+            tool_call.name == "task_close_control_update"
+            and str((tool_call.args or {}).get("operation") or "") == "confirm"
+        )
+        if tool_call.name in confirmation_tools or is_admin_confirm:
+            draft = task.context.get("pending_task_draft") if isinstance(task.context, dict) else None
+            if not matches_draft_confirmation(
+                str(task.request or ""),
+                draft,
+                allow_short_command=bool(task.context.get("conversation_reference_explicit")),
+            ):
+                return (
+                    ToolResult(
+                        status=ToolStatus.DENIED,
+                        tool=tool_call.name,
+                        error=f"Draft confirmation requires the exact phrase: {draft_confirmation_phrase((draft or {}).get('_draft_type'))}.",
+                    ),
+                    None,
+                    [],
+                )
         if tool_call.name == "task_create_draft":
             args = _draft_args_with_metadata(
                 _task_create_args_with_actor_label(dict(tool_call.args or {}), task),
@@ -374,20 +447,23 @@ class Bitrix24Specialist(BaseSpecialist):
     ) -> dict[str, Any] | None:
         if result is None or approvals:
             return None
-        if tool_call.name not in _FAST_RETURN_READ_TOOLS and tool_call.name not in _FAST_RETURN_TASK_CREATE_TOOLS:
+        is_read_tool = tool_call.name in _FAST_RETURN_READ_TOOLS
+        is_final_tool = tool_call.name in _FAST_RETURN_FINAL_TOOLS
+        if not is_read_tool and not is_final_tool:
             return None
-        if _is_ambiguous_read_result(tool_call.name, result):
+        planned_capability = str(task.context.get("t0006_planned_capability") or "").strip()
+        planned_tool = planned_capability if planned_capability in _LLM_TOOL_NAMES else ""
+        if is_read_tool and planned_tool and planned_tool != tool_call.name:
+            return None
+        if _is_incomplete_read_result(tool_call.name, result, task=task):
             return None
         if result.status == ToolStatus.OK:
-            reason = (
-                "task_create_tool_success"
-                if tool_call.name in _FAST_RETURN_TASK_CREATE_TOOLS
-                else "read_only_tool_success"
-            )
+            reason = "task_create_tool_success" if is_final_tool else "read_only_tool_success"
             return {
                 "fast_return_reason": reason,
                 "terminal_tool": tool_call.name,
                 "tool_status": str(result.status),
+                "terminal_status": _terminal_status(tool_call.name, result),
             }
         if result.status == ToolStatus.DENIED and _is_oauth_authorization_result(result):
             return {
@@ -558,11 +634,21 @@ def _project_create_args_with_actor_context(args: dict[str, Any], task: AgentTas
 
 
 def _warehouse_args_with_default_products(args: dict[str, Any], task: AgentTask) -> dict[str, Any]:
+    request = str(task.request or "")
+    original_request = str(task.context.get("t0006_original_request") or "")
+    defaults = {**args, "product_limit": int(args.get("product_limit") or 50)}
+    product_query = _warehouse_product_query(request)
+    if product_query and not str(defaults.get("product_query") or "").strip():
+        defaults["product_query"] = product_query
+    if product_query:
+        defaults["include_products"] = True
+    if _warehouse_request_resets_page(request) or _warehouse_request_resets_page(original_request):
+        return {**defaults, "include_products": True, "product_limit": 50, "product_offset": 0}
     if args.get("include_products") is True:
-        return args
-    if _warehouse_request_implies_stock(str(task.request or "")):
-        return {**args, "include_products": True, "product_limit": int(args.get("product_limit") or 10)}
-    return args
+        return defaults
+    if _warehouse_request_implies_stock(request) or _warehouse_request_implies_stock(original_request):
+        return {**defaults, "include_products": True}
+    return defaults if product_query else args
 
 
 def _warehouse_request_implies_stock(request: str) -> bool:
@@ -570,6 +656,39 @@ def _warehouse_request_implies_stock(request: str) -> bool:
     if any(marker in normalized for marker in ("остат", "налич", "что есть", "что находится")):
         return True
     return bool(re.search(r"\b(?:битрикс\s+)?покажи(?:те)?\s+(?:мне\s+)?склад\b", normalized))
+
+
+def _warehouse_request_resets_page(request: str) -> bool:
+    normalized = request.casefold().replace("ё", "е")
+    return any(
+        marker in normalized
+        for marker in (
+            "покажи все",
+            "покажи всё",
+            "покажи весь",
+            "весь склад",
+            "выведи все",
+            "выведи всё",
+            "все позиции",
+            "начиная с 1",
+        )
+    )
+
+
+def _warehouse_product_query(request: str) -> str:
+    """Extract the product portion of an explicit ``find X in warehouse Y`` request."""
+    normalized = re.sub(r"\s+", " ", request or "").strip()
+    match = re.search(
+        r"(?:найди|найти|покажи|показать)\s+(?P<product>.+?)\s+(?:на|в)\s+складе?\b",
+        normalized,
+        re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    candidate = match.group("product").strip(' .,;:!?«»"')
+    if candidate.casefold() in {"все", "всё", "остатки", "позиции", "склад"}:
+        return ""
+    return candidate
 
 
 def _args_with_actor_admin_context(
@@ -632,17 +751,38 @@ def _is_oauth_authorization_result(result: ToolResult) -> bool:
     return bool(data.get("oauth_required") or isinstance(data.get("authorization"), dict))
 
 
-def _is_ambiguous_read_result(tool_name: str, result: ToolResult) -> bool:
+def _is_incomplete_read_result(tool_name: str, result: ToolResult, *, task: AgentTask) -> bool:
     if result.status != ToolStatus.OK:
         return False
     data = result.data if isinstance(result.data, dict) else {}
     if tool_name == "bitrix_warehouse_search":
         matches = data.get("matches")
-        return isinstance(matches, list) and len(matches) > 1
+        products = data.get("products")
+        request = str(task.request or "")
+        original_request = str(task.context.get("t0006_original_request") or "")
+        if (
+            _warehouse_request_implies_stock(request) or _warehouse_request_implies_stock(original_request)
+        ) and not isinstance(products, dict):
+            return True
+        return isinstance(matches, list) and len(matches) > 1 and not isinstance(products, dict)
     if tool_name == "bitrix_project_search":
         items = data.get("items")
         return isinstance(items, list) and len(items) > 1
     return False
+
+
+def _terminal_status(tool_name: str, result: ToolResult) -> str:
+    if tool_name in _FAST_RETURN_NEEDS_HUMAN_TOOLS:
+        return "needs_human"
+    if tool_name == "project_create_confirm":
+        data = result.data if isinstance(result.data, dict) else {}
+        if isinstance(data.get("followup_task_draft"), dict):
+            return "needs_human"
+    if tool_name == "task_close_control_update":
+        data = result.data if isinstance(result.data, dict) else {}
+        if str(data.get("operation") or "") == "prepare":
+            return "needs_human"
+    return "completed"
 
 
 def _enforce_task_close_response(result: AgentResult, *, settings: Settings | None = None) -> AgentResult:
@@ -682,8 +822,9 @@ def _format_admin_change_draft_answer(data: dict[str, Any]) -> str:
     field = str(draft.get("field") or draft.get("action") or "настройка")
     target = str(draft.get("target_user_name") or draft.get("target_user_id") or "").strip()
     subject = f"{field} ({target})" if target else field
-    return (
+    answer = (
         f"Подготовлен черновик изменения: {subject}; "
         f"было — {draft.get('old_value')!s}, станет — {draft.get('new_value')!s}. "
         "Черновик действует 15 минут. Подтвердите или отмените изменение."
     )
+    return f"{answer}\n\nДля подтверждения отправьте фразу: «{draft_confirmation_phrase(draft.get('_draft_type'))}»."

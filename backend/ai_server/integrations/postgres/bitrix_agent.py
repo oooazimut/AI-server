@@ -449,6 +449,8 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                 stored_params["_original_request"] = initial_request
             if actor_user_id is not None:
                 stored_params["_draft_user_id"] = actor_user_id
+            params.clear()
+            params.update(stored_params)
             payload_json = json.dumps(stored_params, ensure_ascii=False)
             transition_payload = dict(stored_params)
             if transition == "edited" and original_request and original_request != initial_request:

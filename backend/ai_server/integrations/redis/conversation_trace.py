@@ -64,6 +64,59 @@ class RedisConversationTrace:
                 logger.debug("ConversationTrace: failed to parse inbound message", exc_info=True)
         await self.record(event)
 
+    async def record_ingress(
+        self,
+        *,
+        event_id: int,
+        event_type: str,
+        payload: dict[str, Any],
+        inserted: bool,
+    ) -> None:
+        """Record a sanitized webhook arrival before routing decides its fate.
+
+        This is deliberately separate from ``inbound_message``.  A Bitrix
+        payload with an unknown event name can still carry a real chat, user,
+        message, and voice attachment.  Recording that boundary lets support
+        distinguish "Bitrix did not deliver it" from "we received but did not
+        recognize it" without retaining raw payloads or attachment URLs.
+        """
+        if not self.enabled:
+            return
+
+        normalized_event_type = str(event_type or "").upper()
+        event: dict[str, Any] = {
+            "trace_type": "ingress_event",
+            "event_id": event_id,
+            "event_type": normalized_event_type,
+            "duplicate": not inserted,
+            "message_event_recognized": normalized_event_type in MESSAGE_EVENTS,
+            "parse_status": "unavailable",
+            "attachment_count": 0,
+            "attachment_type_hints": [],
+            "audio_attachment_hint": False,
+        }
+        try:
+            incoming = parse_incoming_message(payload)
+            type_hints = sorted(
+                {str(item.type).strip().lower() for item in incoming.files if item.type and str(item.type).strip()}
+            )[:10]
+            event.update(
+                {
+                    "parse_status": "parsed",
+                    "message_id": incoming.message_id,
+                    "user_id": incoming.user_id,
+                    "dialog_id": incoming.dialog_id,
+                    "chat_id": incoming.chat_id,
+                    "attachment_count": len(incoming.files),
+                    "attachment_type_hints": type_hints,
+                    "audio_attachment_hint": any(_looks_like_audio(item.type, item.name) for item in incoming.files),
+                }
+            )
+        except Exception as exc:
+            event["parse_status"] = f"error:{type(exc).__name__}"
+            logger.debug("ConversationTrace: failed to inspect ingress event", exc_info=True)
+        await self.record(event)
+
     async def record_route(
         self,
         *,
@@ -259,6 +312,11 @@ def _payload_user_name(payload: dict[str, Any]) -> str:
         or " ".join(str(part).strip() for part in (user.get("firstName"), user.get("lastName")) if part)
         or " ".join(str(part).strip() for part in (user.get("FIRST_NAME"), user.get("LAST_NAME")) if part)
     ).strip()
+
+
+def _looks_like_audio(file_type: object, name: object) -> bool:
+    hint = f"{file_type or ''} {name or ''}".lower()
+    return any(marker in hint for marker in ("audio", "voice", ".ogg", ".opus", ".mp3", ".m4a", ".wav"))
 
 
 def _compact_event(value: Any, *, max_text_chars: int) -> Any:
