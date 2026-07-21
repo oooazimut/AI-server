@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime
 from typing import Any
@@ -16,6 +17,7 @@ from ai_server.agents.ports import (
     ResultPublisherPort,
     SchedulerPort,
 )
+from ai_server.integrations.redis.outbound_queue import outbound_delivery_key
 from ai_server.models import AgentManifest, AgentResult, AgentTask, ScheduledTask, ToolResult, ToolStatus
 from ai_server.orchestrators.orchestrator_llm import (
     OrchestratorFinalResult,
@@ -30,6 +32,30 @@ from ai_server.technical_footer import TechnicalFooterService, append_footer
 from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)
+
+_DRAFT_CONFIRMATION_LINE = re.compile(
+    r"\s*Для подтверждения отправьте фразу:\s*[«\"][^»\"]+[»\"]\.?",
+    re.IGNORECASE,
+)
+_NEXT_PAGE_HINT = re.compile(r"(?:можно\s+запросить|попросите\s+показать)\s+следующ", re.IGNORECASE)
+
+
+def _append_conversation_reference(message: str, task: AgentTask) -> str:
+    """Put the human-visible branch hint at the absolute end of every reply."""
+    number = task.context.get("conversation_number")
+    if number in (None, ""):
+        return message
+    visible = str(number)
+
+    rendered, confirmation_count = _DRAFT_CONFIRMATION_LINE.subn("", message)
+    rendered = rendered.rstrip()
+    if confirmation_count:
+        reference = f"Диалог №{visible}. Для подтверждения: «{visible} подтвердить»"
+    elif _NEXT_PAGE_HINT.search(rendered):
+        reference = f"Диалог №{visible}. Для продолжения: «{visible} следующая»"
+    else:
+        reference = f"Диалог №{visible}."
+    return f"{rendered}\n\n{reference}" if rendered else reference
 
 
 class InternalOrchestrator(BaseSpecialist):
@@ -57,6 +83,7 @@ class InternalOrchestrator(BaseSpecialist):
         result_publisher: ResultPublisherPort | None = None,
         conversation_trace: Any = None,
         dialog_guard: Any = None,
+        outbound_queue: Any = None,
     ) -> None:
         super().__init__(
             manifest,
@@ -72,6 +99,7 @@ class InternalOrchestrator(BaseSpecialist):
         self._result_publisher = result_publisher
         self._conversation_trace = conversation_trace
         self._dialog_guard = dialog_guard
+        self._outbound_queue = outbound_queue
 
     # ------------------------------------------------------------------
     # BaseSpecialist hooks
@@ -231,7 +259,7 @@ class InternalOrchestrator(BaseSpecialist):
                     routing = message.get("routing") or {}
                     if routing.get("channel_id") and routing.get("recipient_id"):
                         stub_task = AgentTask(
-                            task_id="",
+                            task_id=str(message.get("correlation_id") or msg_id),
                             request="",
                             context={
                                 "channel_id": routing["channel_id"],
@@ -273,6 +301,22 @@ class InternalOrchestrator(BaseSpecialist):
         result_publisher: ResultPublisherPort | None = None,
         **specialist_deps: Any,
     ) -> InternalOrchestrator:
+        # S04 staging runtime is plan-authoritative.  The legacy BaseSpecialist
+        # decision loop is not retained as a fallback when this planner is wired.
+        if hasattr(orchestrator_llm, "plan") and hasattr(orchestrator_llm, "finalize"):
+            from ai_server.orchestrators.plan_authoritative import PlanAuthoritativeOrchestrator
+
+            return PlanAuthoritativeOrchestrator.build(
+                manifest,
+                manifests=manifests,
+                orchestrator_llm=orchestrator_llm,
+                orchestrator_store=orchestrator_store,
+                orchestrator_retriever=orchestrator_retriever,
+                channels=channels,
+                footer_service=footer_service,
+                result_publisher=result_publisher,
+                **specialist_deps,
+            )
         _manifests = manifests or []
         if not specialist_deps.get("bitrix_bot"):
             specialist_deps["bitrix_bot"] = specialist_deps.get("bitrix_client")
@@ -304,6 +348,7 @@ class InternalOrchestrator(BaseSpecialist):
             result_publisher=result_publisher,
             conversation_trace=specialist_deps.get("conversation_trace"),
             dialog_guard=specialist_deps.get("dialog_guard"),
+            outbound_queue=specialist_deps.get("outbound_queue"),
         )
         # Break circular dep: CallSpecialistTool needs orch to schedule specialist tasks
         call_tool.schedule_fn = orch._apply_scheduled_tasks_from_specialist
@@ -379,6 +424,8 @@ class InternalOrchestrator(BaseSpecialist):
         answer = result.answer or ""
         body = append_footer(answer, footer) if answer else ""
         if body:
+            body = _append_conversation_reference(body, task)
+        if body:
             if self._dialog_guard is not None and await self._dialog_guard.task_is_stale(task):
                 logger.info(
                     "Suppressing stale channel send task_id=%s dialog_key=%s",
@@ -393,6 +440,57 @@ class InternalOrchestrator(BaseSpecialist):
                         body=body,
                         status="suppressed",
                         error="dialog_cancelled",
+                    )
+                return
+            if self._outbound_queue is not None:
+                send_started_at = _trace_now_iso()
+                send_t0 = time.monotonic()
+                delivery_key = outbound_delivery_key(
+                    channel_id=str(channel_id),
+                    recipient_id=str(recipient_id),
+                    task_id=str(task.task_id),
+                    body=body,
+                )
+                try:
+                    delivery_id, created = await self._outbound_queue.enqueue(
+                        delivery_key=delivery_key,
+                        channel_id=str(channel_id),
+                        recipient_id=str(recipient_id),
+                        body=body,
+                        task=task.model_dump(),
+                        result=result.model_dump(),
+                    )
+                except Exception:
+                    await self._record_timing(
+                        task,
+                        stage="channel_outbox_enqueue",
+                        started_at=send_started_at,
+                        elapsed_ms=(time.monotonic() - send_t0) * 1000,
+                        status="error",
+                        details={"channel_id": channel_id, "recipient_id": recipient_id},
+                    )
+                    raise
+                await self._record_timing(
+                    task,
+                    stage="channel_outbox_enqueue",
+                    started_at=send_started_at,
+                    elapsed_ms=(time.monotonic() - send_t0) * 1000,
+                    status="queued" if created else "deduplicated",
+                    details={
+                        "channel_id": channel_id,
+                        "recipient_id": recipient_id,
+                        "delivery_id": delivery_id,
+                        "body_chars": len(body),
+                    },
+                )
+                if self._conversation_trace is not None:
+                    await self._conversation_trace.record_outbound(
+                        task=task,
+                        result=result,
+                        recipient_id=str(recipient_id),
+                        body=body,
+                        status="queued" if created else "deduplicated",
+                        delivery_id=delivery_id,
                     )
                 return
             send_started_at = _trace_now_iso()

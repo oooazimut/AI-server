@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,20 @@ from ai_server.utils import MOSCOW_TZ
 from .agent_schema import PostgresAgentSchema
 
 _TABLE = "bitrix24.portal_search_items"
+
+
+def _draft_actor_user_id(params: dict[str, Any]) -> int | None:
+    values = [params.get("_draft_user_id"), params.get("_actor_user_id"), params.get("user_id")]
+    fields = params.get("fields") if isinstance(params.get("fields"), dict) else {}
+    values.extend([fields.get("CREATED_BY"), fields.get("RESPONSIBLE_ID")])
+    for value in values:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return None
 
 
 class PostgresBitrixAgentStore(PostgresAgentSchema):
@@ -97,6 +112,75 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
             )
             db.execute(
                 """
+                CREATE TABLE IF NOT EXISTS bitrix24.interactive_drafts (
+                    draft_id TEXT PRIMARY KEY,
+                    dialog_key TEXT NOT NULL,
+                    user_id INTEGER,
+                    draft_type TEXT NOT NULL,
+                    specialist_id TEXT NOT NULL,
+                    original_request TEXT NOT NULL DEFAULT '',
+                    params_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL
+                )
+                """
+            )
+            db.execute(
+                "ALTER TABLE bitrix24.interactive_drafts ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1"
+            )
+            db.execute("ALTER TABLE bitrix24.interactive_drafts ADD COLUMN IF NOT EXISTS claim_token TEXT")
+            db.execute("ALTER TABLE bitrix24.interactive_drafts ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ")
+            db.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_interactive_drafts_one_active_dialog
+                ON bitrix24.interactive_drafts(dialog_key)
+                WHERE status = 'active'
+                """
+            )
+            db.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_interactive_drafts_one_open_dialog
+                ON bitrix24.interactive_drafts(dialog_key)
+                WHERE status IN ('active', 'confirming')
+                """
+            )
+            db.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_interactive_drafts_one_live_dialog
+                ON bitrix24.interactive_drafts(dialog_key)
+                WHERE status IN ('active', 'confirming', 'finalizing')
+                """
+            )
+            db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_interactive_drafts_status_expiry
+                ON bitrix24.interactive_drafts(status, expires_at)
+                """
+            )
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bitrix24.interactive_draft_transitions (
+                    id BIGSERIAL PRIMARY KEY,
+                    draft_id TEXT NOT NULL,
+                    dialog_key TEXT NOT NULL,
+                    transition TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    actor_user_id INTEGER,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_interactive_draft_transitions_draft
+                ON bitrix24.interactive_draft_transitions(draft_id, created_at)
+                """
+            )
+            db.execute(
+                """
                 CREATE TABLE IF NOT EXISTS bitrix24.task_close_control_settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
@@ -110,9 +194,34 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                 CREATE TABLE IF NOT EXISTS bitrix24.task_close_controlled_users (
                     user_id INTEGER PRIMARY KEY,
                     active BOOLEAN NOT NULL DEFAULT TRUE,
+                    controlled_from TIMESTAMPTZ,
                     updated_by INTEGER,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
+                """
+            )
+            db.execute(
+                "ALTER TABLE bitrix24.task_close_controlled_users ADD COLUMN IF NOT EXISTS controlled_from TIMESTAMPTZ"
+            )
+            db.execute(
+                """
+                UPDATE bitrix24.task_close_controlled_users AS controlled
+                SET controlled_from = COALESCE(
+                        (
+                            SELECT CASE
+                                WHEN length(setting.value) = 10
+                                    THEN setting.value::date::timestamp AT TIME ZONE 'Europe/Moscow'
+                                ELSE setting.value::timestamptz
+                            END
+                            FROM bitrix24.task_close_control_settings AS setting
+                            WHERE setting.key = 'control_enabled_from'
+                              AND setting.value ~ '^\\d{4}-\\d{2}-\\d{2}($|[T ])'
+                            LIMIT 1
+                        ),
+                        controlled.updated_at,
+                        now()
+                    )
+                WHERE controlled.active IS TRUE AND controlled.controlled_from IS NULL
                 """
             )
             db.execute(
@@ -269,6 +378,120 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
 
     async def save_task_draft(self, dialog_key: str, params: dict[str, Any]) -> None:
         async with await self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT draft_id, draft_type, original_request, params_json, status, version, created_at, expires_at
+                FROM bitrix24.interactive_drafts
+                WHERE dialog_key = %s AND status IN ('active', 'confirming', 'finalizing')
+                FOR UPDATE
+                """,
+                (dialog_key,),
+            )
+            active = await cur.fetchone()
+            draft_type = str(params.get("_draft_type") or "task_create").strip() or "task_create"
+            actor_user_id = _draft_actor_user_id(params)
+            specialist_id = str(params.get("_draft_specialist") or "bitrix24").strip() or "bitrix24"
+            draft_params = dict(params)
+            promoted_created_at = _parse_draft_datetime(draft_params.pop("_promoted_legacy_created_at", None))
+            original_request = str(draft_params.get("_original_request") or "")
+            now = datetime.now(UTC)
+            transition = "created"
+            if active and active["status"] == "active" and active["expires_at"] <= now:
+                await db.execute(
+                    """
+                    UPDATE bitrix24.interactive_drafts
+                    SET status = 'expired', updated_at = %s
+                    WHERE draft_id = %s AND status = 'active'
+                    """,
+                    (now, active["draft_id"]),
+                )
+                await db.execute(
+                    """
+                    INSERT INTO bitrix24.interactive_draft_transitions
+                        (draft_id, dialog_key, transition, payload_json, actor_user_id)
+                    VALUES (%s, %s, 'expired', %s, %s)
+                    """,
+                    (active["draft_id"], dialog_key, active["params_json"], actor_user_id),
+                )
+                active = None
+            if active:
+                if active["status"] != "active":
+                    raise RuntimeError(
+                        f"ACTIVE_DRAFT_IN_PROGRESS:{active['draft_id']}:{active['draft_type']}:{active['status']}"
+                    )
+                active_type = str(active["draft_type"] or "")
+                if active_type != draft_type:
+                    raise RuntimeError(f"ACTIVE_DRAFT_CONFLICT:{active['draft_id']}:{active_type}:{draft_type}")
+                draft_id = str(active["draft_id"])
+                created_at = active["created_at"]
+                expires_at = active["expires_at"]
+                version = int(active["version"] or 1) + 1
+                transition = "edited"
+                initial_request = str(active["original_request"] or original_request)
+            else:
+                draft_id = str(uuid.uuid4())
+                created_at = min(promoted_created_at, now) if promoted_created_at is not None else now
+                expires_at = now + timedelta(minutes=15)
+                if promoted_created_at is not None:
+                    expires_at = created_at + timedelta(minutes=15)
+                version = 1
+                initial_request = original_request
+            stored_params = {
+                **draft_params,
+                "_draft_id": draft_id,
+                "_draft_type": draft_type,
+                "_draft_specialist": specialist_id,
+                "_draft_created_at": created_at.isoformat(),
+                "_draft_expires_at": expires_at.isoformat(),
+                "_draft_version": version,
+            }
+            if initial_request:
+                stored_params["_original_request"] = initial_request
+            if actor_user_id is not None:
+                stored_params["_draft_user_id"] = actor_user_id
+            params.clear()
+            params.update(stored_params)
+            payload_json = json.dumps(stored_params, ensure_ascii=False)
+            transition_payload = dict(stored_params)
+            if transition == "edited" and original_request and original_request != initial_request:
+                transition_payload["_edit_request"] = original_request
+            transition_payload_json = json.dumps(transition_payload, ensure_ascii=False)
+            await db.execute(
+                """
+                INSERT INTO bitrix24.interactive_drafts
+                    (draft_id, dialog_key, user_id, draft_type, specialist_id, original_request,
+                     params_json, status, version, created_at, updated_at, expires_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', %s, %s, %s, %s)
+                ON CONFLICT (draft_id) DO UPDATE
+                SET user_id = EXCLUDED.user_id,
+                    original_request = EXCLUDED.original_request,
+                    params_json = EXCLUDED.params_json,
+                    version = EXCLUDED.version,
+                    updated_at = EXCLUDED.updated_at,
+                    expires_at = EXCLUDED.expires_at
+                """,
+                (
+                    draft_id,
+                    dialog_key,
+                    actor_user_id,
+                    draft_type,
+                    specialist_id,
+                    initial_request,
+                    payload_json,
+                    version,
+                    created_at,
+                    now,
+                    expires_at,
+                ),
+            )
+            await db.execute(
+                """
+                INSERT INTO bitrix24.interactive_draft_transitions
+                    (draft_id, dialog_key, transition, payload_json, actor_user_id)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (draft_id, dialog_key, transition, transition_payload_json, actor_user_id),
+            )
             await db.execute(
                 """
                 INSERT INTO bitrix24.pending_task_draft (dialog_key, params_json)
@@ -277,11 +500,406 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                 SET params_json = EXCLUDED.params_json,
                     created_at = now()
                 """,
-                (dialog_key, json.dumps(params, ensure_ascii=False)),
+                (dialog_key, payload_json),
             )
+
+    async def claim_task_draft(
+        self,
+        dialog_key: str,
+        *,
+        expected_draft_id: str,
+        expected_version: int,
+        expected_type: str,
+    ) -> dict[str, Any] | None:
+        now = datetime.now(UTC)
+        claim_token = str(uuid.uuid4())
+        async with await self._connect() as db:
+            cur = await db.execute(
+                """
+                UPDATE bitrix24.interactive_drafts
+                SET status = 'confirming', claim_token = %s, claimed_at = %s, updated_at = %s
+                WHERE dialog_key = %s
+                  AND draft_id = %s
+                  AND version = %s
+                  AND draft_type = %s
+                  AND status = 'active'
+                  AND expires_at > %s
+                RETURNING draft_id, params_json, user_id
+                """,
+                (claim_token, now, now, dialog_key, expected_draft_id, expected_version, expected_type, now),
+            )
+            claimed = await cur.fetchone()
+            if not claimed:
+                return None
+            await db.execute(
+                """
+                INSERT INTO bitrix24.interactive_draft_transitions
+                    (draft_id, dialog_key, transition, payload_json, actor_user_id)
+                VALUES (%s, %s, 'confirming', %s, %s)
+                """,
+                (claimed["draft_id"], dialog_key, claimed["params_json"], claimed["user_id"]),
+            )
+        raw = claimed["params_json"]
+        result = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        result["_draft_claim_token"] = claim_token
+        return result
+
+    async def claim_expired_task_draft(
+        self,
+        dialog_key: str,
+        *,
+        expected_draft_id: str,
+        expected_version: int,
+        expected_type: str,
+    ) -> dict[str, Any] | None:
+        now = datetime.now(UTC)
+        claim_token = str(uuid.uuid4())
+        async with await self._connect() as db:
+            cur = await db.execute(
+                """
+                UPDATE bitrix24.interactive_drafts
+                SET status = 'finalizing', claim_token = %s, claimed_at = %s, updated_at = %s
+                WHERE dialog_key = %s
+                  AND draft_id = %s
+                  AND version = %s
+                  AND draft_type = %s
+                  AND status IN ('active', 'expired')
+                  AND expires_at <= %s
+                RETURNING draft_id, params_json, user_id
+                """,
+                (claim_token, now, now, dialog_key, expected_draft_id, expected_version, expected_type, now),
+            )
+            claimed = await cur.fetchone()
+            if not claimed:
+                return None
+            await db.execute(
+                """
+                INSERT INTO bitrix24.interactive_draft_transitions
+                    (draft_id, dialog_key, transition, payload_json, actor_user_id)
+                VALUES (%s, %s, 'finalizing', %s, %s)
+                """,
+                (claimed["draft_id"], dialog_key, claimed["params_json"], claimed["user_id"]),
+            )
+        raw = claimed["params_json"]
+        result = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        result["_draft_claim_token"] = claim_token
+        return result
+
+    async def reclaim_stale_finalizing_task_draft(
+        self,
+        dialog_key: str,
+        *,
+        expected_draft_id: str,
+        expected_version: int,
+        expected_type: str,
+        lease_seconds: int = 300,
+    ) -> dict[str, Any] | None:
+        now = datetime.now(UTC)
+        cutoff = now - timedelta(seconds=max(lease_seconds, 60))
+        claim_token = str(uuid.uuid4())
+        async with await self._connect() as db:
+            cur = await db.execute(
+                """
+                UPDATE bitrix24.interactive_drafts
+                SET claim_token = %s, claimed_at = %s, updated_at = %s
+                WHERE dialog_key = %s
+                  AND draft_id = %s
+                  AND version = %s
+                  AND draft_type = %s
+                  AND status = 'finalizing'
+                  AND COALESCE(claimed_at, updated_at) <= %s
+                RETURNING draft_id, params_json, user_id
+                """,
+                (
+                    claim_token,
+                    now,
+                    now,
+                    dialog_key,
+                    expected_draft_id,
+                    expected_version,
+                    expected_type,
+                    cutoff,
+                ),
+            )
+            claimed = await cur.fetchone()
+            if not claimed:
+                return None
+            await db.execute(
+                """
+                INSERT INTO bitrix24.interactive_draft_transitions
+                    (draft_id, dialog_key, transition, payload_json, actor_user_id)
+                VALUES (%s, %s, 'reclaimed_finalizing', %s, %s)
+                """,
+                (claimed["draft_id"], dialog_key, claimed["params_json"], claimed["user_id"]),
+            )
+        raw = claimed["params_json"]
+        result = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        result["_draft_claim_token"] = claim_token
+        result["_reclaimed_finalizing"] = True
+        return result
+
+    async def renew_task_draft_claim(
+        self,
+        dialog_key: str,
+        *,
+        draft_id: str,
+        claim_token: str,
+        expected_status: str,
+    ) -> bool:
+        if not draft_id or not claim_token or expected_status not in {"confirming", "finalizing"}:
+            return False
+        now = datetime.now(UTC)
+        async with await self._connect() as db:
+            cur = await db.execute(
+                """
+                UPDATE bitrix24.interactive_drafts
+                SET claimed_at = %s, updated_at = %s
+                WHERE dialog_key = %s AND draft_id = %s
+                  AND claim_token = %s AND status = %s
+                RETURNING draft_id
+                """,
+                (now, now, dialog_key, draft_id, claim_token, expected_status),
+            )
+            return bool(await cur.fetchone())
+
+    async def resolve_stale_confirming_task_draft(
+        self,
+        dialog_key: str,
+        *,
+        expected_draft_id: str,
+        expected_version: int,
+        expected_type: str,
+        lease_seconds: int = 300,
+    ) -> dict[str, Any] | None:
+        now = datetime.now(UTC)
+        cutoff = now - timedelta(seconds=max(lease_seconds, 60))
+        async with await self._connect() as db:
+            cur = await db.execute(
+                """
+                UPDATE bitrix24.interactive_drafts
+                SET status = 'attention', claim_token = NULL, claimed_at = NULL, updated_at = %s
+                WHERE dialog_key = %s AND draft_id = %s AND version = %s
+                  AND draft_type = %s AND status = 'confirming'
+                  AND COALESCE(claimed_at, updated_at) <= %s
+                RETURNING params_json, user_id
+                """,
+                (now, dialog_key, expected_draft_id, expected_version, expected_type, cutoff),
+            )
+            resolved = await cur.fetchone()
+            if not resolved:
+                return None
+            await db.execute(
+                """
+                INSERT INTO bitrix24.interactive_draft_transitions
+                    (draft_id, dialog_key, transition, payload_json, actor_user_id)
+                VALUES (%s, %s, 'attention_unknown_outcome', %s, %s)
+                """,
+                (expected_draft_id, dialog_key, resolved["params_json"], resolved["user_id"]),
+            )
+        raw = resolved["params_json"]
+        result = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        result["_draft_resolution_status"] = "attention"
+        return result
+
+    async def release_task_draft(self, dialog_key: str, *, draft_id: str, claim_token: str = "") -> None:
+        now = datetime.now(UTC)
+        async with await self._connect() as db:
+            cur = await db.execute(
+                """
+                UPDATE bitrix24.interactive_drafts
+                SET status = CASE
+                        WHEN status = 'finalizing' THEN 'expired'
+                        WHEN expires_at > %s THEN 'active'
+                        ELSE 'expired'
+                    END,
+                    claim_token = NULL,
+                    claimed_at = NULL,
+                    updated_at = %s
+                WHERE dialog_key = %s AND draft_id = %s AND status IN ('confirming', 'finalizing')
+                  AND (%s = '' OR claim_token = %s)
+                RETURNING params_json, user_id, status
+                """,
+                (now, now, dialog_key, draft_id, claim_token, claim_token),
+            )
+            released = await cur.fetchone()
+            if released:
+                await db.execute(
+                    """
+                    INSERT INTO bitrix24.interactive_draft_transitions
+                        (draft_id, dialog_key, transition, payload_json, actor_user_id)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (draft_id, dialog_key, released["status"], released["params_json"], released["user_id"]),
+                )
+
+    async def finalize_task_draft_claim(
+        self,
+        dialog_key: str,
+        *,
+        draft_id: str,
+        params: dict[str, Any],
+        claim_token: str = "",
+    ) -> dict[str, Any] | None:
+        now = datetime.now(UTC)
+        async with await self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT draft_type, specialist_id, user_id, version, created_at, expires_at
+                FROM bitrix24.interactive_drafts
+                WHERE dialog_key = %s AND draft_id = %s AND status = 'confirming'
+                  AND (%s = '' OR claim_token = %s)
+                FOR UPDATE
+                """,
+                (dialog_key, draft_id, claim_token, claim_token),
+            )
+            claimed = await cur.fetchone()
+            if not claimed:
+                return None
+            version = int(claimed["version"] or 1) + 1
+            status = "active" if claimed["expires_at"] > now else "expired"
+            stored = {
+                **params,
+                "_draft_id": draft_id,
+                "_draft_type": str(claimed["draft_type"]),
+                "_draft_specialist": str(claimed["specialist_id"]),
+                "_draft_user_id": claimed["user_id"],
+                "_draft_created_at": claimed["created_at"].isoformat(),
+                "_draft_expires_at": claimed["expires_at"].isoformat(),
+                "_draft_version": version,
+            }
+            payload_json = json.dumps(stored, ensure_ascii=False)
+            await db.execute(
+                """
+                UPDATE bitrix24.interactive_drafts
+                SET params_json = %s, status = %s, version = %s,
+                    claim_token = NULL, claimed_at = NULL, updated_at = %s
+                WHERE draft_id = %s AND status = 'confirming'
+                """,
+                (payload_json, status, version, now, draft_id),
+            )
+            await db.execute(
+                """
+                INSERT INTO bitrix24.interactive_draft_transitions
+                    (draft_id, dialog_key, transition, payload_json, actor_user_id)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    draft_id,
+                    dialog_key,
+                    "processed" if status == "active" else "expired",
+                    payload_json,
+                    claimed["user_id"],
+                ),
+            )
+            if status == "active":
+                await db.execute(
+                    """
+                    INSERT INTO bitrix24.pending_task_draft (dialog_key, params_json)
+                    VALUES (%s, %s)
+                    ON CONFLICT (dialog_key) DO UPDATE
+                    SET params_json = EXCLUDED.params_json, created_at = now()
+                    """,
+                    (dialog_key, payload_json),
+                )
+            else:
+                await db.execute(
+                    "DELETE FROM bitrix24.pending_task_draft WHERE dialog_key = %s",
+                    (dialog_key,),
+                )
+        return stored
+
+    async def get_task_draft_for_finalizer(self, dialog_key: str) -> dict[str, Any] | None:
+        async with await self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT params_json, claim_token
+                FROM bitrix24.interactive_drafts
+                WHERE dialog_key = %s AND status IN ('active', 'expired', 'finalizing')
+                ORDER BY created_at
+                LIMIT 1
+                """,
+                (dialog_key,),
+            )
+            row = await cur.fetchone()
+        if not row:
+            return None
+        raw = row["params_json"]
+        result = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        result["_draft_claim_token"] = str(row["claim_token"] or "")
+        return result
+
+    async def get_claimed_task_draft(
+        self,
+        dialog_key: str,
+        *,
+        expected_type: str,
+    ) -> dict[str, Any] | None:
+        async with await self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT params_json, claim_token
+                FROM bitrix24.interactive_drafts
+                WHERE dialog_key = %s AND draft_type = %s AND status = 'confirming'
+                LIMIT 1
+                """,
+                (dialog_key, expected_type),
+            )
+            row = await cur.fetchone()
+        if not row:
+            return None
+        raw = row["params_json"]
+        result = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        result["_draft_claim_token"] = str(row["claim_token"] or "")
+        return result
 
     async def get_task_draft(self, dialog_key: str, *, ttl_minutes: int | None = None) -> dict[str, Any] | None:
         async with await self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT draft_id, params_json, status, created_at, expires_at, user_id
+                FROM bitrix24.interactive_drafts
+                WHERE dialog_key = %s AND status IN ('active', 'confirming', 'finalizing')
+                FOR UPDATE
+                """,
+                (dialog_key,),
+            )
+            active = await cur.fetchone()
+            if active:
+                if active["status"] in {"confirming", "finalizing"}:
+                    return None
+                now = datetime.now(UTC)
+                effective_expiry = active["expires_at"]
+                if ttl_minutes is not None and ttl_minutes > 0:
+                    effective_expiry = min(effective_expiry, active["created_at"] + timedelta(minutes=ttl_minutes))
+                if effective_expiry <= now:
+                    await db.execute(
+                        """
+                        UPDATE bitrix24.interactive_drafts
+                        SET status = 'expired', updated_at = %s
+                        WHERE draft_id = %s AND status IN ('active', 'confirming')
+                        """,
+                        (now, active["draft_id"]),
+                    )
+                    await db.execute(
+                        """
+                        INSERT INTO bitrix24.interactive_draft_transitions
+                            (draft_id, dialog_key, transition, payload_json, actor_user_id)
+                        VALUES (%s, %s, 'expired', %s, %s)
+                        """,
+                        (
+                            active["draft_id"],
+                            dialog_key,
+                            active["params_json"],
+                            active["user_id"],
+                        ),
+                    )
+                    await db.execute(
+                        "DELETE FROM bitrix24.pending_task_draft WHERE dialog_key = %s",
+                        (dialog_key,),
+                    )
+                    return None
+                raw = active["params_json"]
+                return json.loads(raw) if isinstance(raw, str) else raw
             if ttl_minutes is not None and ttl_minutes > 0:
                 await db.execute(
                     """
@@ -292,21 +910,45 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                     (dialog_key, ttl_minutes),
                 )
             cur = await db.execute(
-                "SELECT params_json FROM bitrix24.pending_task_draft WHERE dialog_key = %s",
+                "SELECT params_json, created_at FROM bitrix24.pending_task_draft WHERE dialog_key = %s",
                 (dialog_key,),
             )
             row = await cur.fetchone()
         if not row:
             return None
         raw = row["params_json"]
-        return json.loads(raw) if isinstance(raw, str) else raw
+        legacy = json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(legacy, dict):
+            return None
+        legacy_created_at = row["created_at"]
+        legacy_ttl_minutes = ttl_minutes if ttl_minutes is not None and ttl_minutes > 0 else 15
+        if legacy_created_at + timedelta(minutes=legacy_ttl_minutes) <= datetime.now(UTC):
+            async with await self._connect() as db:
+                await db.execute(
+                    "DELETE FROM bitrix24.pending_task_draft WHERE dialog_key = %s AND created_at = %s",
+                    (dialog_key, legacy_created_at),
+                )
+            return None
+        promoted = dict(legacy)
+        promoted["_promoted_legacy_created_at"] = legacy_created_at.isoformat()
+        await self.save_task_draft(dialog_key, promoted)
+        return await self.get_task_draft(dialog_key, ttl_minutes=ttl_minutes)
 
-    def list_task_drafts(self, *, draft_type: str = "", limit: int = 100) -> list[dict[str, Any]]:
+    def list_task_drafts(
+        self,
+        *,
+        draft_type: str = "",
+        limit: int = 100,
+        expired_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        expiry_operator = "<=" if expired_only else ">"
+        status_predicate = "status IN ('active', 'expired', 'finalizing')" if expired_only else "status = 'active'"
         with self._sync_connect() as db:
             rows = db.execute(
-                """
-                SELECT dialog_key, params_json, created_at
-                FROM bitrix24.pending_task_draft
+                f"""
+                SELECT dialog_key, params_json, status, created_at, updated_at
+                FROM bitrix24.interactive_drafts
+                WHERE {status_predicate} AND expires_at {expiry_operator} now()
                 ORDER BY created_at
                 LIMIT %s
                 """,
@@ -324,16 +966,71 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                 {
                     "dialog_key": row["dialog_key"],
                     "params": params,
+                    "status": row["status"],
                     "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
                 }
             )
         return result
 
-    async def delete_task_draft(self, dialog_key: str) -> None:
+    async def delete_task_draft(
+        self,
+        dialog_key: str,
+        *,
+        status: str = "cancelled",
+        expected_draft_id: str = "",
+        expected_version: int | None = None,
+        expected_claim_token: str = "",
+    ) -> None:
+        if status not in {"cancelled", "confirmed", "finalized"}:
+            raise ValueError("draft terminal status must be cancelled, confirmed, or finalized")
         async with await self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT draft_id, params_json, user_id
+                FROM bitrix24.interactive_drafts
+                WHERE dialog_key = %s
+                  AND status IN ('active', 'confirming', 'expired', 'finalizing')
+                  AND (%s = '' OR draft_id = %s)
+                  AND (%s IS NULL OR version = %s)
+                  AND (%s = '' OR claim_token = %s)
+                FOR UPDATE
+                """,
+                (
+                    dialog_key,
+                    expected_draft_id,
+                    expected_draft_id,
+                    expected_version,
+                    expected_version,
+                    expected_claim_token,
+                    expected_claim_token,
+                ),
+            )
+            active = await cur.fetchone()
+            if active:
+                await db.execute(
+                    """
+                    UPDATE bitrix24.interactive_drafts
+                    SET status = %s, claim_token = NULL, claimed_at = NULL, updated_at = now()
+                    WHERE draft_id = %s AND status IN ('active', 'confirming', 'expired', 'finalizing')
+                    """,
+                    (status, active["draft_id"]),
+                )
+                await db.execute(
+                    """
+                    INSERT INTO bitrix24.interactive_draft_transitions
+                        (draft_id, dialog_key, transition, payload_json, actor_user_id)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (active["draft_id"], dialog_key, status, active["params_json"], active["user_id"]),
+                )
             await db.execute(
-                "DELETE FROM bitrix24.pending_task_draft WHERE dialog_key = %s",
-                (dialog_key,),
+                """
+                DELETE FROM bitrix24.pending_task_draft
+                WHERE dialog_key = %s
+                  AND (%s = '' OR params_json::jsonb ->> '_draft_id' = %s)
+                """,
+                (dialog_key, expected_draft_id, expected_draft_id),
             )
 
     # ------------------------------------------------------------------
@@ -414,11 +1111,37 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
             )
         return cleaned
 
+    def upsert_task_close_operator(
+        self,
+        *,
+        user_id: int,
+        active: bool = True,
+        updated_by: int | None = None,
+    ) -> None:
+        with self._sync_connect() as db:
+            db.execute(
+                """
+                INSERT INTO bitrix24.task_close_control_operators (user_id, active, updated_by, updated_at)
+                VALUES (%s, %s, %s, now())
+                ON CONFLICT (user_id) DO UPDATE SET
+                    active = EXCLUDED.active,
+                    updated_by = EXCLUDED.updated_by,
+                    updated_at = now()
+                """,
+                (user_id, active, updated_by),
+            )
+            self._record_task_close_control_revision(
+                db,
+                actor_user_id=updated_by,
+                action="set_operator",
+                payload={"user_id": user_id, "active": active},
+            )
+
     def get_task_close_controlled_user(self, user_id: int) -> dict[str, Any] | None:
         with self._sync_connect() as db:
             row = db.execute(
                 """
-                SELECT user_id, active, updated_by, updated_at
+                SELECT user_id, active, controlled_from, updated_by, updated_at
                 FROM bitrix24.task_close_controlled_users
                 WHERE user_id = %s
                 """,
@@ -449,14 +1172,22 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
             db.execute(
                 """
                 INSERT INTO bitrix24.task_close_controlled_users
-                    (user_id, active, updated_by, updated_at)
-                VALUES (%s, %s, %s, now())
+                    (user_id, active, controlled_from, updated_by, updated_at)
+                VALUES (%s, %s, CASE WHEN %s THEN now() ELSE NULL END, %s, now())
                 ON CONFLICT (user_id) DO UPDATE SET
                     active = EXCLUDED.active,
+                    controlled_from = CASE
+                        WHEN EXCLUDED.active AND (
+                            bitrix24.task_close_controlled_users.controlled_from IS NULL
+                            OR bitrix24.task_close_controlled_users.active IS FALSE
+                        )
+                        THEN now()
+                        ELSE bitrix24.task_close_controlled_users.controlled_from
+                    END,
                     updated_by = EXCLUDED.updated_by,
                     updated_at = now()
                 """,
-                (user_id, active, updated_by),
+                (user_id, active, active, updated_by),
             )
             self._record_task_close_control_revision(
                 db,
@@ -483,6 +1214,140 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
         result = dict(row)
         result["payload"] = safe_json(result.pop("payload_json"))
         return result
+
+    async def confirm_admin_change_draft(
+        self,
+        *,
+        dialog_key: str,
+        draft_id: str,
+        draft_version: int,
+        actor_user_id: int,
+    ) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        async with await self._connect() as db:
+            cur = await db.execute(
+                """
+                SELECT params_json
+                FROM bitrix24.interactive_drafts
+                WHERE dialog_key = %s AND draft_id = %s AND version = %s
+                  AND draft_type = 'admin_change' AND status = 'active' AND expires_at > %s
+                FOR UPDATE
+                """,
+                (dialog_key, draft_id, draft_version, now),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return {"status": "not_found"}
+            raw = row["params_json"]
+            draft = json.loads(raw) if isinstance(raw, str) else raw
+            if not isinstance(draft, dict):
+                return {"status": "invalid"}
+            field = str(draft.get("field") or "")
+            target_user_id = safe_int(draft.get("target_user_id"))
+            lock_key = f"task_close_control:{field}:{target_user_id or 0}"
+            await db.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lock_key,))
+
+            current: object
+            if field in {"operator", "controlled_user"} and target_user_id is not None:
+                table = (
+                    "bitrix24.task_close_control_operators"
+                    if field == "operator"
+                    else "bitrix24.task_close_controlled_users"
+                )
+                cur = await db.execute(f"SELECT active FROM {table} WHERE user_id = %s FOR UPDATE", (target_user_id,))
+                member = await cur.fetchone()
+                current = bool(member and member["active"])
+            elif field in {"auto_close_time", "control_enabled_from"}:
+                cur = await db.execute(
+                    "SELECT value FROM bitrix24.task_close_control_settings WHERE key = %s FOR UPDATE",
+                    (field,),
+                )
+                setting = await cur.fetchone()
+                current = str(setting["value"]) if setting else ("20:00" if field == "auto_close_time" else "")
+            else:
+                return {"status": "invalid"}
+            if current != draft.get("old_value"):
+                return {"status": "conflict", "current_value": current, "draft": draft}
+
+            new_value = draft.get("new_value")
+            if field == "operator" and target_user_id is not None:
+                await db.execute(
+                    """
+                    INSERT INTO bitrix24.task_close_control_operators (user_id, active, updated_by, updated_at)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        active = EXCLUDED.active, updated_by = EXCLUDED.updated_by, updated_at = EXCLUDED.updated_at
+                    """,
+                    (target_user_id, bool(new_value), actor_user_id, now),
+                )
+            elif field == "controlled_user" and target_user_id is not None:
+                await db.execute(
+                    """
+                    INSERT INTO bitrix24.task_close_controlled_users
+                        (user_id, active, controlled_from, updated_by, updated_at)
+                    VALUES (%s, %s, CASE WHEN %s THEN %s ELSE NULL END, %s, %s)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        active = EXCLUDED.active,
+                        controlled_from = CASE
+                            WHEN EXCLUDED.active AND (
+                                bitrix24.task_close_controlled_users.active IS FALSE
+                                OR bitrix24.task_close_controlled_users.controlled_from IS NULL
+                            ) THEN EXCLUDED.controlled_from
+                            ELSE bitrix24.task_close_controlled_users.controlled_from
+                        END,
+                        updated_by = EXCLUDED.updated_by,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    (target_user_id, bool(new_value), bool(new_value), now, actor_user_id, now),
+                )
+            else:
+                await db.execute(
+                    """
+                    INSERT INTO bitrix24.task_close_control_settings (key, value, updated_by, updated_at)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (key) DO UPDATE SET
+                        value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = EXCLUDED.updated_at
+                    """,
+                    (field, str(new_value or ""), actor_user_id, now),
+                )
+            revision_payload = {
+                "draft_id": draft_id,
+                "field": field,
+                "target_user_id": target_user_id,
+                "old_value": current,
+                "new_value": new_value,
+            }
+            await db.execute(
+                """
+                INSERT INTO bitrix24.task_close_control_revisions (actor_user_id, action, payload_json)
+                VALUES (%s, %s, %s)
+                """,
+                (actor_user_id, "confirm_admin_change", json.dumps(revision_payload, ensure_ascii=False)),
+            )
+            await db.execute(
+                """
+                UPDATE bitrix24.interactive_drafts
+                SET status = 'confirmed', updated_at = %s
+                WHERE draft_id = %s AND version = %s AND status = 'active'
+                """,
+                (now, draft_id, draft_version),
+            )
+            await db.execute(
+                """
+                INSERT INTO bitrix24.interactive_draft_transitions
+                    (draft_id, dialog_key, transition, payload_json, actor_user_id)
+                VALUES (%s, %s, 'confirmed', %s, %s)
+                """,
+                (draft_id, dialog_key, json.dumps(draft, ensure_ascii=False), actor_user_id),
+            )
+            await db.execute(
+                """
+                DELETE FROM bitrix24.pending_task_draft
+                WHERE dialog_key = %s AND params_json::jsonb ->> '_draft_id' = %s
+                """,
+                (dialog_key, draft_id),
+            )
+        return {"status": "confirmed", "draft": draft}
 
     def list_task_close_processing_states(
         self,
@@ -791,7 +1656,10 @@ class PostgresBitrixAgentStore(PostgresAgentSchema):
                     metadata=safe_json(row["metadata_json"]),
                 )
             )
-        return sorted(scored, key=lambda item: (-item.score, item.entity_type, item.title))[:limit]
+        return sorted(
+            scored,
+            key=lambda item: (-item.score, item.entity_type, item.title.casefold(), item.entity_id),
+        )[:limit]
 
     def disk_delta_folder_candidates(
         self,
@@ -1038,3 +1906,18 @@ def _row_to_search_result(row: dict) -> PortalSearchResult:
         score=0,
         metadata=safe_json(row["metadata_json"]),
     )
+
+
+def _parse_draft_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)

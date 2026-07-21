@@ -64,6 +64,10 @@ class Settings:
     tech_footer_balance_enabled: bool
     tech_footer_balance_cache_seconds: int
     diagnost_enabled: bool
+    diagnost_feedback_enabled: bool
+    diagnost_trace_snapshot_enabled: bool
+    diagnost_trace_settle_seconds: float
+    diagnost_high_latency_ms: float
     conversation_trace_enabled: bool
     conversation_trace_secret: str
     conversation_trace_ttl_hours: int
@@ -433,7 +437,7 @@ def get_settings() -> Settings:
         bitrix_oauth_client_secret=_env("BITRIX_OAUTH_CLIENT_SECRET"),
         bitrix_oauth_enabled=_env_bool("BITRIX_OAUTH_ENABLED", True),
         bitrix_oauth_required_for_writes=_env_bool("BITRIX_OAUTH_REQUIRED_FOR_WRITES", True),
-        bitrix_task_draft_ttl_minutes=_env_int("BITRIX_TASK_DRAFT_TTL_MINUTES", 24 * 60) or (24 * 60),
+        bitrix_task_draft_ttl_minutes=_env_int("BITRIX_TASK_DRAFT_TTL_MINUTES", 15) or 15,
         bitrix_task_close_report_admin_user_ids=_env("BITRIX_TASK_CLOSE_REPORT_ADMIN_USER_IDS", "1"),
         bitrix_task_close_report_auto_restore_hours=_env_int_default("BITRIX_TASK_CLOSE_REPORT_AUTO_RESTORE_HOURS", 24),
         bitrix_task_close_control_admin_user_ids=_env(
@@ -484,11 +488,15 @@ def get_settings() -> Settings:
         tech_footer_balance_enabled=_env_bool("AI_SERVER_TECH_FOOTER_BALANCE_ENABLED", True),
         tech_footer_balance_cache_seconds=_env_int("AI_SERVER_TECH_FOOTER_BALANCE_CACHE_SECONDS", 300) or 300,
         diagnost_enabled=_env_bool("DIAGNOST_ENABLED", True),
-        conversation_trace_enabled=_env_bool("CONVERSATION_TRACE_ENABLED", False),
+        diagnost_feedback_enabled=_env_bool("DIAGNOST_FEEDBACK_ENABLED", False),
+        diagnost_trace_snapshot_enabled=_env_bool("DIAGNOST_TRACE_SNAPSHOT_ENABLED", True),
+        diagnost_trace_settle_seconds=_env_float("DIAGNOST_TRACE_SETTLE_SECONDS", 1.0) or 1.0,
+        diagnost_high_latency_ms=_env_float("DIAGNOST_HIGH_LATENCY_MS", 120000.0) or 120000.0,
+        conversation_trace_enabled=_env_bool("CONVERSATION_TRACE_ENABLED", True),
         conversation_trace_secret=_env("CONVERSATION_TRACE_SECRET"),
         conversation_trace_ttl_hours=_env_int("CONVERSATION_TRACE_TTL_HOURS", 48) or 48,
         conversation_trace_max_text_chars=_env_int("CONVERSATION_TRACE_MAX_TEXT_CHARS", 8000) or 8000,
-        learning_events_enabled=_env_bool("LEARNING_EVENTS_ENABLED", True),
+        learning_events_enabled=_env_bool("LEARNING_EVENTS_ENABLED", False),
         learning_events_capture_text=_env_bool("LEARNING_EVENTS_CAPTURE_TEXT", True),
         learning_events_max_text_chars=_env_int("LEARNING_EVENTS_MAX_TEXT_CHARS", 8000) or 8000,
         webhook_event_queue_enabled=_env_bool("WEBHOOK_EVENT_QUEUE_ENABLED", True),

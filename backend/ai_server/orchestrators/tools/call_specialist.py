@@ -20,6 +20,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_ACTIVE_DRAFT_BRANCH_FIELD = "conversation_reference_active_draft_branch"
+_ACTIVE_DRAFT_NUMBER_FIELD = "conversation_reference_active_draft_number"
+
 
 class CallSpecialistTool:
     """Routes a request to a named specialist agent.
@@ -73,6 +76,83 @@ class CallSpecialistTool:
             },
         )
 
+    async def get_active_bitrix_draft(self, dialog_key: str) -> dict[str, Any] | None:
+        """Read a Bitrix write draft without invoking a model or Bitrix API."""
+        specialist = self._specialists.get("bitrix24")
+        getter = getattr(specialist, "get_active_draft", None)
+        if not callable(getter) or not dialog_key:
+            return None
+        draft = await getter(dialog_key)
+        return dict(draft) if isinstance(draft, dict) else None
+
+    async def discard_active_bitrix_draft(self, dialog_key: str, *, expected_draft_id: str) -> bool:
+        specialist = self._specialists.get("bitrix24")
+        discard = getattr(specialist, "discard_active_draft", None)
+        if not callable(discard) or not dialog_key or not expected_draft_id:
+            return False
+        return bool(await discard(dialog_key, expected_draft_id=expected_draft_id))
+
+    async def _persist_pending_state(
+        self,
+        *,
+        dialog_key: str | None,
+        specialist_id: str,
+        specialist_status: str,
+    ) -> ToolResult | None:
+        if self._store is None or not dialog_key:
+            return None
+        try:
+            if specialist_status in ("needs_clarification", "needs_human"):
+                await self._store.set_kv(dialog_key, "pending_specialist", specialist_id)
+                transition = "set"
+            else:
+                await self._store.delete_kv(dialog_key, "pending_specialist")
+                transition = "clear"
+        except Exception:
+            logger.exception("CallSpecialistTool: KV update failed for dialog_key=%s", dialog_key)
+            return ToolResult(
+                status=ToolStatus.ERROR,
+                tool=self.name,
+                error="pending specialist state transition failed",
+                data={
+                    "specialist": specialist_id,
+                    "status": "failed",
+                    "reason": "PENDING_STATE_WRITE_FAILED",
+                    "state_transition": "failed",
+                },
+            )
+        return ToolResult(
+            status=ToolStatus.OK,
+            tool=self.name,
+            data={"state_transition": transition},
+        )
+
+    async def _sync_active_bitrix_draft(self, task: AgentTask, *, dialog_key: str | None) -> ToolResult | None:
+        """Keep the one active write draft addressable from a base Bitrix chat."""
+        if self._store is None or not dialog_key:
+            return None
+        base_key = str(task.context.get("base_dialog_key") or "").strip()
+        number = task.context.get("conversation_number")
+        if not base_key or number in (None, ""):
+            return None
+        try:
+            draft = await self.get_active_bitrix_draft(dialog_key)
+            current = str(await self._store.get_kv(base_key, _ACTIVE_DRAFT_BRANCH_FIELD) or "")
+            if draft:
+                await self._store.set_kv(base_key, _ACTIVE_DRAFT_BRANCH_FIELD, dialog_key)
+                await self._store.set_kv(base_key, _ACTIVE_DRAFT_NUMBER_FIELD, str(number))
+            elif current == dialog_key:
+                await self._store.delete_kv(base_key, _ACTIVE_DRAFT_BRANCH_FIELD)
+                await self._store.delete_kv(base_key, _ACTIVE_DRAFT_NUMBER_FIELD)
+        except Exception:
+            logger.exception("CallSpecialistTool: active Bitrix draft reference update failed")
+            return ToolResult(
+                status=ToolStatus.ERROR,
+                tool=self.name,
+                error="active Bitrix draft reference transition failed",
+            )
+        return None
+
     async def execute(
         self,
         args: dict[str, Any],
@@ -117,14 +197,13 @@ class CallSpecialistTool:
             except Exception:
                 logger.exception("CallSpecialistTool: schedule_fn failed for %s", specialist_id)
 
-        if self._store and dialog_key:
-            try:
-                if sr.status in ("needs_clarification", "needs_human"):
-                    await self._store.set_kv(dialog_key, "pending_specialist", specialist_id)
-                else:
-                    await self._store.delete_kv(dialog_key, "pending_specialist")
-            except Exception:
-                logger.exception("CallSpecialistTool: KV update failed for dialog_key=%s", dialog_key)
+        state_result = await self._persist_pending_state(
+            dialog_key=dialog_key,
+            specialist_id=specialist_id,
+            specialist_status=str(sr.status),
+        )
+        if state_result is not None and state_result.status == ToolStatus.ERROR:
+            return state_result
 
         return ToolResult(
             status=ToolStatus.OK,
@@ -142,7 +221,14 @@ class CallSpecialistTool:
 
     async def execute_with_task(self, args: dict[str, Any], *, task: AgentTask) -> ToolResult:
         specialist_id = str(args.get("specialist_id") or "").strip()
-        request = str(args.get("request") or "").strip()
+        planned_request = str(args.get("request") or "").strip()
+        original_request = str(task.context.get("t0006_original_request") or "").strip()
+        dispatch_request = str(task.context.get("t0007_dispatch_request") or "").strip()
+        explicit_segment_request = str(task.context.get("t0007_explicit_segment_request") or "").strip()
+        # The orchestrator, rather than a specialist, owns decomposition.  A
+        # non-empty dispatch request is therefore the only request the
+        # specialist may execute for this branch; the original is audit-only.
+        request = dispatch_request or explicit_segment_request or original_request or planned_request
 
         specialist = self._specialists.get(specialist_id)
         if specialist is None:
@@ -153,7 +239,18 @@ class CallSpecialistTool:
             )
 
         dialog_key = str(task.context.get("dialog_key") or "") or None
-        sub_task = task.model_copy(update={"request": request})
+        sub_task = task.model_copy(
+            update={
+                "request": request,
+                "context": {
+                    **task.context,
+                    "t0006_effective_specialist_request": request,
+                    "t0006_planned_subtask_request": str(
+                        task.context.get("t0006_planned_subtask_request") or planned_request
+                    ),
+                },
+            }
+        )
         try:
             sr = await specialist.handle(sub_task)
         except Exception as exc:
@@ -167,14 +264,18 @@ class CallSpecialistTool:
             except Exception:
                 logger.exception("CallSpecialistTool: schedule_fn failed for %s", specialist_id)
 
-        if self._store and dialog_key:
-            try:
-                if sr.status in ("needs_clarification", "needs_human"):
-                    await self._store.set_kv(dialog_key, "pending_specialist", specialist_id)
-                else:
-                    await self._store.delete_kv(dialog_key, "pending_specialist")
-            except Exception:
-                logger.exception("CallSpecialistTool: KV update failed for dialog_key=%s", dialog_key)
+        state_result = await self._persist_pending_state(
+            dialog_key=dialog_key,
+            specialist_id=specialist_id,
+            specialist_status=str(sr.status),
+        )
+        if state_result is not None and state_result.status == ToolStatus.ERROR:
+            return state_result
+
+        if specialist_id == "bitrix24":
+            draft_result = await self._sync_active_bitrix_draft(task, dialog_key=dialog_key)
+            if draft_result is not None:
+                return draft_result
 
         return ToolResult(
             status=ToolStatus.OK,

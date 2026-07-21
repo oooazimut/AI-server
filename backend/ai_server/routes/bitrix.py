@@ -7,7 +7,7 @@ from urllib.parse import parse_qsl
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from ..integrations.bitrix.events import payload_event_type
+from ..integrations.bitrix.events import MESSAGE_EVENTS, payload_event_type
 from ..integrations.bitrix.portal_search import (
     PortalSearchIndex,
     entity_types_for_scope,
@@ -49,6 +49,7 @@ async def bitrix_status(request: Request) -> dict[str, Any]:
         "reconciler": dict(request.app.state.reconciler_status),
         "webhook_events": dict(request.app.state.webhook_event_status),
         "webhook_event_queue": {**worker_status, **queue_stats},
+        "outbound_queue": await request.app.state.outbound_queue.stats(),
     }
 
 
@@ -146,6 +147,7 @@ async def bitrix_webhook_events_status(request: Request) -> dict[str, Any]:
     return {
         "worker": worker_status,
         "queue": queue_stats,
+        "outbound_queue": await request.app.state.outbound_queue.stats(),
         "latest_events": await request.app.state.webhook_event_queue.latest(limit=20),
     }
 
@@ -181,6 +183,16 @@ async def conversation_trace_recent(
         "count": len(events),
         "events": events,
     }
+
+
+@router.get("/admin/outbound-queue/status")
+async def outbound_queue_admin_status(
+    request: Request,
+    x_trace_secret: Annotated[str | None, Header(alias="X-Trace-Secret")] = None,
+    secret: str = "",
+) -> dict[str, Any]:
+    _validate_trace_secret(request, provided=x_trace_secret or secret)
+    return await request.app.state.outbound_queue.public_status()
 
 
 @router.get("/agent/webhook-events/status")
@@ -226,12 +238,19 @@ async def bitrix_events(
             payload,
             event_type=event_type,
         )
-        await request.app.state.conversation_trace.record_inbound(
+        await request.app.state.conversation_trace.record_ingress(
             event_id=event_id,
             event_type=event_type,
             payload=payload,
             inserted=inserted,
         )
+        if event_type in MESSAGE_EVENTS:
+            await request.app.state.conversation_trace.record_inbound(
+                event_id=event_id,
+                event_type=event_type,
+                payload=payload,
+                inserted=inserted,
+            )
         queue_status = request.app.state.webhook_event_queue_status
         queue_status["last_enqueued_at"] = now_ts()
         queue_status["last_enqueued_event_id"] = event_id

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from datetime import datetime
@@ -220,10 +221,14 @@ class BaseSpecialist:
         # Load per-specialist dialog history from agent's own PG schema (if configured),
         # otherwise fall back to the shared history passed via task.context.
         dialog_key: str = task.context.get("dialog_key") or ""
+        shared_history = list(task.context.get("dialog_history") or [])
         if self.store is not None and dialog_key:
-            dialog_history: list[dict] = await self.store.load_turns(dialog_key, limit=20)
+            specialist_history: list[dict] = await self.store.load_turns(dialog_key, limit=20)
+            # The orchestrator may have asked the preceding question before a
+            # specialist was ever called. Preserve that context for this turn.
+            dialog_history = [*shared_history, *specialist_history][-20:]
         else:
-            dialog_history = list(task.context.get("dialog_history") or [])
+            dialog_history = shared_history
 
         available_skills = (
             self.skill_store.list_skills_with_content(self.manifest) if self.skill_store is not None else []
@@ -273,6 +278,7 @@ class BaseSpecialist:
         approval_actions: list[ActionRecord] = []
         decision_results: list[Any] = []
         terminal_response_metadata: dict[str, Any] = {}
+        successful_tool_calls: set[str] = set()
         decision = None
 
         for step in range(1, self.max_steps + 1):
@@ -351,6 +357,31 @@ class BaseSpecialist:
                 break
             stop_after_step = False
             for tool_call in executable_calls:
+                call_fingerprint = _tool_call_fingerprint(tool_call)
+                if call_fingerprint in successful_tool_calls:
+                    duplicate_details = {
+                        "tool": tool_call.name,
+                        "reason": "duplicate_after_success",
+                    }
+                    actions_taken.append(
+                        ActionRecord(
+                            name=f"{self.action_prefix}_duplicate_success_guard",
+                            status="stopped",
+                            details=duplicate_details,
+                        )
+                    )
+                    await self._record_timing(
+                        task,
+                        stage="duplicate_success_guard",
+                        started_at=_trace_now_iso(),
+                        elapsed_ms=0.0,
+                        status="stopped",
+                        step=step,
+                        tool=tool_call.name,
+                        details=duplicate_details,
+                    )
+                    stop_after_step = True
+                    continue
                 tool_started_at = _trace_now_iso()
                 tool_t0 = time.monotonic()
                 try:
@@ -385,6 +416,8 @@ class BaseSpecialist:
                 )
                 if result is not None:
                     tool_results.append(result)
+                    if result.status == ToolStatus.OK:
+                        successful_tool_calls.add(call_fingerprint)
                 if action is not None:
                     actions_taken.append(action)
                 approval_actions.extend(approvals)
@@ -657,3 +690,8 @@ class BaseSpecialist:
 
 def _trace_now_iso() -> str:
     return datetime.now(MOSCOW_TZ).isoformat()
+
+
+def _tool_call_fingerprint(tool_call: Any) -> str:
+    args = getattr(tool_call, "args", {}) or {}
+    return f"{getattr(tool_call, 'name', '')}:{json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)}"

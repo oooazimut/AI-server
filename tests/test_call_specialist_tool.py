@@ -94,6 +94,23 @@ def test_passes_dialog_key_and_user_id_to_specialist():
     assert call_args.user.id == "42"
 
 
+def test_explicit_segment_request_wins_over_the_full_dialog_request():
+    spec = _fake_specialist()
+    tool = _make_tool({"bitrix24": spec})
+    task = AgentTask(
+        task_id="t1",
+        request="Логист покажи машины Битрикс покажи склад Борисова",
+        context={
+            "t0006_original_request": "Логист покажи машины Битрикс покажи склад Борисова",
+            "t0007_explicit_segment_request": "покажи склад Борисова",
+        },
+    )
+
+    asyncio.run(tool.execute_with_task({"specialist_id": "bitrix24", "request": "покажи склад Борисова"}, task=task))
+
+    assert spec.handle.call_args[0][0].request == "покажи склад Борисова"
+
+
 def test_definition_includes_all_specialist_ids():
     tool = _make_tool({"bitrix24": _fake_specialist(), "pto": _fake_specialist()})
     defn = tool.definition()

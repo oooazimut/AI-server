@@ -114,6 +114,42 @@ def test_record_inbound_message_writes_safe_searchable_trace():
     assert any("ai_server:conversation_trace:message:127203" in str(call) for call in pipe.zadd.mock_calls)
 
 
+def test_record_ingress_keeps_unknown_v2_event_searchable_without_raw_payload():
+    trace, client = _make_trace()
+    pipe = _make_pipe(client)
+    payload = _message_payload()
+    payload["event"] = "ONIMBOTV2VOICEADD"
+    payload["data"]["message"]["attachments"] = [{"id": 501, "name": "voice.ogg", "type": "audio/ogg"}]
+
+    anyio_run(
+        trace.record_ingress(
+            event_id=619,
+            event_type="ONIMBOTV2VOICEADD",
+            payload=payload,
+            inserted=True,
+        )
+    )
+
+    pipe.set.assert_called_once()
+    _, payload_json = pipe.set.call_args.args[:2]
+    stored = json.loads(payload_json)
+    dumped = json.dumps(stored, ensure_ascii=False)
+
+    assert stored["trace_type"] == "ingress_event"
+    assert stored["message_event_recognized"] is False
+    assert stored["parse_status"] == "parsed"
+    assert stored["message_id"] == 127203
+    assert stored["user_id"] == 27
+    assert stored["dialog_id"] == "chat3669"
+    assert stored["attachment_count"] == 1
+    assert stored["attachment_type_hints"] == ["audio/ogg"]
+    assert stored["audio_attachment_hint"] is True
+    assert "top-secret" not in dumped
+    assert "nested-access" not in dumped
+    assert any("ai_server:conversation_trace:user:27" in str(call) for call in pipe.zadd.mock_calls)
+    assert any("ai_server:conversation_trace:message:127203" in str(call) for call in pipe.zadd.mock_calls)
+
+
 def test_record_agent_result_and_outbound_are_indexed_by_task_and_user():
     trace, client = _make_trace()
     pipe = _make_pipe(client)

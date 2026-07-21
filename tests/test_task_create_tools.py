@@ -12,8 +12,9 @@ from ai_server.agents.bitrix24.tools.task_create import (
     TaskCreateDraftTool,
     TaskDraftDiscardTool,
 )
+from ai_server.integrations.bitrix.oauth import BitrixOAuthTokenMissing
 from ai_server.models import ToolStatus
-from tests.fakes import FakeTaskDraftStore
+from tests.fakes import FakePortalSearchIndex, FakeTaskDraftStore
 
 
 def _exec(tool, args, *, user_id=None, dialog_key=None, dialog_id=None):
@@ -39,6 +40,7 @@ def test_draft_tool_saves_to_store():
     )
     assert result.status == ToolStatus.OK
     assert "d:42" in store._drafts
+    assert store._drafts["d:42"]["_draft_type"] == "task_create"
     assert store._drafts["d:42"]["fields"]["TITLE"] == "Тест"
 
 
@@ -122,6 +124,198 @@ def test_draft_tool_prepares_personal_project_before_default_self_task():
     assert "GROUP_ID" not in followup["params"]["fields"]
 
 
+def test_draft_tool_does_not_create_duplicate_for_ambiguous_personal_project():
+    class _AmbiguousProjectClient:
+        async def search_projects(self, query: str, *, limit: int = 10):
+            return [
+                {"ID": "77", "NAME": "Кулинич Валерий"},
+                {"ID": "78", "NAME": "Кулинич Валерий"},
+            ]
+
+    store = FakeTaskDraftStore()
+    result = _exec(
+        TaskCreateDraftTool(store=store, project_client=_AmbiguousProjectClient()),
+        {
+            "title": "Тест",
+            "responsible_self": True,
+            "responsible_name": "Кулинич Валерий",
+            "project_name": "Кулинич Валерий",
+            "_default_personal_project": True,
+            "no_deadline": True,
+        },
+        user_id=9,
+        dialog_key="d:42",
+        dialog_id="chat42",
+    )
+
+    assert result.status == ToolStatus.NOT_FOUND
+    assert store._drafts == {}
+
+
+def test_explicit_project_draft_requires_one_exact_numeric_project():
+    class _ProjectClient:
+        async def search_projects(self, query: str, *, limit: int = 10):
+            return [{"ID": "77", "NAME": "Ларгус-2"}]
+
+    store = FakeTaskDraftStore()
+    tool = TaskCreateDraftTool(store=store, project_client=_ProjectClient())
+
+    result = _exec(
+        tool,
+        {"title": "Тест", "responsible_self": True, "project_name": "Ларгус-2"},
+        user_id=9,
+        dialog_key="d:42",
+    )
+
+    assert result.status == ToolStatus.OK
+    assert store._drafts["d:42"]["fields"]["GROUP_ID"] == 77
+
+
+def test_explicit_project_draft_uses_exact_postgres_snapshot_before_live_rest():
+    class _ForbiddenLiveClient:
+        async def search_projects(self, query: str, *, limit: int = 10):
+            raise AssertionError("exact PostgreSQL snapshot must avoid live REST")
+
+    index = FakePortalSearchIndex()
+    index.upsert_item(entity_type="project", entity_id="77", title="Ларгус 2")
+    store = FakeTaskDraftStore()
+    tool = TaskCreateDraftTool(
+        store=store,
+        project_client=_ForbiddenLiveClient(),
+        portal_search=index,
+    )
+
+    result = _exec(
+        tool,
+        {"title": "Тест", "responsible_self": True, "project_name": "Ларгус-2"},
+        user_id=9,
+        dialog_key="d:42",
+    )
+
+    assert result.status == ToolStatus.OK
+    assert store._drafts["d:42"]["fields"]["GROUP_ID"] == 77
+    assert store._drafts["d:42"]["_resolved_project"] == {"id": 77, "name": "Ларгус 2"}
+    assert result.data["preview"]["project"] == "Ларгус 2"
+
+
+def test_explicit_project_draft_rejects_ambiguous_exact_postgres_snapshot():
+    class _ForbiddenLiveClient:
+        async def search_projects(self, query: str, *, limit: int = 10):
+            raise AssertionError("ambiguous authoritative snapshot must fail closed")
+
+    index = FakePortalSearchIndex()
+    index.upsert_item(entity_type="project", entity_id="77", title="Ларгус-2")
+    index.upsert_item(entity_type="project", entity_id="78", title="Ларгус-2")
+    store = FakeTaskDraftStore()
+
+    result = _exec(
+        TaskCreateDraftTool(
+            store=store,
+            project_client=_ForbiddenLiveClient(),
+            portal_search=index,
+        ),
+        {"title": "Тест", "responsible_self": True, "project_name": "Ларгус-2"},
+        user_id=9,
+        dialog_key="d:42",
+    )
+
+    assert result.status == ToolStatus.NOT_FOUND
+    assert store._drafts == {}
+
+
+def test_explicit_project_draft_falls_back_to_live_for_fuzzy_only_snapshot():
+    class _LiveClient:
+        def __init__(self):
+            self.calls = []
+
+        async def search_projects(self, query: str, *, limit: int = 10):
+            self.calls.append((query, limit))
+            return [{"ID": "77", "NAME": "Ларгус-2"}]
+
+    index = FakePortalSearchIndex()
+    index.upsert_item(entity_type="project", entity_id="78", title="Ларгус-20")
+    live = _LiveClient()
+    store = FakeTaskDraftStore()
+
+    result = _exec(
+        TaskCreateDraftTool(store=store, project_client=live, portal_search=index),
+        {"title": "Тест", "responsible_self": True, "project_name": "Ларгус-2"},
+        user_id=9,
+        dialog_key="d:42",
+    )
+
+    assert result.status == ToolStatus.OK
+    assert live.calls == [("Ларгус-2", 10)]
+    assert store._drafts["d:42"]["fields"]["GROUP_ID"] == 77
+
+
+def test_explicit_project_snapshot_requires_current_user_oauth_actor():
+    class _MissingOAuth:
+        async def client_for_user(self, user_id: int):
+            raise BitrixOAuthTokenMissing(user_id)
+
+        def authorization_hint(self, user_id: int):
+            return {}
+
+    class _ForbiddenFallback:
+        async def search_projects(self, query: str, *, limit: int = 10):
+            raise AssertionError("missing OAuth actor must stop before fallback")
+
+    index = FakePortalSearchIndex()
+    index.upsert_item(entity_type="project", entity_id="77", title="Ларгус-2")
+    store = FakeTaskDraftStore()
+
+    result = _exec(
+        TaskCreateDraftTool(
+            store=store,
+            project_client=_ForbiddenFallback(),
+            portal_search=index,
+            bitrix_oauth=_MissingOAuth(),
+        ),
+        {"title": "Тест", "responsible_self": True, "project_name": "Ларгус-2"},
+        user_id=9,
+        dialog_key="d:42",
+    )
+
+    assert result.status == ToolStatus.DENIED
+    assert store._drafts == {}
+
+
+def test_explicit_project_draft_without_resolver_fails_closed():
+    store = FakeTaskDraftStore()
+    tool = TaskCreateDraftTool(store=store, project_client=None)
+
+    result = _exec(
+        tool,
+        {"title": "Тест", "responsible_self": True, "project_name": "Ларгус-2"},
+        user_id=9,
+        dialog_key="d:42",
+    )
+
+    assert result.status == ToolStatus.NOT_FOUND
+    assert store._drafts == {}
+
+
+def test_explicit_project_draft_with_zero_or_ambiguous_matches_fails_closed():
+    class _ProjectClient:
+        def __init__(self, projects):
+            self.projects = projects
+
+        async def search_projects(self, query: str, *, limit: int = 10):
+            return self.projects
+
+    for projects in ([], [{"ID": "77", "NAME": "Ларгус-2"}, {"ID": "78", "NAME": "Ларгус-2"}]):
+        store = FakeTaskDraftStore()
+        result = _exec(
+            TaskCreateDraftTool(store=store, project_client=_ProjectClient(projects)),
+            {"title": "Тест", "responsible_self": True, "project_name": "Ларгус-2"},
+            user_id=9,
+            dialog_key="d:42",
+        )
+        assert result.status == ToolStatus.NOT_FOUND
+        assert store._drafts == {}
+
+
 # ---------------------------------------------------------------------------
 # TaskCreateConfirmTool
 # ---------------------------------------------------------------------------
@@ -144,6 +338,7 @@ def test_confirm_tool_creates_task():
 
     assert result.status == ToolStatus.OK
     assert result.data["result"]["task"]["id"] == 777
+    write_client.call.assert_awaited_once_with("tasks.task.add", {"fields": {"TITLE": "Задача", "RESPONSIBLE_ID": 9}})
     assert "d:1" not in store._drafts
 
 
@@ -172,6 +367,128 @@ def test_confirm_tool_uses_oauth_when_required():
     oauth_client.call.assert_awaited_once()
     write_client.call.assert_not_called()
     assert "d:1" not in store._drafts
+
+
+def test_confirm_tool_rejects_stale_resolved_project_before_write():
+    store = FakeTaskDraftStore()
+    anyio.run(
+        lambda: store.save_task_draft(
+            "d:1",
+            {
+                "_draft_type": "task_create",
+                "_resolved_project": {"id": 77, "name": "Ларгус-2"},
+                "fields": {"TITLE": "Задача", "RESPONSIBLE_ID": 9, "GROUP_ID": 77},
+            },
+        )
+    )
+
+    class _RenamedProjectClient:
+        def __init__(self):
+            self.call_count = 0
+
+        async def search_projects(self, query: str, *, limit: int = 10):
+            return [{"ID": "77", "NAME": "Ларгус-3"}]
+
+        async def call(self, method: str, params: dict):
+            self.call_count += 1
+            raise AssertionError("stale project reference must stop before write")
+
+    oauth_client = _RenamedProjectClient()
+    tool = TaskCreateConfirmTool(
+        store=store,
+        bitrix_oauth=FakeBitrixOAuth(oauth_client),
+        dry_run=False,
+        oauth_required_for_writes=True,
+    )
+
+    result = _exec(tool, {}, user_id=9, dialog_key="d:1", dialog_id="chat99")
+
+    assert result.status == ToolStatus.NOT_FOUND
+    assert oauth_client.call_count == 0
+    assert "d:1" in store._drafts
+
+
+def test_confirm_tool_revalidates_exact_resolved_project_before_write():
+    store = FakeTaskDraftStore()
+    anyio.run(
+        lambda: store.save_task_draft(
+            "d:1",
+            {
+                "_draft_type": "task_create",
+                "_resolved_project": {"id": 77, "name": "Ларгус-2"},
+                "fields": {"TITLE": "Задача", "RESPONSIBLE_ID": 9, "GROUP_ID": 77},
+            },
+        )
+    )
+
+    class _ExactProjectClient:
+        def __init__(self):
+            self.calls = []
+
+        async def search_projects(self, query: str, *, limit: int = 10):
+            return [{"ID": "77", "NAME": "Ларгус 2"}]
+
+        async def call(self, method: str, params: dict):
+            self.calls.append((method, params))
+            return {"task": {"id": 777}}
+
+    oauth_client = _ExactProjectClient()
+    tool = TaskCreateConfirmTool(
+        store=store,
+        bitrix_oauth=FakeBitrixOAuth(oauth_client),
+        dry_run=False,
+        oauth_required_for_writes=True,
+    )
+
+    result = _exec(tool, {}, user_id=9, dialog_key="d:1", dialog_id="chat99")
+
+    assert result.status == ToolStatus.OK
+    assert oauth_client.calls == [
+        (
+            "tasks.task.add",
+            {"fields": {"TITLE": "Задача", "RESPONSIBLE_ID": 9, "GROUP_ID": 77}},
+        )
+    ]
+    assert "d:1" not in store._drafts
+
+
+def test_confirm_tool_preserves_transient_project_validation_failure_status():
+    store = FakeTaskDraftStore()
+    anyio.run(
+        lambda: store.save_task_draft(
+            "d:1",
+            {
+                "_draft_type": "task_create",
+                "_resolved_project": {"id": 77, "name": "Ларгус-2"},
+                "fields": {"TITLE": "Задача", "RESPONSIBLE_ID": 9, "GROUP_ID": 77},
+            },
+        )
+    )
+
+    class _TransientFailureClient:
+        def __init__(self):
+            self.call_count = 0
+
+        async def search_projects(self, query: str, *, limit: int = 10):
+            raise RuntimeError("temporary read failure")
+
+        async def call(self, method: str, params: dict):
+            self.call_count += 1
+            raise AssertionError("validation failure must stop before write")
+
+    oauth_client = _TransientFailureClient()
+    tool = TaskCreateConfirmTool(
+        store=store,
+        bitrix_oauth=FakeBitrixOAuth(oauth_client),
+        dry_run=False,
+        oauth_required_for_writes=True,
+    )
+
+    result = _exec(tool, {}, user_id=9, dialog_key="d:1", dialog_id="chat99")
+
+    assert result.status == ToolStatus.ERROR
+    assert oauth_client.call_count == 0
+    assert "d:1" in store._drafts
 
 
 def test_confirm_tool_required_oauth_blocks_missing_dialog_id():

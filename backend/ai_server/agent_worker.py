@@ -39,10 +39,11 @@ from ai_server.integrations.redis.conversation_trace import RedisConversationTra
 from ai_server.integrations.redis.diagnost_queue import RedisDiagnostQueue
 from ai_server.integrations.redis.dialog_guard import RedisDialogGuard
 from ai_server.integrations.redis.event_queue import RedisEventQueue
+from ai_server.integrations.redis.outbound_queue import RedisOutboundQueue
 from ai_server.llm import build_orchestrator_llm_client
 from ai_server.models import AgentTask
 from ai_server.orchestrators.internal import InternalOrchestrator
-from ai_server.orchestrators.orchestrator_llm import OrchestratorLLMService
+from ai_server.orchestrators.plan_authoritative import DeepSeekPlanService
 from ai_server.registry import load_agent_manifests
 from ai_server.runtime import ensure_runtime_dirs
 from ai_server.settings import get_settings
@@ -61,6 +62,7 @@ from ai_server.workers.diagnost.event_worker import run_diagnost_event_worker
 from ai_server.workers.diagnost.feedback_receiver import FeedbackReceiverAdapter
 from ai_server.workers.diagnost.feedback_scheduler import run_feedback_scheduler_worker
 from ai_server.workers.logistics.staff_sync import run_staff_sync
+from ai_server.workers.orchestrator.outbound_delivery import run_outbound_delivery_worker
 from ai_server.workers.orchestrator.result_publisher import OrchestratorResultPublisher, SpecialistResultPublisher
 
 logger = logging.getLogger(__name__)
@@ -113,6 +115,10 @@ async def main() -> None:
 
     diagnost_store = PostgresDiagnostStore(settings.database_url)
     await diagnost_store.ensure_schema()
+    if not settings.diagnost_feedback_enabled:
+        cancelled_feedback = await diagnost_store.cancel_pending_feedback()
+        if cancelled_feedback:
+            logger.info("Diagnost feedback disabled: cancelled %d pending prompts", cancelled_feedback)
 
     portal_search_indexer = PortalSearchIndexerWorker(
         bitrix,
@@ -122,6 +128,7 @@ async def main() -> None:
     )
     diagnost_queue = RedisDiagnostQueue(settings.redis_url)
     conversation_trace = RedisConversationTrace(settings.redis_url, settings=settings)
+    outbound_queue = RedisOutboundQueue(settings.redis_url)
     dialog_guard = RedisDialogGuard(settings.redis_url, settings=settings)
     result_publisher = OrchestratorResultPublisher(diagnost_queue, conversation_trace=conversation_trace)
     specialist_result_publisher = SpecialistResultPublisher(diagnost_queue, conversation_trace=conversation_trace)
@@ -139,6 +146,19 @@ async def main() -> None:
         logger.info("AgentScheduler disabled by AI_SERVER_SCHEDULER_ENABLED=false")
 
     agent_tasks: list[asyncio.Task] = []
+    bitrix_channel = BitrixChatChannel(settings=settings, bitrix=bitrix)
+    # The outbox is an independent durable subsystem: it must drain an existing
+    # backlog even when inbound webhook processing is intentionally disabled.
+    agent_tasks.append(
+        asyncio.create_task(
+            run_outbound_delivery_worker(
+                outbound_queue,
+                channels={"bitrix24": bitrix_channel},
+                conversation_trace=conversation_trace,
+                incident_queue=diagnost_queue,
+            )
+        )
+    )
 
     if settings.webhook_event_queue_enabled and settings.webhook_event_worker_enabled:
         bitrix_llm_svc = BitrixLLMService(settings=settings)
@@ -159,7 +179,6 @@ async def main() -> None:
             else None
         )
 
-        bitrix_channel = BitrixChatChannel(settings=settings, bitrix=bitrix)
         specialist_deps = SpecialistDeps(
             settings=settings,
             manifests=manifests,
@@ -168,7 +187,7 @@ async def main() -> None:
             bitrix_oauth=bitrix_oauth,
             bitrix_bot=bitrix,
             scheduler=scheduler,
-            orchestrator_llm=OrchestratorLLMService(build_orchestrator_llm_client(settings)),
+            orchestrator_llm=DeepSeekPlanService(build_orchestrator_llm_client(settings)),
             orchestrator_store=orchestrator_store,
             bitrix_llm=bitrix_llm_svc,
             bitrix_store=bitrix_store,
@@ -186,6 +205,7 @@ async def main() -> None:
             footer_service=TechnicalFooterService(settings=settings),
             conversation_trace=conversation_trace,
             dialog_guard=dialog_guard,
+            outbound_queue=outbound_queue,
             result_publisher=result_publisher,
         )
         orch_manifest = next((m for m in manifests if m.kind == "orchestrator"), None)
@@ -402,7 +422,7 @@ async def main() -> None:
             "errors": 0,
             "last_error": None,
         }
-        feedback_receiver = FeedbackReceiverAdapter(diagnost_store)
+        feedback_receiver = FeedbackReceiverAdapter(diagnost_store) if settings.diagnost_feedback_enabled else None
         agent_tasks.append(
             asyncio.create_task(
                 run_webhook_event_worker(
@@ -453,8 +473,21 @@ async def main() -> None:
                 )
         agent_tasks.append(asyncio.create_task(portal_search_indexer.run(agent_queue)))
         if settings.diagnost_enabled:
-            agent_tasks.append(asyncio.create_task(run_diagnost_event_worker(diagnost_queue, diagnost_store)))
-            agent_tasks.append(asyncio.create_task(run_feedback_scheduler_worker(diagnost_store, bitrix)))
+            agent_tasks.append(
+                asyncio.create_task(
+                    run_diagnost_event_worker(
+                        diagnost_queue,
+                        diagnost_store,
+                        conversation_trace=conversation_trace,
+                        feedback_enabled=settings.diagnost_feedback_enabled,
+                        trace_snapshot_enabled=settings.diagnost_trace_snapshot_enabled,
+                        trace_settle_seconds=settings.diagnost_trace_settle_seconds,
+                        high_latency_ms=settings.diagnost_high_latency_ms,
+                    )
+                )
+            )
+            if settings.diagnost_feedback_enabled:
+                agent_tasks.append(asyncio.create_task(run_feedback_scheduler_worker(diagnost_store, bitrix)))
         else:
             logger.info("Diagnost workers disabled by DIAGNOST_ENABLED=false")
 
@@ -498,6 +531,7 @@ async def main() -> None:
                     store=portal_search,
                     settings=settings,
                     status=_task_close_direct_status,
+                    outbound_queue=outbound_queue,
                 )
             )
         )
@@ -558,6 +592,7 @@ async def main() -> None:
         t.cancel()
     await asyncio.gather(*agent_tasks, return_exceptions=True)
     scheduler.stop()
+    await outbound_queue.close()
     logger.info("Agent worker stopped")
 
 

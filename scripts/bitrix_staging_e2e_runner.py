@@ -642,8 +642,8 @@ def verify_task_state(args: argparse.Namespace, test: TestCase) -> dict[str, Any
         return {"checked": True, "ok": False, **status}
     return {
         "checked": True,
-        "ok": not status.get("is_closed"),
-        "expected_open": True,
+        "ok": bool(status.get("is_closed")),
+        "expected_closed": True,
         **status,
     }
 

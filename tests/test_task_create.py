@@ -40,6 +40,7 @@ def test_draft_complete_with_no_deadline():
         user_id=9,
     )
     assert draft.is_ready
+    assert draft.params["_draft_type"] == "task_create"
     assert draft.params["fields"]["TITLE"] == "Проверить камеру"
     assert draft.params["fields"]["RESPONSIBLE_ID"] == 9
     assert draft.params["fields"]["NO_DEADLINE"] is True

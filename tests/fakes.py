@@ -622,6 +622,7 @@ class FakePortalSearchIndex:
         self._task_close_control_events: dict[tuple[str, str], dict[str, Any]] = {}
         self._task_close_settings: dict[str, dict[str, Any]] = {}
         self._task_close_controlled_users: set[int] = set()
+        self._task_close_controlled_from: dict[int, str] = {}
 
     def ensure_schema(self) -> None:
         pass
@@ -906,12 +907,28 @@ class FakePortalSearchIndex:
         return set(self._task_close_controlled_users)
 
     def upsert_task_close_controlled_user(
-        self, *, user_id: int, active: bool = True, updated_by: int | None = None
+        self,
+        *,
+        user_id: int,
+        active: bool = True,
+        updated_by: int | None = None,
+        controlled_from: str | None = None,
     ) -> None:
         if active:
             self._task_close_controlled_users.add(int(user_id))
+            if controlled_from:
+                self._task_close_controlled_from.setdefault(int(user_id), controlled_from)
         else:
             self._task_close_controlled_users.discard(int(user_id))
+
+    def get_task_close_controlled_user(self, user_id: int) -> dict[str, Any] | None:
+        if int(user_id) not in self._task_close_controlled_users:
+            return None
+        return {
+            "user_id": int(user_id),
+            "active": True,
+            "controlled_from": self._task_close_controlled_from.get(int(user_id)),
+        }
 
 
 class FakeOrchestratorStore:
@@ -920,6 +937,7 @@ class FakeOrchestratorStore:
     def __init__(self) -> None:
         self._kv: dict[tuple[str, str], str] = {}
         self._turns: dict[str, list[dict[str, str]]] = {}
+        self._replacement_candidates: dict[str, dict[str, str]] = {}
 
     def set_pending(self, dialog_key: str, specialist_id: str) -> None:
         self._kv[(dialog_key, "pending_specialist")] = specialist_id
@@ -946,6 +964,27 @@ class FakeOrchestratorStore:
 
     async def delete_kv(self, dialog_key: str, field: str) -> None:
         self._kv.pop((dialog_key, field), None)
+
+    async def save_replacement_candidate(self, dialog_key, *, request_text, draft_id, draft_type, ttl_minutes=15):
+        current = self._replacement_candidates.get(dialog_key)
+        if current:
+            return dict(current)
+        value = {
+            "request_text": str(request_text),
+            "draft_id": str(draft_id),
+            "draft_type": str(draft_type),
+            "created_at": "fake-now",
+            "expires_at": "fake-later",
+        }
+        self._replacement_candidates[dialog_key] = value
+        return dict(value)
+
+    async def get_replacement_candidate(self, dialog_key):
+        current = self._replacement_candidates.get(dialog_key)
+        return dict(current) if current else None
+
+    async def delete_replacement_candidate(self, dialog_key):
+        self._replacement_candidates.pop(dialog_key, None)
 
 
 def _fake_usage(*, agent_id: str = "bitrix24") -> ModelUsageRecord:
@@ -1037,10 +1076,199 @@ class FakeTaskDraftStore:
         self._task_close_controlled_users: set[int] = set()
         self._task_close_settings: dict[str, dict[str, Any]] = {}
         self._task_close_revisions: list[dict[str, Any]] = []
+        self._draft_sequence = 0
+        self._confirming: set[str] = set()
+        self._claim_sequence = 0
+        self._claim_tokens: dict[str, str] = {}
 
     async def save_task_draft(self, dialog_key: str, params: dict[str, Any]) -> None:
-        self._drafts[dialog_key] = params
+        if dialog_key in self._confirming:
+            raise RuntimeError("ACTIVE_DRAFT_IN_PROGRESS")
+        current = self._drafts.get(dialog_key)
+        incoming_type = str(params.get("_draft_type") or "task_create")
+        if current and str(current.get("_draft_type") or "task_create") != incoming_type:
+            raise RuntimeError("ACTIVE_DRAFT_CONFLICT")
+        if current:
+            draft_id = str(current.get("_draft_id"))
+            version = int(current.get("_draft_version") or 1) + 1
+            created_at = current.get("_draft_created_at", "fake-created-at")
+        else:
+            self._draft_sequence += 1
+            draft_id = f"fake-draft-{self._draft_sequence}"
+            version = 1
+            created_at = "fake-created-at"
+        self._drafts[dialog_key] = {
+            **params,
+            "_draft_id": draft_id,
+            "_draft_type": incoming_type,
+            "_draft_version": version,
+            "_draft_created_at": created_at,
+            "_draft_expires_at": "fake-expires-at",
+        }
+        if current and current.get("_original_request"):
+            self._drafts[dialog_key]["_original_request"] = current["_original_request"]
         self._expired.discard(dialog_key)
+
+    async def claim_task_draft(
+        self,
+        dialog_key: str,
+        *,
+        expected_draft_id: str,
+        expected_version: int,
+        expected_type: str,
+    ) -> dict[str, Any] | None:
+        draft = self._drafts.get(dialog_key)
+        if (
+            not draft
+            or dialog_key in self._confirming
+            or str(draft.get("_draft_id")) != expected_draft_id
+            or int(draft.get("_draft_version") or 0) != expected_version
+            or str(draft.get("_draft_type")) != expected_type
+        ):
+            return None
+        self._confirming.add(dialog_key)
+        self._claim_sequence += 1
+        claim_token = f"fake-claim-{self._claim_sequence}"
+        self._claim_tokens[dialog_key] = claim_token
+        return {**draft, "_draft_claim_token": claim_token}
+
+    async def claim_expired_task_draft(
+        self,
+        dialog_key: str,
+        *,
+        expected_draft_id: str,
+        expected_version: int,
+        expected_type: str,
+    ) -> dict[str, Any] | None:
+        return await self.claim_task_draft(
+            dialog_key,
+            expected_draft_id=expected_draft_id,
+            expected_version=expected_version,
+            expected_type=expected_type,
+        )
+
+    async def reclaim_stale_finalizing_task_draft(
+        self,
+        dialog_key: str,
+        *,
+        expected_draft_id: str,
+        expected_version: int,
+        expected_type: str,
+        lease_seconds: int = 300,
+    ) -> dict[str, Any] | None:
+        draft = self._drafts.get(dialog_key)
+        if (
+            not draft
+            or dialog_key not in self._confirming
+            or str(draft.get("_draft_id")) != expected_draft_id
+            or int(draft.get("_draft_version") or 0) != expected_version
+            or str(draft.get("_draft_type")) != expected_type
+        ):
+            return None
+        self._claim_sequence += 1
+        claim_token = f"fake-claim-{self._claim_sequence}"
+        self._claim_tokens[dialog_key] = claim_token
+        return {**draft, "_draft_claim_token": claim_token, "_reclaimed_finalizing": True}
+
+    async def renew_task_draft_claim(
+        self,
+        dialog_key: str,
+        *,
+        draft_id: str,
+        claim_token: str,
+        expected_status: str,
+    ) -> bool:
+        draft = self._drafts.get(dialog_key)
+        return bool(
+            draft
+            and dialog_key in self._confirming
+            and str(draft.get("_draft_id")) == draft_id
+            and self._claim_tokens.get(dialog_key) == claim_token
+            and expected_status in {"confirming", "finalizing"}
+        )
+
+    async def resolve_stale_confirming_task_draft(
+        self,
+        dialog_key: str,
+        *,
+        expected_draft_id: str,
+        expected_version: int,
+        expected_type: str,
+        lease_seconds: int = 300,
+    ) -> dict[str, Any] | None:
+        draft = self._drafts.get(dialog_key)
+        if (
+            not draft
+            or dialog_key not in self._confirming
+            or str(draft.get("_draft_id")) != expected_draft_id
+            or int(draft.get("_draft_version") or 0) != expected_version
+            or str(draft.get("_draft_type")) != expected_type
+            or not draft.get("_force_stale_claim")
+        ):
+            return None
+        self._confirming.discard(dialog_key)
+        self._claim_tokens.pop(dialog_key, None)
+        self._drafts.pop(dialog_key, None)
+        return {**draft, "_draft_resolution_status": "attention"}
+
+    async def release_task_draft(
+        self,
+        dialog_key: str,
+        *,
+        draft_id: str,
+        claim_token: str = "",
+    ) -> None:
+        draft = self._drafts.get(dialog_key)
+        token_matches = not claim_token or self._claim_tokens.get(dialog_key) == claim_token
+        if draft and str(draft.get("_draft_id")) == draft_id and token_matches:
+            self._confirming.discard(dialog_key)
+            self._claim_tokens.pop(dialog_key, None)
+
+    async def finalize_task_draft_claim(
+        self,
+        dialog_key: str,
+        *,
+        draft_id: str,
+        params: dict[str, Any],
+        claim_token: str = "",
+    ) -> dict[str, Any] | None:
+        current = self._drafts.get(dialog_key)
+        if (
+            not current
+            or dialog_key not in self._confirming
+            or str(current.get("_draft_id")) != draft_id
+            or (claim_token and self._claim_tokens.get(dialog_key) != claim_token)
+        ):
+            return None
+        stored = {
+            **params,
+            "_draft_id": draft_id,
+            "_draft_type": current.get("_draft_type"),
+            "_draft_version": int(current.get("_draft_version") or 1) + 1,
+            "_draft_created_at": current.get("_draft_created_at"),
+            "_draft_expires_at": current.get("_draft_expires_at"),
+        }
+        self._drafts[dialog_key] = stored
+        self._confirming.discard(dialog_key)
+        self._claim_tokens.pop(dialog_key, None)
+        return stored
+
+    async def get_task_draft_for_finalizer(self, dialog_key: str) -> dict[str, Any] | None:
+        draft = self._drafts.get(dialog_key)
+        return dict(draft) if isinstance(draft, dict) else None
+
+    async def get_claimed_task_draft(
+        self,
+        dialog_key: str,
+        *,
+        expected_type: str,
+    ) -> dict[str, Any] | None:
+        draft = self._drafts.get(dialog_key)
+        if dialog_key not in self._confirming or not isinstance(draft, dict):
+            return None
+        if str(draft.get("_draft_type")) != expected_type:
+            return None
+        return {**draft, "_draft_claim_token": self._claim_tokens.get(dialog_key, "")}
 
     async def get_task_draft(self, dialog_key: str, *, ttl_minutes: int | None = None) -> dict[str, Any] | None:
         if ttl_minutes is not None and dialog_key in self._expired:
@@ -1049,8 +1277,90 @@ class FakeTaskDraftStore:
             return None
         return self._drafts.get(dialog_key)
 
-    async def delete_task_draft(self, dialog_key: str) -> None:
+    async def delete_task_draft(
+        self,
+        dialog_key: str,
+        *,
+        status: str = "cancelled",
+        expected_draft_id: str = "",
+        expected_version: int | None = None,
+        expected_claim_token: str = "",
+    ) -> None:
+        current = self._drafts.get(dialog_key)
+        identity_matches = not expected_draft_id or (current and str(current.get("_draft_id")) == expected_draft_id)
+        version_matches = expected_version is None or (
+            current and int(current.get("_draft_version") or 0) == expected_version
+        )
+        token_matches = not expected_claim_token or self._claim_tokens.get(dialog_key) == expected_claim_token
+        if identity_matches and version_matches and token_matches:
+            self._drafts.pop(dialog_key, None)
+            self._confirming.discard(dialog_key)
+            self._claim_tokens.pop(dialog_key, None)
+
+    async def confirm_admin_change_draft(
+        self,
+        *,
+        dialog_key: str,
+        draft_id: str,
+        draft_version: int,
+        actor_user_id: int,
+    ) -> dict[str, Any]:
+        draft = self._drafts.get(dialog_key)
+        if (
+            not isinstance(draft, dict)
+            or dialog_key in self._confirming
+            or str(draft.get("_draft_id")) != draft_id
+            or int(draft.get("_draft_version") or 0) != draft_version
+            or str(draft.get("_draft_type")) != "admin_change"
+        ):
+            return {"status": "not_found"}
+        field = str(draft.get("field") or "")
+        target_user_id = int(draft.get("target_user_id") or 0)
+        if field == "operator":
+            current: object = target_user_id in self._task_close_operators
+        elif field == "controlled_user":
+            current = target_user_id in self._task_close_controlled_users
+        elif field == "auto_close_time":
+            current = str(self._task_close_settings.get(field, {}).get("value") or "20:00")
+        elif field == "control_enabled_from":
+            current = str(self._task_close_settings.get(field, {}).get("value") or "")
+        else:
+            return {"status": "invalid"}
+        if current != draft.get("old_value"):
+            return {"status": "conflict", "current_value": current, "draft": dict(draft)}
+
+        new_value = draft.get("new_value")
+        if field == "operator":
+            if bool(new_value):
+                self._task_close_operators.add(target_user_id)
+            else:
+                self._task_close_operators.discard(target_user_id)
+        elif field == "controlled_user":
+            if bool(new_value):
+                self._task_close_controlled_users.add(target_user_id)
+            else:
+                self._task_close_controlled_users.discard(target_user_id)
+        else:
+            self._task_close_settings[field] = {
+                "key": field,
+                "value": str(new_value or ""),
+                "updated_by": actor_user_id,
+            }
+        self._task_close_revisions.append(
+            {
+                "action": "confirm_admin_change",
+                "actor_user_id": actor_user_id,
+                "payload": {
+                    "draft_id": draft_id,
+                    "field": field,
+                    "target_user_id": target_user_id or None,
+                    "old_value": current,
+                    "new_value": new_value,
+                },
+            }
+        )
         self._drafts.pop(dialog_key, None)
+        return {"status": "confirmed", "draft": dict(draft)}
 
     def get_task_close_control_setting(self, key: str) -> dict[str, Any] | None:
         setting = self._task_close_settings.get(key)
@@ -1072,6 +1382,19 @@ class FakeTaskDraftStore:
             {"action": "set_operators", "actor_user_id": actor_user_id, "payload": {"operator_user_ids": saved}}
         )
         return saved
+
+    def upsert_task_close_operator(self, *, user_id: int, active: bool = True, updated_by: int | None = None) -> None:
+        if active:
+            self._task_close_operators.add(int(user_id))
+        else:
+            self._task_close_operators.discard(int(user_id))
+        self._task_close_revisions.append(
+            {
+                "action": "set_operator",
+                "actor_user_id": updated_by,
+                "payload": {"user_id": int(user_id), "active": active},
+            }
+        )
 
     def task_close_controlled_user_ids(self) -> set[int]:
         return set(self._task_close_controlled_users)

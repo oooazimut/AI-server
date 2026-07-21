@@ -37,7 +37,9 @@ class PostgresDiagnostStore(PostgresAgentSchema):
                     actions JSONB,
                     model_usage JSONB,
                     metadata JSONB,
-                    source TEXT NOT NULL DEFAULT 'orchestrator'
+                    source TEXT NOT NULL DEFAULT 'orchestrator',
+                    trace_snapshot JSONB,
+                    trace_captured_at TIMESTAMPTZ
                 )
                 """
             )
@@ -53,6 +55,8 @@ class PostgresDiagnostStore(PostgresAgentSchema):
             await db.execute(
                 "ALTER TABLE diagnost.events ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'orchestrator'"
             )
+            await db.execute("ALTER TABLE diagnost.events ADD COLUMN IF NOT EXISTS trace_snapshot JSONB")
+            await db.execute("ALTER TABLE diagnost.events ADD COLUMN IF NOT EXISTS trace_captured_at TIMESTAMPTZ")
             await db.execute(
                 """
                 CREATE TABLE IF NOT EXISTS diagnost.incidents (
@@ -103,6 +107,24 @@ class PostgresDiagnostStore(PostgresAgentSchema):
                 """
             )
             await db.execute("CREATE INDEX IF NOT EXISTS idx_feedback_event ON diagnost.feedback (event_id)")
+
+    async def save_trace_snapshot(self, event_id: str, trace: list[dict[str, Any]]) -> None:
+        """Persist the single canonical long-lived copy of a task's sanitized trace."""
+        async with await self._connect() as db:
+            await db.execute(
+                """
+                UPDATE diagnost.events
+                SET trace_snapshot = %s, trace_captured_at = NOW()
+                WHERE event_id = %s
+                """,
+                (_jsonb(trace), event_id),
+            )
+
+    async def cancel_pending_feedback(self) -> int:
+        """Prevent old unsent prompts from resurfacing while feedback is disabled."""
+        async with await self._connect() as db:
+            cur = await db.execute("UPDATE diagnost.pending_feedback SET status = 'cancelled' WHERE status = 'pending'")
+            return int(cur.rowcount or 0)
 
     async def save_event(self, task: AgentTask, result: AgentResult, *, source: str = "orchestrator") -> None:
         user_id = str(task.user.id) if task.user and task.user.id is not None else None
