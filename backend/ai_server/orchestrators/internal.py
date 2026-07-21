@@ -33,7 +33,11 @@ from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)
 
-_DRAFT_CONFIRMATION_LINE = re.compile(r"(Для подтверждения отправьте фразу:\s*[«\"])([^»\"]+)([»\"])", re.IGNORECASE)
+_DRAFT_CONFIRMATION_LINE = re.compile(
+    r"\s*Для подтверждения отправьте фразу:\s*[«\"][^»\"]+[»\"]\.?",
+    re.IGNORECASE,
+)
+_NEXT_PAGE_HINT = re.compile(r"(?:можно\s+запросить|попросите\s+показать)\s+следующ", re.IGNORECASE)
 
 
 def _append_conversation_reference(message: str, task: AgentTask) -> str:
@@ -43,11 +47,15 @@ def _append_conversation_reference(message: str, task: AgentTask) -> str:
         return message
     visible = str(number)
 
-    def with_reference(match: re.Match[str]) -> str:
-        return f"{match.group(1)}{visible} подтвердить{match.group(3)}"
-
-    rendered = _DRAFT_CONFIRMATION_LINE.sub(with_reference, message)
-    return f"{rendered}\n\nДиалог №{visible}. Для продолжения: «{visible} следующая»"
+    rendered, confirmation_count = _DRAFT_CONFIRMATION_LINE.subn("", message)
+    rendered = rendered.rstrip()
+    if confirmation_count:
+        reference = f"Диалог №{visible}. Для подтверждения: «{visible} подтвердить»"
+    elif _NEXT_PAGE_HINT.search(rendered):
+        reference = f"Диалог №{visible}. Для продолжения: «{visible} следующая»"
+    else:
+        reference = f"Диалог №{visible}."
+    return f"{rendered}\n\n{reference}" if rendered else reference
 
 
 class InternalOrchestrator(BaseSpecialist):

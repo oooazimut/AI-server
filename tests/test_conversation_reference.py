@@ -121,13 +121,31 @@ def test_legacy_part_reference_is_rejected_before_any_specialist_dispatch():
     asyncio.run(run())
 
 
-def test_footer_places_number_last_and_rewrites_draft_confirmation_phrase():
+def test_footer_uses_only_numbered_confirmation_hint_for_draft():
     task = _task("create").model_copy(update={"context": {**_task("create").context, "conversation_number": 101}})
     rendered = _append_conversation_reference(
         "Черновик. Для подтверждения отправьте фразу: «да, подтверждаю создание задачи».", task
     )
-    assert "«101 подтвердить»" in rendered
-    assert rendered.endswith("Диалог №101. Для продолжения: «101 следующая»")
+    assert rendered == "Черновик.\n\nДиалог №101. Для подтверждения: «101 подтвердить»"
+    assert "следующая" not in rendered
+    assert "отправьте фразу" not in rendered
+
+
+def test_footer_uses_numbered_continuation_only_when_answer_has_next_page():
+    task = _task("warehouse").model_copy(update={"context": {**_task("warehouse").context, "conversation_number": 102}})
+    rendered = _append_conversation_reference(
+        "Показаны позиции 1-50 из 244. Остальные позиции есть; можно запросить следующие.", task
+    )
+    assert rendered.endswith("Диалог №102. Для продолжения: «102 следующая»")
+    assert "подтвердить" not in rendered
+
+
+def test_footer_uses_only_dialog_number_for_final_answer():
+    task = _task("warehouse").model_copy(update={"context": {**_task("warehouse").context, "conversation_number": 103}})
+    rendered = _append_conversation_reference("Показаны все 10 позиций с положительным остатком.", task)
+    assert rendered.endswith("Диалог №103.")
+    assert "Для продолжения" not in rendered
+    assert "Для подтверждения" not in rendered
 
 
 def test_visible_numbers_increment_during_day_and_restart_from_101_next_day(monkeypatch):
