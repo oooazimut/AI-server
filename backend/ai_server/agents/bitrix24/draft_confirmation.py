@@ -26,7 +26,12 @@ def draft_confirmation_phrase(draft_type: str | None) -> str:
     return _PHRASES.get(str(draft_type or "").strip(), _PHRASES["task_create"])
 
 
-def matches_draft_confirmation(request: str, draft: dict[str, Any] | None) -> bool:
+def matches_draft_confirmation(
+    request: str,
+    draft: dict[str, Any] | None,
+    *,
+    allow_short_command: bool = False,
+) -> bool:
     """Accept the displayed confirmation despite harmless voice-recognition noise.
 
     A plain ``да`` is deliberately insufficient: the draft type must still be
@@ -36,6 +41,8 @@ def matches_draft_confirmation(request: str, draft: dict[str, Any] | None) -> bo
         return False
     expected = _normalize(draft_confirmation_phrase(str(draft.get("_draft_type") or "task_create")))
     actual = _normalize(request)
+    if allow_short_command and actual in {"подтвердить", "подтверждаю", "подтверждение"}:
+        return True
     if actual == expected:
         return True
     expected_words = expected.split()

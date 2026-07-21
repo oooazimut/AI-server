@@ -64,8 +64,13 @@ def _draft_discard_request(request: str) -> bool:
     return any(marker in text for marker in ("отмени черновик", "отменить черновик", "не создавай", "удали черновик"))
 
 
-def _is_new_request_during_draft(request: str, draft: dict[str, Any]) -> bool:
-    if matches_draft_confirmation(request, draft) or _draft_discard_request(request):
+def _is_new_request_during_draft(
+    request: str,
+    draft: dict[str, Any],
+    *,
+    allow_short_command: bool = False,
+) -> bool:
+    if matches_draft_confirmation(request, draft, allow_short_command=allow_short_command) or _draft_discard_request(request):
         return False
     incoming = _draft_intent(request)
     # A read-only request has no draft intent and must remain available while a
@@ -588,7 +593,33 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                 reason="REPLACEMENT_CANDIDATE_WAITING",
             )
         draft = await call.get_active_bitrix_draft(dialog_key)
-        if not draft or not _is_new_request_during_draft(task.request, draft):
+        if not draft or not _is_new_request_during_draft(
+            task.request,
+            draft,
+            allow_short_command=bool(task.context.get("conversation_reference_explicit")),
+        ):
+            return task, None
+        incoming_type = _draft_intent(task.request)
+        active_type = str(draft.get("_draft_type") or "")
+        # A revised request of the same type is a new version of this exact
+        # draft.  Let the typed tool preserve draft_id and increment its
+        # version; no confirmation-choice round trip is needed.
+        if incoming_type and incoming_type == active_type:
+            return task, None
+        # Different write types must not overwrite each other's typed state.
+        # The old unconfirmed draft has not made an external change, so it can
+        # be discarded before the new typed draft is prepared.
+        if incoming_type:
+            discarded = await call.discard_active_bitrix_draft(
+                dialog_key,
+                expected_draft_id=str(draft.get("_draft_id") or ""),
+            )
+            if not discarded:
+                return task, self._draft_control_result(
+                    task,
+                    "Не удалось безопасно заменить предыдущий черновик: он уже изменён или истёк.",
+                    reason="ACTIVE_DRAFT_REPLACE_FAILED",
+                )
             return task, None
         await save_candidate(
             dialog_key,

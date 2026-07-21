@@ -44,13 +44,10 @@ def _append_conversation_reference(message: str, task: AgentTask) -> str:
     visible = str(number)
 
     def with_reference(match: re.Match[str]) -> str:
-        phrase = match.group(2).strip()
-        if phrase.casefold().startswith(f"{visible},"):
-            return match.group(0)
-        return f"{match.group(1)}{visible}, {phrase}{match.group(3)}"
+        return f"{match.group(1)}{visible} подтвердить{match.group(3)}"
 
     rendered = _DRAFT_CONFIRMATION_LINE.sub(with_reference, message)
-    return f"{rendered}\n\nДиалог №{visible}. Для продолжения: «{visible}, …»"
+    return f"{rendered}\n\nДиалог №{visible}. Для продолжения: «{visible} следующая»"
 
 
 class InternalOrchestrator(BaseSpecialist):

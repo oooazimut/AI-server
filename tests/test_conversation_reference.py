@@ -30,17 +30,13 @@ def test_new_branch_uses_visible_number_and_explicit_continuation_reuses_it():
     asyncio.run(run())
 
 
-def test_short_continuation_needs_no_number_only_when_one_branch_is_active():
+def test_short_continuation_without_number_is_restricted_even_with_one_branch():
     async def run():
         store = FakeOrchestratorStore()
-        first = await resolve_conversation_reference(_task("Покажи склад Борисова"), store)
-        automatic = await resolve_conversation_reference(_task("Покажи следующую страницу"), store)
-        assert automatic.error == ""
-        assert automatic.task.context["dialog_key"] == first.task.context["dialog_key"]
-
-        await resolve_conversation_reference(_task("Покажи склад Карасева"), store)
-        ambiguous = await resolve_conversation_reference(_task("Покажи следующую страницу"), store)
-        assert "несколько активных" in ambiguous.error
+        await resolve_conversation_reference(_task("Покажи склад Борисова"), store)
+        restricted = await resolve_conversation_reference(_task("Покажи следующую страницу"), store)
+        assert "укажите номер диалога" in restricted.error.casefold()
+        assert restricted.task.context["conversation_reference_dispatch_allowed"] is False
 
     asyncio.run(run())
 
@@ -55,6 +51,23 @@ def test_continuation_accepts_plain_visible_number_at_the_end():
         assert continued.error == ""
         assert continued.task.request == "Покажи следующую страницу"
         assert continued.task.context["dialog_key"] == first.task.context["dialog_key"]
+        assert continued.task.context["conversation_reference_explicit"] is True
+
+    asyncio.run(run())
+
+
+def test_two_explicit_numbers_load_their_own_dialog_branches():
+    async def run():
+        store = FakeOrchestratorStore()
+        first = await resolve_conversation_reference(_task("Покажи склад Борисова"), store)
+        second = await resolve_conversation_reference(_task("Покажи склад Карасева"), store)
+
+        continued = await resolve_conversation_reference(_task("следующая 102"), store)
+
+        assert first.task.context["conversation_number"] == 101
+        assert second.task.context["conversation_number"] == 102
+        assert continued.task.context["dialog_key"] == second.task.context["dialog_key"]
+        assert continued.task.context["dialog_key"] != first.task.context["dialog_key"]
 
     asyncio.run(run())
 
@@ -90,5 +103,5 @@ def test_footer_places_number_last_and_rewrites_draft_confirmation_phrase():
     rendered = _append_conversation_reference(
         "Черновик. Для подтверждения отправьте фразу: «да, подтверждаю создание задачи».", task
     )
-    assert "«101, да, подтверждаю создание задачи»" in rendered
-    assert rendered.endswith("Диалог №101. Для продолжения: «101, …»")
+    assert "«101 подтвердить»" in rendered
+    assert rendered.endswith("Диалог №101. Для продолжения: «101 следующая»")

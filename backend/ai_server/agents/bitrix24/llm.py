@@ -1974,7 +1974,11 @@ def _common_draft_confirm_decision(
     draft = context.get("pending_task_draft") if isinstance(context, dict) else None
     if not isinstance(draft, dict) or not draft:
         return None
-    if not matches_draft_confirmation(_strip_command_prefix(request), draft):
+    if not matches_draft_confirmation(
+        _strip_command_prefix(request),
+        draft,
+        allow_short_command=bool(context.get("conversation_reference_explicit")),
+    ):
         return None
 
     draft_type = _text(draft.get("_draft_type")) or "task_create"

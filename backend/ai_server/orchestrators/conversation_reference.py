@@ -1,8 +1,9 @@
 """Stable, user-visible references for independent dialog branches.
 
-The visible number is deliberately only a hint: a short continuation may use
-the most recent live branch when it is unambiguous.  The full date stays in
-the durable key, so a new day can safely start its visible sequence again.
+The visible number selects one exact live branch.  Continuations never guess
+the most recent branch: this keeps concurrent user conversations isolated.
+The full date stays in the durable key, so a new day can safely start its
+visible sequence again.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ _SUFFIX = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _CONTINUATION = re.compile(
-    r"\b(?:следующ|продолж|подтверж|отмен|закрыва|да\b|нет\b|покажи\s+ещ[её])",
+    r"\b(?:следующ|продолж|подтверж|отмен|закрыва|измен|да\b|нет\b|покажи\s+ещ[её])",
     re.IGNORECASE,
 )
 _LEGACY_PART_REFERENCE = re.compile(r"\b\d{3,}\s*(?:[,.:;—–-]\s*|\s+)част(?:ь|и)\s+\d+\b", re.IGNORECASE)
@@ -34,7 +35,7 @@ _CURRENT_AT_FIELD = "conversation_reference_current_at"
 _RECENT_FIELD = "conversation_reference_recent"
 _FIELD_PREFIX = "conversation_reference:"
 _VISIBLE_START = 100
-_AUTO_CONTINUATION_TTL = timedelta(minutes=30)
+_AUTO_CONTINUATION_TTL = timedelta(minutes=15)
 
 
 @dataclass(frozen=True)
@@ -170,18 +171,11 @@ async def resolve_conversation_reference(task: AgentTask, store: Any) -> Convers
         branch_key, number = str(mapped), explicit_number
         request = clean_request
     elif _looks_like_continuation(request):
-        recent = _recent_numbers(await store.get_kv(base_key, _RECENT_FIELD), now=now)
-        if len(recent) > 1:
-            known = ", ".join(str(item) for item in sorted(recent))
-            return ConversationReferenceResolution(
-                task=task,
-                error=f"Есть несколько активных диалогов: №{known}. Начните сообщение с нужного номера.",
-            )
-        if len(recent) == 1:
-            number = next(iter(recent))
-            mapped = await store.get_kv(base_key, _reference_field(day, number))
-            if mapped:
-                branch_key = str(mapped)
+        return _reference_constraint(
+            task,
+            context,
+            "Для продолжения, подтверждения, отмены или изменения укажите номер диалога: «122 подтвердить».",
+        )
 
     if not branch_key:
         raw_counter = await store.get_kv(base_key, _COUNTER_FIELD)
@@ -206,6 +200,7 @@ async def resolve_conversation_reference(task: AgentTask, store: Any) -> Convers
                     "dialog_key": branch_key,
                     "conversation_number": number,
                     "conversation_day": day,
+                    "conversation_reference_explicit": explicit_number is not None,
                     "conversation_original_request": str(task.request or ""),
                 },
             }

@@ -346,7 +346,11 @@ class Bitrix24Specialist(BaseSpecialist):
         ) == "confirm"
         if tool_call.name in confirmation_tools or is_admin_confirm:
             draft = task.context.get("pending_task_draft") if isinstance(task.context, dict) else None
-            if not matches_draft_confirmation(str(task.request or ""), draft):
+            if not matches_draft_confirmation(
+                str(task.request or ""),
+                draft,
+                allow_short_command=bool(task.context.get("conversation_reference_explicit")),
+            ):
                 return (
                     ToolResult(
                         status=ToolStatus.DENIED,
