@@ -16,6 +16,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from ai_server.agents.base import _trace_now_iso
 from ai_server.agents.bitrix24.draft_confirmation import matches_draft_confirmation
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ModelUsageRecord, ToolResult
@@ -598,10 +599,33 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
 
     async def handle(self, task: AgentTask) -> AgentResult:
         started = time.monotonic()
+        started_at = _trace_now_iso()
+        await self._record_timing(
+            task,
+            stage="orchestrator_entry",
+            started_at=started_at,
+            elapsed_ms=0.0,
+            status="claimed",
+            details={"task_id": task.task_id},
+        )
         # Reference failures deliberately still enter the mandatory Pro plan.
         # The validated plan receives a fail-closed constraint and cannot
         # dispatch a specialist for an unknown, expired or ambiguous branch.
+        reference_started_at = _trace_now_iso()
+        reference_t0 = time.monotonic()
         task = (await resolve_conversation_reference(task, self.store)).task
+        await self._record_timing(
+            task,
+            stage="conversation_reference",
+            started_at=reference_started_at,
+            elapsed_ms=(time.monotonic() - reference_t0) * 1000,
+            status="restricted" if task.context.get("conversation_reference_error") else "completed",
+            details={
+                "conversation_number": task.context.get("conversation_number"),
+                "conversation_part": task.context.get("conversation_part"),
+                "dispatch_allowed": bool(task.context.get("conversation_reference_dispatch_allowed", True)),
+            },
+        )
         dialog_key = str(task.context.get("dialog_key") or "")
         active = False
         if self._dialog_guard is not None and dialog_key:
@@ -609,10 +633,19 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             task = task.model_copy(update={"context": {**task.context, "dialog_cancel_generation": int(generation)}})
             active = True
         try:
+            state_started_at = _trace_now_iso()
+            state_t0 = time.monotonic()
             try:
                 task, _ = await self._load_authoritative_pending_specialist(task)
                 task = await self._load_authoritative_dialog_history(task)
             except Exception:
+                await self._record_timing(
+                    task,
+                    stage="orchestrator_state_load",
+                    started_at=state_started_at,
+                    elapsed_ms=(time.monotonic() - state_t0) * 1000,
+                    status="error",
+                )
                 usage = ModelUsageRecord(
                     agent_id=self.manifest.id,
                     provider="internal",
@@ -633,6 +666,14 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                 await self._send_to_channel(task, result)
                 await self._publish_result(task, result)
                 return result
+            await self._record_timing(
+                task,
+                stage="orchestrator_state_load",
+                started_at=state_started_at,
+                elapsed_ms=(time.monotonic() - state_t0) * 1000,
+                status="completed",
+                details={"pending_specialist": str(task.context.get("pending_specialist") or "")},
+            )
             catalog = self._catalog()
             pending_specialist = str(task.context.get("pending_specialist") or "").strip()
             constraints = _constraints(
@@ -661,6 +702,8 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                         }
                     )
                 try:
+                    planner_started_at = _trace_now_iso()
+                    planner_t0 = time.monotonic()
                     raw, usage = await self._planner.plan(
                         manifest=self.manifest,
                         task=task,
@@ -668,12 +711,37 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                         constraints=call_constraints,
                     )
                 except Exception:
+                    await self._record_timing(
+                        task,
+                        stage="pro_plan",
+                        started_at=planner_started_at,
+                        elapsed_ms=(time.monotonic() - planner_t0) * 1000,
+                        status="error",
+                        step=attempt,
+                        details={
+                            "attempt": attempt,
+                            "repair_reason": planner_rejections[-1] if planner_rejections else "",
+                        },
+                    )
                     if attempt == 1:
                         raise
                     reason = "MODEL_REPAIR_UNAVAILABLE"
                     planner_rejections.append(reason)
                     planner_attempt_audit.append({"attempt": attempt, "status": "error", "rejection": reason})
                     break
+                await self._record_timing(
+                    task,
+                    stage="pro_plan",
+                    started_at=planner_started_at,
+                    elapsed_ms=(time.monotonic() - planner_t0) * 1000,
+                    status="completed",
+                    step=attempt,
+                    details={
+                        "attempt": attempt,
+                        "repair_reason": planner_rejections[-1] if planner_rejections else "",
+                        "model": usage.model,
+                    },
+                )
                 planner_usages.append(usage)
                 response_hash = _hash(raw)
                 attempt_audit = {
@@ -682,14 +750,35 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                     "status": "accepted",
                 }
                 planner_attempt_audit.append(attempt_audit)
+                validation_started_at = _trace_now_iso()
+                validation_t0 = time.monotonic()
                 try:
                     plan = _decode_plan(raw, plan_id=plan_id, request=task.request, constraints=constraints)
                 except PlanRejected as exc:
                     reason = str(exc)
+                    await self._record_timing(
+                        task,
+                        stage="plan_validation",
+                        started_at=validation_started_at,
+                        elapsed_ms=(time.monotonic() - validation_t0) * 1000,
+                        status="rejected",
+                        step=attempt,
+                        details={"reason": reason, "subtasks": 0},
+                    )
                     attempt_audit.update({"status": "rejected", "rejection": reason})
                     planner_rejections.append(reason)
                     if attempt == 1 and reason in REPAIRABLE_PLAN_REJECTIONS:
                         continue
+                else:
+                    await self._record_timing(
+                        task,
+                        stage="plan_validation",
+                        started_at=validation_started_at,
+                        elapsed_ms=(time.monotonic() - validation_t0) * 1000,
+                        status="accepted",
+                        step=attempt,
+                        details={"plan_state": plan.state, "subtasks": len(plan.subtasks)},
+                    )
                 break
             if plan is None:
                 reason = planner_rejections[-1] if planner_rejections else "MODEL_PLAN_UNAVAILABLE"
@@ -813,6 +902,7 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             )
 
         part_bindings = await bind_conversation_parts(task, self.store, [item.subtask_id for item in plan.subtasks])
+        dispatch_group = f"{plan.plan_id}:specialists"
 
         async def run(subtask: Subtask) -> tuple[Subtask, str, ToolResult]:
             # Correlation is created *before* reaching the specialist, so its
@@ -840,8 +930,38 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                     }
                 }
             )
-            value = await call.execute_with_task(
-                {"specialist_id": subtask.specialist_id, "request": subtask.request}, task=correlated_task
+            dispatch_started_at = _trace_now_iso()
+            dispatch_t0 = time.monotonic()
+            try:
+                value = await call.execute_with_task(
+                    {"specialist_id": subtask.specialist_id, "request": subtask.request}, task=correlated_task
+                )
+            except Exception:
+                await self._record_timing(
+                    correlated_task,
+                    stage="specialist_dispatch",
+                    started_at=dispatch_started_at,
+                    elapsed_ms=(time.monotonic() - dispatch_t0) * 1000,
+                    status="error",
+                    details={
+                        "parallel_group": dispatch_group,
+                        "subtask_id": subtask.subtask_id,
+                        "specialist_id": subtask.specialist_id,
+                    },
+                )
+                raise
+            await self._record_timing(
+                correlated_task,
+                stage="specialist_dispatch",
+                started_at=dispatch_started_at,
+                elapsed_ms=(time.monotonic() - dispatch_t0) * 1000,
+                status=str(value.status),
+                details={
+                    "parallel_group": dispatch_group,
+                    "subtask_id": subtask.subtask_id,
+                    "specialist_id": subtask.specialist_id,
+                    "conversation_part": part.get("part"),
+                },
             )
             return subtask, attempt_id, value
 
@@ -915,6 +1035,8 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                     },
                 )
             )
+        render_started_at = _trace_now_iso()
+        render_t0 = time.monotonic()
         answer = (
             "; ".join(str(item["answer"]).strip() for item in facts if str(item["answer"]).strip())
             or "Не удалось получить подтверждённый результат специалистов."
@@ -941,6 +1063,18 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                     "verified_terminal_facts": verified_terminal,
                 },
             )
+        )
+        await self._record_timing(
+            task,
+            stage="deterministic_render",
+            started_at=render_started_at,
+            elapsed_ms=(time.monotonic() - render_t0) * 1000,
+            status="completed",
+            details={
+                "branch_count": len(facts),
+                "branch_statuses": [str(item["status"]) for item in facts],
+                "parallel_group": dispatch_group,
+            },
         )
         branch_statuses = {str(item["status"]) for item in facts}
         if approvals or "needs_human" in branch_statuses:

@@ -517,6 +517,60 @@ def test_unknown_number_still_calls_pro_but_cannot_dispatch_a_specialist():
     assert output.model_usage[0].provider == "test"
 
 
+def test_trace_captures_pro_plan_parallel_specialists_and_deterministic_render():
+    class TimingTrace:
+        def __init__(self):
+            self.events = []
+
+        async def record_timing(self, **kwargs):
+            self.events.append(kwargs)
+
+    class CompositePlanner(_Planner):
+        async def plan(self, *, task, constraints, **kwargs):
+            return _plan(
+                task.request,
+                plan_id=constraints["plan_id"],
+                subtasks=[
+                    {
+                        "subtask_id": "s1",
+                        "segment_id": None,
+                        "specialist_id": "bitrix24",
+                        "capability": "bitrix_warehouse_search",
+                        "request": "first",
+                    },
+                    {
+                        "subtask_id": "s2",
+                        "segment_id": None,
+                        "specialist_id": "bitrix24",
+                        "capability": "bitrix_warehouse_search",
+                        "request": "second",
+                    },
+                ],
+            ), ModelUsageRecord(agent_id="test", provider="test", model="test")
+
+    subject, _ = _live_subject(
+        AgentResult(status="completed", agent_id="bitrix24", answer="fact"), planner=CompositePlanner()
+    )
+    trace = TimingTrace()
+    subject._conversation_trace = trace
+
+    asyncio.run(subject.handle(AgentTask(task_id="t1", request="two branches")))
+
+    stages = [event["stage"] for event in trace.events]
+    assert {
+        "orchestrator_entry",
+        "conversation_reference",
+        "orchestrator_state_load",
+        "pro_plan",
+        "plan_validation",
+        "deterministic_render",
+    } <= set(stages)
+    dispatches = [event for event in trace.events if event["stage"] == "specialist_dispatch"]
+    assert len(dispatches) == 2
+    assert {event["details"]["subtask_id"] for event in dispatches} == {"s1", "s2"}
+    assert len({event["details"]["parallel_group"] for event in dispatches}) == 1
+
+
 def test_multi_source_partial_failure_keeps_success_and_names_failed_source():
     class _MultiPlanner(_Planner):
         async def plan(self, *, task, constraints, **kwargs):
