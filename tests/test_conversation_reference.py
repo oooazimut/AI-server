@@ -72,6 +72,26 @@ def test_two_explicit_numbers_load_their_own_dialog_branches():
     asyncio.run(run())
 
 
+def test_new_write_reuses_the_active_draft_branch_but_read_keeps_a_new_branch():
+    async def run():
+        store = FakeOrchestratorStore()
+        first = await resolve_conversation_reference(_task("создай задачу проверить договор"), store)
+        base_key = "chat:4321:user:1"
+        await store.set_kv(base_key, "conversation_reference_active_draft_branch", first.task.context["dialog_key"])
+        await store.set_kv(base_key, "conversation_reference_active_draft_number", "101")
+
+        revision = await resolve_conversation_reference(_task("создай задачу проверить счёт"), store)
+        read = await resolve_conversation_reference(_task("Покажи склад Борисова"), store)
+
+        assert revision.task.context["dialog_key"] == first.task.context["dialog_key"]
+        assert revision.task.context["conversation_number"] == 101
+        assert revision.task.context["conversation_reference_reused_active_draft"] is True
+        assert read.task.context["conversation_number"] == 102
+        assert read.task.context["dialog_key"] != first.task.context["dialog_key"]
+
+    asyncio.run(run())
+
+
 def test_composite_dialog_keeps_one_root_and_never_requires_a_part_number():
     async def run():
         store = FakeOrchestratorStore()
