@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from datetime import datetime
@@ -277,6 +278,7 @@ class BaseSpecialist:
         approval_actions: list[ActionRecord] = []
         decision_results: list[Any] = []
         terminal_response_metadata: dict[str, Any] = {}
+        successful_tool_calls: set[str] = set()
         decision = None
 
         for step in range(1, self.max_steps + 1):
@@ -355,6 +357,31 @@ class BaseSpecialist:
                 break
             stop_after_step = False
             for tool_call in executable_calls:
+                call_fingerprint = _tool_call_fingerprint(tool_call)
+                if call_fingerprint in successful_tool_calls:
+                    duplicate_details = {
+                        "tool": tool_call.name,
+                        "reason": "duplicate_after_success",
+                    }
+                    actions_taken.append(
+                        ActionRecord(
+                            name=f"{self.action_prefix}_duplicate_success_guard",
+                            status="stopped",
+                            details=duplicate_details,
+                        )
+                    )
+                    await self._record_timing(
+                        task,
+                        stage="duplicate_success_guard",
+                        started_at=_trace_now_iso(),
+                        elapsed_ms=0.0,
+                        status="stopped",
+                        step=step,
+                        tool=tool_call.name,
+                        details=duplicate_details,
+                    )
+                    stop_after_step = True
+                    continue
                 tool_started_at = _trace_now_iso()
                 tool_t0 = time.monotonic()
                 try:
@@ -389,6 +416,8 @@ class BaseSpecialist:
                 )
                 if result is not None:
                     tool_results.append(result)
+                    if result.status == ToolStatus.OK:
+                        successful_tool_calls.add(call_fingerprint)
                 if action is not None:
                     actions_taken.append(action)
                 approval_actions.extend(approvals)
@@ -661,3 +690,8 @@ class BaseSpecialist:
 
 def _trace_now_iso() -> str:
     return datetime.now(MOSCOW_TZ).isoformat()
+
+
+def _tool_call_fingerprint(tool_call: Any) -> str:
+    args = getattr(tool_call, "args", {}) or {}
+    return f"{getattr(tool_call, 'name', '')}:{json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)}"

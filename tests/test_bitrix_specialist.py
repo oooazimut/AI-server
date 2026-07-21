@@ -269,6 +269,181 @@ def test_bitrix_specialist_fast_returns_portal_search_result_and_traces_tool():
     assert tool_events[0]["details"]["tool_result_status"] == "ok"
 
 
+def test_bitrix_specialist_fast_returns_warehouse_page_with_multiple_matches():
+    tools = FakeResolverTools(
+        warehouse_result=ToolResult(
+            status="ok",
+            tool="bitrix_warehouse_search",
+            data={
+                "matches": [{"id": "5", "title": "Garage"}, {"id": "6", "title": "Garage reserve"}],
+                "products": {
+                    "status": "ok",
+                    "store_id": "5",
+                    "items": [{"product_id": "51", "product_name": "Item 51", "amount": 1}],
+                    "limit": 50,
+                    "offset": 50,
+                    "available_items_with_names": 100,
+                    "has_more": False,
+                },
+            },
+        )
+    )
+    llm = FakeBitrixLLM(
+        tool_call_steps=[
+            [BitrixLLMToolCall(name="bitrix_warehouse_search", args={"query": "Garage", "product_offset": 50})],
+            [BitrixLLMToolCall(name="bitrix_warehouse_search", args={"query": "Garage", "product_offset": 50})],
+        ],
+        final_answer="Items 51-100.",
+    )
+
+    result = asyncio.run(
+        _bitrix_specialist(tools=tools, llm=llm).handle(
+            AgentTask(
+                task_id="t1",
+                request="next page",
+                user={"id": "9"},
+                context={"t0006_planned_capability": "bitrix_warehouse_search"},
+            )
+        )
+    )
+
+    assert result.status == "completed"
+    assert len(llm.decide_calls) == 1
+    assert len(tools.warehouse_calls) == 1
+    assert result.metadata["fast_return"] is True
+    assert result.metadata["terminal_tool"] == "bitrix_warehouse_search"
+
+
+def test_bitrix_specialist_keeps_planned_final_tool_after_intermediate_read():
+    tools = FakeResolverTools(
+        project_search_result=ToolResult(
+            status="ok",
+            tool="bitrix_project_search",
+            data={"items": [{"id": "7", "name": "Garage"}]},
+        ),
+        named_results={
+            "task_create_draft": ToolResult(
+                status="ok",
+                tool="task_create_draft",
+                data={"preview": {"title": "Check camera"}},
+            )
+        },
+    )
+    llm = FakeBitrixLLM(
+        tool_call_steps=[
+            [BitrixLLMToolCall(name="bitrix_project_search", args={"query": "Garage", "limit": 10})],
+            [
+                BitrixLLMToolCall(
+                    name="task_create_draft",
+                    args={"title": "Check camera", "responsible_self": True},
+                )
+            ],
+            [
+                BitrixLLMToolCall(
+                    name="task_create_draft",
+                    args={"title": "Check camera", "responsible_self": True},
+                )
+            ],
+        ],
+        final_status="needs_human",
+        final_answer="Draft ready.",
+    )
+
+    result = asyncio.run(
+        _bitrix_specialist(tools=tools, llm=llm).handle(
+            AgentTask(
+                task_id="t1",
+                request="create task in Garage",
+                user={"id": "9"},
+                context={"dialog_key": "d:9", "t0006_planned_capability": "task_create_draft"},
+            )
+        )
+    )
+
+    assert result.status == "needs_human"
+    assert len(llm.decide_calls) == 2
+    assert len(tools.project_search_calls) == 1
+    assert len(tools.named_calls["task_create_draft"]) == 1
+    assert result.metadata["terminal_tool"] == "task_create_draft"
+
+
+def test_bitrix_specialist_blocks_duplicate_successful_tool_call():
+    tools = FakeResolverTools(
+        bitrix_api_result=ToolResult(
+            status="ok",
+            tool="bitrix_api",
+            data={"result": {"task": {"id": "42"}}},
+        )
+    )
+    call = BitrixLLMToolCall(
+        name="bitrix_api",
+        args={"action": "call", "method": "tasks.task.get", "params": {"taskId": 42}},
+    )
+    llm = FakeBitrixLLM(tool_call_steps=[[call], [call], [call]], final_answer="Task 42.")
+
+    result = asyncio.run(
+        _bitrix_specialist(tools=tools, llm=llm).handle(
+            AgentTask(task_id="t1", request="show task 42", user={"id": "9"})
+        )
+    )
+
+    assert result.status == "completed"
+    assert len(llm.decide_calls) == 2
+    assert len(tools.bitrix_api_calls) == 1
+    assert any(action.name == "bitrix_duplicate_success_guard" for action in result.actions_taken)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "expected_status"),
+    [
+        ("calendar_event_draft", "needs_human"),
+        ("calendar_event_confirm", "completed"),
+    ],
+)
+def test_bitrix_specialist_fast_returns_calendar_lifecycle_tools(tool_name, expected_status):
+    tools = FakeResolverTools(
+        named_results={
+            tool_name: ToolResult(
+                status="ok",
+                tool=tool_name,
+                data={"title": "T-0007 test event"},
+            )
+        }
+    )
+    call = BitrixLLMToolCall(name=tool_name, args={})
+    llm = FakeBitrixLLM(tool_call_steps=[[call], [call]], final_answer="Calendar result.")
+    context = {"dialog_key": "d:9", "t0006_planned_capability": tool_name}
+    request = "calendar request"
+    if tool_name == "calendar_event_confirm":
+        request = "подтверждаю"
+        context.update(
+            {
+                "conversation_reference_explicit": True,
+                "pending_task_draft": {"_draft_type": "calendar_event"},
+            }
+        )
+
+    result = asyncio.run(
+        _bitrix_specialist(tools=tools, llm=llm).handle(
+            AgentTask(
+                task_id="t1",
+                request=request,
+                user={"id": "9"},
+                context=context,
+            )
+        )
+    )
+
+    assert result.status == expected_status
+    assert len(llm.decide_calls) == 1
+    assert len(tools.named_calls[tool_name]) == 1
+    assert result.metadata["terminal_tool"] == tool_name
+
+
+def test_bitrix_specialist_uses_common_five_step_guardrail():
+    assert Bitrix24Specialist.max_steps == 5
+
+
 def test_bitrix_specialist_treats_show_warehouse_as_stock_request():
     tools = FakeResolverTools(
         warehouse_result=ToolResult(
@@ -4024,6 +4199,7 @@ class FakeResolverTools:
         task_search_result: ToolResult | None = None,
         project_search_result: ToolResult | None = None,
         warehouse_result: ToolResult | None = None,
+        named_results: dict[str, ToolResult] | None = None,
         raw_user: dict | None = None,
     ) -> None:
         self.bitrix_api_calls: list = []
@@ -4032,6 +4208,7 @@ class FakeResolverTools:
         self.project_search_calls: list = []
         self.warehouse_calls: list = []
         self.portal_search_calls: list = []
+        self.named_calls: dict[str, list] = {}
         self._raw_user = raw_user
         self._tools = [
             _FakePortalSearchTool(portal_search_result, self.portal_search_calls),
@@ -4058,6 +4235,10 @@ class FakeResolverTools:
                 self.bitrix_api_calls,
             ),
         ]
+        for name, result in (named_results or {}).items():
+            calls: list = []
+            self.named_calls[name] = calls
+            self._tools.append(_FakeNamedTool(name, result, calls))
 
     def agent_tools(self) -> list:
         return self._tools

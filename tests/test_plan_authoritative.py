@@ -824,6 +824,7 @@ def test_handle_preserves_verbatim_request_for_validated_bitrix_specialist(origi
     assert received.context["t0006_original_request"] == original_request
     assert received.context["t0006_effective_specialist_request"] == original_request
     assert received.context["t0006_planned_subtask_request"] == "planner-shortened-input"
+    assert received.context["t0006_planned_capability"] == "bitrix_warehouse_search"
 
 
 def test_explicit_segments_bind_each_part_to_its_named_specialist():

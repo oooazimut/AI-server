@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from ai_server.agents.base import BaseSpecialist
+from ai_server.agents.bitrix24.draft_confirmation import draft_confirmation_phrase, matches_draft_confirmation
 from ai_server.agents.bitrix24.llm import (
     BitrixAgentLLM,
     BitrixLLMService,
@@ -13,7 +14,6 @@ from ai_server.agents.bitrix24.llm import (
     _format_task_close_draft_answer,
     llm_failure_result,
 )
-from ai_server.agents.bitrix24.draft_confirmation import draft_confirmation_phrase, matches_draft_confirmation
 from ai_server.agents.bitrix24.ports import ProposalStorePort, TaskDraftStorePort
 from ai_server.agents.bitrix24.quality_control import (
     TASK_QUALITY_WEBHOOK_EVENTS,
@@ -98,20 +98,40 @@ _FAST_RETURN_READ_TOOLS = frozenset(
         "bitrix_my_tasks",
         "bitrix_task_search",
         "bitrix_project_search",
+        "task_close_control_get",
     }
 )
 
-_FAST_RETURN_TASK_CREATE_TOOLS = frozenset(
+_FAST_RETURN_FINAL_TOOLS = frozenset(
     {
+        "project_create_draft",
+        "project_create_confirm",
+        "project_create_discard",
+        "task_create_draft",
         "task_create_confirm",
         "task_draft_discard",
-        "project_create_discard",
+        "task_close_draft",
+        "task_close_confirm",
+        "task_close_discard",
+        "task_close_report_incident",
+        "task_close_control_update",
+        "calendar_event_draft",
+        "calendar_event_confirm",
+        "calendar_event_discard",
+    }
+)
+
+_FAST_RETURN_NEEDS_HUMAN_TOOLS = frozenset(
+    {
+        "project_create_draft",
+        "task_create_draft",
+        "task_close_draft",
+        "calendar_event_draft",
     }
 )
 
 
 class Bitrix24Specialist(BaseSpecialist):
-    max_steps = 7
     action_prefix = "bitrix"
 
     def __init__(
@@ -341,9 +361,10 @@ class Bitrix24Specialist(BaseSpecialist):
             "calendar_event_confirm",
             "project_create_confirm",
         }
-        is_admin_confirm = tool_call.name == "task_close_control_update" and str(
-            (tool_call.args or {}).get("operation") or ""
-        ) == "confirm"
+        is_admin_confirm = (
+            tool_call.name == "task_close_control_update"
+            and str((tool_call.args or {}).get("operation") or "") == "confirm"
+        )
         if tool_call.name in confirmation_tools or is_admin_confirm:
             draft = task.context.get("pending_task_draft") if isinstance(task.context, dict) else None
             if not matches_draft_confirmation(
@@ -426,20 +447,23 @@ class Bitrix24Specialist(BaseSpecialist):
     ) -> dict[str, Any] | None:
         if result is None or approvals:
             return None
-        if tool_call.name not in _FAST_RETURN_READ_TOOLS and tool_call.name not in _FAST_RETURN_TASK_CREATE_TOOLS:
+        is_read_tool = tool_call.name in _FAST_RETURN_READ_TOOLS
+        is_final_tool = tool_call.name in _FAST_RETURN_FINAL_TOOLS
+        if not is_read_tool and not is_final_tool:
+            return None
+        planned_capability = str(task.context.get("t0006_planned_capability") or "").strip()
+        planned_tool = planned_capability if planned_capability in _LLM_TOOL_NAMES else ""
+        if is_read_tool and planned_tool and planned_tool != tool_call.name:
             return None
         if _is_ambiguous_read_result(tool_call.name, result):
             return None
         if result.status == ToolStatus.OK:
-            reason = (
-                "task_create_tool_success"
-                if tool_call.name in _FAST_RETURN_TASK_CREATE_TOOLS
-                else "read_only_tool_success"
-            )
+            reason = "task_create_tool_success" if is_final_tool else "read_only_tool_success"
             return {
                 "fast_return_reason": reason,
                 "terminal_tool": tool_call.name,
                 "tool_status": str(result.status),
+                "terminal_status": _terminal_status(tool_call.name, result),
             }
         if result.status == ToolStatus.DENIED and _is_oauth_authorization_result(result):
             return {
@@ -660,7 +684,7 @@ def _warehouse_product_query(request: str) -> str:
     )
     if not match:
         return ""
-    candidate = match.group("product").strip(" .,;:!?«»\"")
+    candidate = match.group("product").strip(' .,;:!?«»"')
     if candidate.casefold() in {"все", "всё", "остатки", "позиции", "склад"}:
         return ""
     return candidate
@@ -732,11 +756,26 @@ def _is_ambiguous_read_result(tool_name: str, result: ToolResult) -> bool:
     data = result.data if isinstance(result.data, dict) else {}
     if tool_name == "bitrix_warehouse_search":
         matches = data.get("matches")
-        return isinstance(matches, list) and len(matches) > 1
+        products = data.get("products")
+        return isinstance(matches, list) and len(matches) > 1 and not isinstance(products, dict)
     if tool_name == "bitrix_project_search":
         items = data.get("items")
         return isinstance(items, list) and len(items) > 1
     return False
+
+
+def _terminal_status(tool_name: str, result: ToolResult) -> str:
+    if tool_name in _FAST_RETURN_NEEDS_HUMAN_TOOLS:
+        return "needs_human"
+    if tool_name == "project_create_confirm":
+        data = result.data if isinstance(result.data, dict) else {}
+        if isinstance(data.get("followup_task_draft"), dict):
+            return "needs_human"
+    if tool_name == "task_close_control_update":
+        data = result.data if isinstance(result.data, dict) else {}
+        if str(data.get("operation") or "") == "prepare":
+            return "needs_human"
+    return "completed"
 
 
 def _enforce_task_close_response(result: AgentResult, *, settings: Settings | None = None) -> AgentResult:

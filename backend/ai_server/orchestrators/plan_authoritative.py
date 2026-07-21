@@ -70,7 +70,9 @@ def _is_new_request_during_draft(
     *,
     allow_short_command: bool = False,
 ) -> bool:
-    if matches_draft_confirmation(request, draft, allow_short_command=allow_short_command) or _draft_discard_request(request):
+    if matches_draft_confirmation(request, draft, allow_short_command=allow_short_command) or _draft_discard_request(
+        request
+    ):
         return False
     incoming = _draft_intent(request)
     # A read-only request has no draft intent and must remain available while a
@@ -960,6 +962,7 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                         # branches.
                         "t0006_original_request": task.request,
                         "t0006_planned_subtask_request": subtask.request,
+                        "t0006_planned_capability": subtask.capability,
                         "t0007_dispatch_request": subtask.request if len(plan.subtasks) > 1 else task.request,
                     }
                 }
