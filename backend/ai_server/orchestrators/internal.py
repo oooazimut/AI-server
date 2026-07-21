@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime
 from typing import Any
@@ -31,6 +32,25 @@ from ai_server.technical_footer import TechnicalFooterService, append_footer
 from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)
+
+_DRAFT_CONFIRMATION_LINE = re.compile(r"(Для подтверждения отправьте фразу:\s*[«\"])([^»\"]+)([»\"])", re.IGNORECASE)
+
+
+def _append_conversation_reference(message: str, task: AgentTask) -> str:
+    """Put the human-visible branch hint at the absolute end of every reply."""
+    number = task.context.get("conversation_number")
+    if number in (None, ""):
+        return message
+    visible = str(number)
+
+    def with_reference(match: re.Match[str]) -> str:
+        phrase = match.group(2).strip()
+        if phrase.casefold().startswith(f"{visible},"):
+            return match.group(0)
+        return f"{match.group(1)}{visible}, {phrase}{match.group(3)}"
+
+    rendered = _DRAFT_CONFIRMATION_LINE.sub(with_reference, message)
+    return f"{rendered}\n\nДиалог №{visible}. Для продолжения: «{visible}, …»"
 
 
 class InternalOrchestrator(BaseSpecialist):
@@ -398,6 +418,8 @@ class InternalOrchestrator(BaseSpecialist):
                 )
         answer = result.answer or ""
         body = append_footer(answer, footer) if answer else ""
+        if body:
+            body = _append_conversation_reference(body, task)
         if body:
             if self._dialog_guard is not None and await self._dialog_guard.task_is_stale(task):
                 logger.info(

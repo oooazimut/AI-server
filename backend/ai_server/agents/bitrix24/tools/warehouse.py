@@ -39,6 +39,10 @@ class BitrixWarehouseSearchTool:
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
+                    "product_query": {
+                        "type": "string",
+                        "description": "Optional product-name filter inside the matched warehouse.",
+                    },
                     "include_products": {"type": "boolean"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20},
                     "product_limit": {"type": "integer", "minimum": 1, "maximum": 50},
@@ -63,6 +67,7 @@ class BitrixWarehouseSearchTool:
                 error="BitrixClient is not injected",
             )
         query = str(args.get("query") or "").strip()
+        product_query = str(args.get("product_query") or "").strip()
         if not query:
             return ToolResult(status=ToolStatus.INVALID_TOOL_CALL, tool=self.name, error="query is required")
 
@@ -86,6 +91,7 @@ class BitrixWarehouseSearchTool:
             limit=limit,
             product_limit=product_limit,
             product_offset=product_offset,
+            product_query=product_query,
             access_actor=access_actor,
         )
         if snapshot_data is not None:
@@ -119,6 +125,7 @@ class BitrixWarehouseSearchTool:
                 store_id,
                 limit=product_limit,
                 offset=product_offset,
+                product_query=product_query,
             )
             data["products"] = products_result
 
@@ -132,6 +139,7 @@ class BitrixWarehouseSearchTool:
         limit: int,
         product_limit: int,
         product_offset: int,
+        product_query: str,
         access_actor: str,
     ) -> dict[str, Any] | None:
         if self._portal_search is None:
@@ -168,10 +176,13 @@ class BitrixWarehouseSearchTool:
                 matches[0],
                 limit=product_limit,
                 offset=product_offset,
+                product_query=product_query,
             )
         return data
 
-    def _snapshot_store_products(self, store: dict[str, Any], *, limit: int, offset: int) -> dict[str, Any]:
+    def _snapshot_store_products(
+        self, store: dict[str, Any], *, limit: int, offset: int, product_query: str = ""
+    ) -> dict[str, Any]:
         if self._portal_search is None:
             return {"status": "not_available", "items": [], "message": "portal search index is missing"}
         store_id = store.get("id")
@@ -193,6 +204,8 @@ class BitrixWarehouseSearchTool:
                 continue
             product_name = str(metadata.get("product_name") or row.title).strip()
             if not product_name:
+                continue
+            if not _matches_product_query(product_name, product_query):
                 continue
             stock_items.append(
                 {
@@ -221,6 +234,7 @@ class BitrixWarehouseSearchTool:
             "filtered_missing_name_count": 0,
             "has_more": offset + len(items) < total,
             "source": "postgres_portal_snapshot",
+            "product_query": product_query,
         }
 
     async def _store_products(
@@ -230,6 +244,7 @@ class BitrixWarehouseSearchTool:
         *,
         limit: int,
         offset: int = 0,
+        product_query: str = "",
     ) -> dict[str, Any]:
         if store_id in (None, ""):
             return {"status": "not_available", "items": [], "message": "store id is missing"}
@@ -264,6 +279,8 @@ class BitrixWarehouseSearchTool:
             if not product_name:
                 missing_name_count += 1
                 continue
+            if not _matches_product_query(product_name, product_query):
+                continue
             named_items.append(
                 {
                     "product_id": product_id,
@@ -287,6 +304,7 @@ class BitrixWarehouseSearchTool:
             "filtered_non_positive_count": len(rows) - len(available_rows),
             "filtered_missing_name_count": missing_name_count,
             "has_more": offset + len(items) < len(named_items),
+            "product_query": product_query,
         }
 
     async def _product_details(
@@ -455,6 +473,15 @@ def _query_terms(query: str) -> list[str]:
             continue
         terms.append(term)
     return terms or [query.casefold()]
+
+
+def _matches_product_query(product_name: str, product_query: str) -> bool:
+    """Keep a warehouse product filter deterministic and transparent."""
+    terms = [term for term in re.findall(r"[\w-]+", product_query.casefold()) if len(term) >= 2]
+    if not terms:
+        return True
+    normalized_name = product_name.casefold()
+    return all(term in normalized_name for term in terms)
 
 
 def _extract_items(raw: Any, preferred_key: str) -> list[dict[str, Any]]:

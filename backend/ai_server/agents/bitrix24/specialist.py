@@ -608,13 +608,18 @@ def _project_create_args_with_actor_context(args: dict[str, Any], task: AgentTas
 def _warehouse_args_with_default_products(args: dict[str, Any], task: AgentTask) -> dict[str, Any]:
     request = str(task.request or "")
     defaults = {**args, "product_limit": int(args.get("product_limit") or 50)}
+    product_query = _warehouse_product_query(request)
+    if product_query and not str(defaults.get("product_query") or "").strip():
+        defaults["product_query"] = product_query
+    if product_query:
+        defaults["include_products"] = True
     if _warehouse_request_resets_page(request):
         return {**defaults, "include_products": True, "product_limit": 50, "product_offset": 0}
     if args.get("include_products") is True:
         return defaults
     if _warehouse_request_implies_stock(request):
         return {**defaults, "include_products": True}
-    return args
+    return defaults if product_query else args
 
 
 def _warehouse_request_implies_stock(request: str) -> bool:
@@ -628,8 +633,33 @@ def _warehouse_request_resets_page(request: str) -> bool:
     normalized = request.casefold().replace("ё", "е")
     return any(
         marker in normalized
-        for marker in ("покажи все", "покажи всё", "выведи все", "выведи всё", "все позиции", "начиная с 1")
+        for marker in (
+            "покажи все",
+            "покажи всё",
+            "покажи весь",
+            "весь склад",
+            "выведи все",
+            "выведи всё",
+            "все позиции",
+            "начиная с 1",
+        )
     )
+
+
+def _warehouse_product_query(request: str) -> str:
+    """Extract the product portion of an explicit ``find X in warehouse Y`` request."""
+    normalized = re.sub(r"\s+", " ", request or "").strip()
+    match = re.search(
+        r"(?:найди|найти|покажи|показать)\s+(?P<product>.+?)\s+(?:на|в)\s+складе?\b",
+        normalized,
+        re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    candidate = match.group("product").strip(" .,;:!?«»\"")
+    if candidate.casefold() in {"все", "всё", "остатки", "позиции", "склад"}:
+        return ""
+    return candidate
 
 
 def _args_with_actor_admin_context(

@@ -19,6 +19,7 @@ from typing import Any, Protocol
 from ai_server.agents.bitrix24.draft_confirmation import matches_draft_confirmation
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ModelUsageRecord, ToolResult
+from ai_server.orchestrators.conversation_reference import resolve_conversation_reference
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.orchestrators.tools.call_specialist import CallSpecialistTool
 
@@ -591,6 +592,25 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
 
     async def handle(self, task: AgentTask) -> AgentResult:
         started = time.monotonic()
+        reference = await resolve_conversation_reference(task, self.store)
+        if reference.error:
+            result = self._terminal(
+                task,
+                "needs_clarification",
+                reference.error,
+                ModelUsageRecord(
+                    agent_id=self.manifest.id,
+                    provider="internal",
+                    model="conversation-reference",
+                    status="not_used",
+                    notes=["No model call: explicit numbered conversation reference was not found."],
+                ),
+                {"reason": "UNKNOWN_CONVERSATION_REFERENCE", "route": "conversation_reference"},
+            )
+            await self._send_to_channel(task, result)
+            await self._publish_result(task, result)
+            return result
+        task = reference.task
         dialog_key = str(task.context.get("dialog_key") or "")
         active = False
         if self._dialog_guard is not None and dialog_key:
@@ -946,7 +966,15 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
         if approvals or "needs_human" in branch_statuses:
             status = "needs_human"
         elif "needs_clarification" in branch_statuses:
-            status = "needs_clarification"
+            # A composite request can legitimately contain a completed answer
+            # and an informational "not found" branch.  Do not expose that as
+            # a blocking clarification unless the branch actually asks the
+            # user a follow-up question.
+            clarification_answers = [
+                str(item["answer"]) for item in facts if str(item["status"]) == "needs_clarification"
+            ]
+            needs_follow_up = any("?" in answer or "уточните" in answer.casefold() for answer in clarification_answers)
+            status = "needs_clarification" if needs_follow_up or len(facts) == 1 else "completed"
         elif "completed" in branch_statuses:
             status = "completed"
         else:

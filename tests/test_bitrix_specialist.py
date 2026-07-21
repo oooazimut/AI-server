@@ -311,6 +311,22 @@ def test_show_all_warehouse_request_always_resets_product_page_to_first():
     assert args["product_offset"] == 0
 
 
+def test_show_entire_warehouse_also_resets_page_and_product_search_is_forwarded():
+    args = _warehouse_args_with_default_products(
+        {"query": "Гараж"},
+        AgentTask(task_id="t1", request="Найди амортизаторы на складе гараж"),
+    )
+    assert args["include_products"] is True
+    assert args["product_query"] == "амортизаторы"
+
+    reset = _warehouse_args_with_default_products(
+        {"query": "Ларгус 2", "product_offset": 50},
+        AgentTask(task_id="t2", request="Покажи весь склад Ларгус 2"),
+    )
+    assert reset["product_offset"] == 0
+    assert reset["product_limit"] == 50
+
+
 def test_bitrix_specialist_fast_returns_read_only_tools():
     cases = [
         (
