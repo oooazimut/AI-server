@@ -75,7 +75,7 @@ def test_two_explicit_numbers_load_their_own_dialog_branches():
     asyncio.run(run())
 
 
-def test_new_write_reuses_the_active_draft_branch_but_read_keeps_a_new_branch():
+def test_new_unnumbered_write_ignores_legacy_active_draft_pointer_and_gets_new_branch():
     async def run():
         store = FakeOrchestratorStore()
         first = await resolve_conversation_reference(_task("создай задачу проверить договор"), store)
@@ -86,11 +86,92 @@ def test_new_write_reuses_the_active_draft_branch_but_read_keeps_a_new_branch():
         revision = await resolve_conversation_reference(_task("создай задачу проверить счёт"), store)
         read = await resolve_conversation_reference(_task("Покажи склад Борисова"), store)
 
-        assert revision.task.context["dialog_key"] == first.task.context["dialog_key"]
-        assert revision.task.context["conversation_number"] == 101
-        assert revision.task.context["conversation_reference_reused_active_draft"] is True
-        assert read.task.context["conversation_number"] == 102
+        assert revision.task.context["dialog_key"] != first.task.context["dialog_key"]
+        assert revision.task.context["conversation_number"] == 102
+        assert "conversation_reference_reused_active_draft" not in revision.task.context
+        assert read.task.context["conversation_number"] == 103
         assert read.task.context["dialog_key"] != first.task.context["dialog_key"]
+
+    asyncio.run(run())
+
+
+def test_task_reminder_calendar_project_and_close_drafts_each_get_their_own_number():
+    async def run():
+        store = FakeOrchestratorStore()
+        requests = [
+            "Создай задачу проверить договор",
+            "Напомни завтра позвонить Борисову",
+            "Добавь встречу в календарь завтра в 10:00",
+            "Создай проект Монтаж",
+            "Закрой задачу 555",
+        ]
+
+        branches = [await resolve_conversation_reference(_task(request), store) for request in requests]
+
+        assert [item.task.context["conversation_number"] for item in branches] == [101, 102, 103, 104, 105]
+        assert len({item.task.context["dialog_key"] for item in branches}) == len(requests)
+
+    asyncio.run(run())
+
+
+def test_numbering_is_source_agnostic_for_warehouse_disk_tasks_and_composite_search():
+    async def run():
+        store = FakeOrchestratorStore()
+        requests = [
+            "Покажи склад Борисова",
+            "Найди на Диске Bitrix документ Инструкция",
+            "Покажи мои активные задачи",
+            "Покажи склад Борисова и найди проект Монтаж",
+        ]
+
+        branches = [await resolve_conversation_reference(_task(request), store) for request in requests]
+
+        assert [item.task.context["conversation_number"] for item in branches] == [101, 102, 103, 104]
+        assert len({item.task.context["dialog_key"] for item in branches}) == len(requests)
+
+    asyncio.run(run())
+
+
+def test_every_unnumbered_user_turn_gets_a_new_number_without_intent_classification():
+    async def run():
+        store = FakeOrchestratorStore()
+
+        first = await resolve_conversation_reference(_task("Спасибо"), store)
+        second = await resolve_conversation_reference(_task("Есть ещё один вопрос"), store)
+
+        assert first.task.context["conversation_number"] == 101
+        assert second.task.context["conversation_number"] == 102
+        assert first.task.context["dialog_key"] != second.task.context["dialog_key"]
+
+    asyncio.run(run())
+
+
+def test_internal_task_without_user_chat_key_is_not_numbered():
+    task = AgentTask(task_id="internal", request="quality_control", context={"bitrix_event_type": "ONTASKUPDATE"})
+
+    resolved = asyncio.run(resolve_conversation_reference(task, FakeOrchestratorStore()))
+
+    assert "conversation_number" not in resolved.task.context
+    assert resolved.task.context == task.context
+
+
+def test_three_parallel_draft_numbers_keep_independent_confirmation_and_cancel_routes():
+    async def run():
+        store = FakeOrchestratorStore()
+        first = await resolve_conversation_reference(_task("Создай задачу проверить договор"), store)
+        second = await resolve_conversation_reference(_task("Напомни завтра позвонить Борисову"), store)
+        third = await resolve_conversation_reference(_task("Закрой задачу 555"), store)
+
+        confirm_second = await resolve_conversation_reference(_task("102 подтвердить"), store)
+        cancel_first = await resolve_conversation_reference(_task("101 отменить"), store)
+        change_third = await resolve_conversation_reference(_task("103 изменить результат"), store)
+
+        assert confirm_second.task.context["dialog_key"] == second.task.context["dialog_key"]
+        assert cancel_first.task.context["dialog_key"] == first.task.context["dialog_key"]
+        assert change_third.task.context["dialog_key"] == third.task.context["dialog_key"]
+        assert confirm_second.task.request == "подтвердить"
+        assert cancel_first.task.request == "отменить"
+        assert change_third.task.request == "изменить результат"
 
     asyncio.run(run())
 
@@ -189,6 +270,43 @@ def test_read_branch_does_not_hide_numbered_active_draft_confirmation():
         assert confirmation.task.context["conversation_number"] == 101
         assert confirmation.task.context["dialog_key"] == draft.task.context["dialog_key"]
         assert confirmation.task.context["conversation_reference_explicit"] is True
+
+    asyncio.run(run())
+
+
+def test_yesterday_number_is_inactive_after_midnight_before_new_day_starts(monkeypatch):
+    async def run():
+        store = FakeOrchestratorStore()
+        current = datetime(2026, 7, 21, 23, 59, tzinfo=MOSCOW_TZ)
+        monkeypatch.setattr(conversation_reference_module, "_now", lambda: current)
+        yesterday = await resolve_conversation_reference(_task("Создай задачу проверить договор"), store)
+
+        current = datetime(2026, 7, 22, 0, 1, tzinfo=MOSCOW_TZ)
+        rejected = await resolve_conversation_reference(_task("101 подтвердить"), store)
+        today = await resolve_conversation_reference(_task("Создай задачу проверить счёт"), store)
+
+        assert rejected.task.context["conversation_reference_dispatch_allowed"] is False
+        assert today.task.context["conversation_number"] == 101
+        assert today.task.context["dialog_key"] != yesterday.task.context["dialog_key"]
+
+    asyncio.run(run())
+
+
+def test_invalid_or_foreign_day_counter_starts_current_day_from_101(monkeypatch):
+    async def run():
+        invalid_store = FakeOrchestratorStore()
+        foreign_day_store = FakeOrchestratorStore()
+        base_key = "chat:4321:user:1"
+        current = datetime(2026, 7, 22, 9, 0, tzinfo=MOSCOW_TZ)
+        monkeypatch.setattr(conversation_reference_module, "_now", lambda: current)
+
+        await invalid_store.set_kv(base_key, "conversation_reference_counter", "broken")
+        first = await resolve_conversation_reference(_task("Покажи склад Борисова"), invalid_store)
+        await foreign_day_store.set_kv(base_key, "conversation_reference_counter", "20260721:999")
+        second = await resolve_conversation_reference(_task("Покажи склад Карасева"), foreign_day_store)
+
+        assert first.task.context["conversation_number"] == 101
+        assert second.task.context["conversation_number"] == 101
 
     asyncio.run(run())
 

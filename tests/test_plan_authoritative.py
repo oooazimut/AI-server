@@ -400,6 +400,60 @@ def test_read_only_request_remains_available_while_active_draft_waits():
     assert asyncio.run(store.get_replacement_candidate("d1")) is None
 
 
+def test_numbered_branches_keep_multiple_independent_drafts_end_to_end():
+    class MultiDraftSpecialist(_Specialist):
+        def __init__(self):
+            super().__init__(AgentResult(status="completed", agent_id="bitrix24", answer="done"))
+            self.drafts = {}
+
+        async def get_active_draft(self, dialog_key):
+            return self.drafts.get(dialog_key)
+
+        async def handle(self, task):
+            self.tasks.append(task)
+            dialog_key = task.context["dialog_key"]
+            if task.request == "подтвердить":
+                self.drafts.pop(dialog_key, None)
+                return AgentResult(status="completed", agent_id="bitrix24", answer="confirmed")
+            draft_type = "calendar_event" if "Напомни" in task.request else "task_close" if "Закрой" in task.request else "task_create"
+            self.drafts[dialog_key] = {
+                "_draft_id": f"draft-{len(self.drafts) + 1}",
+                "_draft_type": draft_type,
+                "_draft_version": 1,
+            }
+            return AgentResult(status="needs_human", agent_id="bitrix24", answer="draft")
+
+    store = FakeOrchestratorStore()
+    specialist = MultiDraftSpecialist()
+    manifest = AgentManifest(
+        id="bitrix24", name="Bitrix", kind="specialist", description="test", capabilities=["bitrix_warehouse_search"]
+    )
+    call = CallSpecialistTool({"bitrix24": specialist}, [manifest], store=store)
+    subject = PlanAuthoritativeOrchestrator(
+        AgentManifest(id="internal_orchestrator", name="Orchestrator", kind="orchestrator", description="test"),
+        agent_tools=[call],
+        planner=_Planner(),
+        llm=_Planner(),
+        store=store,
+    )
+    context = {"dialog_key": "chat:4321:user:1", "base_dialog_key": "chat:4321:user:1"}
+
+    asyncio.run(subject.handle(AgentTask(task_id="t1", request="Создай задачу проверить договор", context=context)))
+    asyncio.run(subject.handle(AgentTask(task_id="t2", request="Напомни завтра позвонить Борисову", context=context)))
+    asyncio.run(subject.handle(AgentTask(task_id="t3", request="Закрой задачу 555", context=context)))
+    asyncio.run(subject.handle(AgentTask(task_id="t4", request="102 подтвердить", context=context)))
+
+    numbers = [task.context["conversation_number"] for task in specialist.tasks]
+    branches = [task.context["dialog_key"] for task in specialist.tasks]
+    assert numbers == [101, 102, 103, 102]
+    assert len(set(branches[:3])) == 3
+    assert branches[3] == branches[1]
+    assert specialist.tasks[3].request == "подтвердить"
+    assert branches[0] in specialist.drafts
+    assert branches[1] not in specialist.drafts
+    assert branches[2] in specialist.drafts
+
+
 def test_duplicate_branch_is_rejected_before_any_specialist_can_run():
     request = "покажи склад Борисова"
     constraints = _constraints(request, {"bitrix24": {"capabilities": ["bitrix_warehouse_search"]}})

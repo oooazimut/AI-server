@@ -33,8 +33,6 @@ _COUNTER_FIELD = "conversation_reference_counter"
 _CURRENT_FIELD = "conversation_reference_current"
 _CURRENT_AT_FIELD = "conversation_reference_current_at"
 _RECENT_FIELD = "conversation_reference_recent"
-_ACTIVE_DRAFT_BRANCH_FIELD = "conversation_reference_active_draft_branch"
-_ACTIVE_DRAFT_NUMBER_FIELD = "conversation_reference_active_draft_number"
 _FIELD_PREFIX = "conversation_reference:"
 _VISIBLE_START = 100
 _AUTO_CONTINUATION_TTL = timedelta(minutes=15)
@@ -74,18 +72,6 @@ def _explicit_reference(request: str) -> tuple[int | None, str]:
 
 def _looks_like_continuation(request: str) -> bool:
     return bool(_CONTINUATION.search((request or "").strip()))
-
-
-def _looks_like_draft_write(request: str) -> bool:
-    lowered = str(request or "").casefold()
-    return bool(
-        re.search(
-            r"\b(?:созда(?:й|ть|йте)|напомни|календар|закр(?:ой|ыть|ойте)\s+задач|"
-            r"напоминани|добав(?:ь|ить|ьте)\b.*\bкалендар|оператор|"
-            r"контрол(?:ь|я)\s+закрытия|время\s+автозакрытия)\b",
-            lowered,
-        )
-    )
 
 
 def _recent_numbers(value: str | None, *, now: datetime) -> dict[int, datetime]:
@@ -172,8 +158,6 @@ async def resolve_conversation_reference(task: AgentTask, store: Any) -> Convers
     day = now.strftime("%Y%m%d")
     branch_key = ""
     number: int | None = None
-    reused_active_draft = False
-
     if explicit_number is not None:
         mapped = await store.get_kv(base_key, _reference_field(day, explicit_number))
         touched = await store.get_kv(base_key, _reference_at_field(day, explicit_number))
@@ -191,17 +175,6 @@ async def resolve_conversation_reference(task: AgentTask, store: Any) -> Convers
             context,
             "Для продолжения, подтверждения, отмены или изменения укажите номер диалога: «122 подтвердить».",
         )
-    elif _looks_like_draft_write(request):
-        active_branch = str(await store.get_kv(base_key, _ACTIVE_DRAFT_BRANCH_FIELD) or "").strip()
-        active_number = str(await store.get_kv(base_key, _ACTIVE_DRAFT_NUMBER_FIELD) or "").strip()
-        if active_branch and active_number.isdigit():
-            candidate = int(active_number)
-            mapped = await store.get_kv(base_key, _reference_field(day, candidate))
-            touched = await store.get_kv(base_key, _reference_at_field(day, candidate))
-            if str(mapped or "") == active_branch and _is_live_reference(touched, now=now):
-                branch_key, number = active_branch, candidate
-                reused_active_draft = True
-
     if not branch_key:
         raw_counter = await store.get_kv(base_key, _COUNTER_FIELD)
         stored_day, separator, stored_number = str(raw_counter or "").partition(":")
@@ -226,7 +199,6 @@ async def resolve_conversation_reference(task: AgentTask, store: Any) -> Convers
                     "conversation_number": number,
                     "conversation_day": day,
                     "conversation_reference_explicit": explicit_number is not None,
-                    "conversation_reference_reused_active_draft": reused_active_draft,
                     "conversation_original_request": str(task.request or ""),
                 },
             }

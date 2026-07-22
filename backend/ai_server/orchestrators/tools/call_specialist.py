@@ -21,10 +21,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_ACTIVE_DRAFT_BRANCH_FIELD = "conversation_reference_active_draft_branch"
-_ACTIVE_DRAFT_NUMBER_FIELD = "conversation_reference_active_draft_number"
-
-
 class CallSpecialistTool:
     """Routes a request to a named specialist agent.
 
@@ -146,32 +142,6 @@ class CallSpecialistTool:
             tool=self.name,
             data={"state_transition": transition},
         )
-
-    async def _sync_active_bitrix_draft(self, task: AgentTask, *, dialog_key: str | None) -> ToolResult | None:
-        """Keep the one active write draft addressable from a base Bitrix chat."""
-        if self._store is None or not dialog_key:
-            return None
-        base_key = str(task.context.get("base_dialog_key") or "").strip()
-        number = task.context.get("conversation_number")
-        if not base_key or number in (None, ""):
-            return None
-        try:
-            draft = await self.get_active_bitrix_draft(dialog_key)
-            current = str(await self._store.get_kv(base_key, _ACTIVE_DRAFT_BRANCH_FIELD) or "")
-            if draft:
-                await self._store.set_kv(base_key, _ACTIVE_DRAFT_BRANCH_FIELD, dialog_key)
-                await self._store.set_kv(base_key, _ACTIVE_DRAFT_NUMBER_FIELD, str(number))
-            elif current == dialog_key:
-                await self._store.delete_kv(base_key, _ACTIVE_DRAFT_BRANCH_FIELD)
-                await self._store.delete_kv(base_key, _ACTIVE_DRAFT_NUMBER_FIELD)
-        except Exception:
-            logger.exception("CallSpecialistTool: active Bitrix draft reference update failed")
-            return ToolResult(
-                status=ToolStatus.ERROR,
-                tool=self.name,
-                error="active Bitrix draft reference transition failed",
-            )
-        return None
 
     async def execute(
         self,
@@ -302,11 +272,6 @@ class CallSpecialistTool:
         )
         if state_result is not None and state_result.status == ToolStatus.ERROR:
             return state_result
-
-        if specialist_id == "bitrix24":
-            draft_result = await self._sync_active_bitrix_draft(task, dialog_key=dialog_key)
-            if draft_result is not None:
-                return draft_result
 
         return ToolResult(
             status=ToolStatus.OK,
