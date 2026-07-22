@@ -25,6 +25,8 @@ router = APIRouter()
 def health(request: Request) -> dict[str, Any]:
     manifests: list[AgentManifest] = request.app.state.manifests
     settings = get_settings()
+    entity_catalog = getattr(request.app.state, "orchestrator_entity_catalog", None)
+    entity_snapshot = entity_catalog.snapshot() if entity_catalog is not None else {}
     return {
         "status": "ok",
         "architecture": "orchestrator_plus_modular_specialists",
@@ -53,6 +55,11 @@ def health(request: Request) -> dict[str, Any]:
         "agent_bitrix_worker_count": settings.agent_bitrix_worker_count,
         "agent_logistics_worker_count": settings.agent_logistics_worker_count,
         "agent_task_timeout_seconds": settings.agent_task_timeout_seconds,
+        "orchestrator_entity_catalog_status": entity_snapshot.get("status", "disabled"),
+        "orchestrator_entity_catalog_version": entity_snapshot.get("version"),
+        "orchestrator_entity_catalog_counts": {
+            key: len(entity_snapshot.get(key) or []) for key in ("users", "projects", "warehouses")
+        },
         "bitrix_dialog_guard_enabled": settings.bitrix_dialog_guard_enabled,
         "bitrix_dialog_stuck_seconds": settings.bitrix_dialog_stuck_seconds,
         "bitrix_dialog_pending_ttl_seconds": settings.bitrix_dialog_pending_ttl_seconds,

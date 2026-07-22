@@ -25,6 +25,8 @@ def test_health_includes_config_flags():
     assert "bitrix_configured" in data
     assert "llm_configured" in data
     assert "logistics_vehicle_usage_enabled" in data
+    assert data["orchestrator_entity_catalog_status"] in {"disabled", "ready", "stale", "error"}
+    assert set(data["orchestrator_entity_catalog_counts"]) == {"users", "projects", "warehouses"}
 
 
 def test_health_reports_split_search_indexer_flags(monkeypatch):
