@@ -356,3 +356,23 @@ def test_numbered_continuation_expires_after_fifteen_minutes(monkeypatch):
         assert expired.task.context["conversation_reference_dispatch_allowed"] is False
 
     asyncio.run(run())
+
+
+def test_any_explicit_active_number_selects_only_that_branch():
+    async def run():
+        store = FakeOrchestratorStore()
+        first = await resolve_conversation_reference(_task("Покажи склад Борисова"), store)
+        await resolve_conversation_reference(_task("Покажи склад Карасева"), store)
+
+        page = await resolve_conversation_reference(_task("101 покажи 5 страницу"), store)
+        date = await resolve_conversation_reference(_task("101 на вторник"), store)
+
+        assert page.task.request == "покажи 5 страницу"
+        assert date.task.request == "на вторник"
+        assert page.task.context["dialog_key"] == first.task.context["dialog_key"]
+        assert date.task.context["dialog_key"] == first.task.context["dialog_key"]
+        assert page.task.context["conversation_number"] == 101
+        assert date.task.context["conversation_number"] == 101
+        assert page.task.context["conversation_reference_explicit"] is True
+
+    asyncio.run(run())

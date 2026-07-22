@@ -18,7 +18,6 @@ from typing import Any, Protocol
 
 from ai_server.agents.base import _trace_now_iso
 from ai_server.agents.bitrix24.draft_confirmation import matches_draft_confirmation
-from ai_server.agents.bitrix24.llm import direct_tool_results_response
 from ai_server.capability_registry import registry_tool, validate_tool_arguments
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import (
@@ -29,6 +28,12 @@ from ai_server.models import (
     ModelUsageRecord,
     ToolResult,
     ToolStatus,
+)
+from ai_server.orchestrators.bitrix_response import render_bitrix_tool_results
+from ai_server.orchestrators.bitrix_semantics import (
+    SemanticPolicyViolation,
+    normalize_command_arguments,
+    normalize_plan,
 )
 from ai_server.orchestrators.conversation_reference import resolve_conversation_reference
 from ai_server.orchestrators.internal import InternalOrchestrator
@@ -49,6 +54,8 @@ REPAIRABLE_PLAN_REJECTIONS = frozenset(
         "STRUCTURED_COMMAND_SCHEMA_MISMATCH",
         "STRUCTURED_COMMAND_TOOL_INVALID",
         "STRUCTURED_COMMAND_ARGUMENTS_INVALID",
+        "SEMANTIC_ARGUMENTS_INVALID",
+        "SEMANTIC_TOOL_MISMATCH",
     }
 )
 
@@ -661,6 +668,7 @@ def _decode_plan(raw: str, *, plan_id: str, request: str, constraints: dict[str,
                 raise PlanRejected("STRUCTURED_COMMAND_TOOL_INVALID")
             if not isinstance(arguments, dict):
                 raise PlanRejected("STRUCTURED_COMMAND_ARGUMENTS_INVALID")
+            arguments = normalize_command_arguments(tool_name, subrequest, arguments)
             if validate_tool_arguments(dict(tool_contract.get("parameters") or {}), arguments):
                 raise PlanRejected("STRUCTURED_COMMAND_ARGUMENTS_INVALID")
             structured_command = StructuredCommand(registry_version, tool_name, dict(arguments))
@@ -1036,7 +1044,8 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                 validation_t0 = time.monotonic()
                 try:
                     plan = _decode_plan(raw, plan_id=plan_id, request=task.request, constraints=constraints)
-                except PlanRejected as exc:
+                    plan = normalize_plan(plan, task=task, constraints=constraints)
+                except (PlanRejected, SemanticPolicyViolation) as exc:
                     reason = str(exc)
                     await self._record_timing(
                         task,
@@ -1301,7 +1310,7 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                 specialist_metadata.get("tool_result"), dict
             ):
                 raw_tool_result = ToolResult.model_validate(specialist_metadata["tool_result"])
-                rendered = direct_tool_results_response(
+                rendered = render_bitrix_tool_results(
                     agent_id=self.manifest.id,
                     tool_results=[raw_tool_result],
                     portal_base_url=str(specialist_metadata.get("portal_base_url") or ""),

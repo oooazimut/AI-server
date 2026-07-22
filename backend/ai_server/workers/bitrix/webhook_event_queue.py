@@ -31,6 +31,15 @@ def _is_disk_event(event_type: str) -> bool:
     return all(marker in event_type for marker in DISK_FILE_EVENT_MARKERS)
 
 
+def _is_search_index_event(event_type: str) -> bool:
+    event_type = event_type.upper()
+    return (
+        _is_disk_event(event_type)
+        or ("TASK" in event_type and ("COMMENT" in event_type or event_type.startswith("ONTASK")))
+        or ("CATALOG" in event_type and "PRODUCT" in event_type)
+    )
+
+
 async def run_webhook_event_worker(
     queue: WebhookConsumePort,
     *,
@@ -270,18 +279,27 @@ async def _route_event(
                 "payload": task.model_dump(),
             }
         )
+        if _is_search_index_event(event_type):
+            await agent_queue.publish(
+                {
+                    "to": "index_refresher",
+                    "from": "webhook_worker",
+                    "type": "bitrix_event",
+                    "payload": payload,
+                }
+            )
         await _trace_route(
             conversation_trace,
             event_id=event_id,
             event_type=event_type,
-            routed_to="bitrix24",
+            routed_to="bitrix24+index_refresher",
             task=task,
             partition_key=partition_key,
-            result={"handled": True, "routed_to": "bitrix24", "event": event_type},
+            result={"handled": True, "routed_to": ["bitrix24", "index_refresher"], "event": event_type},
         )
-        return {"handled": True, "routed_to": "bitrix24", "event": event_type}
+        return {"handled": True, "routed_to": ["bitrix24", "index_refresher"], "event": event_type}
 
-    if _is_disk_event(event_type):
+    if _is_search_index_event(event_type):
         await agent_queue.publish(
             {
                 "to": "index_refresher",

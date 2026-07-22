@@ -119,6 +119,51 @@ def test_route_event_assigns_numbered_branch_before_orchestrator_queue():
     assert contexts[0]["dialog_key"] != contexts[1]["dialog_key"]
 
 
+def test_task_update_is_fanned_out_to_quality_control_and_search_refresh():
+    queue = RecordingAgentQueue()
+    payload = {"event": "ONTASKUPDATE", "data": {"FIELDS_AFTER": {"ID": "8413"}}}
+
+    result = _run(
+        _route_event(
+            event_id=3,
+            event_type="ONTASKUPDATE",
+            payload=payload,
+            agent_queue=queue,
+            attachment_service=FakeAttachmentService(),
+            transcriber=FakeTranscriber(),
+            settings=_settings(),
+        )
+    )
+
+    assert result["routed_to"] == ["bitrix24", "index_refresher"]
+    assert [item["to"] for item in queue.published] == ["bitrix24", "index_refresher"]
+    assert queue.published[1]["payload"] == payload
+
+
+def test_comment_and_catalog_events_go_to_search_refresh():
+    for event_type, fields in (
+        ("ONTASKCOMMENTADD", {"TASK_ID": "8413"}),
+        ("CATALOG.PRODUCT.ON.UPDATE", {"ID": "1001"}),
+    ):
+        queue = RecordingAgentQueue()
+        payload = {"event": event_type, "data": {"FIELDS_AFTER": fields}}
+
+        result = _run(
+            _route_event(
+                event_id=4,
+                event_type=event_type,
+                payload=payload,
+                agent_queue=queue,
+                attachment_service=FakeAttachmentService(),
+                transcriber=FakeTranscriber(),
+                settings=_settings(),
+            )
+        )
+
+        assert result["routed_to"] == "index_refresher"
+        assert [item["to"] for item in queue.published] == ["index_refresher"]
+
+
 def test_dialog_guard_reset_publishes_pending_task_and_increments_generation():
     pending = _task("Bitrix find project Largus")
     guard = FakeDialogGuard(active={"age_seconds": 130, "task_id": "old"}, pending=pending)

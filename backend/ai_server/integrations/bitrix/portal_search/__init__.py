@@ -4,7 +4,11 @@ from ai_server.integrations.bitrix.portal_search.content_indexer import (
     sync_portal_content_index,
     sync_portal_content_item,
 )
-from ai_server.integrations.bitrix.portal_search.entity_syncs import sync_disk_file_item
+from ai_server.integrations.bitrix.portal_search.entity_syncs import (
+    sync_catalog_product_item,
+    sync_disk_file_item,
+    sync_task_item,
+)
 from ai_server.integrations.bitrix.portal_search.file_cache import delete_portal_file_cache_path, portal_file_cache_path
 from ai_server.integrations.bitrix.portal_search.formatting import (
     entity_types_for_scope,
@@ -43,6 +47,8 @@ __all__ = [
     "portal_file_cache_path",
     "sync_disk_delta_index",
     "sync_disk_file_item",
+    "sync_task_item",
+    "sync_catalog_product_item",
     "sync_portal_content_index",
     "sync_portal_content_item",
     "sync_portal_index",

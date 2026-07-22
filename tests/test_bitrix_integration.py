@@ -452,7 +452,7 @@ def test_bitrix_warehouse_search_tool_oauth_read_denies_live_lookup_without_user
     assert oauth_bitrix.calls == []
 
 
-def test_bitrix_warehouse_search_tool_uses_stock_snapshot_before_live_bitrix():
+def test_bitrix_warehouse_search_tool_live_verifies_stock_instead_of_serving_stale_snapshot():
     fake_bitrix = FakeBitrixClient()
     index = FakePortalSearchIndex()
     index.upsert_item(
@@ -487,12 +487,12 @@ def test_bitrix_warehouse_search_tool_uses_stock_snapshot_before_live_bitrix():
     )
 
     assert result.status == ToolStatus.OK
-    assert result.data["source"] == "postgres_portal_snapshot"
-    assert result.data["products"]["source"] == "postgres_portal_snapshot"
+    assert result.data["source"] == "live_bitrix_rest"
     assert result.data["products"]["items"][0]["product_id"] == 1001
     assert result.data["products"]["items"][0]["product_name"] == "Cable"
-    assert result.data["products"]["items"][0]["amount"] == "3"
-    assert fake_bitrix.calls == []
+    assert result.data["products"]["items"][0]["amount"] == "7"
+    assert ("catalog.store.list", {}) in fake_bitrix.calls
+    assert any(method == "catalog.storeproduct.list" for method, _ in fake_bitrix.calls)
 
 
 def test_bitrix_warehouse_snapshot_uses_oauth_actor_before_returning_index_data():

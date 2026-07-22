@@ -1389,6 +1389,84 @@ def test_search_webhook_indexer_upserts_and_deletes_file(monkeypatch):
     assert index.get_item(entity_type="disk_file", entity_id=777) is None
 
 
+def test_search_webhook_indexer_refreshes_task_and_comments_immediately(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("SEARCH_WEBHOOK_INDEXER_ENABLED", "true")
+    settings = get_settings()
+    index = FakePortalSearchIndex()
+
+    class EventBitrix(FakePortalBitrix):
+        async def get_task(self, task_id: int, *, select=None):
+            return {
+                "task": {
+                    "id": str(task_id),
+                    "title": "Проверить договор",
+                    "description": "Новая редакция",
+                    "status": "2",
+                    "responsibleId": "9",
+                    "createdBy": "1",
+                    "changedDate": "2026-07-22T10:00:00+03:00",
+                }
+            }
+
+        async def result(self, method: str, payload: dict):
+            if method == "task.commentitem.getlist":
+                return [{"POST_MESSAGE": "Добавлен свежий комментарий"}]
+            if method == "tasks.task.result.list":
+                return []
+            return await super().result(method, payload)
+
+    job, prepared = prepare_search_webhook_job(
+        {"event": "ONTASKCOMMENTADD", "data": {"FIELDS_AFTER": {"TASK_ID": "202"}}},
+        settings=settings,
+    )
+    assert job is not None
+    assert prepared["entity_type"] == "task"
+
+    result = anyio_run(process_search_webhook_job(EventBitrix(), index, job, status={}, settings=settings))
+
+    item = index.get_item(entity_type="task", entity_id=202)
+    assert result["reason"] == "task_indexed"
+    assert item is not None
+    assert "свежий комментарий" in item.body.casefold()
+    assert item.metadata["event_synced_at"]
+
+    missing_task_job, rejected = prepare_search_webhook_job(
+        {"event": "ONTASKCOMMENTADD", "data": {"FIELDS_AFTER": {"ID": "999"}}},
+        settings=settings,
+    )
+    assert missing_task_job is None
+    assert rejected["reason"] == "task_id_not_found"
+
+
+def test_search_webhook_indexer_refreshes_catalog_product_metadata(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("SEARCH_WEBHOOK_INDEXER_ENABLED", "true")
+    settings = get_settings()
+    index = FakePortalSearchIndex()
+
+    class ProductEventBitrix(FakePortalBitrix):
+        async def result(self, method: str, payload: dict):
+            if method == "catalog.product.get":
+                return {"product": {"id": 1001, "iblockId": 7, "name": "Амортизатор", "previewText": "Газовый"}}
+            return await super().result(method, payload)
+
+    job, prepared = prepare_search_webhook_job(
+        {"event": "CATALOG.PRODUCT.ON.UPDATE", "data": {"FIELDS_AFTER": {"ID": "1001"}}},
+        settings=settings,
+    )
+    assert job is not None
+    assert prepared["entity_type"] == "catalog_product"
+
+    result = anyio_run(process_search_webhook_job(ProductEventBitrix(), index, job, status={}, settings=settings))
+
+    item = index.get_item(entity_type="catalog_product", entity_id=1001)
+    assert result["reason"] == "catalog_product_indexed"
+    assert item is not None
+    assert item.title == "Амортизатор"
+    assert item.metadata["event_synced_at"]
+
+
 class FakePortalBitrix:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []

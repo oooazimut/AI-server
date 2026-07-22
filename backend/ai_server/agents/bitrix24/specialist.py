@@ -13,7 +13,6 @@ from ai_server.agents.bitrix24.llm import (
     BitrixLLMService,
     _format_task_close_confirm_answer,
     _format_task_close_draft_answer,
-    direct_tool_results_response,
     llm_failure_result,
 )
 from ai_server.agents.bitrix24.ports import ProposalStorePort, TaskDraftStorePort
@@ -55,7 +54,15 @@ from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigErr
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService
 from ai_server.integrations.bitrix.profile import compact_user_profile
 from ai_server.knowledge import MarkdownKnowledgeBase
-from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult, ToolStatus
+from ai_server.models import (
+    ActionRecord,
+    AgentManifest,
+    AgentResult,
+    AgentTask,
+    ModelUsageRecord,
+    ToolResult,
+    ToolStatus,
+)
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import Settings, get_settings
 from ai_server.skills import SkillStore
@@ -263,12 +270,9 @@ class Bitrix24Specialist(BaseSpecialist):
             details={"registry_version": registry["registry_version"]},
         )
 
-        rendered = direct_tool_results_response(
-            agent_id=self.manifest.id,
-            tool_results=[result],
-            portal_base_url=self._settings_for_qc.bitrix_portal_base_url if self._settings_for_qc else "",
-            command_arguments=arguments,
-        )
+        terminal_status = _terminal_status(tool_name, result)
+        if result.status not in {ToolStatus.OK, ToolStatus.NOT_FOUND}:
+            terminal_status = "failed"
         actions = [
             ActionRecord(
                 name="bitrix_capability_contract",
@@ -284,12 +288,12 @@ class Bitrix24Specialist(BaseSpecialist):
             actions.append(action)
         metadata = {
             "terminal": True,
-            "answer_is_final": True,
+            "answer_is_final": False,
             "safe_to_send": True,
             "fast_return": True,
             "fast_return_reason": "orchestrator_structured_command",
             "terminal_tool": tool_name,
-            "terminal_status": rendered.status,
+            "terminal_status": terminal_status,
             "registry_version": registry["registry_version"],
             "structured_command": True,
             "command_arguments": arguments,
@@ -297,21 +301,26 @@ class Bitrix24Specialist(BaseSpecialist):
             "portal_base_url": self._settings_for_qc.bitrix_portal_base_url if self._settings_for_qc else "",
             "permission_context": context_details,
         }
-        dialog_key = str(task.context.get("dialog_key") or "")
-        if self.store is not None and dialog_key and rendered.answer:
-            await self.store.append_turn(dialog_key, task.request, rendered.answer)
         output = AgentResult(
-            status="needs_human" if approvals else rendered.status,
+            status="needs_human" if approvals else terminal_status,
             agent_id=self.manifest.id,
-            answer=rendered.answer,
+            answer="",
             actions_taken=actions,
             actions_requiring_approval=list(approvals),
-            model_usage=[rendered.model_usage],
+            model_usage=[
+                ModelUsageRecord(
+                    agent_id=self.manifest.id,
+                    provider="internal",
+                    model="structured-bitrix-executor",
+                    status="not_used",
+                    notes=["No Bitrix model call and no specialist-side response rendering."],
+                )
+            ],
             confidence=1.0 if result.status == ToolStatus.OK else 0.0,
             logs=["Bitrix executed one version-bound orchestrator command without a specialist model call."],
             metadata=metadata,
         )
-        return _enforce_task_close_response(output, settings=self._settings_for_qc)
+        return output
 
     def _structured_command_failure(
         self,

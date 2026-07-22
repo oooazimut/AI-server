@@ -1283,6 +1283,148 @@ async def _sync_tasks(bitrix: BitrixClient, index: PortalSearchIndex, settings: 
     }
 
 
+async def sync_task_item(
+    bitrix: BitrixClient,
+    index: PortalSearchIndex,
+    *,
+    task_id: int,
+    settings: Settings,
+) -> PortalSearchResult | None:
+    """Refresh one task after a task or comment webhook.
+
+    The six-hour scan remains the reconciliation path.  This targeted path
+    refreshes the searchable task text immediately and preserves metadata that
+    is maintained by the closure/report subsystem.
+    """
+
+    raw = await bitrix.get_task(
+        task_id,
+        select=[
+            "ID",
+            "TITLE",
+            "DESCRIPTION",
+            "STATUS",
+            "RESPONSIBLE_ID",
+            "RESPONSIBLE",
+            "CREATED_BY",
+            "CREATOR",
+            "GROUP_ID",
+            "DEADLINE",
+            "CREATED_DATE",
+            "CHANGED_DATE",
+            "CLOSED_DATE",
+            "ACCOMPLICES",
+            "AUDITORS",
+            "UF_TASK_WEBDAV_FILES",
+        ],
+    )
+    task = raw.get("task") if isinstance(raw, dict) and isinstance(raw.get("task"), dict) else raw
+    if not isinstance(task, dict):
+        return None
+    resolved_id = _first(task, "id", "ID") or task_id
+    comments = (
+        await _task_comment_texts(bitrix, resolved_id, limit=settings.search_index_task_comment_limit)
+        if settings.search_index_include_task_comments
+        else []
+    )
+    task_results = await _task_result_texts(bitrix, resolved_id, limit=_BITRIX_TASK_RESULT_LIMIT)
+    title = str(_first(task, "title", "TITLE") or f"Задача #{resolved_id}")
+    responsible_label = _person_label(_first(task, "responsible", "RESPONSIBLE"))
+    creator_label = _person_label(_first(task, "creator", "CREATOR"))
+    responsible = responsible_label or to_str(_first(task, "responsibleId", "RESPONSIBLE_ID"))
+    creator = creator_label or to_str(_first(task, "createdBy", "CREATED_BY"))
+    close_marker_metadata = _task_close_marker_metadata(task_results=task_results, comments=comments)
+    body_parts = [
+        str(_first(task, "description", "DESCRIPTION") or ""),
+        f"Статус: {_first(task, 'status', 'STATUS')}",
+        f"Исполнитель: {responsible}" if responsible else "",
+        f"Постановщик: {creator}" if creator else "",
+        f"Проект: {_first(task, 'groupId', 'GROUP_ID')}",
+        f"Срок: {_first(task, 'deadline', 'DEADLINE')}",
+        f"Дата создания: {_first(task, 'createdDate', 'CREATED_DATE')}",
+        f"Дата закрытия: {_first(task, 'closedDate', 'CLOSED_DATE')}",
+        "Результаты:\n" + "\n".join(f"- {result}" for result in task_results) if task_results else "",
+        "Комментарии:\n" + "\n".join(f"- {comment}" for comment in comments) if comments else "",
+        f"AI close marker: {_TASK_CLOSE_INCOMPLETE_MARKER}" if close_marker_metadata["ai_close_incomplete"] else "",
+    ]
+    existing = index.get_item(entity_type="task", entity_id=resolved_id)
+    preserved = dict(existing.metadata) if existing is not None else {}
+    event_synced_at = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
+    metadata = {
+        **preserved,
+        "status": _first(task, "status", "STATUS"),
+        "responsible_id": _first(task, "responsibleId", "RESPONSIBLE_ID"),
+        "responsible_label": responsible_label,
+        "created_by": _first(task, "createdBy", "CREATED_BY"),
+        "creator_label": creator_label,
+        "group_id": _first(task, "groupId", "GROUP_ID"),
+        "deadline": _first(task, "deadline", "DEADLINE"),
+        "created_date": _first(task, "createdDate", "CREATED_DATE"),
+        "changed_date": _first(task, "changedDate", "CHANGED_DATE"),
+        "closed_date": _first(task, "closedDate", "CLOSED_DATE"),
+        "accomplices": _first(task, "accomplices", "ACCOMPLICES"),
+        "auditors": _first(task, "auditors", "AUDITORS"),
+        "comments_indexed": bool(comments),
+        "comments_count": len(comments),
+        "task_results_indexed": bool(task_results),
+        "task_results_count": len(task_results),
+        "event_synced_at": event_synced_at,
+        **close_marker_metadata,
+    }
+    index.upsert_item(
+        entity_type="task",
+        entity_id=resolved_id,
+        title=title,
+        body="\n".join(part for part in body_parts if str(part).strip()),
+        url=_task_url(resolved_id, settings),
+        metadata=metadata,
+        source_updated_at=to_str(_first(task, "changedDate", "CHANGED_DATE")) or event_synced_at,
+    )
+    return index.get_item(entity_type="task", entity_id=resolved_id)
+
+
+async def sync_catalog_product_item(
+    bitrix: BitrixClient,
+    index: PortalSearchIndex,
+    *,
+    product_id: int,
+    settings: Settings,
+) -> PortalSearchResult | None:
+    """Refresh product metadata after a catalog product webhook."""
+
+    raw = await bitrix.result("catalog.product.get", {"id": product_id})
+    product = raw.get("product") if isinstance(raw, dict) and isinstance(raw.get("product"), dict) else raw
+    if not isinstance(product, dict):
+        return None
+    resolved_id = _first(product, "id", "ID") or product_id
+    iblock_id = _first(product, "iblockId", "IBLOCK_ID", "iblock_id")
+    title = str(_first(product, "name", "NAME") or f"Товар #{resolved_id}")
+    event_synced_at = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
+    existing = index.get_item(entity_type="catalog_product", entity_id=resolved_id)
+    metadata = {
+        **(dict(existing.metadata) if existing is not None else {}),
+        "iblock_id": iblock_id,
+        "event_synced_at": event_synced_at,
+    }
+    index.upsert_item(
+        entity_type="catalog_product",
+        entity_id=resolved_id,
+        title=title,
+        body="\n".join(
+            part
+            for part in (
+                str(_first(product, "previewText", "PREVIEW_TEXT") or ""),
+                str(_first(product, "detailText", "DETAIL_TEXT") or ""),
+            )
+            if part.strip()
+        ),
+        url=_catalog_product_url(iblock_id, resolved_id, settings),
+        metadata=metadata,
+        source_updated_at=event_synced_at,
+    )
+    return index.get_item(entity_type="catalog_product", entity_id=resolved_id)
+
+
 async def _sync_projects(bitrix: BitrixClient, index: PortalSearchIndex, settings: Settings) -> int:
     projects = await bitrix.search_projects("", limit=settings.search_index_max_projects)
     if not isinstance(projects, list):

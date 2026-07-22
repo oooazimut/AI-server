@@ -62,9 +62,12 @@ def _branch_key(base_dialog_key: str, day: str, number: int) -> str:
 
 def _explicit_reference(request: str) -> tuple[int | None, str]:
     match = _PREFIX.match(request or "")
-    if match and _looks_like_continuation(match.group("text")):
+    if match:
         return int(match.group("number")), match.group("text").strip()
     match = _SUFFIX.match(request or "")
+    # A trailing number is commonly an entity ID (for example "close task
+    # 555").  Keep the historical continuation-word guard for suffixes; an
+    # unconditional branch selector is the unambiguous leading number.
     if match and _looks_like_continuation(match.group("text")):
         return int(match.group("number")), match.group("text").strip()
     return None, request

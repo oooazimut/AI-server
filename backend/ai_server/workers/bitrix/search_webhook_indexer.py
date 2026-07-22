@@ -11,8 +11,10 @@ from ai_server.integrations.bitrix.portal_search import (
     delete_portal_file_cache_path,
     format_portal_content_sync_stats,
     portal_file_cache_path,
+    sync_catalog_product_item,
     sync_disk_file_item,
     sync_portal_content_item,
+    sync_task_item,
 )
 from ai_server.settings import Settings
 from ai_server.utils import MOSCOW_TZ
@@ -28,7 +30,12 @@ UPDATE_MARKERS = ("ADD", "CREATE", "UPDATE", "RESTORE", "MOVE", "RENAME")
 class SearchWebhookJob:
     event: str
     action: str
-    file_id: int
+    entity_type: str
+    entity_id: int
+
+    @property
+    def file_id(self) -> int:
+        return self.entity_id
 
 
 def prepare_search_webhook_job(
@@ -37,23 +44,24 @@ def prepare_search_webhook_job(
     event = _payload_event_type(payload)
     if not settings.search_webhook_indexer_enabled:
         return None, {"handled": False, "reason": "disabled", "event": event}
-    if not _is_disk_file_event(event):
+    entity_type = _event_entity_type(event)
+    if entity_type is None:
         return None, {"handled": False, "reason": "unsupported_event", "event": event}
-
-    file_id = _extract_file_id(payload)
-    if file_id is None:
-        return None, {"handled": False, "reason": "file_id_not_found", "event": event}
+    entity_id = _extract_event_entity_id(payload, entity_type=entity_type, event=event)
+    if entity_id is None:
+        return None, {"handled": False, "reason": f"{entity_type}_id_not_found", "event": event}
 
     action = _event_action(event)
     if action is None:
-        return None, {"handled": False, "reason": "unsupported_disk_action", "event": event, "file_id": file_id}
+        return None, {"handled": False, "reason": "unsupported_action", "event": event, "entity_id": entity_id}
 
-    return SearchWebhookJob(event=event, action=action, file_id=file_id), {
+    return SearchWebhookJob(event=event, action=action, entity_type=entity_type, entity_id=entity_id), {
         "handled": True,
         "queued": True,
         "event": event,
         "action": action,
-        "file_id": file_id,
+        "entity_type": entity_type,
+        "entity_id": entity_id,
     }
 
 
@@ -67,10 +75,27 @@ async def process_search_webhook_job(
 ) -> dict[str, Any]:
     _record_seen(status, job, settings=settings)
     try:
-        if job.action == "delete":
+        if job.entity_type == "disk_file" and job.action == "delete":
             result = await _delete_indexed_file(index, job, settings=settings)
-        else:
+        elif job.action == "delete":
+            deleted = index.delete_item(entity_type=job.entity_type, entity_id=job.entity_id)
+            result = {
+                "handled": True,
+                "reason": "deleted" if deleted else "already_absent",
+                "event": job.event,
+                "action": job.action,
+                "entity_type": job.entity_type,
+                "entity_id": job.entity_id,
+                "deleted": deleted,
+            }
+        elif job.entity_type == "disk_file":
             result = await _upsert_indexed_file(bitrix, index, job, settings=settings)
+        elif job.entity_type == "task":
+            result = await _upsert_indexed_task(bitrix, index, job, settings=settings)
+        elif job.entity_type == "catalog_product":
+            result = await _upsert_indexed_product(bitrix, index, job, settings=settings)
+        else:
+            result = {"handled": False, "reason": "unsupported_entity_type", "entity_type": job.entity_type}
         status["last_reason"] = result.get("reason")
         status["last_result"] = result
         status["processed"] = int(status.get("processed") or 0) + 1
@@ -85,7 +110,8 @@ async def process_search_webhook_job(
             "reason": "error",
             "event": job.event,
             "action": job.action,
-            "file_id": job.file_id,
+            "entity_type": job.entity_type,
+            "entity_id": job.entity_id,
             "error": type(exc).__name__,
         }
 
@@ -165,11 +191,50 @@ async def _upsert_indexed_file(
     return result
 
 
+async def _upsert_indexed_task(
+    bitrix: BitrixClient,
+    index: PortalSearchIndex,
+    job: SearchWebhookJob,
+    *,
+    settings: Settings,
+) -> dict[str, Any]:
+    item = await sync_task_item(bitrix, index, task_id=job.entity_id, settings=settings)
+    return {
+        "handled": item is not None,
+        "reason": "task_indexed" if item is not None else "task_not_loaded",
+        "event": job.event,
+        "action": job.action,
+        "task_id": job.entity_id,
+        "title": item.title if item is not None else "",
+    }
+
+
+async def _upsert_indexed_product(
+    bitrix: BitrixClient,
+    index: PortalSearchIndex,
+    job: SearchWebhookJob,
+    *,
+    settings: Settings,
+) -> dict[str, Any]:
+    item = await sync_catalog_product_item(bitrix, index, product_id=job.entity_id, settings=settings)
+    return {
+        "handled": item is not None,
+        "reason": "catalog_product_indexed" if item is not None else "catalog_product_not_loaded",
+        "event": job.event,
+        "action": job.action,
+        "product_id": job.entity_id,
+        "title": item.title if item is not None else "",
+    }
+
+
 def _record_seen(status: dict[str, Any], job: SearchWebhookJob, *, settings: Settings) -> None:
     status["enabled"] = settings.search_webhook_indexer_enabled
     status["last_received_at"] = datetime.now(MOSCOW_TZ).isoformat()
     status["last_event"] = job.event
-    status["last_file_id"] = job.file_id
+    status["last_entity_type"] = job.entity_type
+    status["last_entity_id"] = job.entity_id
+    if job.entity_type == "disk_file":
+        status["last_file_id"] = job.file_id
     status["last_action"] = job.action
     status["last_error"] = None
     status["events_seen"] = int(status.get("events_seen") or 0) + 1
@@ -181,6 +246,16 @@ def _payload_event_type(payload: dict[str, Any]) -> str:
 
 def _is_disk_file_event(event: str) -> bool:
     return all(marker in event for marker in DISK_FILE_EVENT_MARKERS)
+
+
+def _event_entity_type(event: str) -> str | None:
+    if _is_disk_file_event(event):
+        return "disk_file"
+    if "TASK" in event and ("COMMENT" in event or event.startswith("ONTASK")):
+        return "task"
+    if "CATALOG" in event and "PRODUCT" in event:
+        return "catalog_product"
+    return None
 
 
 def _event_action(event: str) -> str | None:
@@ -203,6 +278,46 @@ def _extract_file_id(payload: dict[str, Any]) -> int | None:
     if isinstance(data, dict):
         candidates.extend(_nested_candidates(data))
     return _first_int(candidates)
+
+
+def _extract_event_entity_id(payload: dict[str, Any], *, entity_type: str, event: str = "") -> int | None:
+    if entity_type == "disk_file":
+        return _extract_file_id(payload)
+    preferred = (
+        ("task_id", "taskId", "TASK_ID", "TASKID")
+        if entity_type == "task"
+        else ("product_id", "productId", "PRODUCT_ID")
+    )
+    candidates = [payload.get(key) for key in preferred]
+    data = payload.get("data")
+    if isinstance(data, dict):
+        candidates.extend(
+            _nested_candidates_for_keys(
+                data,
+                preferred,
+                allow_generic_id=entity_type != "task" or "COMMENT" not in event,
+            )
+        )
+    if entity_type != "task" or "COMMENT" not in event:
+        # Entity update events frequently expose the entity as ID inside FIELDS_AFTER.
+        candidates.extend([payload.get("id"), payload.get("ID")])
+    return _first_int(candidates)
+
+
+def _nested_candidates_for_keys(
+    data: dict[str, Any],
+    keys: tuple[str, ...],
+    *,
+    allow_generic_id: bool,
+) -> list[Any]:
+    candidates = [data.get(key) for key in keys]
+    for nested_key in ("FIELDS_AFTER", "FIELDS_BEFORE", "fields", "PARAMS", "params"):
+        nested = data.get(nested_key)
+        if isinstance(nested, dict):
+            candidates.extend(_nested_candidates_for_keys(nested, keys, allow_generic_id=allow_generic_id))
+            if allow_generic_id:
+                candidates.extend([nested.get("ID"), nested.get("id")])
+    return candidates
 
 
 def _nested_candidates(data: dict[str, Any]) -> list[Any]:

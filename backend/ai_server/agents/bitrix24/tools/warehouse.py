@@ -93,7 +93,10 @@ class BitrixWarehouseSearchTool:
             return access_error
 
         snapshot_data = None
-        if not list_all:
+        # Stock amounts are operational data: never serve them solely from the
+        # periodic PostgreSQL snapshot.  The snapshot may resolve a warehouse,
+        # while every contents/product request is verified through live Bitrix.
+        if not list_all and not include_products:
             snapshot_data = self._snapshot_search(
                 query=query,
                 include_products=include_products,
