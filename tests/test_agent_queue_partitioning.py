@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import anyio
@@ -8,6 +10,7 @@ import anyio
 from ai_server.agent_queue_utils import agent_queue_partition_key
 from ai_server.integrations.memory.agent_queue import InMemoryAgentQueue
 from ai_server.integrations.redis.agent_queue import RedisAgentQueue
+from ai_server.orchestrators.internal import InternalOrchestrator
 
 
 def _run(coro):
@@ -177,3 +180,43 @@ def test_memory_agent_queue_removes_pending_by_partition():
     assert removed == 1
     assert remaining is not None
     assert remaining["id"] == "m2"
+
+
+def test_five_orchestrator_workers_can_claim_five_numbered_branches():
+    async def _impl() -> list[str]:
+        queue = InMemoryAgentQueue()
+        orchestrator = InternalOrchestrator(
+            SimpleNamespace(id="internal_orchestrator"),
+            agent_tools=[],
+            llm=None,
+        )
+        for number in range(101, 106):
+            await queue.publish(_message(f"m{number}", f"chat:1:user:1:day:20260722:conversation:{number}"))
+        claims = await asyncio.gather(*(orchestrator._claim_queue_message(queue, "orchestrator") for _ in range(5)))
+        return [partition for message, partition in claims if message is not None]
+
+    partitions = anyio.run(_impl)
+
+    assert len(partitions) == 5
+    assert len(set(partitions)) == 5
+
+
+def test_same_numbered_branch_remains_serialized_while_active():
+    async def _impl() -> tuple[dict | None, dict | None]:
+        queue = InMemoryAgentQueue()
+        orchestrator = InternalOrchestrator(
+            SimpleNamespace(id="internal_orchestrator"),
+            agent_tools=[],
+            llm=None,
+        )
+        branch = "chat:1:user:1:day:20260722:conversation:101"
+        await queue.publish(_message("m1", branch))
+        await queue.publish(_message("m2", branch))
+        first, _ = await orchestrator._claim_queue_message(queue, "orchestrator")
+        second, _ = await orchestrator._claim_queue_message(queue, "orchestrator")
+        return first, second
+
+    first, second = anyio.run(_impl)
+
+    assert first is not None
+    assert second is None

@@ -95,6 +95,21 @@ def test_new_unnumbered_write_ignores_legacy_active_draft_pointer_and_gets_new_b
     asyncio.run(run())
 
 
+def test_already_resolved_ingress_branch_is_idempotent():
+    async def run():
+        store = FakeOrchestratorStore()
+        first = await resolve_conversation_reference(_task("Покажи склад Борисова"), store)
+
+        repeated = await resolve_conversation_reference(first.task, store)
+        next_new = await resolve_conversation_reference(_task("Покажи склад Карасева"), store)
+
+        assert repeated.task == first.task
+        assert repeated.task.context["conversation_number"] == 101
+        assert next_new.task.context["conversation_number"] == 102
+
+    asyncio.run(run())
+
+
 def test_task_reminder_calendar_project_and_close_drafts_each_get_their_own_number():
     async def run():
         store = FakeOrchestratorStore()

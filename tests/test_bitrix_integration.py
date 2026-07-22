@@ -405,6 +405,18 @@ def test_bitrix_warehouse_search_tool_finds_store_and_products():
     assert any(method == "catalog.storeproduct.list" for method, _ in fake_bitrix.calls)
 
 
+def test_bitrix_warehouse_search_tool_lists_all_stores_without_literal_name_search():
+    fake_bitrix = FakeBitrixClient()
+    tool = BitrixWarehouseSearchTool(client=fake_bitrix)
+
+    result = anyio_run(tool.execute({"query": "все", "list_all": True, "include_products": False, "limit": 10}))
+
+    assert result.status == ToolStatus.OK
+    assert [item["id"] for item in result.data["matches"]] == [10, 11]
+    assert result.data["list_all"] is True
+    assert "products" not in result.data
+
+
 def test_bitrix_warehouse_search_tool_uses_oauth_client_for_live_reads():
     fallback_bitrix = FakeBitrixClient()
     oauth_bitrix = FakeBitrixClient()

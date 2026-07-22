@@ -436,6 +436,7 @@ async def main() -> None:
                     conversation_trace=conversation_trace,
                     dialog_guard=dialog_guard,
                     bitrix_sender=bitrix,
+                    orchestrator_store=orchestrator_store,
                 )
             )
         )

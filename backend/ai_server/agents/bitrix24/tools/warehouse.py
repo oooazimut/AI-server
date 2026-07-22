@@ -44,6 +44,10 @@ class BitrixWarehouseSearchTool:
                         "description": "Optional product-name filter inside the matched warehouse.",
                     },
                     "include_products": {"type": "boolean"},
+                    "list_all": {
+                        "type": "boolean",
+                        "description": "Return the warehouse list instead of treating query as a warehouse name.",
+                    },
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20},
                     "product_limit": {"type": "integer", "minimum": 1, "maximum": 50},
                     "product_offset": {"type": "integer", "minimum": 0},
@@ -68,8 +72,11 @@ class BitrixWarehouseSearchTool:
             )
         query = str(args.get("query") or "").strip()
         product_query = str(args.get("product_query") or "").strip()
-        if not query:
+        list_all = bool(args.get("list_all"))
+        if not query and not list_all:
             return ToolResult(status=ToolStatus.INVALID_TOOL_CALL, tool=self.name, error="query is required")
+        if list_all:
+            query = query or "все"
 
         limit = max(1, min(int(args.get("limit") or 10), 20))
         product_limit = max(1, min(int(args.get("product_limit") or 50), 50))
@@ -85,15 +92,17 @@ class BitrixWarehouseSearchTool:
         if access_error is not None:
             return access_error
 
-        snapshot_data = self._snapshot_search(
-            query=query,
-            include_products=include_products,
-            limit=limit,
-            product_limit=product_limit,
-            product_offset=product_offset,
-            product_query=product_query,
-            access_actor=access_actor,
-        )
+        snapshot_data = None
+        if not list_all:
+            snapshot_data = self._snapshot_search(
+                query=query,
+                include_products=include_products,
+                limit=limit,
+                product_limit=product_limit,
+                product_offset=product_offset,
+                product_query=product_query,
+                access_actor=access_actor,
+            )
         if snapshot_data is not None:
             return ToolResult(status=ToolStatus.OK, tool=self.name, data=snapshot_data)
 
@@ -108,7 +117,11 @@ class BitrixWarehouseSearchTool:
             )
 
         stores = _extract_items(raw_stores, "stores")
-        matches = _match_stores(stores, query=query, limit=limit)
+        matches = (
+            [_compact_store(store) for store in stores[:limit]]
+            if list_all
+            else _match_stores(stores, query=query, limit=limit)
+        )
         data: dict[str, Any] = {
             "query": query,
             "source": "live_bitrix_rest",
@@ -116,6 +129,7 @@ class BitrixWarehouseSearchTool:
             "matches": matches,
             "total_stores_seen": len(stores),
             "summary": _stores_summary(matches, query=query),
+            "list_all": list_all,
         }
 
         if include_products and matches:

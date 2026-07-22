@@ -130,15 +130,23 @@ def _reference_constraint(task: AgentTask, context: dict[str, Any], message: str
 async def resolve_conversation_reference(task: AgentTask, store: Any) -> ConversationReferenceResolution:
     """Attach a task to an explicit or safely inferred numbered branch.
 
-    This function intentionally does *not* alter queue partitioning.  The
-    first rollout adds durable identity and an unambiguous continuation path;
-    a later approved rollout can safely use the branch key for parallel reads.
+    The webhook worker resolves this before publishing to the orchestrator
+    queue, so the numbered branch is also the queue/dialog-guard partition.
+    The orchestrator calls it again defensively; already resolved tasks must
+    therefore be returned unchanged.
     """
     context = dict(task.context or {})
     # Numbered branches are a Bitrix-chat surface.  Keep direct/internal tasks
     # and old callers untouched until they explicitly provide the base key.
     base_key = str(context.get("base_dialog_key") or "").strip()
     if not base_key or store is None or not hasattr(store, "get_kv") or not hasattr(store, "set_kv"):
+        return ConversationReferenceResolution(task=task)
+    if (
+        context.get("conversation_number") is not None
+        and str(context.get("conversation_day") or "").strip()
+        and str(context.get("dialog_key") or "").strip()
+        and str(context.get("dialog_key") or "").strip() != base_key
+    ):
         return ConversationReferenceResolution(task=task)
 
     request = str(task.request or "").strip()

@@ -9,9 +9,9 @@ Bitrix проверяет версию контракта, JSON-схему, те
 ## Поиск складов
 
 - `найди`, `покажи`, `поищи`, `выведи`, `ищи` — синонимы; результат определяют объект и ограничения, а не глагол.
-- Список складов: `bitrix_warehouse_search(query="все", include_products=false, limit=10)`.
+- Список складов: `bitrix_warehouse_search(query="все", list_all=true, include_products=false, limit=10)`. `list_all=true` обязателен: слово `все` не является названием склада.
 - Один склад без другого объекта: карточка склада и первые 10 товаров — `include_products=true, product_limit=10, product_offset=0`.
-- Товар на указанном складе: добавить `product_query`, оставить `include_products=true`.
+- Товар на указанном складе: использовать только tool/capability `bitrix_warehouse_search`, добавить `product_query`, оставить `include_products=true`. Названия операций матрицы (`product_at_warehouse`, `warehouse_contents`) не являются capability.
 - Явное `по складам` / `по всем складам`: отдельная складская команда на каждый найденный склад; результаты группируются.
 - Адрес/местонахождение склада: `include_products=false`.
 - `следующая`, `ещё`, `дальше`: тот же склад и фильтр, следующий `product_offset`.

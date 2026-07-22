@@ -8,6 +8,7 @@ import anyio
 from ai_server.models import AgentResult, AgentTask
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.workers.bitrix.webhook_event_queue import _handle_dialog_guard, _route_event
+from tests.fakes import FakeOrchestratorStore
 
 
 def _run(coro):
@@ -81,6 +82,41 @@ def test_route_event_prompts_when_dialog_active_too_long():
     assert guard.pending is not None
     assert "сбросить предыдущий запрос" in sender.messages[0][1]
     assert "выполнить после предыдущего" in sender.messages[0][1]
+
+
+def test_route_event_assigns_numbered_branch_before_orchestrator_queue():
+    store = FakeOrchestratorStore()
+    queue = RecordingAgentQueue()
+
+    first = _run(
+        _route_event(
+            event_id=1,
+            event_type="ONIMBOTV2MESSAGEADD",
+            payload=_payload("Покажи склад Борисов"),
+            agent_queue=queue,
+            attachment_service=FakeAttachmentService(),
+            transcriber=FakeTranscriber(),
+            settings=_settings(),
+            orchestrator_store=store,
+        )
+    )
+    second = _run(
+        _route_event(
+            event_id=2,
+            event_type="ONIMBOTV2MESSAGEADD",
+            payload=_payload("Покажи склад Карасев"),
+            agent_queue=queue,
+            attachment_service=FakeAttachmentService(),
+            transcriber=FakeTranscriber(),
+            settings=_settings(),
+            orchestrator_store=store,
+        )
+    )
+
+    assert first["routed_to"] == second["routed_to"] == "orchestrator"
+    contexts = [item["payload"]["context"] for item in queue.published]
+    assert [item["conversation_number"] for item in contexts] == [101, 102]
+    assert contexts[0]["dialog_key"] != contexts[1]["dialog_key"]
 
 
 def test_dialog_guard_reset_publishes_pending_task_and_increments_generation():

@@ -379,3 +379,26 @@ def test_orchestrator_can_use_first_result_for_one_bounded_followup_command():
     assert [item["arguments"]["method"] for item in specialist.commands] == ["user.search", "tasks.task.list"]
     assert len(planner.plan_calls) == 2
     assert result.metadata["structured_command_rounds"] == 2
+
+
+def test_live_bitrix_catalog_exposes_only_exact_tool_ids_as_planner_capabilities():
+    specialist = _StructuredSpecialist()
+    manifest = AgentManifest(
+        id="bitrix24",
+        name="Bitrix",
+        kind="specialist",
+        description="test",
+        capabilities=["bitrix24", "document_search", "projects_crm"],
+    )
+    call = CallSpecialistTool({"bitrix24": specialist}, [manifest])
+    planner = _TwoRoundPlanner()
+    orchestrator = PlanAuthoritativeOrchestrator(
+        AgentManifest(id="internal_orchestrator", name="Orchestrator", kind="orchestrator", description="test"),
+        agent_tools=[call],
+        planner=planner,
+        llm=planner,
+    )
+
+    catalog = orchestrator._catalog()
+
+    assert catalog["bitrix24"]["capabilities"] == ["bitrix_api"]

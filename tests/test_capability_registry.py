@@ -56,9 +56,7 @@ def test_argument_validation_fails_closed_for_required_type_range_enum_and_unkno
     assert "arguments.limit: below minimum 1" in errors
     assert "arguments.mode: value is not in enum" in errors
     assert "arguments.extra: unknown argument" in errors
-    assert validate_tool_arguments(schema, {"query": "x", "limit": True}) == [
-        "arguments.limit: expected integer"
-    ]
+    assert validate_tool_arguments(schema, {"query": "x", "limit": True}) == ["arguments.limit: expected integer"]
 
 
 def test_live_bitrix_registry_contains_search_matrix_and_orchestrator_contract():
@@ -73,3 +71,5 @@ def test_live_bitrix_registry_contains_search_matrix_and_orchestrator_contract()
     assert matrix["warehouse"]["list_warehouses"]["include_products"] is False
     assert "orchestrator_command_contract" in skills
     assert "structured_command" in skills["orchestrator_command_contract"]
+    assert matrix["warehouse"]["list_warehouses"]["list_all"] is True
+    assert "search_product is not a tool" in matrix["rules"][0]["notes"][-1]

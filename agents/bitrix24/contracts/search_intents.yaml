@@ -37,6 +37,8 @@ warehouse:
     product_limit: 10
   list_warehouses:
     meaning: A request for the warehouse list itself.
+    tool: bitrix_warehouse_search
+    list_all: true
     include_products: false
   warehouse_info:
     meaning: Address, location or other warehouse information.
@@ -55,7 +57,7 @@ rules:
     notes:
       - Search verbs are equivalent; the requested object selects the operation.
       - An address or location request selects warehouse_info without products.
-      - An explicit product selects search_product.
+      - An explicit product selects bitrix_warehouse_search with product_query; search_product is not a tool.
   - entity: bitrix_task
     object_markers: [задача, задачи]
     default_operation: my_active_tasks

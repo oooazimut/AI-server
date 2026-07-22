@@ -12,6 +12,7 @@ from ai_server.integrations.bitrix.chat_parser import (
     build_agent_task_from_task_event,
 )
 from ai_server.integrations.bitrix.events import MESSAGE_EVENTS
+from ai_server.orchestrators.conversation_reference import resolve_conversation_reference
 from ai_server.settings import Settings
 from ai_server.utils import MOSCOW_TZ
 from ai_server.workers.bitrix.search_webhook_indexer import DISK_FILE_EVENT_MARKERS
@@ -42,6 +43,7 @@ async def run_webhook_event_worker(
     conversation_trace: Any = None,
     dialog_guard: Any = None,
     bitrix_sender: Any = None,
+    orchestrator_store: Any = None,
 ) -> None:
     worker_count = settings.webhook_event_queue_worker_count
     active_partition_keys: set[str] = set()
@@ -77,6 +79,7 @@ async def run_webhook_event_worker(
                 conversation_trace=conversation_trace,
                 dialog_guard=dialog_guard,
                 bitrix_sender=bitrix_sender,
+                orchestrator_store=orchestrator_store,
             )
         )
         for index in range(worker_count)
@@ -127,6 +130,7 @@ async def _run_webhook_event_worker_loop(
     conversation_trace: Any = None,
     dialog_guard: Any = None,
     bitrix_sender: Any = None,
+    orchestrator_store: Any = None,
 ) -> None:
     while True:
         event_id: int | None = None
@@ -160,6 +164,7 @@ async def _run_webhook_event_worker_loop(
                 conversation_trace=conversation_trace,
                 dialog_guard=dialog_guard,
                 bitrix_sender=bitrix_sender,
+                orchestrator_store=orchestrator_store,
             )
             await queue.mark_done(event_id, result)
             status["last_error"] = None
@@ -195,6 +200,7 @@ async def _route_event(
     conversation_trace: Any = None,
     dialog_guard: Any = None,
     bitrix_sender: Any = None,
+    orchestrator_store: Any = None,
 ) -> dict[str, Any]:
     """Route a Bitrix webhook event to the appropriate agent queue."""
     if event_type in MESSAGE_EVENTS:
@@ -204,6 +210,7 @@ async def _route_event(
             transcriber=transcriber,
             settings=settings,
         )
+        task = (await resolve_conversation_reference(task, orchestrator_store)).task
         guard_result = await _handle_dialog_guard(
             task,
             agent_queue=agent_queue,

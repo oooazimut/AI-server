@@ -782,9 +782,14 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                 continue
             tools = [item for item in registry.get("tools") or [] if isinstance(item, dict)]
             tool_ids = {item["id"] for item in tools}
+            capabilities = (
+                tool_ids or set(manifest.capabilities)
+                if agent_id == "bitrix24"
+                else set(manifest.capabilities) | tool_ids
+            )
             catalog[agent_id] = {
                 "description": str(manifest.handoff_description or manifest.name),
-                "capabilities": sorted(set(manifest.capabilities) | tool_ids),
+                "capabilities": sorted(capabilities),
                 "tools": tools,
                 "skills": [item for item in registry.get("skills") or [] if isinstance(item, dict)],
                 "contracts": [item for item in registry.get("contracts") or [] if isinstance(item, dict)],
