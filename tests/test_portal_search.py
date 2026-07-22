@@ -11,6 +11,7 @@ from ai_server.integrations.bitrix.portal_search import (
     sync_disk_delta_index,
     sync_portal_content_index,
     sync_portal_index,
+    sync_task_item,
 )
 from ai_server.integrations.bitrix.task_close_control import (
     TASK_CLOSE_DECISION_CONTROLLED,
@@ -653,6 +654,51 @@ def test_portal_metadata_sync_queues_controlled_direct_closed_tasks(monkeypatch)
     assert early_state is None
     assert late_state is not None
     assert late_state["status"] == TASK_CLOSE_DIRECT_STATUS_ACTIVE
+
+
+def test_targeted_task_webhook_refresh_queues_controlled_direct_close(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_DOMAIN", "asutp-expert.bitrix24.ru")
+    index = FakePortalSearchIndex()
+    index.set_task_close_control_setting(
+        key="control_enabled_from",
+        value="2026-07-12T00:00:00+03:00",
+        updated_by=1,
+    )
+    index.upsert_task_close_controlled_user(user_id=13, active=True, updated_by=1)
+
+    class TargetedClosedBitrix(FakePortalBitrix):
+        async def get_task(self, task_id: int, *, select=None):
+            return {
+                "task": {
+                    "ID": task_id,
+                    "TITLE": "Closed from webhook",
+                    "DESCRIPTION": "Point one\nPoint two",
+                    "STATUS": 5,
+                    "RESPONSIBLE_ID": 13,
+                    "CREATED_BY": 1,
+                    "CHANGED_DATE": "2026-07-12T16:01:00+03:00",
+                    "CLOSED_DATE": "2026-07-12T16:00:00+03:00",
+                    "CLOSED_BY": 13,
+                    "UF_TASK_WEBDAV_FILES": [],
+                }
+            }
+
+        async def result(self, method: str, payload: dict):
+            if method in {"task.commentitem.getlist", "tasks.task.result.list"}:
+                return []
+            return await super().result(method, payload)
+
+    anyio_run(sync_task_item(TargetedClosedBitrix(), index, task_id=420, settings=get_settings()))
+
+    close_key = task_close_event_key(task_id=420, closed_at="2026-07-12T16:00:00+03:00")
+    event = index.get_task_close_control_event(task_id=420, close_event_key=close_key)
+    state = index.get_task_close_processing_state(task_id=420, state_key=direct_close_state_key(close_key))
+    assert event is not None
+    assert event["decision"] == TASK_CLOSE_DECISION_CONTROLLED
+    assert state is not None
+    assert state["status"] == TASK_CLOSE_DIRECT_STATUS_ACTIVE
+    assert state["payload"]["task_points"] == ["Point one", "Point two"]
 
 
 def test_portal_metadata_sync_keeps_uncontrolled_direct_close_ignored_after_user_added(monkeypatch):

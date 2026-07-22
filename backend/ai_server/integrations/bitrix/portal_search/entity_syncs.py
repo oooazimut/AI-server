@@ -1313,6 +1313,8 @@ async def sync_task_item(
             "CREATED_DATE",
             "CHANGED_DATE",
             "CLOSED_DATE",
+            "CLOSED_BY",
+            "CLOSED_BY_USER_ID",
             "ACCOMPLICES",
             "AUDITORS",
             "UF_TASK_WEBDAV_FILES",
@@ -1329,11 +1331,49 @@ async def sync_task_item(
     )
     task_results = await _task_result_texts(bitrix, resolved_id, limit=_BITRIX_TASK_RESULT_LIMIT)
     title = str(_first(task, "title", "TITLE") or f"Задача #{resolved_id}")
+    task_attachments: list[dict[str, Any]] = []
+    if settings.search_index_include_task_attachments:
+        for attached_object_id in _attachment_ids(_first(task, "ufTaskWebdavFiles", "UF_TASK_WEBDAV_FILES")):
+            try:
+                attached = await bitrix.get_attached_object(attached_object_id)
+            except Exception:
+                continue
+            if isinstance(attached, dict):
+                task_attachments.append(attached)
+    current_report_files = await _task_close_report_records_from_attachments(
+        bitrix,
+        task_attachments,
+        settings=settings,
+    )
+    report_integrity_metadata = await _task_close_report_integrity_metadata(
+        bitrix=bitrix,
+        index=index,
+        settings=settings,
+        task_id=resolved_id,
+        task_title=title,
+        current_report_files=current_report_files,
+    )
+    effective_report_files = _dict_list(report_integrity_metadata.get("ai_close_report_files"))
     responsible_label = _person_label(_first(task, "responsible", "RESPONSIBLE"))
     creator_label = _person_label(_first(task, "creator", "CREATOR"))
     responsible = responsible_label or to_str(_first(task, "responsibleId", "RESPONSIBLE_ID"))
     creator = creator_label or to_str(_first(task, "createdBy", "CREATED_BY"))
     close_marker_metadata = _task_close_marker_metadata(task_results=task_results, comments=comments)
+    report_marker_metadata = _task_close_marker_metadata_from_report_files(effective_report_files)
+    if report_marker_metadata:
+        close_marker_metadata = {**close_marker_metadata, **report_marker_metadata}
+    event_synced_at = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
+    task_close_control_metadata, activation_key = _task_close_direct_control_metadata(
+        index,
+        task=task,
+        task_id=resolved_id,
+        task_title=title,
+        task_results=task_results,
+        current_report_files=effective_report_files,
+        close_marker_metadata=close_marker_metadata,
+        settings=settings,
+        now_iso=event_synced_at,
+    )
     body_parts = [
         str(_first(task, "description", "DESCRIPTION") or ""),
         f"Статус: {_first(task, 'status', 'STATUS')}",
@@ -1349,7 +1389,6 @@ async def sync_task_item(
     ]
     existing = index.get_item(entity_type="task", entity_id=resolved_id)
     preserved = dict(existing.metadata) if existing is not None else {}
-    event_synced_at = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
     metadata = {
         **preserved,
         "status": _first(task, "status", "STATUS"),
@@ -1369,7 +1408,9 @@ async def sync_task_item(
         "task_results_indexed": bool(task_results),
         "task_results_count": len(task_results),
         "event_synced_at": event_synced_at,
+        **report_integrity_metadata,
         **close_marker_metadata,
+        **task_close_control_metadata,
     }
     index.upsert_item(
         entity_type="task",
@@ -1380,6 +1421,23 @@ async def sync_task_item(
         metadata=metadata,
         source_updated_at=to_str(_first(task, "changedDate", "CHANGED_DATE")) or event_synced_at,
     )
+    report_files_by_attachment_id = {
+        to_str(record.get("attached_object_id")): record
+        for record in effective_report_files
+        if to_str(record.get("attached_object_id"))
+    }
+    for attached in task_attachments:
+        _index_task_attachment(
+            index,
+            attached=attached,
+            task_id=resolved_id,
+            task_title=title,
+            task_updated_at=to_str(_first(task, "changedDate", "CHANGED_DATE")),
+            report_file=report_files_by_attachment_id.get(to_str(_first(attached, "ID", "id"))),
+            settings=settings,
+        )
+    if activation_key is not None:
+        _activate_task_close_direct_queues(index, {activation_key}, now_iso=event_synced_at)
     return index.get_item(entity_type="task", entity_id=resolved_id)
 
 
