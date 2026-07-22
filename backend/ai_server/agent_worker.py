@@ -42,6 +42,7 @@ from ai_server.integrations.redis.event_queue import RedisEventQueue
 from ai_server.integrations.redis.outbound_queue import RedisOutboundQueue
 from ai_server.llm import build_orchestrator_llm_client
 from ai_server.models import AgentTask
+from ai_server.orchestrators.entity_catalog import OrchestratorEntityCatalog
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.orchestrators.plan_authoritative import DeepSeekPlanService
 from ai_server.registry import load_agent_manifests
@@ -163,6 +164,14 @@ async def main() -> None:
     if settings.webhook_event_queue_enabled and settings.webhook_event_worker_enabled:
         bitrix_llm_svc = BitrixLLMService(settings=settings)
         logistics_llm_svc = LogisticsLLMService()
+        entity_catalog = OrchestratorEntityCatalog(
+            bitrix,
+            refresh_interval_seconds=settings.orchestrator_entity_catalog_refresh_seconds,
+            user_limit=settings.orchestrator_entity_catalog_user_limit,
+            project_limit=settings.orchestrator_entity_catalog_project_limit,
+            warehouse_limit=settings.orchestrator_entity_catalog_warehouse_limit,
+        )
+        await entity_catalog.refresh()
 
         vu_settings = (
             VehicleUsageSettings(
@@ -189,6 +198,7 @@ async def main() -> None:
             scheduler=scheduler,
             orchestrator_llm=DeepSeekPlanService(build_orchestrator_llm_client(settings)),
             orchestrator_store=orchestrator_store,
+            orchestrator_entity_catalog=entity_catalog,
             bitrix_llm=bitrix_llm_svc,
             bitrix_store=bitrix_store,
             pto_llm=PtoLLMService(),
@@ -213,6 +223,7 @@ async def main() -> None:
             orch_manifest,
             **specialist_deps.as_build_kwargs(),
         )
+        agent_tasks.append(asyncio.create_task(entity_catalog.run_periodic()))
 
         agent_queue = RedisAgentQueue(
             settings.redis_url,

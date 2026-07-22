@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
+from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI
 
 from .agent_scheduler import AgentScheduler
@@ -25,6 +26,7 @@ from .integrations.redis.dialog_guard import RedisDialogGuard
 from .integrations.redis.event_queue import RedisEventQueue
 from .integrations.redis.outbound_queue import RedisOutboundQueue
 from .llm import build_orchestrator_llm_client
+from .orchestrators.entity_catalog import OrchestratorEntityCatalog
 from .orchestrators.internal import InternalOrchestrator
 from .orchestrators.orchestrator_llm import OrchestratorLLMService
 from .registry import load_agent_manifests
@@ -247,6 +249,14 @@ async def lifespan(app: FastAPI):
 
     if settings.webhook_event_queue_enabled and settings.webhook_event_worker_enabled:
         bitrix_llm_svc = BitrixLLMService(settings=settings)
+        entity_catalog = OrchestratorEntityCatalog(
+            bitrix,
+            refresh_interval_seconds=settings.orchestrator_entity_catalog_refresh_seconds,
+            user_limit=settings.orchestrator_entity_catalog_user_limit,
+            project_limit=settings.orchestrator_entity_catalog_project_limit,
+            warehouse_limit=settings.orchestrator_entity_catalog_warehouse_limit,
+        )
+        await entity_catalog.refresh()
 
         vu_settings = (
             VehicleUsageSettings(
@@ -275,6 +285,7 @@ async def lifespan(app: FastAPI):
             scheduler=scheduler,
             orchestrator_llm=OrchestratorLLMService(build_orchestrator_llm_client(settings)),
             orchestrator_store=orchestrator_store,
+            orchestrator_entity_catalog=entity_catalog,
             bitrix_llm=bitrix_llm_svc,
             bitrix_store=bitrix_store,
             pto_llm=PtoLLMService(),
@@ -295,6 +306,14 @@ async def lifespan(app: FastAPI):
             **specialist_deps.as_build_kwargs(),
         )
         app.state.orchestrator = orchestrator
+        app.state.orchestrator_entity_catalog = entity_catalog
+        scheduler.add_job(
+            "orchestrator",
+            "entity_catalog_refresh",
+            entity_catalog.refresh,
+            IntervalTrigger(seconds=settings.orchestrator_entity_catalog_refresh_seconds),
+            replace_existing=True,
+        )
 
         agent_queue = _make_agent_queue(settings)
         app.state.agent_queue = agent_queue

@@ -301,7 +301,7 @@ def test_handle_preserves_approval_and_needs_human_state():
     assert [item.name for item in output.actions_requiring_approval] == ["write"]
 
 
-def test_new_calendar_request_is_discarded_during_active_task_draft():
+def test_new_calendar_request_still_reaches_pro_during_active_task_draft():
     class DraftingSpecialist(_Specialist):
         async def get_active_draft(self, dialog_key):
             return {
@@ -335,15 +335,13 @@ def test_new_calendar_request_is_discarded_during_active_task_draft():
         )
     )
 
-    assert output.status == "needs_clarification"
-    assert len(specialist.tasks) == 0
-    assert output.metadata["reason"] == "ACTIVE_DRAFT_ALREADY_EXISTS"
-    assert "Проверить договор" in output.answer
-    assert "Для управления активным черновиком: подтвердить или отменить." in output.answer
+    assert output.status == "completed"
+    assert len(specialist.tasks) == 1
+    assert specialist.tasks[0].context["active_bitrix_draft"]["_draft_type"] == "task_create"
     assert asyncio.run(store.get_replacement_candidate("d1")) is None
 
 
-def test_second_task_draft_is_discarded_instead_of_replacing_active_draft():
+def test_second_task_request_still_reaches_pro_with_active_draft_context():
     class DraftingSpecialist(_Specialist):
         async def get_active_draft(self, dialog_key):
             return {"_draft_id": "draft-1", "_draft_type": "task_create", "_draft_version": 1}
@@ -366,9 +364,9 @@ def test_second_task_draft_is_discarded_instead_of_replacing_active_draft():
         subject.handle(AgentTask(task_id="t1", request="создай задачу проверить договор", context={"dialog_key": "d1"}))
     )
 
-    assert output.status == "needs_clarification"
-    assert len(specialist.tasks) == 0
-    assert output.metadata["reason"] == "ACTIVE_DRAFT_ALREADY_EXISTS"
+    assert output.status == "completed"
+    assert len(specialist.tasks) == 1
+    assert specialist.tasks[0].context["active_bitrix_draft"]["_draft_type"] == "task_create"
     assert asyncio.run(store.get_replacement_candidate("d1")) is None
 
 

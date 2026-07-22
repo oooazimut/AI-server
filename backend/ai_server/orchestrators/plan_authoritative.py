@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from ai_server.agents.base import _trace_now_iso
-from ai_server.agents.bitrix24.draft_confirmation import matches_draft_confirmation
 from ai_server.capability_registry import registry_tool, validate_tool_arguments
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
 from ai_server.models import (
@@ -37,6 +36,7 @@ from ai_server.orchestrators.bitrix_semantics import (
 )
 from ai_server.orchestrators.conversation_reference import resolve_conversation_reference
 from ai_server.orchestrators.internal import InternalOrchestrator
+from ai_server.orchestrators.orchestrator_policy import selected_bitrix_policy
 from ai_server.orchestrators.tools.call_specialist import CallSpecialistTool
 
 PLAN_SCHEMA = "t0007.plan.v2"
@@ -56,6 +56,9 @@ REPAIRABLE_PLAN_REJECTIONS = frozenset(
         "STRUCTURED_COMMAND_ARGUMENTS_INVALID",
         "SEMANTIC_ARGUMENTS_INVALID",
         "SEMANTIC_TOOL_MISMATCH",
+        "ENTITY_AMBIGUOUS",
+        "ENTITY_NOT_FOUND",
+        "ENTITY_ID_MISMATCH",
     }
 )
 
@@ -114,82 +117,8 @@ _PLANNER_DOMAINS: tuple[dict[str, object], ...] = (
     },
 )
 
-_ACTIVE_DRAFT_MANAGEMENT_HINT = "Для управления активным черновиком: подтвердить или отменить."
-
-
 def _normalized_text(value: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s-]", " ", value.casefold())).strip()
-
-
-def _draft_intent(request: str) -> str | None:
-    text = _normalized_text(request)
-    if re.search(
-        r"\bнапомни\b|\bнапоминани|\bкалендар|\bсозда(?:й|ть|йте)\s+событи|"
-        r"\bдобав(?:ь|ить|ьте)\b.*\bкалендар",
-        text,
-    ):
-        return "calendar_event"
-    if re.search(r"\bсозда(?:й|ть|йте)\s+проект", text):
-        return "project_create"
-    if re.search(r"\bзакр(?:ой|ыть|ойте)\s+задач", text):
-        return "task_close"
-    if re.search(r"\bсозда(?:й|ть|йте)\s+задач", text):
-        return "task_create"
-    return None
-
-
-def _draft_discard_request(request: str) -> bool:
-    text = _normalized_text(request)
-    return any(marker in text for marker in ("отмени черновик", "отменить черновик", "не создавай", "удали черновик"))
-
-
-def _is_new_request_during_draft(
-    request: str,
-    draft: dict[str, Any],
-    *,
-    allow_short_command: bool = False,
-) -> bool:
-    if matches_draft_confirmation(request, draft, allow_short_command=allow_short_command) or _draft_discard_request(
-        request
-    ):
-        return False
-    incoming = _draft_intent(request)
-    # A read-only request has no draft intent and must remain available while a
-    # draft is waiting for confirmation.  Every new write intent, including a
-    # second request of the same type, is blocked: one dialog has one draft.
-    return bool(incoming)
-
-
-def _active_draft_summary(draft: dict[str, Any]) -> str:
-    """Render a compact reminder without coupling the orchestrator to tool formatters."""
-    draft_type = str(draft.get("_draft_type") or "task_create")
-    labels = {
-        "task_create": "создание задачи",
-        "task_close": "закрытие задачи",
-        "calendar_event": "запись в календаре",
-        "project_create": "создание проекта",
-        "admin_change": "изменение настройки",
-    }
-    fields = draft.get("fields") if isinstance(draft.get("fields"), dict) else {}
-    params = draft.get("params") if isinstance(draft.get("params"), dict) else {}
-    nested_fields = params.get("fields") if isinstance(params.get("fields"), dict) else {}
-    title = next(
-        (
-            str(value).strip()
-            for value in (
-                draft.get("task_title"),
-                draft.get("title"),
-                fields.get("TITLE"),
-                nested_fields.get("TITLE"),
-                nested_fields.get("NAME"),
-                params.get("name"),
-            )
-            if value not in (None, "") and str(value).strip()
-        ),
-        "",
-    )
-    label = labels.get(draft_type, "операция Bitrix")
-    return f"Активный черновик — {label}: «{title}»." if title else f"Активный черновик — {label}."
 
 
 def _planning_draft_view(draft: dict[str, Any]) -> dict[str, Any]:
@@ -244,6 +173,7 @@ class DeepSeekPlanService:
             "user": task.user.model_dump(),
             "dialog_history": list(task.context.get("dialog_history") or []),
             "active_bitrix_draft": task.context.get("active_bitrix_draft"),
+            "entity_catalog": task.context.get("orchestrator_entity_catalog"),
             "execution_history": list(task.context.get("orchestrator_execution_history") or []),
             "capability_catalog": catalog,
             "hard_constraints": {
@@ -307,7 +237,10 @@ class DeepSeekPlanService:
                         "For every tool marked structured_command=true, choose the exact tool and arguments yourself and "
                         "return a structured_command with registry_version set to the literal CURRENT. The backend binds "
                         "CURRENT to the authoritative live catalog version before dispatch. The specialist will execute it once and is forbidden "
-                        "to reinterpret the request. Use the specialist skills in capability_catalog as business rules. "
+                        "to reinterpret the request. Use selected_orchestrator_rules as the business authority; "
+                        "specialist skills are capability labels only and must not change meaning. "
+                        "Resolve named employees, projects and warehouses only from entity_catalog and place exact IDs "
+                        "into the structured command. If no unique entry exists, ask one clarification. "
                         "The tools list is the complete capability index; tool_contracts contains detailed schemas for this request. "
                         "selected_skill_rules and selected_contract_rules contain the applicable detailed rules. "
                         "For such a subtask, capability and structured_command.tool_name must both equal that exact tool id. "
@@ -441,14 +374,24 @@ def _planner_capability_catalog(catalog: dict[str, Any], request: str) -> dict[s
             ],
             "tool_contracts": selected_tools,
             "skills": [{"id": item.get("id"), "title": item.get("title")} for item in skills],
-            "selected_skill_rules": [item for item in skills if str(item.get("id") or "") in detailed_skill_ids],
+            "selected_skill_rules": (
+                [] if specialist_id == "bitrix24" else [
+                    item for item in skills if str(item.get("id") or "") in detailed_skill_ids
+                ]
+            ),
             "contracts": [{"id": item.get("id")} for item in contracts],
-            "selected_contract_rules": [
-                item for item in contracts if str(item.get("id") or "") in detailed_contract_ids
-            ],
+            "selected_contract_rules": (
+                [] if specialist_id == "bitrix24" else [
+                    item for item in contracts if str(item.get("id") or "") in detailed_contract_ids
+                ]
+            ),
             "allowed_actions": list(entry.get("allowed_actions") or []),
             "approval_required": list(entry.get("approval_required") or []),
         }
+        if specialist_id == "bitrix24":
+            policy = selected_bitrix_policy(request)
+            compact[specialist_id]["orchestrator_policy_version"] = policy["schema_version"]
+            compact[specialist_id]["selected_orchestrator_rules"] = policy["rules"]
     return compact
 
 
@@ -715,9 +658,16 @@ def _decode_plan(raw: str, *, plan_id: str, request: str, constraints: dict[str,
 class PlanAuthoritativeOrchestrator(InternalOrchestrator):
     """Live replacement selected by ``InternalOrchestrator.build`` for S04."""
 
-    def __init__(self, *args: Any, planner: PlanAuthoritativeLLM, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        planner: PlanAuthoritativeLLM,
+        entity_catalog: Any | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._planner = planner
+        self._entity_catalog = entity_catalog
 
     @classmethod
     def build(cls, manifest: AgentManifest | None, **kwargs: Any) -> PlanAuthoritativeOrchestrator:
@@ -731,6 +681,7 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
         channels = kwargs.pop("channels", None)
         footer_service = kwargs.pop("footer_service", None)
         result_publisher = kwargs.pop("result_publisher", None)
+        entity_catalog = kwargs.pop("orchestrator_entity_catalog", None)
         if not kwargs.get("bitrix_bot"):
             kwargs["bitrix_bot"] = kwargs.get("bitrix_client")
         specialists = build_specialist_registry(
@@ -752,6 +703,7 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             conversation_trace=kwargs.get("conversation_trace"),
             dialog_guard=kwargs.get("dialog_guard"),
             planner=planner,
+            entity_catalog=entity_catalog,
             outbound_queue=kwargs.get("outbound_queue"),
         )
         call.schedule_fn = instance._apply_scheduled_tasks_from_specialist
@@ -833,25 +785,8 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
         if self.store is not None and dialog_key and answer and hasattr(self.store, "append_turn"):
             await self.store.append_turn(dialog_key, task.request, answer)  # type: ignore[attr-defined]
 
-    def _draft_control_result(self, task: AgentTask, answer: str, *, reason: str) -> AgentResult:
-        usage = ModelUsageRecord(
-            agent_id=self.manifest.id,
-            provider="internal",
-            model="active-draft-state-machine",
-            status="not_used",
-            notes=["No model call: protected active draft state was handled deterministically."],
-        )
-        return AgentResult(
-            status="needs_clarification",
-            agent_id=self.manifest.id,
-            answer=answer,
-            model_usage=[usage],
-            actions_taken=[ActionRecord(name="active_draft_guard", status="ok", details={"reason": reason})],
-            metadata={"reason": reason, "route": "active_draft_guard"},
-        )
-
     async def _guard_active_draft(self, task: AgentTask) -> tuple[AgentTask, AgentResult | None]:
-        """Allow one write draft per dialog and discard conflicting new requests."""
+        """Attach branch-local draft state; the mandatory Pro planner decides meaning."""
         dialog_key = str(task.context.get("dialog_key") or "")
         call = self._tool_registry.get("call_specialist")
         if not dialog_key or not isinstance(call, CallSpecialistTool):
@@ -860,18 +795,7 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
         if not draft:
             return task, None
         task = task.model_copy(update={"context": {**task.context, "active_bitrix_draft": _planning_draft_view(draft)}})
-        if not _is_new_request_during_draft(
-            task.request,
-            draft,
-            allow_short_command=bool(task.context.get("conversation_reference_explicit")),
-        ):
-            return task, None
-        return task, self._draft_control_result(
-            task,
-            "Новый запрос не запущен: в этом диалоге уже есть активный черновик.\n\n"
-            f"{_active_draft_summary(draft)}\n\n{_ACTIVE_DRAFT_MANAGEMENT_HINT}",
-            reason="ACTIVE_DRAFT_ALREADY_EXISTS",
-        )
+        return task, None
 
     async def handle(self, task: AgentTask) -> AgentResult:
         started = time.monotonic()
@@ -949,20 +873,12 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                 status="completed",
                 details={"pending_specialist": str(task.context.get("pending_specialist") or "")},
             )
-            task, draft_guard_result = await self._guard_active_draft(task)
-            if draft_guard_result is not None:
-                draft_guard_result = draft_guard_result.model_copy(
-                    update={
-                        "metadata": {
-                            **draft_guard_result.metadata,
-                            "total_ms": round((time.monotonic() - started) * 1000, 1),
-                        }
-                    }
+            task, _ = await self._guard_active_draft(task)
+            if self._entity_catalog is not None:
+                entity_view = self._entity_catalog.view_for_request(task.request)
+                task = task.model_copy(
+                    update={"context": {**task.context, "orchestrator_entity_catalog": entity_view}}
                 )
-                await self._append_authoritative_dialog_turn(task, draft_guard_result.answer)
-                await self._send_to_channel(task, draft_guard_result)
-                await self._publish_result(task, draft_guard_result)
-                return draft_guard_result
             catalog = self._catalog()
             planner_catalog = _planner_capability_catalog(catalog, task.request)
             pending_specialist = str(task.context.get("pending_specialist") or "").strip()

@@ -146,6 +146,7 @@ class CalendarEventDraftTool:
                     "date_iso": {"type": "string"},
                     "end_iso": {"type": "string"},
                     "attendee_ids": {"type": "array", "items": {"type": "integer"}},
+                    "owner_name": {"type": "string"},
                     "reminder_minutes": {"type": "integer"},
                 },
                 "required": ["title"],

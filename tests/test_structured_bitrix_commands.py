@@ -154,11 +154,13 @@ def test_planner_catalog_keeps_complete_index_but_only_relevant_bitrix_details()
         "bitrix_warehouse_search",
         "bitrix_api",
     }
-    assert {item["id"] for item in compact["bitrix24"]["selected_skill_rules"]} == {
-        "orchestrator_command_contract",
-        "catalog",
+    assert compact["bitrix24"]["selected_skill_rules"] == []
+    assert compact["bitrix24"]["selected_contract_rules"] == []
+    assert compact["bitrix24"]["orchestrator_policy_version"] == "orchestrator.bitrix_policy.v1"
+    assert {item["id"] for item in compact["bitrix24"]["selected_orchestrator_rules"]} >= {
+        "authority",
+        "warehouse_search",
     }
-    assert compact["bitrix24"]["selected_contract_rules"] == catalog["bitrix24"]["contracts"]
     assert compact["logistics"]["tool_contracts"] == catalog["logistics"]["tools"]
 
 

@@ -212,15 +212,10 @@ class Bitrix24Specialist(BaseSpecialist):
 
         definitions = self.tool_definitions()
         available = {str(item.get("name") or "") for item in definitions if isinstance(item, dict)}
-        enabled = (
-            self._settings_for_qc.resolved_bitrix_structured_command_tools(available)
-            if self._settings_for_qc is not None
-            else available
-        )
         return build_capability_registry(
             self.manifest,
             definitions,
-            structured_tool_names=enabled,
+            structured_tool_names=available,
         )
 
     async def execute_structured_command(self, task: AgentTask, command: dict[str, Any]) -> AgentResult:
@@ -240,7 +235,7 @@ class Bitrix24Specialist(BaseSpecialist):
         arguments = dict(command["arguments"])
         context_started_at = _trace_now_iso()
         context_t0 = time.monotonic()
-        task, context_details = await self._load_extra_context(task)
+        task, context_details = await self._load_structured_context(task, tool_name)
         task = task.model_copy(update={"context": {**task.context, "structured_command_execution": True}})
         await self._record_timing(
             task,
@@ -507,7 +502,7 @@ class Bitrix24Specialist(BaseSpecialist):
         )
 
     async def handle(self, task: AgentTask) -> AgentResult:
-        """Dispatch quality-control events to internal handler; all else goes to LLM loop."""
+        """Allow only autonomous QC; user traffic must arrive as an exact command."""
         bitrix_event_type = str(task.context.get("bitrix_event_type") or "").upper()
         if (
             task.request == "quality_control"
@@ -521,6 +516,31 @@ class Bitrix24Specialist(BaseSpecialist):
                 bitrix=self._bitrix_task_client,
                 settings=self._settings_for_qc,
             )
+        if task.context.get("channel_id") or task.context.get("recipient_id"):
+            return AgentResult(
+                status="failed",
+                agent_id=self.manifest.id,
+                answer="Bitrix отклонил пользовательский запрос без готовой команды оркестратора.",
+                model_usage=[
+                    ModelUsageRecord(
+                        agent_id=self.manifest.id,
+                        provider="internal",
+                        model="bitrix-executor-guard",
+                        status="not_used",
+                        notes=["Conversational Bitrix semantic path is disabled."],
+                    )
+                ],
+                actions_taken=[
+                    ActionRecord(
+                        name="bitrix_executor_guard",
+                        status="rejected",
+                        details={"reason": "ORCHESTRATOR_STRUCTURED_COMMAND_REQUIRED"},
+                    )
+                ],
+                metadata={"reason": "ORCHESTRATOR_STRUCTURED_COMMAND_REQUIRED"},
+            )
+        # Compatibility-only surface for isolated unit tests and internal
+        # maintenance. The live CallSpecialistTool rejects this path for Bitrix.
         result = await super().handle(task)
         return _enforce_task_close_response(result, settings=self._settings_for_qc)
 
@@ -556,8 +576,13 @@ class Bitrix24Specialist(BaseSpecialist):
                     [],
                 )
         if tool_call.name == "task_create_draft":
+            source_args = dict(tool_call.args or {})
+            if task.context.get("structured_command_execution"):
+                prepared_args = source_args
+            else:
+                prepared_args = _task_create_args_with_actor_label(source_args, task)
             args = _draft_args_with_metadata(
-                _task_create_args_with_actor_label(dict(tool_call.args or {}), task),
+                prepared_args,
                 task,
             )
             tool_call = SimpleNamespace(
@@ -566,8 +591,13 @@ class Bitrix24Specialist(BaseSpecialist):
                 summary=getattr(tool_call, "summary", ""),
             )
         elif tool_call.name == "calendar_event_draft":
+            source_args = dict(tool_call.args or {})
+            if task.context.get("structured_command_execution"):
+                prepared_args = source_args
+            else:
+                prepared_args = _calendar_event_args_with_actor_label(source_args, task)
             args = _draft_args_with_metadata(
-                _calendar_event_args_with_actor_label(dict(tool_call.args or {}), task),
+                prepared_args,
                 task,
             )
             tool_call = SimpleNamespace(
@@ -709,6 +739,39 @@ class Bitrix24Specialist(BaseSpecialist):
             ],
         }
         return merged_task, extra_details
+
+    async def _load_structured_context(self, task: AgentTask, tool_name: str) -> tuple[AgentTask, dict]:
+        """Load only executor safety state required by the exact command."""
+
+        context: dict[str, Any] = {}
+        if tool_name in {
+            "task_create_confirm",
+            "task_close_confirm",
+            "calendar_event_confirm",
+            "project_create_confirm",
+            "task_draft_discard",
+            "task_close_discard",
+            "calendar_event_discard",
+            "project_create_discard",
+        }:
+            dialog_key = str(task.context.get("dialog_key") or "")
+            if dialog_key and self._draft_store is not None:
+                pending = await self._draft_store.get_task_draft(
+                    dialog_key,
+                    ttl_minutes=self._settings_for_qc.bitrix_task_draft_ttl_minutes
+                    if self._settings_for_qc
+                    else None,
+                )
+                if pending:
+                    context["pending_task_draft"] = pending
+        if tool_name in {"project_create_draft", "task_close_control_get", "task_close_control_update"}:
+            context.update(await self._load_permission_context(task))
+        merged = task.model_copy(update={"context": {**task.context, **context}})
+        return merged, {
+            "mode": "structured_minimal",
+            "loaded_draft": "pending_task_draft" in context,
+            "loaded_permission_profile": "bitrix_current_user_profile" in context,
+        }
 
     async def _load_permission_context(self, task: AgentTask) -> dict:
         profile_result = await self._current_user_profile_result(task)

@@ -196,6 +196,11 @@ class BitrixTaskSearchTool:
                         "enum": ["my", "responsible", "created_by", "member", "all"],
                         "description": "Current-user role filter. Default: my.",
                     },
+                    "target_user_id": {
+                        "type": "integer",
+                        "description": "Exact employee ID selected by the orchestrator; ACL still uses the requester.",
+                    },
+                    "target_user_name": {"type": "string"},
                     "status": {
                         "type": "string",
                         "enum": ["active", "open", "closed", "overdue", "deferred", "declined", "all"],
@@ -306,7 +311,11 @@ class BitrixTaskSearchTool:
             )
 
         scope = _scope_arg(args.get("scope"))
-        if scope in {"my", "responsible", "created_by", "member"} and user_id is None:
+        target_user_id = _safe_int(args.get("target_user_id"))
+        scope_user_id = target_user_id or user_id
+        if user_id is None or (
+            scope in {"my", "responsible", "created_by", "member"} and scope_user_id is None
+        ):
             return ToolResult(
                 status=ToolStatus.DENIED,
                 tool=self.name,
@@ -392,7 +401,7 @@ class BitrixTaskSearchTool:
             query=comment_query or query or (AI_CLOSE_INCOMPLETE_MARKER if ai_close_incomplete else ""),
             scope=scope,
             status=status,
-            user_id=user_id,
+            user_id=scope_user_id,
             project_id=project_id,
             created_from=_first_arg_text(args, "created_from", "created_start"),
             created_to=_first_arg_text(args, "created_to", "created_end"),
@@ -410,7 +419,24 @@ class BitrixTaskSearchTool:
             access_actor=access_actor,
         )
         if snapshot_result is not None:
-            return snapshot_result
+            if read_client is None:
+                read_client, access_actor, access_error = await resolve_current_user_read_client(
+                    self.name,
+                    fallback_client=self._client,
+                    bitrix_oauth=self._bitrix_oauth,
+                    user_id=user_id,
+                )
+                if access_error is not None:
+                    return access_error
+            verified_snapshot = await _verify_snapshot_task_result(
+                read_client,
+                snapshot_result,
+                scope=scope,
+                scope_user_id=scope_user_id,
+                access_actor=access_actor,
+            )
+            if verified_snapshot is not None:
+                return verified_snapshot
         if ai_close_incomplete:
             return ToolResult(
                 status=ToolStatus.NOT_CONFIGURED,
@@ -446,7 +472,7 @@ class BitrixTaskSearchTool:
         calls = _task_search_calls(
             scope=scope,
             status=status,
-            user_id=user_id,
+            user_id=scope_user_id,
             project_id=project_id,
             query="" if include_comments else query,
         )
@@ -461,7 +487,7 @@ class BitrixTaskSearchTool:
             )
 
         scope_filtered_tasks = [
-            task for task in sorted_tasks if _matches_snapshot_scope(task, scope=scope, user_id=user_id)
+            task for task in sorted_tasks if _matches_snapshot_scope(task, scope=scope, user_id=scope_user_id)
         ]
         pre_comment_filtered = [
             task
@@ -512,6 +538,8 @@ class BitrixTaskSearchTool:
                 "source": "live_bitrix_rest",
                 "access_actor": access_actor,
                 "scope": scope,
+                "target_user_id": target_user_id,
+                "target_user_name": _first_arg_text(args, "target_user_name"),
                 "scope_label": _scope_label(scope),
                 "status": status,
                 "query": query,
@@ -663,6 +691,65 @@ def _snapshot_scope_is_user_bounded(scope: str, *, user_id: int | None) -> bool:
     return user_id is not None and scope in {"my", "responsible", "created_by", "member"}
 
 
+async def _verify_snapshot_task_result(
+    client: BitrixToolClientPort,
+    result: ToolResult,
+    *,
+    scope: str,
+    scope_user_id: int | None,
+    access_actor: str,
+) -> ToolResult | None:
+    """Intersect PostgreSQL candidates with tasks visible to the requester OAuth."""
+
+    data = dict(result.data or {})
+    items = [item for item in data.get("items") or [] if isinstance(item, dict)]
+    task_ids = [_safe_int(item.get("id")) for item in items]
+    task_ids = [item for item in task_ids if item is not None]
+    if not task_ids:
+        return result.model_copy(
+            update={
+                "data": {
+                    **data,
+                    "source": "postgres_candidates_live_acl",
+                    "access_actor": access_actor,
+                    "access_verified_at": datetime.now(UTC).isoformat(),
+                    "access_filtered_count": 0,
+                }
+            }
+        )
+    try:
+        raw = await client.result(
+            "tasks.task.list",
+            {
+                "filter": {"ID": task_ids},
+                "select": TASK_SELECT,
+                "order": {"ID": "ASC"},
+            },
+        )
+    except (BitrixApiError, BitrixConfigError):
+        return None
+    # The indexed candidate was already role-filtered against the requested
+    # employee. The current-user OAuth query below is only an ACL intersection;
+    # Bitrix list payloads may omit accomplice/auditor arrays.
+    visible_tasks = _extract_tasks(raw)
+    visible_ids = {_safe_int(_task_id(task)) for task in visible_tasks}
+    verified_items = [item for item in items if _safe_int(item.get("id")) in visible_ids]
+    return result.model_copy(
+        update={
+            "data": {
+                **data,
+                "source": "postgres_candidates_live_acl",
+                "access_actor": access_actor,
+                "access_verified_at": datetime.now(UTC).isoformat(),
+                "access_filtered_count": len(items) - len(verified_items),
+                "items": verified_items,
+                "total": len(verified_items),
+                "has_more": False,
+            }
+        }
+    )
+
+
 def _snapshot_result_to_task(item: Any, *, query: str) -> dict[str, Any]:
     metadata = dict(getattr(item, "metadata", {}) or {})
     body = str(getattr(item, "body", "") or "")
@@ -780,6 +867,10 @@ class BitrixProjectSearchTool:
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Project/workgroup name to search."},
+                    "project_id": {
+                        "type": "integer",
+                        "description": "Exact project ID selected by the orchestrator entity catalog.",
+                    },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
@@ -787,7 +878,7 @@ class BitrixProjectSearchTool:
                         "description": "Maximum projects to return. Default: 10.",
                     },
                 },
-                "required": ["query"],
+                "anyOf": [{"required": ["query"]}, {"required": ["project_id"]}],
             },
         )
 
@@ -806,11 +897,12 @@ class BitrixProjectSearchTool:
                 error="BitrixClient or PortalSearchIndex is required",
             )
         query = _first_arg_text(args, "query", "project", "name")
-        if not query:
+        project_id = _safe_int(args.get("project_id"))
+        if not query and project_id is None:
             return ToolResult(
                 status=ToolStatus.ERROR,
                 tool=self.name,
-                error="Project query is required.",
+                error="Project query or exact project_id is required.",
                 data={"query": ""},
             )
         limit = _bounded_int(
@@ -831,21 +923,6 @@ class BitrixProjectSearchTool:
             if access_error is not None:
                 return access_error
 
-        snapshot_matches = _search_projects_snapshot(self._portal_search, query, limit=limit)
-        if snapshot_matches is not None:
-            return ToolResult(
-                status=ToolStatus.OK,
-                tool=self.name,
-                data={
-                    "source": "postgres_portal_snapshot",
-                    "access_actor": access_actor,
-                    "query": query,
-                    "items": snapshot_matches,
-                    "total": len(snapshot_matches),
-                    "limit": limit,
-                    "errors": [],
-                },
-            )
         if read_client is None:
             read_client, access_actor, access_error = await resolve_current_user_read_client(
                 self.name,
@@ -855,14 +932,28 @@ class BitrixProjectSearchTool:
             )
             if access_error is not None:
                 return access_error
-        matches, errors = await _search_projects(read_client, query, limit=limit)
+        snapshot_matches = _search_projects_snapshot(self._portal_search, query, limit=limit) if query else None
+        if project_id is not None:
+            try:
+                raw = await read_client.result(
+                    "sonet_group.get",
+                    {"FILTER": {"ID": project_id}, "ORDER": {"NAME": "ASC"}},
+                )
+                matches = _extract_sonet_groups(raw)[:1]
+                errors = []
+            except (BitrixApiError, BitrixConfigError) as exc:
+                matches, errors = [], [{"source": "sonet_group.get", "error": str(exc)}]
+        else:
+            matches, errors = await _search_projects(read_client, query, limit=limit)
         return ToolResult(
             status=ToolStatus.OK,
             tool=self.name,
             data={
-                "source": "live_bitrix_rest",
+                "source": "postgres_candidates_live_acl" if snapshot_matches is not None else "live_bitrix_rest",
                 "access_actor": access_actor,
+                "access_verified_at": datetime.now(UTC).isoformat(),
                 "query": query,
+                "project_id": project_id,
                 "items": [_project_summary(group) for group in matches],
                 "total": len(matches),
                 "limit": limit,

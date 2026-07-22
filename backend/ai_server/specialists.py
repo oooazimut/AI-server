@@ -31,6 +31,7 @@ class SpecialistDeps:
     orchestrator_llm: Any = None
     orchestrator_store: Any = None  # AgentDialogStorePort | None
     orchestrator_retriever: Any = None  # HybridKnowledgeRetriever | None
+    orchestrator_entity_catalog: Any = None  # OrchestratorEntityCatalog | None
     # bitrix24 specialist
     bitrix_llm: Any = None
     bitrix_retriever: Any = None

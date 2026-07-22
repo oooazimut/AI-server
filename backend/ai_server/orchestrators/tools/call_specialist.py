@@ -137,6 +137,7 @@ class CallSpecialistTool:
                     "state_transition": "failed",
                 },
             )
+
         return ToolResult(
             status=ToolStatus.OK,
             tool=self.name,
@@ -227,6 +228,19 @@ class CallSpecialistTool:
                 status=ToolStatus.ERROR,
                 tool=self.name,
                 error=f"unknown specialist: {specialist_id}",
+            )
+        registry = self.capability_registry(specialist_id)
+        requires_structured = specialist_id == "bitrix24" and any(
+            bool(item.get("structured_command"))
+            for item in (registry or {}).get("tools") or []
+            if isinstance(item, dict)
+        )
+        if requires_structured and not isinstance(structured_command, dict):
+            return ToolResult(
+                status=ToolStatus.INVALID_TOOL_CALL,
+                tool=self.name,
+                error="Bitrix requires one exact structured command from the orchestrator.",
+                data={"reason": "ORCHESTRATOR_STRUCTURED_COMMAND_REQUIRED"},
             )
 
         dialog_key = str(task.context.get("dialog_key") or "") or None

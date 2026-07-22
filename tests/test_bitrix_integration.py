@@ -495,7 +495,7 @@ def test_bitrix_warehouse_search_tool_live_verifies_stock_instead_of_serving_sta
     assert any(method == "catalog.storeproduct.list" for method, _ in fake_bitrix.calls)
 
 
-def test_bitrix_warehouse_snapshot_uses_oauth_actor_before_returning_index_data():
+def test_bitrix_warehouse_uses_live_oauth_acl_before_returning_data():
     fallback_bitrix = FakeBitrixClient()
     oauth_bitrix = FakeBitrixClient()
     oauth = FakeBitrixOAuth(oauth_bitrix)
@@ -512,11 +512,11 @@ def test_bitrix_warehouse_snapshot_uses_oauth_actor_before_returning_index_data(
     result = anyio_run(tool.execute({"query": "Borisov warehouse", "limit": 5}, user_id=13))
 
     assert result.status == ToolStatus.OK
-    assert result.data["source"] == "postgres_portal_snapshot"
+    assert result.data["source"] == "live_bitrix_rest"
     assert result.data["access_actor"] == "oauth_current_user"
     assert oauth.user_ids == [13]
     assert fallback_bitrix.calls == []
-    assert oauth_bitrix.calls == []
+    assert ("catalog.store.list", {}) in oauth_bitrix.calls
 
 
 def test_bitrix_warehouse_snapshot_oauth_denies_without_user_id():

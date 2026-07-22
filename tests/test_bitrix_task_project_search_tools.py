@@ -99,6 +99,20 @@ class _UntrustedBitrixSearchClient(_FakeBitrixSearchClient):
         return await super().result(method, params)
 
 
+def _live_task_65() -> dict:
+    return {
+        "id": "65",
+        "title": "Bot stable check",
+        "status": "5",
+        "responsibleId": "13",
+        "createdBy": "9",
+        "createdDate": "2025-01-13T09:00:00+03:00",
+        "closedDate": "2025-01-15T09:12:40+03:00",
+        "deadline": "2025-01-15T12:00:00+03:00",
+        "groupId": "45",
+    }
+
+
 class _FakePortalTaskIndex:
     def __init__(self, items: list[SimpleNamespace]) -> None:
         self.items = items
@@ -301,6 +315,7 @@ def test_task_search_can_match_query_in_comments_without_title_filter():
 
 def test_task_search_uses_snapshot_for_comment_query():
     client = _FakeBitrixSearchClient()
+    client.tasks.append(_live_task_65())
     index = _FakePortalTaskIndex(
         [
             SimpleNamespace(
@@ -345,15 +360,16 @@ def test_task_search_uses_snapshot_for_comment_query():
     )
 
     assert result.status == "ok"
-    assert result.data["source"] == "postgres_portal_snapshot"
+    assert result.data["source"] == "postgres_candidates_live_acl"
     assert [item["id"] for item in result.data["items"]] == ["65"]
     assert result.data["items"][0]["comment_snippets"] == ["bot stable after fix"]
     assert result.data["items"][0]["responsible_label"] == "Dmitry"
-    assert client.calls == []
+    assert any(method == "tasks.task.list" for method, _ in client.calls)
 
 
 def test_task_search_uses_snapshot_for_ai_close_problem_type():
     client = _FakeBitrixSearchClient()
+    client.tasks.append(_live_task_65())
     index = _FakePortalTaskIndex(
         [
             SimpleNamespace(
@@ -394,14 +410,14 @@ def test_task_search_uses_snapshot_for_ai_close_problem_type():
     )
 
     assert result.status == "ok"
-    assert result.data["source"] == "postgres_portal_snapshot"
+    assert result.data["source"] == "postgres_candidates_live_acl"
     assert result.data["query"] == ""
     assert result.data["comment_query"] == ""
     assert result.data["ai_close_problem_type"] == "not_done"
     assert [item["id"] for item in result.data["items"]] == ["65"]
     assert result.data["items"][0]["ai_close_incomplete"] is True
     assert result.data["items"][0]["ai_close_problem_types"] == ["not_done"]
-    assert client.calls == []
+    assert any(method == "tasks.task.list" for method, _ in client.calls)
 
 
 def test_task_search_ai_close_problem_does_not_fallback_to_live_bitrix_without_index():
@@ -429,6 +445,7 @@ def test_task_search_ai_close_problem_does_not_fallback_to_live_bitrix_without_i
 def test_task_search_snapshot_uses_oauth_actor_before_returning_index_data():
     fallback_client = _FakeBitrixSearchClient()
     oauth_client = _FakeBitrixSearchClient()
+    oauth_client.tasks.append(_live_task_65())
     oauth = _FakeBitrixOAuth(oauth_client)
     index = _FakePortalTaskIndex(
         [
@@ -452,7 +469,7 @@ def test_task_search_snapshot_uses_oauth_actor_before_returning_index_data():
     )
 
     assert result.status == "ok"
-    assert result.data["source"] == "postgres_portal_snapshot"
+    assert result.data["source"] == "postgres_candidates_live_acl"
     assert result.data["access_actor"] == "oauth_current_user"
     assert oauth.user_ids == [13]
     assert fallback_client.calls == []
@@ -465,11 +482,11 @@ def test_task_search_snapshot_oauth_denies_without_user_id():
     index = _FakePortalTaskIndex(
         [
             SimpleNamespace(
-                entity_id="65",
+                    entity_id="103",
                 title="Bot stable check",
                 body="РљРѕРјРјРµРЅС‚Р°СЂРёРё:\n- bot stable after fix",
                 score=62,
-                url="https://example.test/tasks/65",
+                    url="https://example.test/tasks/103",
                 metadata={"status": "5", "responsible_id": "13", "created_by": "9"},
             )
         ]
@@ -496,11 +513,11 @@ def test_task_search_does_not_use_snapshot_for_all_scope():
     index = _FakePortalTaskIndex(
         [
             SimpleNamespace(
-                entity_id="65",
+                entity_id="103",
                 title="Hidden all-scope task",
                 body="Комментарии:\n- bot stable after fix",
                 score=62,
-                url="https://example.test/tasks/65",
+                url="https://example.test/tasks/103",
                 metadata={
                     "status": "5",
                     "responsible_id": "99",
@@ -535,11 +552,11 @@ def test_task_snapshot_search_respects_role_scope():
     index = _FakePortalTaskIndex(
         [
             SimpleNamespace(
-                entity_id="65",
+                entity_id="103",
                 title="Observer task",
                 body="Комментарии:\n- bot stable after fix",
                 score=62,
-                url="https://example.test/tasks/65",
+                url="https://example.test/tasks/103",
                 metadata={
                     "status": "5",
                     "responsible_id": "35",
@@ -567,7 +584,7 @@ def test_task_snapshot_search_respects_role_scope():
 
     assert responsible.status == "ok"
     assert responsible.data["items"] == []
-    assert [item["id"] for item in member.data["items"]] == ["65"]
+    assert [item["id"] for item in member.data["items"]] == ["103"]
 
 
 def test_task_search_comment_query_requires_comment_match():
@@ -739,7 +756,7 @@ def test_project_search_oauth_read_denies_live_lookup_without_user_id():
     assert oauth_client.calls == []
 
 
-def test_project_search_uses_snapshot_before_live_bitrix():
+def test_project_search_intersects_snapshot_candidates_with_live_bitrix():
     client = _FakeBitrixSearchClient()
     index = FakePortalSearchIndex()
     index.upsert_item(
@@ -761,9 +778,9 @@ def test_project_search_uses_snapshot_before_live_bitrix():
     result = anyio.run(lambda: tool.execute({"query": "Ларгус-2"}, user_id=13))
 
     assert result.status == "ok"
-    assert result.data["source"] == "postgres_portal_snapshot"
-    assert result.data["items"] == [{"id": "45", "name": "Ларгус 2", "description": "Автомобильный проект"}]
-    assert client.calls == []
+    assert result.data["source"] == "postgres_candidates_live_acl"
+    assert result.data["items"] == [{"id": "45", "name": "Ларгус 2", "description": ""}]
+    assert any(method == "sonet_group.get" for method, _ in client.calls)
 
 
 def test_project_search_snapshot_uses_oauth_actor_before_returning_index_data():
@@ -783,11 +800,11 @@ def test_project_search_snapshot_uses_oauth_actor_before_returning_index_data():
     result = anyio.run(lambda: tool.execute({"query": "Р›Р°СЂРіСѓСЃ-2"}, user_id=13))
 
     assert result.status == "ok"
-    assert result.data["source"] == "postgres_portal_snapshot"
+    assert result.data["source"] == "postgres_candidates_live_acl"
     assert result.data["access_actor"] == "oauth_current_user"
     assert oauth.user_ids == [13]
     assert fallback_client.calls == []
-    assert oauth_client.calls == []
+    assert any(method == "sonet_group.get" for method, _ in oauth_client.calls)
 
 
 def test_project_search_snapshot_oauth_denies_without_user_id():

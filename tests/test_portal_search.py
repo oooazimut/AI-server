@@ -413,7 +413,7 @@ def test_portal_search_tool_reports_missing_index():
     assert "missing" in result.data["message"].lower()
 
 
-def test_portal_search_tool_supports_store_scope():
+def test_portal_search_tool_denies_store_scope_in_favor_of_warehouse_tool():
     import asyncio
 
     index = _create_index()
@@ -428,11 +428,11 @@ def test_portal_search_tool_supports_store_scope():
 
     result = asyncio.run(tool.execute({"query": "Borisov", "scope": "stores", "limit": 5}))
 
-    assert result.status == "ok"
-    assert result.data["results"][0]["entity_type"] == "catalog_store"
+    assert result.status == "denied"
+    assert "warehouses" in result.error
 
 
-def test_portal_search_tool_uses_oauth_actor_for_store_scope():
+def test_portal_search_tool_does_not_use_oauth_for_forbidden_store_scope():
     import asyncio
 
     index = _create_index()
@@ -449,10 +449,8 @@ def test_portal_search_tool_uses_oauth_actor_for_store_scope():
 
     result = asyncio.run(tool.execute({"query": "Borisov", "scope": "stores", "limit": 5}, user_id=13))
 
-    assert result.status == "ok"
-    assert result.data["access_actor"] == "oauth_current_user"
-    assert result.data["results"][0]["entity_type"] == "catalog_store"
-    assert oauth.user_ids == [13]
+    assert result.status == "denied"
+    assert oauth.user_ids == []
     assert oauth_files.calls == []
 
 

@@ -1,0 +1,90 @@
+{
+  "schema_version": "orchestrator.bitrix_policy.v1",
+  "authority": "internal_orchestrator",
+  "rules": [
+    {
+      "id": "authority",
+      "markers": [],
+      "tools": [],
+      "content": [
+        "The Pro planner always interprets every user request.",
+        "Bitrix receives one exact version-bound command and must not reinterpret free text or choose another tool.",
+        "PostgreSQL remains inside the Bitrix data gateway; it never grants access. Current-user ACL/OAuth verification is mandatory before facts are returned."
+      ]
+    },
+    {
+      "id": "warehouse_search",
+      "markers": ["склад", "остат", "товар", "налич", "warehouse", "stock", "product"],
+      "tools": ["bitrix_warehouse_search"],
+      "content": [
+        "Resolve every named warehouse to an exact store_id from entity_catalog before dispatch.",
+        "Show/find/list warehouse phrases return warehouse contents by default; list all warehouses only when explicitly requested.",
+        "Use product_limit 50 and product_offset 0 by default. A product phrase means product_query plus include_products=true.",
+        "Two or more named warehouses become independent parallel commands, one exact store_id per command."
+      ]
+    },
+    {
+      "id": "task_read",
+      "markers": ["задач", "исполнител", "ответствен", "постанов", "дедлайн", "task"],
+      "tools": ["bitrix_my_tasks", "bitrix_task_search"],
+      "content": [
+        "An unqualified task request means active tasks involving the requester as responsible, creator or member.",
+        "A named employee must resolve to one exact target_user_id from entity_catalog; never widen an unresolved person to scope=all.",
+        "Closed, deferred or declined tasks are included only when explicitly requested."
+      ]
+    },
+    {
+      "id": "task_create",
+      "markers": ["создай задачу", "поставь задачу", "сделай задачу"],
+      "tools": ["task_create_draft", "task_create_confirm", "task_draft_discard"],
+      "content": [
+        "If responsible is omitted, use the requester exact user ID.",
+        "Default deadline is three working days at 19:00 Moscow.",
+        "If project is omitted, use the responsible employee personal open project named by surname and first name.",
+        "If that personal project is missing, prepare its open-project draft and preserve the linked task draft; do not silently create outside a project.",
+        "Writes always use a 15-minute numbered draft and exact numbered confirmation."
+      ]
+    },
+    {
+      "id": "calendar",
+      "markers": ["календар", "напом", "событ", "calendar", "remind", "event"],
+      "tools": ["calendar_event_draft", "calendar_event_confirm", "calendar_event_discard"],
+      "content": [
+        "If date and time are both omitted, default to three calendar days from now at 12:00 Moscow.",
+        "Default duration is 30 minutes and default owner/participant is the requester.",
+        "Keep every explicitly supplied date, time, title and participant unchanged.",
+        "Writes always use a 15-minute numbered draft and exact numbered confirmation."
+      ]
+    },
+    {
+      "id": "project",
+      "markers": ["проект", "групп", "project", "workgroup"],
+      "tools": ["bitrix_project_search", "project_create_draft", "project_create_confirm", "project_create_discard"],
+      "content": [
+        "Resolve named projects to one exact project_id from entity_catalog before a dependent command.",
+        "A personal project created by default is open and available for other employees to join.",
+        "Project reads are returned only after current-user live ACL verification."
+      ]
+    },
+    {
+      "id": "document_search",
+      "markers": ["диск", "файл", "документ", "папк", "вложен", "disk", "file", "document", "folder"],
+      "tools": ["portal_search"],
+      "content": [
+        "portal_search is only for documents/files and uses the PostgreSQL index as candidates.",
+        "Every returned document/file must pass current-user live Bitrix access verification; stale unverifiable candidates are suppressed.",
+        "Default page size is 10. A continuation advances only the numbered branch that owns the stored page."
+      ]
+    },
+    {
+      "id": "task_closure",
+      "markers": ["закрой задачу", "закрытие задачи", "выполнено", "не выполнено"],
+      "tools": ["task_close_draft", "task_close_confirm", "task_close_discard", "task_close_report_incident", "task_close_control_get", "task_close_control_update"],
+      "content": [
+        "Task closure uses the four-block draft: completed work, equipment/materials, additional information, overall status with explicit unfinished/unconfirmed points.",
+        "Never mark unfinished or unconfirmed points as completed.",
+        "Confirmation applies only to the exact numbered branch and exact stored draft."
+      ]
+    }
+  ]
+}

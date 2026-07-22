@@ -152,6 +152,9 @@ class TaskCreateDraftTool:
                     "group_name": {"type": "string"},
                     "deadline_iso": {"type": "string"},
                     "no_deadline": {"type": "boolean"},
+                    "_default_personal_project": {"type": "boolean"},
+                    "_default_personal_project_owner_id": {"type": "integer"},
+                    "_default_personal_project_missing": {"type": "boolean"},
                 },
                 "required": ["title"],
                 "allOf": [
@@ -177,6 +180,16 @@ class TaskCreateDraftTool:
                     "the default personal project cannot be selected safely"
                 ),
             )
+        if _truthy(args.get("_default_personal_project_missing")):
+            project_create_result = await _prepare_missing_default_personal_project(
+                store=self._store,
+                args=dict(args),
+                user_id=user_id,
+                dialog_key=dialog_key,
+                dialog_id=dialog_id,
+            )
+            if project_create_result is not None:
+                return project_create_result
         resolved_args, project_note, project_error = await _args_with_resolved_project(
             args,
             project_client=self._project_client,

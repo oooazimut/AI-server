@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -39,6 +40,10 @@ class BitrixWarehouseSearchTool:
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
+                    "store_id": {
+                        "type": "integer",
+                        "description": "Exact store ID selected by the orchestrator entity catalog.",
+                    },
                     "product_query": {
                         "type": "string",
                         "description": "Optional product-name filter inside the matched warehouse.",
@@ -52,7 +57,7 @@ class BitrixWarehouseSearchTool:
                     "product_limit": {"type": "integer", "minimum": 1, "maximum": 50},
                     "product_offset": {"type": "integer", "minimum": 0},
                 },
-                "required": ["query"],
+                "anyOf": [{"required": ["query"]}, {"required": ["store_id"]}],
             },
         )
 
@@ -71,10 +76,15 @@ class BitrixWarehouseSearchTool:
                 error="BitrixClient is not injected",
             )
         query = str(args.get("query") or "").strip()
+        store_id = _safe_int(args.get("store_id"))
         product_query = str(args.get("product_query") or "").strip()
         list_all = bool(args.get("list_all"))
-        if not query and not list_all:
-            return ToolResult(status=ToolStatus.INVALID_TOOL_CALL, tool=self.name, error="query is required")
+        if not query and store_id is None and not list_all:
+            return ToolResult(
+                status=ToolStatus.INVALID_TOOL_CALL,
+                tool=self.name,
+                error="query or exact store_id is required",
+            )
         if list_all:
             query = query or "все"
 
@@ -92,23 +102,6 @@ class BitrixWarehouseSearchTool:
         if access_error is not None:
             return access_error
 
-        snapshot_data = None
-        # Stock amounts are operational data: never serve them solely from the
-        # periodic PostgreSQL snapshot.  The snapshot may resolve a warehouse,
-        # while every contents/product request is verified through live Bitrix.
-        if not list_all and not include_products:
-            snapshot_data = self._snapshot_search(
-                query=query,
-                include_products=include_products,
-                limit=limit,
-                product_limit=product_limit,
-                product_offset=product_offset,
-                product_query=product_query,
-                access_actor=access_actor,
-            )
-        if snapshot_data is not None:
-            return ToolResult(status=ToolStatus.OK, tool=self.name, data=snapshot_data)
-
         try:
             raw_stores = await read_client.result("catalog.store.list", {})
         except (BitrixApiError, BitrixConfigError) as exc:
@@ -123,12 +116,21 @@ class BitrixWarehouseSearchTool:
         matches = (
             [_compact_store(store) for store in stores[:limit]]
             if list_all
-            else _match_stores(stores, query=query, limit=limit)
+            else (
+                [
+                    _compact_store(store)
+                    for store in stores
+                    if _safe_int(_first(store, "id", "ID")) == store_id
+                ][:1]
+                if store_id is not None
+                else _match_stores(stores, query=query, limit=limit)
+            )
         )
         data: dict[str, Any] = {
             "query": query,
             "source": "live_bitrix_rest",
             "access_actor": access_actor,
+            "access_verified_at": datetime.now(UTC).isoformat(),
             "matches": matches,
             "total_stores_seen": len(stores),
             "summary": _stores_summary(matches, query=query),
@@ -379,6 +381,13 @@ def _match_stores(stores: list[dict[str, Any]], *, query: str, limit: int) -> li
             scored.append((score, _compact_store(store)))
     scored.sort(key=lambda item: (-item[0], str(item[1].get("title") or "")))
     return [store for _, store in scored[:limit]]
+
+
+def _safe_int(value: object) -> int | None:
+    try:
+        return int(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _compact_store(store: dict[str, Any]) -> dict[str, Any]:

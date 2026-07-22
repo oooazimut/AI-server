@@ -56,6 +56,10 @@ class Settings:
     orchestrator_llm_reasoning: bool
     orchestrator_llm_reasoning_effort: str
     orchestrator_llm_timeout_seconds: float
+    orchestrator_entity_catalog_refresh_seconds: int
+    orchestrator_entity_catalog_user_limit: int
+    orchestrator_entity_catalog_project_limit: int
+    orchestrator_entity_catalog_warehouse_limit: int
     bitrix_structured_commands_enabled: bool
     bitrix_structured_command_tools: str
     deepseek_api_key: str
@@ -494,6 +498,22 @@ def get_settings() -> Settings:
         orchestrator_llm_reasoning=_env_bool("AI_SERVER_ORCHESTRATOR_LLM_REASONING"),
         orchestrator_llm_reasoning_effort=_env("AI_SERVER_ORCHESTRATOR_LLM_REASONING_EFFORT"),
         orchestrator_llm_timeout_seconds=_env_float("AI_SERVER_ORCHESTRATOR_LLM_TIMEOUT_SECONDS", 120.0) or 120.0,
+        orchestrator_entity_catalog_refresh_seconds=_env_int(
+            "AI_SERVER_ORCHESTRATOR_ENTITY_CATALOG_REFRESH_SECONDS", 900
+        )
+        or 900,
+        orchestrator_entity_catalog_user_limit=_env_int(
+            "AI_SERVER_ORCHESTRATOR_ENTITY_CATALOG_USER_LIMIT", 2000
+        )
+        or 2000,
+        orchestrator_entity_catalog_project_limit=_env_int(
+            "AI_SERVER_ORCHESTRATOR_ENTITY_CATALOG_PROJECT_LIMIT", 500
+        )
+        or 500,
+        orchestrator_entity_catalog_warehouse_limit=_env_int(
+            "AI_SERVER_ORCHESTRATOR_ENTITY_CATALOG_WAREHOUSE_LIMIT", 1000
+        )
+        or 1000,
         bitrix_structured_commands_enabled=_env_bool("BITRIX_STRUCTURED_COMMANDS_ENABLED", True),
         bitrix_structured_command_tools=_env("BITRIX_STRUCTURED_COMMAND_TOOLS", "*"),
         deepseek_api_key=_deepseek_api_key(),

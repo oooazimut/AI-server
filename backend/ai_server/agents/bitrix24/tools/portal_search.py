@@ -14,7 +14,16 @@ from ai_server.tools.bitrix_ports import BitrixFileDownloadPort
 from ai_server.tools.bitrix_search import PortalSearchPort, entity_types_for_scope, format_portal_search_results
 from ai_server.utils import optional_int
 
-_DENIED_AGENT_SCOPES = {"", "all", "tasks"}
+_DENIED_AGENT_SCOPES = {
+    "",
+    "all",
+    "tasks",
+    "projects",
+    "catalog",
+    "stores",
+    "products",
+    "stock",
+}
 _ACCESS_CHECKED_SCOPES = {"documents", "files"}
 _DOCUMENT_ENTITY_TYPES = {"disk_file", "task_attachment"}
 _PAGINATION_FIELD = "portal_search_page"
@@ -52,8 +61,8 @@ class PortalSearchTool:
         return ToolDefinition(
             name="portal_search",
             description=(
-                "Search the local Bitrix portal index. Use only for focused document/file/project/catalog lookup. "
-                "Do not use for tasks or unrestricted all-scope search; use bitrix_task_search for tasks."
+                "Search the PostgreSQL Bitrix document/file index. Every result is verified live through the "
+                "requester's OAuth before return. Use dedicated structured tools for tasks, projects and catalog."
             ),
             parameters={
                 "type": "object",
@@ -62,15 +71,8 @@ class PortalSearchTool:
                     "scope": {
                         "type": "string",
                         "enum": [
-                            "all",
                             "documents",
                             "files",
-                            "tasks",
-                            "projects",
-                            "catalog",
-                            "stores",
-                            "products",
-                            "stock",
                         ],
                     },
                     "limit": {"type": "integer", "minimum": 1, "maximum": _SHOW_ALL_LIMIT},
@@ -126,8 +128,9 @@ class PortalSearchTool:
                 status=ToolStatus.DENIED,
                 tool="portal_search",
                 error=(
-                    "portal_search requires a focused non-task scope. "
-                    "Use bitrix_task_search for tasks; use documents/files/projects/catalog/stores/products/stock for portal search."
+                    "portal_search requires a focused non-task scope: documents/files only. "
+                    "Use bitrix_task_search for tasks and dedicated structured tools for projects, "
+                    "warehouses and catalog."
                 ),
                 data={"query": query, "scope": scope, "limit": limit},
             )
