@@ -61,3 +61,11 @@ Bitrix проверяет версию контракта, JSON-схему, те
 - Bitrix policy/OAuth/ACL являются обязательным окончательным барьером.
 - Ошибка версии, схемы, доступа или состояния черновика останавливает выполнение; специалист не исправляет смысл команды самостоятельно.
 - Автономные webhook/worker-процессы контроля закрытия не переводятся в разговорный оркестратор.
+
+## Default project for a new task
+
+- If no project is named, use the personal project of the resolved responsible user, not necessarily the sender.
+- If no responsible user is named, the sender is responsible and the sender's personal project is used.
+- A named project overrides the personal-project default.
+- A named responsible user must be resolved to one exact numeric ID and label; ambiguity is clarified instead of guessing.
+- A missing default personal project is prepared as an open and visible project owned by the responsible user, then the linked task draft is prepared.

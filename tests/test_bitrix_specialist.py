@@ -8,7 +8,10 @@ import pytest
 import ai_server.agents.bitrix24.llm as bitrix_llm
 from ai_server.agents.bitrix24 import Bitrix24Specialist, BitrixLLMDecision, BitrixLLMService, BitrixLLMToolCall
 from ai_server.agents.bitrix24.llm import ALLOWED_TOOL_NAMES
-from ai_server.agents.bitrix24.specialist import _warehouse_args_with_default_products
+from ai_server.agents.bitrix24.specialist import (
+    _task_create_args_with_actor_label,
+    _warehouse_args_with_default_products,
+)
 from ai_server.agents.bitrix24.tools.project_create import ProjectCreateDiscardTool
 from ai_server.agents.bitrix24.tools.task_close import TaskCloseDraftTool
 from ai_server.agents.bitrix24.tools.task_close_control import TaskCloseControlUpdateTool
@@ -81,6 +84,61 @@ def _bitrix_read_tool_definitions() -> list[dict]:
             "none",
         )
     ]
+
+
+def test_task_create_defaults_to_responsible_personal_project():
+    task = AgentTask(
+        task_id="t1",
+        request="Create a task for Borisov",
+        user={"id": "9", "display_name": "Kulinich Valery"},
+    )
+
+    args = _task_create_args_with_actor_label(
+        {
+            "title": "Wash the car",
+            "responsible_id": 17,
+            "responsible_name": "Borisov Andrey Sergeevich",
+        },
+        task,
+    )
+
+    assert args["project_name"] == "Borisov Andrey"
+    assert args["_default_personal_project"] is True
+    assert args["_default_personal_project_owner_id"] == 17
+
+
+def test_task_create_explicit_project_overrides_responsible_personal_project():
+    task = AgentTask(
+        task_id="t1",
+        request="Create a task for Borisov in Garage",
+        user={"id": "9", "display_name": "Kulinich Valery"},
+    )
+
+    args = _task_create_args_with_actor_label(
+        {
+            "title": "Wash the car",
+            "responsible_id": 17,
+            "responsible_name": "Borisov Andrey Sergeevich",
+            "project_name": "Garage",
+        },
+        task,
+    )
+
+    assert args["project_name"] == "Garage"
+    assert "_default_personal_project" not in args
+
+
+def test_task_create_without_responsible_label_fails_closed_for_default_project():
+    task = AgentTask(
+        task_id="t1",
+        request="Create a task for employee 17",
+        user={"id": "9", "display_name": "Kulinich Valery"},
+    )
+
+    args = _task_create_args_with_actor_label({"title": "Wash the car", "responsible_id": 17}, task)
+
+    assert args["_default_personal_project_unresolved"] is True
+    assert "project_name" not in args
 
 
 def test_bitrix_llm_selects_flash_only_for_read_only_requests(monkeypatch):
@@ -1551,13 +1609,18 @@ def test_bitrix_specialist_passes_user_profile_and_permission_rag_to_llm():
 
 
 def test_bitrix_specialist_task_create_draft_saves_to_store():
+    class _ExistingPersonalProjectClient:
+        async def search_projects(self, query: str, *, limit: int = 10):
+            assert query == "Kulinich Valery"
+            return [{"ID": "77", "NAME": "Kulinich Valery"}]
+
     store = FakeTaskDraftStore()
     manifest = get_agent_manifest("bitrix24")
     retriever = HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider())
     specialist = Bitrix24Specialist(
         manifest,
         retriever=retriever,
-        agent_tools=[TaskCreateDraftTool(store=store)],
+        agent_tools=[TaskCreateDraftTool(store=store, project_client=_ExistingPersonalProjectClient())],
         llm=FakeBitrixLLM(
             tool_calls=[
                 BitrixLLMToolCall(
@@ -1578,7 +1641,7 @@ def test_bitrix_specialist_task_create_draft_saves_to_store():
             AgentTask(
                 task_id="t1",
                 request="Создай задачу на меня проверить IP-камеру завтра",
-                user={"id": "9"},
+                user={"id": "9", "display_name": "Kulinich Valery"},
                 context={"dialog_key": "d:9"},
             )
         )
@@ -1591,6 +1654,7 @@ def test_bitrix_specialist_task_create_draft_saves_to_store():
     assert draft_fields["TITLE"] == "проверить IP-камеру"
     assert draft_fields["RESPONSIBLE_ID"] == 9
     assert draft_fields["CREATED_BY"] == 9
+    assert draft_fields["GROUP_ID"] == 77
     assert draft_fields["DEADLINE"]
 
 

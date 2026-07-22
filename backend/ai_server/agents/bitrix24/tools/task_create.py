@@ -168,6 +168,15 @@ class TaskCreateDraftTool:
         dialog_key: str | None = None,
         dialog_id: str | None = None,
     ) -> ToolResult:
+        if _truthy(args.get("_default_personal_project_unresolved")):
+            return ToolResult(
+                status=ToolStatus.CONTRACT_VIOLATION,
+                tool=self.name,
+                error=(
+                    "task_create_draft requires the resolved responsible_name when no explicit project is given; "
+                    "the default personal project cannot be selected safely"
+                ),
+            )
         resolved_args, project_note, project_error = await _args_with_resolved_project(
             args,
             project_client=self._project_client,
@@ -704,8 +713,19 @@ async def _prepare_missing_default_personal_project(
         )
 
     actor_name = compact_text(str(args.get("responsible_name") or args.get("responsible_label") or project_name))
+    project_owner_id = (
+        optional_int(args.get("_default_personal_project_owner_id"))
+        or optional_int(args.get("responsible_id"))
+        or (user_id if _truthy(args.get("responsible_self")) else None)
+    )
+    if project_owner_id is None:
+        return ToolResult(
+            status=ToolStatus.CONTRACT_VIOLATION,
+            tool=TaskCreateDraftTool.name,
+            error="default personal project requires an exact responsible user id",
+        )
     project_draft = build_project_create_draft_from_args(
-        {"name": project_name, "personal_for_self": True},
+        {"name": project_name, "personal_for_self": True, "owner_id": project_owner_id},
         user_id=user_id,
         actor_name=actor_name,
         actor_is_admin=False,

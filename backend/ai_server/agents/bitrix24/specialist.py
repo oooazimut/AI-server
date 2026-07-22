@@ -787,17 +787,24 @@ def _task_create_args_with_actor_label(args: dict[str, Any], task: AgentTask) ->
     user_id = optional_int(task.user.id)
     responsible_id = optional_int(args.get("responsible_id"))
     responsible_self = _truthy(args.get("responsible_self"))
-    if not responsible_self and (user_id is None or responsible_id != user_id):
-        return args
-    label = _current_user_label(task)
-    if not label:
-        return args
     updated = dict(args)
-    if not str(updated.get("responsible_name") or updated.get("responsible_label") or "").strip():
+    explicit_project = any(updated.get(key) for key in ("group_id", "project_name", "group_name"))
+    provided_label = str(updated.get("responsible_name") or updated.get("responsible_label") or "").strip()
+    responsible_is_actor = responsible_self or (user_id is not None and responsible_id == user_id)
+    label = _current_user_label(task) if responsible_is_actor else provided_label
+    target_user_id = user_id if responsible_is_actor else responsible_id
+
+    if label and not provided_label:
         updated["responsible_name"] = label
-    if not any(updated.get(key) for key in ("group_id", "project_name", "group_name")):
+    if explicit_project:
+        return updated
+    if label:
         updated["project_name"] = _personal_project_name(label)
         updated["_default_personal_project"] = True
+        if target_user_id is not None:
+            updated["_default_personal_project_owner_id"] = target_user_id
+    elif target_user_id is not None:
+        updated["_default_personal_project_unresolved"] = True
     return updated
 
 

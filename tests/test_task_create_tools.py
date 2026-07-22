@@ -124,6 +124,60 @@ def test_draft_tool_prepares_personal_project_before_default_self_task():
     assert "GROUP_ID" not in followup["params"]["fields"]
 
 
+def test_draft_tool_prepares_open_personal_project_for_named_responsible():
+    class _NoProjectClient:
+        async def search_projects(self, query: str, *, limit: int = 10):
+            assert query == "Borisov Andrey"
+            return []
+
+    store = FakeTaskDraftStore()
+    tool = TaskCreateDraftTool(store=store, project_client=_NoProjectClient())
+
+    result = _exec(
+        tool,
+        {
+            "title": "Wash the car",
+            "responsible_id": 17,
+            "responsible_name": "Borisov Andrey Sergeevich",
+            "project_name": "Borisov Andrey",
+            "_default_personal_project": True,
+            "_default_personal_project_owner_id": 17,
+            "no_deadline": True,
+        },
+        user_id=9,
+        dialog_key="d:42",
+        dialog_id="chat42",
+    )
+
+    assert result.status == ToolStatus.OK
+    project_fields = store._drafts["d:42"]["params"]["fields"]
+    assert project_fields["NAME"] == "Borisov Andrey"
+    assert project_fields["OWNER_ID"] == 17
+    assert project_fields["OPENED"] == "Y"
+    assert project_fields["VISIBLE"] == "Y"
+    assert project_fields["PROJECT"] == "Y"
+    followup_fields = store._drafts["d:42"]["after_project_create_task_draft"]["params"]["fields"]
+    assert followup_fields["RESPONSIBLE_ID"] == 17
+    assert followup_fields["CREATED_BY"] == 9
+
+
+def test_draft_tool_rejects_unresolved_default_personal_project():
+    store = FakeTaskDraftStore()
+    result = _exec(
+        TaskCreateDraftTool(store=store),
+        {
+            "title": "Wash the car",
+            "responsible_id": 17,
+            "_default_personal_project_unresolved": True,
+        },
+        user_id=9,
+        dialog_key="d:42",
+    )
+
+    assert result.status == ToolStatus.CONTRACT_VIOLATION
+    assert store._drafts == {}
+
+
 def test_draft_tool_does_not_create_duplicate_for_ambiguous_personal_project():
     class _AmbiguousProjectClient:
         async def search_projects(self, query: str, *, limit: int = 10):
