@@ -22,13 +22,14 @@ def _args(request: str, tool: str, args: dict, *, now: datetime | None = None) -
     return normalized.subtasks[0].structured_command.arguments
 
 
-def test_show_warehouse_means_contents_but_find_warehouse_means_identity():
+def test_warehouse_search_verbs_have_the_same_contents_semantics():
     shown = _args("Покажи склад Борисова", "bitrix_warehouse_search", {"query": "Борисова"})
     found = _args("Найди склад Борисова", "bitrix_warehouse_search", {"query": "Борисова"})
+    listed = _args("Выведи склад Борисова", "bitrix_warehouse_search", {"query": "Борисова"})
 
-    assert shown["include_products"] is True
-    assert shown["product_limit"] == 50
-    assert found["include_products"] is False
+    for result in (shown, found, listed):
+        assert result["include_products"] is True
+        assert result["product_limit"] == 50
 
 
 def test_product_on_warehouse_is_canonical_and_not_left_to_specialist_reasoning():

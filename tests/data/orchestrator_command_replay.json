@@ -1,6 +1,6 @@
 [
   {"request": "Покажи склад Борисова", "tool": "bitrix_warehouse_search", "input": {"query": "ошибка модели"}, "expected": {"query": "борисова", "include_products": true, "product_limit": 50}},
-  {"request": "Найди склад Борисова", "tool": "bitrix_warehouse_search", "input": {"query": "Борисова"}, "expected": {"query": "борисова", "include_products": false}},
+  {"request": "Найди склад Борисова", "tool": "bitrix_warehouse_search", "input": {"query": "Борисова"}, "expected": {"query": "борисова", "include_products": true, "product_limit": 50}},
   {"request": "Покажи список складов", "tool": "bitrix_warehouse_search", "input": {"query": ""}, "expected": {"query": "все", "list_all": true, "include_products": false}},
   {"request": "Найди амортизатор на складе Борисова", "tool": "bitrix_warehouse_search", "input": {"query": "амортизатор"}, "expected": {"query": "борисова", "product_query": "амортизатор", "include_products": true}},
   {"request": "Покажи 3 страницу склада Борисова", "tool": "bitrix_warehouse_search", "input": {"query": "Борисова"}, "expected": {"product_offset": 100, "include_products": true}},

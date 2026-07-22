@@ -77,10 +77,11 @@ def _warehouse_semantics(request: str, arguments: dict[str, Any]) -> dict[str, A
                 "product_limit": DEFAULT_WAREHOUSE_PRODUCT_LIMIT,
             }
         )
-    elif any(marker in text for marker in ("покажи склад", "остат", "товар", "налич")):
+    elif any(
+        marker in text
+        for marker in ("покажи склад", "найди склад", "выведи склад", "ищи склад", "остат", "товар", "налич")
+    ):
         result.update({"include_products": True, "product_limit": DEFAULT_WAREHOUSE_PRODUCT_LIMIT})
-    elif "найди склад" in text:
-        result["include_products"] = False
 
     page_match = re.search(r"\b(\d+)\s*(?:-?ю|страниц)", text)
     if page_match:
