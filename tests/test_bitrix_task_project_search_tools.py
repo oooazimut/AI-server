@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import anyio
 
-from ai_server.agents.bitrix24.tools.tasks import BitrixProjectSearchTool, BitrixTaskSearchTool
+from ai_server.agents.bitrix24.tools.tasks import BitrixMyTasksTool, BitrixProjectSearchTool, BitrixTaskSearchTool
 from ai_server.integrations.bitrix.oauth import BitrixOAuthTokenMissing
 from tests.fakes import FakePortalSearchIndex
 
@@ -89,6 +89,16 @@ class _FakeBitrixSearchClient:
         return []
 
 
+class _UntrustedBitrixSearchClient(_FakeBitrixSearchClient):
+    """Simulate Bitrix returning rows outside the requested REST filter."""
+
+    async def result(self, method: str, params: dict):
+        self.calls.append((method, params))
+        if method == "tasks.task.list":
+            return {"tasks": list(self.tasks)}
+        return await super().result(method, params)
+
+
 class _FakePortalTaskIndex:
     def __init__(self, items: list[SimpleNamespace]) -> None:
         self.items = items
@@ -138,6 +148,26 @@ def test_task_search_responsible_scope_uses_current_user_and_active_statuses():
     assert [item["title"] for item in result.data["items"]] == ["Ответственная задача"]
     assert result.data["total"] == 1
     assert client.calls[0][1]["filter"] == {"STATUS": [1, 2, 3, 4], "RESPONSIBLE_ID": 13}
+
+
+def test_my_tasks_postfilters_foreign_and_closed_rows_from_untrusted_rest_result():
+    client = _UntrustedBitrixSearchClient()
+
+    result = anyio.run(lambda: BitrixMyTasksTool(client=client).execute({"status": "open"}, user_id=13))
+
+    assert result.status == "ok"
+    assert {item["id"] for item in result.data["items"]} == {"101", "102", "103"}
+    assert result.data["scope_filtered_count"] == 2
+
+
+def test_task_search_postfilters_foreign_rows_from_untrusted_rest_result():
+    client = _UntrustedBitrixSearchClient()
+
+    result = anyio.run(lambda: BitrixTaskSearchTool(client=client).execute({"scope": "responsible"}, user_id=13))
+
+    assert result.status == "ok"
+    assert [item["id"] for item in result.data["items"]] == ["101"]
+    assert result.data["scope_filtered_count"] == 3
 
 
 def test_task_search_uses_oauth_client_for_live_current_user_reads():

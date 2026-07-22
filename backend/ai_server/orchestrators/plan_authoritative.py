@@ -48,7 +48,11 @@ def _normalized_text(value: str) -> str:
 
 def _draft_intent(request: str) -> str | None:
     text = _normalized_text(request)
-    if re.search(r"\bнапомни\b|\bкалендар", text):
+    if re.search(
+        r"\bнапомни\b|\bнапоминани|\bкалендар|\bсозда(?:й|ть|йте)\s+событи|"
+        r"\bдобав(?:ь|ить|ьте)\b.*\bкалендар",
+        text,
+    ):
         return "calendar_event"
     if re.search(r"\bсозда(?:й|ть|йте)\s+проект", text):
         return "project_create"
@@ -599,6 +603,10 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                 await delete_candidate(dialog_key)
                 replacement = task.model_copy(update={"request": str(candidate.get("request_text") or "")})
                 return replacement, None
+            if _draft_intent(task.request) is None:
+                # A saved replacement choice must not block independent reads.
+                # Keep the candidate intact and let the read continue normally.
+                return task, None
             return task, self._draft_control_result(
                 task,
                 "Есть незавершённый черновик и сохранён новый запрос. Напишите: «Продолжить текущий черновик» "
@@ -619,21 +627,9 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
         # version; no confirmation-choice round trip is needed.
         if incoming_type and incoming_type == active_type:
             return task, None
-        # Different write types must not overwrite each other's typed state.
-        # The old unconfirmed draft has not made an external change, so it can
-        # be discarded before the new typed draft is prepared.
-        if incoming_type:
-            discarded = await call.discard_active_bitrix_draft(
-                dialog_key,
-                expected_draft_id=str(draft.get("_draft_id") or ""),
-            )
-            if not discarded:
-                return task, self._draft_control_result(
-                    task,
-                    "Не удалось безопасно заменить предыдущий черновик: он уже изменён или истёк.",
-                    reason="ACTIVE_DRAFT_REPLACE_FAILED",
-                )
-            return task, None
+        # A different write type is never allowed to discard an active draft
+        # implicitly.  Save the new request as a short-lived candidate and let
+        # the user choose which operation should continue.
         await save_candidate(
             dialog_key,
             request_text=task.request,
@@ -724,6 +720,20 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                 status="completed",
                 details={"pending_specialist": str(task.context.get("pending_specialist") or "")},
             )
+            task, draft_guard_result = await self._guard_active_draft(task)
+            if draft_guard_result is not None:
+                draft_guard_result = draft_guard_result.model_copy(
+                    update={
+                        "metadata": {
+                            **draft_guard_result.metadata,
+                            "total_ms": round((time.monotonic() - started) * 1000, 1),
+                        }
+                    }
+                )
+                await self._append_authoritative_dialog_turn(task, draft_guard_result.answer)
+                await self._send_to_channel(task, draft_guard_result)
+                await self._publish_result(task, draft_guard_result)
+                return draft_guard_result
             catalog = self._catalog()
             pending_specialist = str(task.context.get("pending_specialist") or "").strip()
             constraints = _constraints(

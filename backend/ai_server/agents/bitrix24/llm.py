@@ -365,6 +365,15 @@ def _direct_task_create_response(
             model_usage=_local_model_usage(agent_id, "warehouse_multi_response"),
         )
     for result in reversed(tool_results):
+        if result.status == "denied" and str(result.data.get("reason") or "") in {
+            "ACTIVE_DRAFT_CONFLICT",
+            "ACTIVE_DRAFT_IN_PROGRESS",
+        }:
+            return BitrixLLMFinalResult(
+                status="needs_clarification",
+                answer=str(result.data.get("answer") or result.error or "Уточните действие с активным черновиком."),
+                model_usage=_local_model_usage(agent_id, "active_draft_conflict_response"),
+            )
         if result.status == "denied" and result.tool in {
             "bitrix_warehouse_search",
             "bitrix_my_tasks",
@@ -1627,11 +1636,16 @@ def _decision_system_prompt(instructions: str = "") -> str:
         'Если данных не хватает, не вызывай tool: верни status=needs_clarification, tool_calls=[{"name":"none"}], '
         "а в answer задай короткий уточняющий вопрос. "
         "Данные о текущем пользователе уже есть в permission_context.bitrix_current_user_profile. "
-        "Для общей фразы 'мои задачи' или 'мои открытые задачи' используй bitrix_my_tasks: он включает задачи, "
+        "Для общей фразы 'задачи', 'мои задачи', 'задачи на меня', 'задачи на мне' или 'мои открытые задачи' "
+        "используй bitrix_my_tasks: без явно названного другого сотрудника запрос всегда относится к текущему "
+        "отправителю и включает задачи, "
         "где текущий пользователь исполнитель, постановщик, соисполнитель или другой участник Bitrix, "
         "возвращает 10 по умолчанию, берёт только активные статусы 1-4 и сортирует по сроку. "
-        "Для 'задачи на мне', 'я исполнитель' используй bitrix_task_search со scope=responsible. "
+        "Только для явных фраз 'я исполнитель' или 'я ответственный' используй bitrix_task_search "
+        "со scope=responsible. "
         "Для 'задачи, поставленные мной' используй bitrix_task_search со scope=created_by. "
+        "Только для явной фразы 'все задачи' используй scope=all. Если текущий пользователь не определён, "
+        "не заменяй личную область всеми доступными задачами: запрос должен быть отклонён безопасно. "
         "Для поиска задачи по ID, названию, сроку, просрочке или проекту используй bitrix_task_search, а не свободный bitrix_api. "
         "Для сложного поиска задач по нескольким критериям тоже используй bitrix_task_search: "
         "deadline_from/deadline_to для срока, created_from/created_to для даты создания, "
@@ -2905,26 +2919,39 @@ def _common_calendar_event_draft_decision(
 def _calendar_request_with_history(request: str, dialog_history: list[dict[str, str]] | None) -> str:
     """Join a short time/title reply to its still-active calendar request."""
     current = _strip_command_prefix(request)
-    if "напомни" in current.casefold():
+    if _looks_like_calendar_draft_request(current):
         return current
     for item in reversed(dialog_history or []):
         if not isinstance(item, dict) or str(item.get("role") or "") != "user":
             continue
         previous = str(item.get("content") or "").strip()
-        if "напомни" in previous.casefold():
+        if _looks_like_calendar_draft_request(previous):
             return f"{previous}. {current}"
     return current
 
 
+def _looks_like_calendar_draft_request(request: str) -> bool:
+    lowered = request.casefold()
+    return bool(
+        re.search(
+            r"\bнапомни\b|\bнапоминани|\bсозда(?:й|ть|йте)\s+событи|"
+            r"\bдобав(?:ь|ить|ьте)\b.*\bкалендар",
+            lowered,
+        )
+    )
+
+
 def _simple_calendar_reminder_args(request: str) -> dict[str, Any] | None:
     lowered = request.casefold()
-    if "напомни" not in lowered:
+    if not _looks_like_calendar_draft_request(request):
         return None
     if any(marker in lowered for marker in ("задач", "проект")):
         return None
 
     match = re.search(
-        r"\bнапомни(?:\s+мне)?\s+(?P<date>сегодня|завтра|послезавтра)\s+(?P<title>.+)",
+        r"\b(?:напомни(?:\s+мне)?|созда(?:й|ть|йте)\s+(?:мне\s+)?напоминани[ея]|"
+        r"созда(?:й|ть|йте)\s+событи[ея]|добав(?:ь|ить|ьте)(?:\s+событи[ея])?\s+в\s+календарь)"
+        r"\s+(?:на\s+)?(?P<date>сегодня|завтра|послезавтра)\s+(?P<title>.+)",
         request,
         flags=re.IGNORECASE | re.DOTALL,
     )
@@ -2932,14 +2959,33 @@ def _simple_calendar_reminder_args(request: str) -> dict[str, Any] | None:
         return None
 
     target_date = _relative_calendar_date(match.group("date"))
-    title = _calendar_reminder_title(match.group("title"))
+    title_source = match.group("title")
+    time_match = re.match(
+        r"(?:на\s+)?(?P<hour>\d{1,2})(?::|\s+)(?P<minute>\d{1,2})(?:\s+(?P<second>\d{1,2}))?\s+",
+        title_source,
+        flags=re.IGNORECASE,
+    )
+    title = _calendar_reminder_title(title_source[time_match.end() :] if time_match else title_source)
     if not target_date or not title:
         return None
-    return {
+    args = {
         "title": title,
         "date_iso": target_date.isoformat(),
         "description": title,
     }
+    if time_match:
+        hour = int(time_match.group("hour"))
+        minute = int(time_match.group("minute"))
+        second = int(time_match.group("second") or 0)
+        if hour > 23 or minute > 59 or second > 59:
+            return None
+        args.pop("date_iso")
+        args["start_iso"] = datetime.combine(
+            target_date,
+            datetime.min.time().replace(hour=hour, minute=minute, second=second),
+            tzinfo=MOSCOW_TZ,
+        ).isoformat()
+    return args
 
 
 def _relative_calendar_date(value: str) -> date | None:
@@ -2992,6 +3038,12 @@ def _common_read_decision(request: str, tool_definitions: list[dict[str, Any]] |
         if require_declared_tool and "portal_search" not in available_tools:
             return None
         return _local_decision_tool("portal_search", document_args)
+
+    my_tasks_args = _common_my_tasks_read_args(clean_request)
+    if my_tasks_args is not None:
+        if require_declared_tool and "bitrix_my_tasks" not in available_tools:
+            return None
+        return _local_decision_tool("bitrix_my_tasks", my_tasks_args)
 
     task_args = _common_task_read_args(clean_request)
     if task_args is not None:
@@ -3195,8 +3247,6 @@ def _common_task_read_args(request: str) -> dict[str, Any] | None:
 
     query = _extract_task_query(request)
     scope = _task_scope_from_text(lowered)
-    if scope == "my" and not _has_explicit_user_task_scope(lowered):
-        scope = "all"
     status = _task_status_from_text(lowered)
     args: dict[str, Any] = {
         "scope": scope,
@@ -3232,6 +3282,31 @@ def _common_task_read_args(request: str) -> dict[str, Any] | None:
         args["status"] = "closed"
         args["include_closed"] = True
     return args
+
+
+def _common_my_tasks_read_args(request: str) -> dict[str, Any] | None:
+    lowered = request.casefold()
+    if "задач" not in lowered or _extract_task_id(request) is not None:
+        return None
+    if _task_scope_from_text(lowered) != "my":
+        return None
+    status = _task_status_from_text(lowered)
+    if status not in {"active", "closed", "all"}:
+        return None
+    if any(
+        (
+            _extract_task_query(request),
+            _extract_project_name_from_task_request(request),
+            _extract_comment_query(request),
+            _extract_ai_close_problem_type(lowered),
+            *_extract_closed_date_range(request),
+        )
+    ):
+        return None
+    return {
+        "status": {"active": "open", "closed": "closed", "all": "all"}[status],
+        "limit": _extract_task_limit(lowered) or 10,
+    }
 
 
 def _extract_task_limit(lowered: str) -> int | None:
@@ -3324,26 +3399,14 @@ def _common_project_query(request: str) -> str:
 def _task_scope_from_text(lowered: str) -> str:
     if "поставлен" in lowered and "мной" in lowered:
         return "created_by"
-    if "на мне" in lowered or "я исполнитель" in lowered or "где я исполнитель" in lowered:
-        return "responsible"
-    return "my"
-
-
-def _has_explicit_user_task_scope(lowered: str) -> bool:
-    return any(
+    if any(
         marker in lowered
-        for marker in (
-            "мои",
-            "мой",
-            "моя",
-            "мою",
-            "мной",
-            "на мне",
-            "я исполнитель",
-            "где я исполнитель",
-            "поставлен",
-        )
-    )
+        for marker in ("я исполнитель", "где я исполнитель", "я ответственный", "где я ответственный")
+    ):
+        return "responsible"
+    if re.search(r"\bвсе\s+(?:доступные\s+)?задач", lowered) and not re.search(r"\bвсе\s+мои\s+задач", lowered):
+        return "all"
+    return "my"
 
 
 def _task_status_from_text(lowered: str) -> str:

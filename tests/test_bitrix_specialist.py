@@ -1,6 +1,7 @@
 import asyncio
 import json
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
 
@@ -682,6 +683,36 @@ def test_bitrix_specialist_fast_returns_read_oauth_authorization():
     assert result.metadata["fast_return_reason"] == "read_only_oauth_authorization_required"
 
 
+def test_bitrix_specialist_converts_active_draft_runtime_conflict_to_safe_result():
+    class _ConflictTool:
+        name = "calendar_event_draft"
+
+        def definition(self):
+            return ToolDefinition(name=self.name, description="", parameters={})
+
+        async def execute(self, args, **kwargs):
+            raise RuntimeError("ACTIVE_DRAFT_CONFLICT:task_create:calendar_event")
+
+    subject = Bitrix24Specialist(
+        get_agent_manifest("bitrix24"),
+        agent_tools=[_ConflictTool()],
+        llm=FakeBitrixLLM(),
+    )
+    result, action, approvals = asyncio.run(
+        subject._execute_tool_call(
+            SimpleNamespace(name="calendar_event_draft", args={"title": "Проверить отчёт"}, summary=""),
+            AgentTask(task_id="t1", request="Создай напоминание", user={"id": "13"}),
+        )
+    )
+
+    assert result.status == "denied"
+    assert result.data["reason"] == "ACTIVE_DRAFT_CONFLICT"
+    assert "RuntimeError" not in result.error
+    assert "активный черновик" in result.error
+    assert action.status == "denied"
+    assert approvals == []
+
+
 def test_bitrix_specialist_does_not_fast_return_ambiguous_project_search():
     llm = FakeBitrixLLM(
         tool_calls=[BitrixLLMToolCall(name="bitrix_project_search", args={"query": "Garage", "limit": 10})],
@@ -761,6 +792,71 @@ def test_bitrix_llm_decide_routes_created_by_task_read_to_deterministic_tool(mon
 
     assert [call.name for call in result.decision.tool_calls] == ["bitrix_task_search"]
     assert result.decision.tool_calls[0].args == {"scope": "created_by", "status": "active", "limit": 10}
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Битрикс покажи задачи",
+        "Битрикс покажи мои задачи",
+        "Битрикс покажи задачи на меня",
+        "Битрикс покажи задачи на мне",
+        "Битрикс покажи задачи, где я участвую",
+    ],
+)
+def test_bitrix_llm_routes_generic_current_user_tasks_without_llm(monkeypatch, request_text):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"must not be used","tool_calls":[]}')
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t1", request=request_text, user={"id": "13"}),
+            retrieval_hits=[],
+            tool_definitions=_bitrix_read_tool_definitions(),
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["bitrix_my_tasks"]
+    assert result.decision.tool_calls[0].args == {"status": "open", "limit": 10}
+
+
+@pytest.mark.parametrize("request_text", ["Покажи задачи, где я исполнитель", "Покажи задачи, где я ответственный"])
+def test_bitrix_llm_routes_explicit_responsible_scope_without_llm(monkeypatch, request_text):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"must not be used","tool_calls":[]}')
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t1", request=request_text, user={"id": "13"}),
+            retrieval_hits=[],
+            tool_definitions=_bitrix_read_tool_definitions(),
+        )
+    )
+
+    assert client.calls == []
+    assert [call.name for call in result.decision.tool_calls] == ["bitrix_task_search"]
+    assert result.decision.tool_calls[0].args == {"scope": "responsible", "status": "active", "limit": 10}
+
+
+def test_bitrix_llm_routes_all_tasks_only_when_explicit(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient('{"status":"completed","answer":"must not be used","tool_calls":[]}')
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(task_id="t1", request="Покажи все задачи", user={"id": "13"}),
+            retrieval_hits=[],
+            tool_definitions=_bitrix_read_tool_definitions(),
+        )
+    )
+
+    assert client.calls == []
+    assert result.decision.tool_calls[0].name == "bitrix_task_search"
+    assert result.decision.tool_calls[0].args == {"scope": "all", "status": "active", "limit": 10}
 
 
 def test_bitrix_llm_routes_named_warehouse_next_page_from_its_visible_answer(monkeypatch):
@@ -919,7 +1015,7 @@ def test_bitrix_llm_decide_routes_task_text_search_even_when_model_answers_from_
 
     assert [call.name for call in result.decision.tool_calls] == ["bitrix_task_search"]
     assert result.decision.tool_calls[0].args == {
-        "scope": "all",
+        "scope": "my",
         "status": "active",
         "limit": 10,
         "query": "Обучение сотрудников",
@@ -958,7 +1054,7 @@ def test_bitrix_llm_decide_routes_advanced_comment_closed_search(monkeypatch):
 
     assert [call.name for call in result.decision.tool_calls] == ["bitrix_task_search"]
     assert result.decision.tool_calls[0].args == {
-        "scope": "all",
+        "scope": "my",
         "status": "closed",
         "limit": 5,
         "include_closed": True,
@@ -999,7 +1095,7 @@ def test_bitrix_llm_decide_routes_ai_close_problem_search(monkeypatch):
 
     assert [call.name for call in result.decision.tool_calls] == ["bitrix_task_search"]
     assert result.decision.tool_calls[0].args == {
-        "scope": "member",
+        "scope": "my",
         "status": "closed",
         "limit": 10,
         "include_closed": True,
@@ -2528,6 +2624,33 @@ def test_bitrix_llm_decide_routes_simple_reminder_to_calendar_draft(monkeypatch)
         "title": "Позвонить Борисову",
         "date_iso": "2026-07-11",
         "description": "Позвонить Борисову",
+    }
+
+
+def test_bitrix_llm_routes_noun_reminder_with_time_without_llm(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setattr(bitrix_llm, "_moscow_today", lambda: date(2026, 7, 10))
+    client = RecordingLLMClient('{"status":"completed","answer":"must not be used","tool_calls":[]}')
+
+    result = asyncio.run(
+        BitrixLLMService(client, settings=get_settings()).decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request="Создай напоминание на завтра на 12 0 0 проверить отчет",
+                user={"id": "13"},
+            ),
+            retrieval_hits=[],
+            tool_definitions=[{"name": "calendar_event_draft", "description": "", "parameters": {}}],
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "calendar_reminder_route"}
+    assert result.decision.tool_calls[0].args == {
+        "title": "Проверить отчет",
+        "description": "Проверить отчет",
+        "start_iso": "2026-07-11T12:00:00+03:00",
     }
 
 

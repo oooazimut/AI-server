@@ -128,6 +128,13 @@ class BitrixMyTasksTool:
             return access_error
 
         sorted_tasks, errors = await _fetch_merged_tasks(read_client, calls)
+        unscoped_total = len(sorted_tasks)
+        sorted_tasks = [
+            task
+            for task in sorted_tasks
+            if _matches_snapshot_scope(task, scope="my", user_id=user_id)
+            and _matches_task_status(task, {"open": "active", "closed": "closed", "all": "all"}[status])
+        ]
         if errors and not sorted_tasks:
             return ToolResult(
                 status=ToolStatus.ERROR,
@@ -151,6 +158,7 @@ class BitrixMyTasksTool:
                 "limit": limit,
                 "offset": offset,
                 "has_more": offset + limit < len(sorted_tasks),
+                "scope_filtered_count": unscoped_total - len(sorted_tasks),
                 "errors": errors,
                 "sources": [call["role_source"] for call in calls],
             },
@@ -452,9 +460,12 @@ class BitrixTaskSearchTool:
                 data={"scope": scope, "status": status, "errors": errors},
             )
 
+        scope_filtered_tasks = [
+            task for task in sorted_tasks if _matches_snapshot_scope(task, scope=scope, user_id=user_id)
+        ]
         pre_comment_filtered = [
             task
-            for task in sorted_tasks
+            for task in scope_filtered_tasks
             if _matches_task_status(task, status)
             and _matches_date_range(
                 task,
@@ -515,6 +526,7 @@ class BitrixTaskSearchTool:
                 "limit": limit,
                 "offset": offset,
                 "has_more": offset + limit < len(filtered),
+                "scope_filtered_count": len(sorted_tasks) - len(scope_filtered_tasks),
                 "errors": errors,
             },
         )

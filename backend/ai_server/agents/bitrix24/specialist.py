@@ -52,7 +52,7 @@ from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigErr
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService
 from ai_server.integrations.bitrix.profile import compact_user_profile
 from ai_server.knowledge import MarkdownKnowledgeBase
-from ai_server.models import AgentManifest, AgentResult, AgentTask, ToolResult, ToolStatus
+from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ToolResult, ToolStatus
 from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import Settings, get_settings
 from ai_server.skills import SkillStore
@@ -434,7 +434,29 @@ class Bitrix24Specialist(BaseSpecialist):
                 args=args,
                 summary=getattr(tool_call, "summary", ""),
             )
-        return await super()._execute_tool_call(tool_call, task)
+        try:
+            return await super()._execute_tool_call(tool_call, task)
+        except RuntimeError as exc:
+            reason = str(exc).split(":", 1)[0]
+            if reason not in {"ACTIVE_DRAFT_CONFLICT", "ACTIVE_DRAFT_IN_PROGRESS"}:
+                raise
+            answer = (
+                "В этом диалоге уже есть активный черновик другого типа. "
+                "Продолжите его либо отмените перед созданием нового."
+                if reason == "ACTIVE_DRAFT_CONFLICT"
+                else "Текущий черновик уже подтверждается или завершается. Дождитесь результата и повторите запрос."
+            )
+            result = ToolResult(
+                status=ToolStatus.DENIED,
+                tool=tool_call.name,
+                error=answer,
+                data={"status": "needs_clarification", "reason": reason, "answer": answer},
+            )
+            return (
+                result,
+                ActionRecord(name=tool_call.name, status=result.status, details=result.model_dump()),
+                [],
+            )
 
     def _terminal_response_metadata(
         self,
@@ -447,6 +469,16 @@ class Bitrix24Specialist(BaseSpecialist):
     ) -> dict[str, Any] | None:
         if result is None or approvals:
             return None
+        if result.status == ToolStatus.DENIED and str(result.data.get("reason") or "") in {
+            "ACTIVE_DRAFT_CONFLICT",
+            "ACTIVE_DRAFT_IN_PROGRESS",
+        }:
+            return {
+                "fast_return_reason": "active_draft_conflict",
+                "terminal_tool": tool_call.name,
+                "tool_status": str(result.status),
+                "terminal_status": "needs_clarification",
+            }
         is_read_tool = tool_call.name in _FAST_RETURN_READ_TOOLS
         is_final_tool = tool_call.name in _FAST_RETURN_FINAL_TOOLS
         if not is_read_tool and not is_final_tool:
