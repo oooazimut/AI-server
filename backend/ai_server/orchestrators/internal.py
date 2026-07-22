@@ -37,6 +37,10 @@ _DRAFT_CONFIRMATION_LINE = re.compile(
     r"\s*Для подтверждения отправьте фразу:\s*[«\"][^»\"]+[»\"]\.?",
     re.IGNORECASE,
 )
+_ACTIVE_DRAFT_MANAGEMENT_LINE = re.compile(
+    r"\s*Для управления активным черновиком:\s*подтвердить или отменить\.?",
+    re.IGNORECASE,
+)
 _NEXT_PAGE_HINT = re.compile(r"(?:можно\s+запросить|попросите\s+показать)\s+следующ", re.IGNORECASE)
 
 
@@ -47,9 +51,15 @@ def _append_conversation_reference(message: str, task: AgentTask) -> str:
         return message
     visible = str(number)
 
-    rendered, confirmation_count = _DRAFT_CONFIRMATION_LINE.subn("", message)
+    rendered, management_count = _ACTIVE_DRAFT_MANAGEMENT_LINE.subn("", message)
+    rendered, confirmation_count = _DRAFT_CONFIRMATION_LINE.subn("", rendered)
     rendered = rendered.rstrip()
-    if confirmation_count:
+    if management_count:
+        reference = (
+            f"Диалог №{visible}. Для подтверждения: «{visible} подтвердить». "
+            f"Для отмены: «{visible} отменить»"
+        )
+    elif confirmation_count:
         reference = f"Диалог №{visible}. Для подтверждения: «{visible} подтвердить»"
     elif _NEXT_PAGE_HINT.search(rendered):
         reference = f"Диалог №{visible}. Для продолжения: «{visible} следующая»"

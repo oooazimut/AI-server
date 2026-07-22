@@ -56,9 +56,28 @@ def test_technical_footer_and_pagination_keep_only_one_numbered_continuation():
     assert rendered.endswith("Диалог №103. Для продолжения: «103 следующая»")
 
 
+def test_active_draft_conflict_keeps_only_numbered_confirm_and_cancel_commands():
+    rendered = _render(
+        "Новый запрос не запущен.\n\n"
+        "Активный черновик — создание задачи: «Проверить договор».\n\n"
+        "Для управления активным черновиком: подтвердить или отменить.",
+        104,
+    )
+
+    assert rendered.count("Тех:") == 1
+    assert rendered.count("Диалог №104") == 1
+    assert "Для управления активным черновиком" not in rendered
+    assert rendered.count("«104 подтвердить»") == 1
+    assert rendered.count("«104 отменить»") == 1
+    assert rendered.index("Тех:") < rendered.index("Диалог №104")
+    assert rendered.endswith(
+        "Диалог №104. Для подтверждения: «104 подтвердить». Для отмены: «104 отменить»"
+    )
+
+
 def test_hidden_technical_footer_does_not_remove_dialog_reference():
-    rendered = _render("Готово.", 104, technical_footer="")
+    rendered = _render("Готово.", 105, technical_footer="")
 
     assert "Тех:" not in rendered
-    assert rendered.count("Диалог №104") == 1
-    assert rendered == "Готово.\n\nДиалог №104."
+    assert rendered.count("Диалог №105") == 1
+    assert rendered == "Готово.\n\nДиалог №105."

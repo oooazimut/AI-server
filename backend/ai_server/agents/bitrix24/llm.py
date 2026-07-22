@@ -1841,7 +1841,12 @@ def _common_draft_discard_decision(
     tool_definitions: list[dict[str, Any]] | None,
 ) -> BitrixLLMDecision | None:
     lowered = _strip_command_prefix(request).casefold()
-    if not _is_draft_discard_request(lowered):
+    numbered_short_discard = bool(context.get("conversation_reference_explicit")) and lowered.strip() in {
+        "отменить",
+        "отмени",
+        "отмена",
+    }
+    if not numbered_short_discard and not _is_draft_discard_request(lowered):
         return None
 
     draft = context.get("pending_task_draft") if isinstance(context, dict) else None

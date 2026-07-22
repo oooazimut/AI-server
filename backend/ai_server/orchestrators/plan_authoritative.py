@@ -38,8 +38,7 @@ REPAIRABLE_PLAN_REJECTIONS = frozenset(
     }
 )
 
-_DRAFT_CONTINUE = "продолжить текущий черновик"
-_DRAFT_REPLACE = "отменить текущий черновик и запустить новый запрос"
+_ACTIVE_DRAFT_MANAGEMENT_HINT = "Для управления активным черновиком: подтвердить или отменить."
 
 
 def _normalized_text(value: str) -> str:
@@ -81,9 +80,40 @@ def _is_new_request_during_draft(
     incoming = _draft_intent(request)
     # A read-only request has no draft intent and must remain available while a
     # draft is waiting for confirmation.  Every new write intent, including a
-    # second request of the same type, is held as a replacement candidate: two
-    # concurrent drafts in one dialog are never safe.
+    # second request of the same type, is blocked: one dialog has one draft.
     return bool(incoming)
+
+
+def _active_draft_summary(draft: dict[str, Any]) -> str:
+    """Render a compact reminder without coupling the orchestrator to tool formatters."""
+    draft_type = str(draft.get("_draft_type") or "task_create")
+    labels = {
+        "task_create": "создание задачи",
+        "task_close": "закрытие задачи",
+        "calendar_event": "запись в календаре",
+        "project_create": "создание проекта",
+        "admin_change": "изменение настройки",
+    }
+    fields = draft.get("fields") if isinstance(draft.get("fields"), dict) else {}
+    params = draft.get("params") if isinstance(draft.get("params"), dict) else {}
+    nested_fields = params.get("fields") if isinstance(params.get("fields"), dict) else {}
+    title = next(
+        (
+            str(value).strip()
+            for value in (
+                draft.get("task_title"),
+                draft.get("title"),
+                fields.get("TITLE"),
+                nested_fields.get("TITLE"),
+                nested_fields.get("NAME"),
+                params.get("name"),
+            )
+            if value not in (None, "") and str(value).strip()
+        ),
+        "",
+    )
+    label = labels.get(draft_type, "операция Bitrix")
+    return f"Активный черновик — {label}: «{title}»." if title else f"Активный черновик — {label}."
 
 
 class PlanAuthoritativeLLM(Protocol):
@@ -570,49 +600,11 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
         )
 
     async def _guard_active_draft(self, task: AgentTask) -> tuple[AgentTask, AgentResult | None]:
-        """Keep a new explicit write intent out of an existing draft's tool path."""
+        """Allow one write draft per dialog and discard conflicting new requests."""
         dialog_key = str(task.context.get("dialog_key") or "")
         call = self._tool_registry.get("call_specialist")
-        if not dialog_key or not isinstance(call, CallSpecialistTool) or self.store is None:
+        if not dialog_key or not isinstance(call, CallSpecialistTool):
             return task, None
-        get_candidate = getattr(self.store, "get_replacement_candidate", None)
-        save_candidate = getattr(self.store, "save_replacement_candidate", None)
-        delete_candidate = getattr(self.store, "delete_replacement_candidate", None)
-        if not callable(get_candidate) or not callable(save_candidate) or not callable(delete_candidate):
-            return task, None
-        candidate = await get_candidate(dialog_key)
-        request = _normalized_text(task.request)
-        if candidate:
-            if request == _DRAFT_CONTINUE:
-                await delete_candidate(dialog_key)
-                return task, self._draft_control_result(
-                    task,
-                    "Продолжаем текущий черновик. Подтвердите его указанной фразой или внесите уточнение.",
-                    reason="REPLACEMENT_CANDIDATE_DISMISSED",
-                )
-            if request == _DRAFT_REPLACE:
-                discarded = await call.discard_active_bitrix_draft(
-                    dialog_key, expected_draft_id=str(candidate.get("draft_id") or "")
-                )
-                if not discarded:
-                    return task, self._draft_control_result(
-                        task,
-                        "Не удалось безопасно отменить прежний черновик: он уже изменён или истёк. Проверьте его состояние.",
-                        reason="REPLACEMENT_DRAFT_CHANGED",
-                    )
-                await delete_candidate(dialog_key)
-                replacement = task.model_copy(update={"request": str(candidate.get("request_text") or "")})
-                return replacement, None
-            if _draft_intent(task.request) is None:
-                # A saved replacement choice must not block independent reads.
-                # Keep the candidate intact and let the read continue normally.
-                return task, None
-            return task, self._draft_control_result(
-                task,
-                "Есть незавершённый черновик и сохранён новый запрос. Напишите: «Продолжить текущий черновик» "
-                "или «Отменить текущий черновик и запустить новый запрос».",
-                reason="REPLACEMENT_CANDIDATE_WAITING",
-            )
         draft = await call.get_active_bitrix_draft(dialog_key)
         if not draft or not _is_new_request_during_draft(
             task.request,
@@ -620,28 +612,11 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             allow_short_command=bool(task.context.get("conversation_reference_explicit")),
         ):
             return task, None
-        incoming_type = _draft_intent(task.request)
-        active_type = str(draft.get("_draft_type") or "")
-        # A revised request of the same type is a new version of this exact
-        # draft.  Let the typed tool preserve draft_id and increment its
-        # version; no confirmation-choice round trip is needed.
-        if incoming_type and incoming_type == active_type:
-            return task, None
-        # A different write type is never allowed to discard an active draft
-        # implicitly.  Save the new request as a short-lived candidate and let
-        # the user choose which operation should continue.
-        await save_candidate(
-            dialog_key,
-            request_text=task.request,
-            draft_id=str(draft.get("_draft_id") or ""),
-            draft_type=str(draft.get("_draft_type") or ""),
-            ttl_minutes=15,
-        )
         return task, self._draft_control_result(
             task,
-            "Текущий черновик ещё не завершён; новый запрос сохранён на 15 минут и пока не запущен. "
-            "Напишите: «Продолжить текущий черновик» или «Отменить текущий черновик и запустить новый запрос».",
-            reason="REPLACEMENT_CANDIDATE_SAVED",
+            "Новый запрос не запущен: в этом диалоге уже есть активный черновик.\n\n"
+            f"{_active_draft_summary(draft)}\n\n{_ACTIVE_DRAFT_MANAGEMENT_HINT}",
+            reason="ACTIVE_DRAFT_ALREADY_EXISTS",
         )
 
     async def handle(self, task: AgentTask) -> AgentResult:

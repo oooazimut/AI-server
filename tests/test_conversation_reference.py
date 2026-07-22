@@ -193,6 +193,22 @@ def test_read_branch_does_not_hide_numbered_active_draft_confirmation():
     asyncio.run(run())
 
 
+def test_numbered_active_draft_cancel_reuses_branch_and_strips_number():
+    async def run():
+        store = FakeOrchestratorStore()
+        draft = await resolve_conversation_reference(_task("Создай задачу проверить договор"), store)
+
+        cancellation = await resolve_conversation_reference(_task("101 отменить"), store)
+
+        assert cancellation.error == ""
+        assert cancellation.task.request == "отменить"
+        assert cancellation.task.context["conversation_number"] == 101
+        assert cancellation.task.context["dialog_key"] == draft.task.context["dialog_key"]
+        assert cancellation.task.context["conversation_reference_explicit"] is True
+
+    asyncio.run(run())
+
+
 def test_numbered_continuation_expires_after_fifteen_minutes(monkeypatch):
     async def run():
         store = FakeOrchestratorStore()

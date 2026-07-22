@@ -2716,6 +2716,36 @@ def test_bitrix_llm_decide_routes_task_draft_discard_without_llm(monkeypatch):
     assert result.decision.tool_calls[0].args == {}
 
 
+def test_bitrix_llm_routes_numbered_short_draft_discard_without_llm(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    client = RecordingLLMClient("not used")
+    service = BitrixLLMService(client, settings=get_settings())
+
+    result = asyncio.run(
+        service.decide(
+            manifest=get_agent_manifest("bitrix24"),
+            task=AgentTask(
+                task_id="t1",
+                request="отменить",
+                user={"id": "13"},
+                context={
+                    "conversation_reference_explicit": True,
+                    "pending_task_draft": {
+                        "_draft_type": "calendar_event",
+                        "title": "Позвонить Борисову",
+                    },
+                },
+            ),
+            retrieval_hits=[],
+            tool_definitions=[{"name": "calendar_event_discard", "description": "", "parameters": {}}],
+        )
+    )
+
+    assert client.calls == []
+    assert result.raw == {"source": "draft_discard_route"}
+    assert [call.name for call in result.decision.tool_calls] == ["calendar_event_discard"]
+
+
 def test_bitrix_llm_does_not_treat_preview_request_as_task_draft_discard(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     client = RecordingLLMClient(
