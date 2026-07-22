@@ -56,6 +56,8 @@ class Settings:
     orchestrator_llm_reasoning: bool
     orchestrator_llm_reasoning_effort: str
     orchestrator_llm_timeout_seconds: float
+    bitrix_structured_commands_enabled: bool
+    bitrix_structured_command_tools: str
     deepseek_api_key: str
     deepseek_balance_base_url: str
     deepseek_balance_timeout_seconds: float
@@ -338,6 +340,18 @@ class Settings:
     def resolved_task_close_control_admin_user_ids(self) -> list[int]:
         return _id_list(self.bitrix_task_close_control_admin_user_ids) or [1]
 
+    def resolved_bitrix_structured_command_tools(self, available: set[str]) -> set[str]:
+        if not self.bitrix_structured_commands_enabled:
+            return set()
+        configured = {
+            item.strip()
+            for item in self.bitrix_structured_command_tools.replace(";", ",").split(",")
+            if item.strip()
+        }
+        if not configured or "*" in configured:
+            return set(available)
+        return set(available) & configured
+
     @property
     def resolved_agent_private_disk_path_markers(self) -> list[str]:
         return [
@@ -480,6 +494,8 @@ def get_settings() -> Settings:
         orchestrator_llm_reasoning=_env_bool("AI_SERVER_ORCHESTRATOR_LLM_REASONING"),
         orchestrator_llm_reasoning_effort=_env("AI_SERVER_ORCHESTRATOR_LLM_REASONING_EFFORT"),
         orchestrator_llm_timeout_seconds=_env_float("AI_SERVER_ORCHESTRATOR_LLM_TIMEOUT_SECONDS", 120.0) or 120.0,
+        bitrix_structured_commands_enabled=_env_bool("BITRIX_STRUCTURED_COMMANDS_ENABLED", True),
+        bitrix_structured_command_tools=_env("BITRIX_STRUCTURED_COMMAND_TOOLS", "*"),
         deepseek_api_key=_deepseek_api_key(),
         deepseek_balance_base_url=_env("AI_SERVER_DEEPSEEK_BALANCE_BASE_URL", "https://api.deepseek.com"),
         deepseek_balance_timeout_seconds=_env_float("AI_SERVER_DEEPSEEK_BALANCE_TIMEOUT_SECONDS", 10.0) or 10.0,

@@ -77,6 +77,7 @@ class AgentManifest(BaseModel):
     entrypoint: str | None = None
     instructions_file: str | None = None
     skills_path: str | None = None
+    contracts_path: str | None = None
     knowledge_path: str | None = None
     automations_path: str | None = None
     channels: list[str] = Field(default_factory=list)

@@ -5,6 +5,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from ai_server.agents.ports import OrchestratorStorePort, SchedulerPort
+from ai_server.capability_registry import build_capability_registry
 from ai_server.models import (
     AgentManifest,
     AgentTask,
@@ -74,6 +75,25 @@ class CallSpecialistTool:
                 },
                 "required": ["specialist_id", "request"],
             },
+        )
+
+    def capability_registry(self, specialist_id: str) -> dict[str, Any] | None:
+        """Read a fresh registry from the same specialist instance that will execute it."""
+
+        specialist = self._specialists.get(specialist_id)
+        manifest = self._manifests.get(specialist_id)
+        if specialist is None or manifest is None:
+            return None
+        provider = getattr(specialist, "capability_registry", None)
+        if callable(provider):
+            value = provider()
+            return dict(value) if isinstance(value, dict) else None
+        definitions = getattr(specialist, "tool_definitions", None)
+        raw = definitions() if callable(definitions) else []
+        return build_capability_registry(
+            manifest,
+            [item for item in raw if isinstance(item, dict)],
+            structured_tool_names=set(),
         )
 
     async def get_active_bitrix_draft(self, dialog_key: str) -> dict[str, Any] | None:
@@ -222,6 +242,7 @@ class CallSpecialistTool:
     async def execute_with_task(self, args: dict[str, Any], *, task: AgentTask) -> ToolResult:
         specialist_id = str(args.get("specialist_id") or "").strip()
         planned_request = str(args.get("request") or "").strip()
+        structured_command = args.get("structured_command")
         original_request = str(task.context.get("t0006_original_request") or "").strip()
         dispatch_request = str(task.context.get("t0007_dispatch_request") or "").strip()
         explicit_segment_request = str(task.context.get("t0007_explicit_segment_request") or "").strip()
@@ -252,7 +273,17 @@ class CallSpecialistTool:
             }
         )
         try:
-            sr = await specialist.handle(sub_task)
+            structured_executor = getattr(specialist, "execute_structured_command", None)
+            if isinstance(structured_command, dict):
+                if not callable(structured_executor):
+                    return ToolResult(
+                        status=ToolStatus.INVALID_TOOL_CALL,
+                        tool=self.name,
+                        error=f"specialist {specialist_id} does not accept structured commands",
+                    )
+                sr = await structured_executor(sub_task, dict(structured_command))
+            else:
+                sr = await specialist.handle(sub_task)
         except Exception as exc:
             err = f"{type(exc).__name__}: {exc}"
             logger.exception("CallSpecialistTool: specialist %s failed", specialist_id)

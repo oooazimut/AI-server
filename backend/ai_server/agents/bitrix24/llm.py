@@ -517,6 +517,62 @@ def _direct_task_create_response(
     return None
 
 
+def direct_tool_results_response(
+    *,
+    agent_id: str,
+    tool_results: list[ToolResult],
+    portal_base_url: str = "",
+    command_arguments: dict[str, Any] | None = None,
+) -> BitrixLLMFinalResult:
+    """Render one exact orchestrator command without another Bitrix model call."""
+
+    direct = _direct_task_create_response(
+        agent_id=agent_id,
+        tool_results=tool_results,
+        portal_base_url=portal_base_url,
+    )
+    if direct is not None:
+        return direct
+    result = tool_results[-1] if tool_results else None
+    if result is None:
+        return BitrixLLMFinalResult(
+            status="failed",
+            answer="Bitrix не вернул результат выполнения команды.",
+            model_usage=_local_model_usage(agent_id, "structured_command_empty_result"),
+        )
+    if result.status in {"error", "not_configured"}:
+        status = "failed"
+    elif result.status in {"invalid_tool_call", "contract_violation"}:
+        status = "needs_clarification"
+    else:
+        status = "completed"
+    return BitrixLLMFinalResult(
+        status=status,
+        answer=_format_generic_tool_answer(result, command_arguments=command_arguments or {}),
+        model_usage=_local_model_usage(agent_id, "structured_command_generic_response"),
+    )
+
+
+def _format_generic_tool_answer(result: ToolResult, *, command_arguments: dict[str, Any]) -> str:
+    data = result.data if isinstance(result.data, dict) else {}
+    if result.status != "ok":
+        return _format_read_denied_answer(data, result.error)
+    summary = _text(data.get("summary")) or _text(command_arguments.get("summary"))
+    if result.tool == "bitrix_api":
+        method = _text(data.get("method")) or _text(command_arguments.get("method")) or "Bitrix API"
+        payload = data.get("result")
+        count = len(payload) if isinstance(payload, list) else None
+        if count is not None:
+            return f"Bitrix выполнил {method}. Получено записей: {count}."
+        return f"Bitrix выполнил {method}."
+    messages = {
+        "save_incomplete_proposal": "Предложение по незавершённой части задачи сохранено.",
+        "delete_incomplete_proposal": "Предложение удалено.",
+        "save_responsible_response": "Ответ ответственного сохранён.",
+    }
+    return messages.get(result.tool) or summary or f"Команда {result.tool} выполнена."
+
+
 def _format_read_denied_answer(data: dict[str, Any], error: str | None) -> str:
     authorization = data.get("authorization") if isinstance(data.get("authorization"), dict) else {}
     message = _text(authorization.get("message")) if authorization else ""

@@ -18,13 +18,23 @@ from typing import Any, Protocol
 
 from ai_server.agents.base import _trace_now_iso
 from ai_server.agents.bitrix24.draft_confirmation import matches_draft_confirmation
+from ai_server.agents.bitrix24.llm import direct_tool_results_response
+from ai_server.capability_registry import registry_tool, validate_tool_arguments
 from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
-from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ModelUsageRecord, ToolResult
+from ai_server.models import (
+    ActionRecord,
+    AgentManifest,
+    AgentResult,
+    AgentTask,
+    ModelUsageRecord,
+    ToolResult,
+    ToolStatus,
+)
 from ai_server.orchestrators.conversation_reference import resolve_conversation_reference
 from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.orchestrators.tools.call_specialist import CallSpecialistTool
 
-PLAN_SCHEMA = "t0007.plan.v1"
+PLAN_SCHEMA = "t0007.plan.v2"
 FINAL_SCHEMA = "t0006.final.v1"
 REPAIRABLE_PLAN_REJECTIONS = frozenset(
     {
@@ -35,6 +45,11 @@ REPAIRABLE_PLAN_REJECTIONS = frozenset(
         "SEGMENT_BINDING_INVALID",
         "DUPLICATE_SUBTASK",
         "WAREHOUSE_SEGMENT_INCOMPLETE",
+        "STRUCTURED_COMMAND_REQUIRED",
+        "STRUCTURED_COMMAND_SCHEMA_MISMATCH",
+        "CAPABILITY_REGISTRY_VERSION_MISMATCH",
+        "STRUCTURED_COMMAND_TOOL_INVALID",
+        "STRUCTURED_COMMAND_ARGUMENTS_INVALID",
     }
 )
 
@@ -116,6 +131,25 @@ def _active_draft_summary(draft: dict[str, Any]) -> str:
     return f"Активный черновик — {label}: «{title}»." if title else f"Активный черновик — {label}."
 
 
+def _planning_draft_view(draft: dict[str, Any]) -> dict[str, Any]:
+    """Expose business fields to the planner without store/claim internals."""
+
+    allowed_internal = {"_draft_type", "_draft_version"}
+
+    def clean(value: object) -> object:
+        if isinstance(value, dict):
+            return {
+                str(key): clean(item)
+                for key, item in value.items()
+                if not str(key).startswith("_") or str(key) in allowed_internal
+            }
+        if isinstance(value, list):
+            return [clean(item) for item in value]
+        return value
+
+    return dict(clean(draft))
+
+
 class PlanAuthoritativeLLM(Protocol):
     async def plan(
         self, *, manifest: AgentManifest, task: AgentTask, catalog: dict[str, Any], constraints: dict[str, Any]
@@ -146,12 +180,22 @@ class DeepSeekPlanService:
             "plan_id": constraints["plan_id"],
             "request": task.request,
             "request_hash": constraints["request_hash"],
+            "user": task.user.model_dump(),
             "dialog_history": list(task.context.get("dialog_history") or []),
+            "active_bitrix_draft": task.context.get("active_bitrix_draft"),
+            "execution_history": list(task.context.get("orchestrator_execution_history") or []),
             "capability_catalog": catalog,
             "hard_constraints": {
                 key: value
                 for key, value in constraints.items()
-                if key not in {"plan_id", "request_hash", "repair_reason", "repair_attempt"}
+                if key
+                not in {
+                    "plan_id",
+                    "request_hash",
+                    "repair_reason",
+                    "repair_attempt",
+                    "capability_catalog",
+                }
             },
             "required_response": {
                 "schema_version": PLAN_SCHEMA,
@@ -167,6 +211,10 @@ class DeepSeekPlanService:
                         "specialist_id": "catalog id",
                         "capability": "catalog capability id",
                         "request": "bounded request",
+                        "structured_command": (
+                            "null for a legacy capability, otherwise an object with exactly: "
+                            "registry_version, tool_name, arguments"
+                        ),
                     }
                 ],
             },
@@ -192,9 +240,17 @@ class DeepSeekPlanService:
                 {
                     "role": "system",
                     "content": (
-                        "Return only strict JSON. You are an untrusted planner; do not call tools or compose a user answer. "
+                        "Return only strict JSON. You are the sole semantic planner; do not call tools or compose a user answer. "
                         "Before sending, verify that the top-level keys are exactly the keys in required_response and that "
                         "schema_version, plan_id, and request_hash exactly match their required_response values. "
+                        "For every tool marked structured_command=true, choose the exact tool and arguments yourself and "
+                        "return a version-bound structured_command. The specialist will execute it once and is forbidden "
+                        "to reinterpret the request. Use the specialist skills in capability_catalog as business rules. "
+                        "For such a subtask, capability and structured_command.tool_name must both equal that exact tool id. "
+                        "max_rounds counts this execution round. Use a value above 1 only when the current exact command is "
+                        "a lookup whose returned IDs/data are required for a later command. On the next planner call, use "
+                        "execution_history and never repeat an already successful command with identical arguments. "
+                        "If the user request is ambiguous, return CLARIFICATION_REQUIRED instead of guessing arguments. "
                         "Use dialog_history when the current request answers a clarification. For a calendar reminder, "
                         "do not ask for a missing time: use 12:00 Moscow; keep an already stated date and title."
                     ),
@@ -255,6 +311,14 @@ class Subtask:
     specialist_id: str
     capability: str
     request: str
+    structured_command: StructuredCommand | None = None
+
+
+@dataclass(frozen=True)
+class StructuredCommand:
+    registry_version: str
+    tool_name: str
+    arguments: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -263,6 +327,7 @@ class Plan:
     state: str
     clarification: str | None
     subtasks: list[Subtask]
+    max_rounds: int = 1
 
 
 def _hash(value: str) -> str:
@@ -374,6 +439,8 @@ def _constraints(
     *,
     pending_specialist: str | None = None,
     conversation_reference_error: str | None = None,
+    max_round_trips: int = 3,
+    prior_command_fingerprints: list[str] | None = None,
 ) -> dict[str, Any]:
     text = request.casefold()
     only_bitrix = "только bitrix" in text or "только битрикс" in text
@@ -386,7 +453,8 @@ def _constraints(
         "pending_specialist": pending_specialist or None,
         "conversation_reference_error": conversation_reference_error or None,
         "max_subtasks": 8,
-        "max_round_trips": 3,
+        "max_round_trips": max(1, min(int(max_round_trips), 3)),
+        "prior_command_fingerprints": list(prior_command_fingerprints or []),
     }
 
 
@@ -427,19 +495,21 @@ def _decode_plan(raw: str, *, plan_id: str, request: str, constraints: dict[str,
     seen_dispatches: set[tuple[str, str, str]] = set()
     subtasks: list[Subtask] = []
     for item in items:
-        if not isinstance(item, dict) or set(item) != {
+        legacy_keys = {
             "subtask_id",
             "segment_id",
             "specialist_id",
             "capability",
             "request",
-        }:
+        }
+        if not isinstance(item, dict) or set(item) not in {frozenset(legacy_keys), frozenset({*legacy_keys, "structured_command"})}:
             raise PlanRejected("SUBTASK_SCHEMA_MISMATCH")
         subtask_id = item["subtask_id"]
         segment_id = item["segment_id"]
         specialist_id = item["specialist_id"]
         capability = item["capability"]
         subrequest = item["request"]
+        raw_command = item.get("structured_command")
         if not isinstance(subtask_id, str) or not subtask_id or subtask_id in seen:
             raise PlanRejected("SUBTASK_ID_INVALID")
         if segment_id is not None and (not isinstance(segment_id, str) or segment_id in seen_segments):
@@ -448,12 +518,46 @@ def _decode_plan(raw: str, *, plan_id: str, request: str, constraints: dict[str,
             raise PlanRejected("FORBIDDEN_SPECIALIST")
         if constraints["only_source"] and specialist_id != "bitrix24":
             raise PlanRejected("SOURCE_RESTRICTION_VIOLATION")
-        available = set((constraints["capability_catalog"].get(specialist_id) or {}).get("capabilities", []))
+        specialist_catalog = constraints["capability_catalog"].get(specialist_id) or {}
+        available = set(specialist_catalog.get("capabilities", []))
         if not isinstance(capability, str) or capability not in available:
             raise PlanRejected("FORBIDDEN_CAPABILITY")
         if not isinstance(subrequest, str) or not subrequest.strip():
             raise PlanRejected("SUBTASK_REQUEST_INVALID")
-        dispatch_key = (specialist_id, capability, _normalized_text(subrequest))
+        tool_contract = registry_tool(specialist_catalog, capability)
+        structured_required = bool(tool_contract and tool_contract.get("structured_command"))
+        structured_command: StructuredCommand | None = None
+        if raw_command is None:
+            if structured_required:
+                raise PlanRejected("STRUCTURED_COMMAND_REQUIRED")
+        else:
+            if not isinstance(raw_command, dict) or set(raw_command) != {
+                "registry_version",
+                "tool_name",
+                "arguments",
+            }:
+                raise PlanRejected("STRUCTURED_COMMAND_SCHEMA_MISMATCH")
+            registry_version = str(raw_command.get("registry_version") or "")
+            tool_name = str(raw_command.get("tool_name") or "")
+            arguments = raw_command.get("arguments")
+            if registry_version != str(specialist_catalog.get("registry_version") or ""):
+                raise PlanRejected("CAPABILITY_REGISTRY_VERSION_MISMATCH")
+            if tool_name != capability or tool_contract is None or not tool_contract.get("structured_command"):
+                raise PlanRejected("STRUCTURED_COMMAND_TOOL_INVALID")
+            if not isinstance(arguments, dict):
+                raise PlanRejected("STRUCTURED_COMMAND_ARGUMENTS_INVALID")
+            if validate_tool_arguments(dict(tool_contract.get("parameters") or {}), arguments):
+                raise PlanRejected("STRUCTURED_COMMAND_ARGUMENTS_INVALID")
+            structured_command = StructuredCommand(registry_version, tool_name, dict(arguments))
+        command_fingerprint = (
+            json.dumps(structured_command.arguments, ensure_ascii=False, sort_keys=True)
+            if structured_command is not None
+            else _normalized_text(subrequest)
+        )
+        dispatch_key = (specialist_id, capability, command_fingerprint)
+        prior_fingerprint = f"{specialist_id}:{capability}:{command_fingerprint}"
+        if prior_fingerprint in set(constraints.get("prior_command_fingerprints") or []):
+            raise PlanRejected("DUPLICATE_SUBTASK")
         if dispatch_key in seen_dispatches:
             raise PlanRejected("DUPLICATE_SUBTASK")
         if expected_segments:
@@ -465,7 +569,7 @@ def _decode_plan(raw: str, *, plan_id: str, request: str, constraints: dict[str,
             raise PlanRejected("SEGMENT_BINDING_INVALID")
         seen.add(subtask_id)
         seen_dispatches.add(dispatch_key)
-        subtasks.append(Subtask(subtask_id, segment_id, specialist_id, capability, subrequest))
+        subtasks.append(Subtask(subtask_id, segment_id, specialist_id, capability, subrequest, structured_command))
     if expected_segments and seen_segments != set(expected_segments):
         raise PlanRejected("SEGMENT_COMPLETENESS_FAILED")
     required_warehouse_labels = list(constraints.get("required_warehouse_labels") or [])
@@ -482,7 +586,7 @@ def _decode_plan(raw: str, *, plan_id: str, request: str, constraints: dict[str,
                 label_counts[represented[0]] += 1
         if any(count != 1 for count in label_counts.values()):
             raise PlanRejected("WAREHOUSE_SEGMENT_INCOMPLETE")
-    return Plan(plan_id, state, clarification, subtasks)
+    return Plan(plan_id, state, clarification, subtasks, value["max_rounds"])
 
 
 class PlanAuthoritativeOrchestrator(InternalOrchestrator):
@@ -528,7 +632,29 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             outbound_queue=kwargs.get("outbound_queue"),
         )
         call.schedule_fn = instance._apply_scheduled_tasks_from_specialist
+        instance._validate_live_catalog(instance._catalog())
         return instance
+
+    @staticmethod
+    def _validate_live_catalog(catalog: dict[str, dict[str, Any]]) -> None:
+        """Fail startup when an advertised structured command is incomplete."""
+
+        for specialist_id, entry in catalog.items():
+            registry_version = str(entry.get("registry_version") or "")
+            seen: set[str] = set()
+            for tool in entry.get("tools") or []:
+                if not isinstance(tool, dict):
+                    raise RuntimeError(f"CAPABILITY_REGISTRY_INVALID:{specialist_id}")
+                tool_id = str(tool.get("id") or "")
+                if not tool_id or tool_id in seen:
+                    raise RuntimeError(f"CAPABILITY_REGISTRY_DUPLICATE_TOOL:{specialist_id}")
+                seen.add(tool_id)
+                if tool.get("structured_command") and (
+                    not registry_version
+                    or not str(tool.get("version") or "")
+                    or not isinstance(tool.get("parameters"), dict)
+                ):
+                    raise RuntimeError(f"CAPABILITY_REGISTRY_STRUCTURED_TOOL_INVALID:{specialist_id}:{tool_id}")
 
     def _catalog(self) -> dict[str, dict[str, Any]]:
         call = self._tool_registry.get("call_specialist")
@@ -536,22 +662,19 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             return {}
         catalog: dict[str, dict[str, Any]] = {}
         for agent_id, manifest in call._manifests.items():
-            specialist = call._specialists.get(agent_id)
-            if specialist is None:
+            registry = call.capability_registry(agent_id)
+            if registry is None:
                 continue
-            tools: list[dict[str, str]] = []
-            definitions = getattr(specialist, "tool_definitions", None)
-            if callable(definitions):
-                for definition in definitions():
-                    if isinstance(definition, dict):
-                        tool_id = str(definition.get("name") or "").strip()
-                        if tool_id:
-                            tools.append({"id": tool_id, "description": str(definition.get("description") or "")})
+            tools = [item for item in registry.get("tools") or [] if isinstance(item, dict)]
             tool_ids = {item["id"] for item in tools}
             catalog[agent_id] = {
                 "description": str(manifest.handoff_description or manifest.name),
                 "capabilities": sorted(set(manifest.capabilities) | tool_ids),
                 "tools": tools,
+                "skills": [item for item in registry.get("skills") or [] if isinstance(item, dict)],
+                "contracts": [item for item in registry.get("contracts") or [] if isinstance(item, dict)],
+                "registry_schema": registry.get("schema_version"),
+                "registry_version": registry.get("registry_version"),
                 "allowed_actions": sorted(manifest.allowed_actions),
                 "approval_required": sorted(manifest.approval_required),
             }
@@ -606,7 +729,12 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
         if not dialog_key or not isinstance(call, CallSpecialistTool):
             return task, None
         draft = await call.get_active_bitrix_draft(dialog_key)
-        if not draft or not _is_new_request_during_draft(
+        if not draft:
+            return task, None
+        task = task.model_copy(
+            update={"context": {**task.context, "active_bitrix_draft": _planning_draft_view(draft)}}
+        )
+        if not _is_new_request_during_draft(
             task.request,
             draft,
             allow_short_command=bool(task.context.get("conversation_reference_explicit")),
@@ -966,8 +1094,22 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             dispatch_started_at = _trace_now_iso()
             dispatch_t0 = time.monotonic()
             try:
+                structured_command = (
+                    {
+                        "registry_version": subtask.structured_command.registry_version,
+                        "tool_name": subtask.structured_command.tool_name,
+                        "arguments": subtask.structured_command.arguments,
+                    }
+                    if subtask.structured_command is not None
+                    else None
+                )
                 value = await call.execute_with_task(
-                    {"specialist_id": subtask.specialist_id, "request": subtask.request}, task=correlated_task
+                    {
+                        "specialist_id": subtask.specialist_id,
+                        "request": subtask.request,
+                        "structured_command": structured_command,
+                    },
+                    task=correlated_task,
                 )
             except Exception:
                 await self._record_timing(
@@ -980,6 +1122,7 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                         "parallel_group": dispatch_group,
                         "subtask_id": subtask.subtask_id,
                         "specialist_id": subtask.specialist_id,
+                        "structured_command": subtask.structured_command is not None,
                     },
                 )
                 raise
@@ -1003,6 +1146,7 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
         if deterministic_route:
             actions.append(ActionRecord(name="pending_specialist_route", status="ok", details=base_meta))
         approvals: list[ActionRecord] = []
+        execution_records: list[dict[str, Any]] = []
         for item, value in zip(plan.subtasks, completed, strict=True):
             if isinstance(value, Exception):
                 attempt_id = f"attempt-{uuid.uuid4().hex}"
@@ -1031,7 +1175,47 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             _, attempt_id, tool = value
             data = tool.data if isinstance(tool.data, dict) else {}
             branch_status = str(data.get("status") or tool.status)
+            specialist_status = branch_status
             branch_answer = str(data.get("answer") or tool.error or "").strip()
+            specialist_metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+            if specialist_metadata.get("structured_command") and isinstance(
+                specialist_metadata.get("tool_result"), dict
+            ):
+                raw_tool_result = ToolResult.model_validate(specialist_metadata["tool_result"])
+                rendered = direct_tool_results_response(
+                    agent_id=self.manifest.id,
+                    tool_results=[raw_tool_result],
+                    portal_base_url=str(specialist_metadata.get("portal_base_url") or ""),
+                    command_arguments=(
+                        specialist_metadata.get("command_arguments")
+                        if isinstance(specialist_metadata.get("command_arguments"), dict)
+                        else {}
+                    ),
+                )
+                branch_status = rendered.status
+                branch_answer = rendered.answer
+                if specialist_status in {"needs_human", "needs_clarification", "failed"}:
+                    branch_status = specialist_status
+                command_arguments = (
+                    specialist_metadata.get("command_arguments")
+                    if isinstance(specialist_metadata.get("command_arguments"), dict)
+                    else {}
+                )
+                execution_records.append(
+                    {
+                        "subtask_id": item.subtask_id,
+                        "specialist_id": item.specialist_id,
+                        "capability": item.capability,
+                        "registry_version": specialist_metadata.get("registry_version"),
+                        "tool_name": raw_tool_result.tool,
+                        "arguments": command_arguments,
+                        "result": raw_tool_result.model_dump(),
+                        "command_fingerprint": (
+                            f"{item.specialist_id}:{item.capability}:"
+                            f"{json.dumps(command_arguments, ensure_ascii=False, sort_keys=True)}"
+                        ),
+                    }
+                )
             if len(plan.subtasks) > 1:
                 if branch_status in {"error", "failed"}:
                     branch_answer = "не завершил обработку."
@@ -1062,6 +1246,68 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                         "specialist_id": item.specialist_id,
                     },
                 )
+            )
+        if (
+            plan.max_rounds > 1
+            and execution_records
+            and not approvals
+            and all(str(fact.get("status") or "") == "completed" for fact in facts)
+            and all(str(record["result"].get("status") or "") == str(ToolStatus.OK) for record in execution_records)
+        ):
+            followup = await self._plan_followup(
+                task,
+                execution_records=execution_records,
+                remaining_rounds=plan.max_rounds - 1,
+            )
+            if followup is not None:
+                next_plan, next_hash, next_usages, next_rejections, next_audit = followup
+                next_result = await self._execute(
+                    task.model_copy(
+                        update={
+                            "context": {
+                                **task.context,
+                                "orchestrator_execution_history": [
+                                    *list(task.context.get("orchestrator_execution_history") or []),
+                                    *execution_records,
+                                ],
+                            }
+                        }
+                    ),
+                    next_plan,
+                    next_hash,
+                    next_usages,
+                    planner_rejections=next_rejections,
+                    planner_attempt_audit=next_audit,
+                )
+                return next_result.model_copy(
+                    update={
+                        "actions_taken": [*actions, *next_result.actions_taken],
+                        "model_usage": [*planner_usages, *next_result.model_usage],
+                        "handoff_to": sorted(
+                            {*next_result.handoff_to, *(record["specialist_id"] for record in execution_records)}
+                        ),
+                        "metadata": {
+                            **next_result.metadata,
+                            "structured_command_rounds": 1
+                            + int(next_result.metadata.get("structured_command_rounds") or 0),
+                        },
+                    }
+                )
+            return AgentResult(
+                status="failed",
+                agent_id=self.manifest.id,
+                answer="Не удалось безопасно продолжить многошаговую команду Bitrix.",
+                model_usage=list(planner_usages),
+                actions_taken=[
+                    *actions,
+                    ActionRecord(
+                        name="structured_command_followup",
+                        status="rejected",
+                        details={"reason": "FOLLOWUP_PLAN_UNAVAILABLE"},
+                    ),
+                ],
+                handoff_to=sorted({record["specialist_id"] for record in execution_records}),
+                metadata={"reason": "FOLLOWUP_PLAN_UNAVAILABLE", "structured_command_rounds": 1},
             )
         render_started_at = _trace_now_iso()
         render_t0 = time.monotonic()
@@ -1129,8 +1375,100 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             actions_taken=actions,
             actions_requiring_approval=approvals,
             handoff_to=sorted({item.specialist_id for item in plan.subtasks}),
-            metadata={**base_meta, "branches": facts},
+            metadata={
+                **base_meta,
+                "branches": facts,
+                "structured_command_rounds": 1 if execution_records else 0,
+            },
         )
+
+    async def _plan_followup(
+        self,
+        task: AgentTask,
+        *,
+        execution_records: list[dict[str, Any]],
+        remaining_rounds: int,
+    ) -> tuple[Plan, str, list[ModelUsageRecord], list[str], list[dict[str, Any]]] | None:
+        history = [*list(task.context.get("orchestrator_execution_history") or []), *execution_records]
+        planning_task = task.model_copy(
+            update={"context": {**task.context, "orchestrator_execution_history": history}}
+        )
+        catalog = self._catalog()
+        self._validate_live_catalog(catalog)
+        constraints = _constraints(
+            task.request,
+            catalog,
+            pending_specialist=str(task.context.get("pending_specialist") or "") or None,
+            max_round_trips=remaining_rounds,
+            prior_command_fingerprints=[
+                str(item.get("command_fingerprint") or "") for item in history if isinstance(item, dict)
+            ],
+        )
+        plan_id = f"plan-{uuid.uuid4().hex}"
+        usages: list[ModelUsageRecord] = []
+        rejections: list[str] = []
+        audit: list[dict[str, Any]] = []
+        for attempt in range(1, 3):
+            call_constraints = {
+                **constraints,
+                "plan_id": plan_id,
+                "request_hash": _hash(task.request),
+                "structured_followup_round": True,
+            }
+            if rejections:
+                call_constraints.update({"repair_reason": rejections[-1], "repair_attempt": attempt})
+            started_at = _trace_now_iso()
+            started = time.monotonic()
+            try:
+                raw, usage = await self._planner.plan(
+                    manifest=self.manifest,
+                    task=planning_task,
+                    catalog=catalog,
+                    constraints=call_constraints,
+                )
+            except Exception:
+                await self._record_timing(
+                    planning_task,
+                    stage="pro_plan_followup",
+                    started_at=started_at,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                    status="error",
+                    step=attempt,
+                )
+                return None
+            usages.append(usage)
+            response_hash = _hash(raw)
+            record = {"attempt": attempt, "response_hash": response_hash, "status": "accepted"}
+            audit.append(record)
+            try:
+                plan = _decode_plan(raw, plan_id=plan_id, request=task.request, constraints=constraints)
+            except PlanRejected as exc:
+                reason = str(exc)
+                rejections.append(reason)
+                record.update({"status": "rejected", "rejection": reason})
+                await self._record_timing(
+                    planning_task,
+                    stage="pro_plan_followup",
+                    started_at=started_at,
+                    elapsed_ms=(time.monotonic() - started) * 1000,
+                    status="rejected",
+                    step=attempt,
+                    details={"reason": reason},
+                )
+                if attempt == 1 and reason in REPAIRABLE_PLAN_REJECTIONS:
+                    continue
+                return None
+            await self._record_timing(
+                planning_task,
+                stage="pro_plan_followup",
+                started_at=started_at,
+                elapsed_ms=(time.monotonic() - started) * 1000,
+                status="accepted",
+                step=attempt,
+                details={"subtasks": len(plan.subtasks)},
+            )
+            return plan, response_hash, usages, rejections, audit
+        return None
 
     @staticmethod
     def _decode_final(raw: str, plan_id: str, response_hash: str, facts: list[dict[str, Any]]) -> str:

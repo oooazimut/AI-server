@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from types import SimpleNamespace
 from typing import Any
 
-from ai_server.agents.base import BaseSpecialist
+from ai_server.agents.base import BaseSpecialist, _trace_now_iso
 from ai_server.agents.bitrix24.draft_confirmation import draft_confirmation_phrase, matches_draft_confirmation
 from ai_server.agents.bitrix24.llm import (
     BitrixAgentLLM,
     BitrixLLMService,
     _format_task_close_confirm_answer,
     _format_task_close_draft_answer,
+    direct_tool_results_response,
     llm_failure_result,
 )
 from ai_server.agents.bitrix24.ports import ProposalStorePort, TaskDraftStorePort
@@ -48,6 +50,7 @@ from ai_server.agents.bitrix24.tools import (
 )
 from ai_server.agents.ports import SchedulerPort
 from ai_server.agents.tool import AgentTool
+from ai_server.capability_registry import build_capability_registry, registry_tool, validate_tool_arguments
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService
 from ai_server.integrations.bitrix.profile import compact_user_profile
@@ -196,6 +199,168 @@ class Bitrix24Specialist(BaseSpecialist):
             expected_version=int(draft.get("_draft_version") or 0) or None,
         )
         return True
+
+    def capability_registry(self) -> dict[str, Any]:
+        """Advertise the live Bitrix command surface to the orchestrator."""
+
+        definitions = self.tool_definitions()
+        available = {str(item.get("name") or "") for item in definitions if isinstance(item, dict)}
+        enabled = (
+            self._settings_for_qc.resolved_bitrix_structured_command_tools(available)
+            if self._settings_for_qc is not None
+            else available
+        )
+        return build_capability_registry(
+            self.manifest,
+            definitions,
+            structured_tool_names=enabled,
+        )
+
+    async def execute_structured_command(self, task: AgentTask, command: dict[str, Any]) -> AgentResult:
+        """Execute one command selected and parameterised by the orchestrator.
+
+        No Bitrix decision or compose model is called on this path.  The
+        specialist remains responsible for live schema/version checks, access
+        policy, OAuth, draft safety, and the actual tool call.
+        """
+
+        registry = self.capability_registry()
+        failure = self._structured_command_failure(command, registry)
+        if failure is not None:
+            return failure
+
+        tool_name = str(command["tool_name"])
+        arguments = dict(command["arguments"])
+        context_started_at = _trace_now_iso()
+        context_t0 = time.monotonic()
+        task, context_details = await self._load_extra_context(task)
+        task = task.model_copy(update={"context": {**task.context, "structured_command_execution": True}})
+        await self._record_timing(
+            task,
+            stage="structured_context_load",
+            started_at=context_started_at,
+            elapsed_ms=(time.monotonic() - context_t0) * 1000,
+            status="completed",
+            tool=tool_name,
+        )
+        tool_call = SimpleNamespace(name=tool_name, args=arguments, summary="orchestrator structured command")
+        tool_started_at = _trace_now_iso()
+        tool_t0 = time.monotonic()
+        result, action, approvals = await self._execute_tool_call(tool_call, task)
+        if result is None:
+            result = ToolResult(
+                status=ToolStatus.ERROR,
+                tool=tool_name,
+                error="structured command returned no tool result",
+            )
+        await self._record_timing(
+            task,
+            stage="structured_tool_execute",
+            started_at=tool_started_at,
+            elapsed_ms=(time.monotonic() - tool_t0) * 1000,
+            status=str(result.status),
+            tool=tool_name,
+            details={"registry_version": registry["registry_version"]},
+        )
+
+        rendered = direct_tool_results_response(
+            agent_id=self.manifest.id,
+            tool_results=[result],
+            portal_base_url=self._settings_for_qc.bitrix_portal_base_url if self._settings_for_qc else "",
+            command_arguments=arguments,
+        )
+        actions = [
+            ActionRecord(
+                name="bitrix_capability_contract",
+                status="ok",
+                details={
+                    "registry_version": registry["registry_version"],
+                    "tool": tool_name,
+                    "mode": "structured_command",
+                },
+            )
+        ]
+        if action is not None:
+            actions.append(action)
+        metadata = {
+            "terminal": True,
+            "answer_is_final": True,
+            "safe_to_send": True,
+            "fast_return": True,
+            "fast_return_reason": "orchestrator_structured_command",
+            "terminal_tool": tool_name,
+            "terminal_status": rendered.status,
+            "registry_version": registry["registry_version"],
+            "structured_command": True,
+            "command_arguments": arguments,
+            "tool_result": result.model_dump(),
+            "portal_base_url": self._settings_for_qc.bitrix_portal_base_url if self._settings_for_qc else "",
+            "permission_context": context_details,
+        }
+        dialog_key = str(task.context.get("dialog_key") or "")
+        if self.store is not None and dialog_key and rendered.answer:
+            await self.store.append_turn(dialog_key, task.request, rendered.answer)
+        output = AgentResult(
+            status="needs_human" if approvals else rendered.status,
+            agent_id=self.manifest.id,
+            answer=rendered.answer,
+            actions_taken=actions,
+            actions_requiring_approval=list(approvals),
+            model_usage=[rendered.model_usage],
+            confidence=1.0 if result.status == ToolStatus.OK else 0.0,
+            logs=["Bitrix executed one version-bound orchestrator command without a specialist model call."],
+            metadata=metadata,
+        )
+        return _enforce_task_close_response(output, settings=self._settings_for_qc)
+
+    def _structured_command_failure(
+        self,
+        command: dict[str, Any],
+        registry: dict[str, Any],
+    ) -> AgentResult | None:
+        reason = ""
+        details: dict[str, Any] = {}
+        if not isinstance(command, dict) or set(command) != {"registry_version", "tool_name", "arguments"}:
+            reason = "STRUCTURED_COMMAND_SCHEMA_MISMATCH"
+        elif str(command.get("registry_version") or "") != str(registry.get("registry_version") or ""):
+            reason = "CAPABILITY_REGISTRY_VERSION_MISMATCH"
+        elif not isinstance(command.get("arguments"), dict):
+            reason = "STRUCTURED_COMMAND_ARGUMENTS_INVALID"
+        else:
+            tool_name = str(command.get("tool_name") or "")
+            tool = registry_tool(registry, tool_name)
+            if tool is None or not tool.get("structured_command"):
+                reason = "STRUCTURED_COMMAND_TOOL_DISABLED"
+            else:
+                errors = validate_tool_arguments(dict(tool.get("parameters") or {}), command["arguments"])
+                if errors:
+                    reason = "STRUCTURED_COMMAND_ARGUMENTS_INVALID"
+                    details["validation_errors"] = errors
+        if not reason:
+            return None
+        answer = "Оркестратор передал несовместимую команду Bitrix; выполнение остановлено безопасно."
+        return AgentResult(
+            status="failed",
+            agent_id=self.manifest.id,
+            answer=answer,
+            actions_taken=[
+                ActionRecord(
+                    name="bitrix_capability_contract",
+                    status="rejected",
+                    details={"reason": reason, **details},
+                )
+            ],
+            confidence=0.0,
+            metadata={
+                "terminal": True,
+                "answer_is_final": True,
+                "safe_to_send": True,
+                "fast_return": True,
+                "fast_return_reason": "structured_command_rejected",
+                "reason": reason,
+                "registry_version": registry.get("registry_version"),
+            },
+        )
 
     @classmethod
     def build(
@@ -418,7 +583,7 @@ class Bitrix24Specialist(BaseSpecialist):
                 args=args,
                 summary=getattr(tool_call, "summary", ""),
             )
-        elif tool_call.name == "bitrix_warehouse_search":
+        elif tool_call.name == "bitrix_warehouse_search" and not task.context.get("structured_command_execution"):
             args = _warehouse_args_with_default_products(dict(tool_call.args or {}), task)
             tool_call = SimpleNamespace(
                 name=tool_call.name,

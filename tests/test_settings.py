@@ -65,6 +65,21 @@ def test_bitrix_oauth_bot_settings_can_be_loaded(monkeypatch):
     assert settings.bitrix_bot_oauth_user_id == 9
 
 
+def test_structured_bitrix_commands_have_global_and_per_tool_rollback(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("BITRIX_STRUCTURED_COMMANDS_ENABLED", "true")
+    monkeypatch.setenv("BITRIX_STRUCTURED_COMMAND_TOOLS", "bitrix_warehouse_search, bitrix_my_tasks")
+
+    settings = get_settings()
+
+    assert settings.resolved_bitrix_structured_command_tools(
+        {"bitrix_warehouse_search", "bitrix_my_tasks", "bitrix_api"}
+    ) == {"bitrix_warehouse_search", "bitrix_my_tasks"}
+
+    monkeypatch.setenv("BITRIX_STRUCTURED_COMMANDS_ENABLED", "false")
+    assert get_settings().resolved_bitrix_structured_command_tools({"bitrix_warehouse_search"}) == set()
+
+
 def test_bitrix_draft_ttl_defaults_to_fifteen_minutes_and_allows_override(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.delenv("BITRIX_TASK_DRAFT_TTL_MINUTES", raising=False)
