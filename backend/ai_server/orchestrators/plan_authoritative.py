@@ -47,10 +47,64 @@ REPAIRABLE_PLAN_REJECTIONS = frozenset(
         "WAREHOUSE_SEGMENT_INCOMPLETE",
         "STRUCTURED_COMMAND_REQUIRED",
         "STRUCTURED_COMMAND_SCHEMA_MISMATCH",
-        "CAPABILITY_REGISTRY_VERSION_MISMATCH",
         "STRUCTURED_COMMAND_TOOL_INVALID",
         "STRUCTURED_COMMAND_ARGUMENTS_INVALID",
     }
+)
+
+_PLANNER_REGISTRY_BINDING = "CURRENT"
+_PLANNER_ALWAYS_DETAILED_TOOLS = frozenset(
+    {
+        "bitrix_api",
+        "task_create_confirm",
+        "task_draft_discard",
+        "task_close_confirm",
+        "task_close_discard",
+        "calendar_event_confirm",
+        "calendar_event_discard",
+        "project_create_confirm",
+        "project_create_discard",
+    }
+)
+_PLANNER_DOMAINS: tuple[dict[str, object], ...] = (
+    {
+        "markers": ("склад", "остат", "товар", "налич", "warehouse", "stock", "product"),
+        "tools": ("bitrix_warehouse_search",),
+        "skills": ("catalog",),
+        "contracts": ("search_intents",),
+    },
+    {
+        "markers": ("задач", "исполнител", "ответствен", "постанов", "дедлайн", "task"),
+        "tools": (
+            "bitrix_my_tasks",
+            "bitrix_task_search",
+            "task_create_draft",
+            "task_close_draft",
+            "task_close_report_incident",
+            "task_close_control_get",
+            "task_close_control_update",
+        ),
+        "skills": ("tasks_create_edit", "tasks_search", "task_closure", "safe_bitrix_write"),
+        "contracts": ("search_intents",),
+    },
+    {
+        "markers": ("календар", "напом", "событ", "calendar", "remind", "event"),
+        "tools": ("calendar_event_draft",),
+        "skills": ("safe_bitrix_write",),
+        "contracts": (),
+    },
+    {
+        "markers": ("проект", "групп", "project", "workgroup"),
+        "tools": ("bitrix_project_search", "project_create_draft"),
+        "skills": ("projects_crm", "safe_bitrix_write"),
+        "contracts": (),
+    },
+    {
+        "markers": ("диск", "файл", "документ", "папк", "вложен", "disk", "file", "document", "folder"),
+        "tools": ("portal_search",),
+        "skills": ("portal_document_search", "portal_links"),
+        "contracts": ("search_intents",),
+    },
 )
 
 _ACTIVE_DRAFT_MANAGEMENT_HINT = "Для управления активным черновиком: подтвердить или отменить."
@@ -213,7 +267,7 @@ class DeepSeekPlanService:
                         "request": "bounded request",
                         "structured_command": (
                             "null for a legacy capability, otherwise an object with exactly: "
-                            "registry_version, tool_name, arguments"
+                            "registry_version, tool_name, arguments; registry_version must be the literal CURRENT"
                         ),
                     }
                 ],
@@ -244,8 +298,11 @@ class DeepSeekPlanService:
                         "Before sending, verify that the top-level keys are exactly the keys in required_response and that "
                         "schema_version, plan_id, and request_hash exactly match their required_response values. "
                         "For every tool marked structured_command=true, choose the exact tool and arguments yourself and "
-                        "return a version-bound structured_command. The specialist will execute it once and is forbidden "
+                        "return a structured_command with registry_version set to the literal CURRENT. The backend binds "
+                        "CURRENT to the authoritative live catalog version before dispatch. The specialist will execute it once and is forbidden "
                         "to reinterpret the request. Use the specialist skills in capability_catalog as business rules. "
+                        "The tools list is the complete capability index; tool_contracts contains detailed schemas for this request. "
+                        "selected_skill_rules and selected_contract_rules contain the applicable detailed rules. "
                         "For such a subtask, capability and structured_command.tool_name must both equal that exact tool id. "
                         "max_rounds counts this execution round. Use a value above 1 only when the current exact command is "
                         "a lookup whose returned IDs/data are required for a later command. On the next planner call, use "
@@ -332,6 +389,60 @@ class Plan:
 
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _planner_capability_catalog(catalog: dict[str, Any], request: str) -> dict[str, Any]:
+    """Return a small, non-authoritative view for the planning model.
+
+    The complete live registry remains in ``constraints`` for backend validation.
+    Unknown request types deliberately receive every tool contract so catalog
+    compaction cannot silently remove a future capability.
+    """
+
+    normalized_request = _normalized_text(request)
+    matched_domains = [
+        domain for domain in _PLANNER_DOMAINS if any(str(marker) in normalized_request for marker in domain["markers"])
+    ]
+    detailed_tool_ids = set(_PLANNER_ALWAYS_DETAILED_TOOLS)
+    detailed_skill_ids = {"orchestrator_command_contract"}
+    detailed_contract_ids: set[str] = set()
+    for domain in matched_domains:
+        detailed_tool_ids.update(str(item) for item in domain["tools"])
+        detailed_skill_ids.update(str(item) for item in domain["skills"])
+        detailed_contract_ids.update(str(item) for item in domain["contracts"])
+
+    compact: dict[str, Any] = {}
+    for specialist_id, entry in catalog.items():
+        tools = [item for item in entry.get("tools") or [] if isinstance(item, dict)]
+        if specialist_id != "bitrix24" or not matched_domains:
+            selected_tools = tools
+        else:
+            selected_tools = [item for item in tools if str(item.get("id") or "") in detailed_tool_ids]
+        skills = [item for item in entry.get("skills") or [] if isinstance(item, dict)]
+        contracts = [item for item in entry.get("contracts") or [] if isinstance(item, dict)]
+        compact[specialist_id] = {
+            "description": entry.get("description"),
+            "capabilities": list(entry.get("capabilities") or []),
+            "registry_binding": _PLANNER_REGISTRY_BINDING,
+            "tools": [
+                {
+                    "id": item.get("id"),
+                    "description": item.get("description"),
+                    "structured_command": bool(item.get("structured_command")),
+                }
+                for item in tools
+            ],
+            "tool_contracts": selected_tools,
+            "skills": [{"id": item.get("id"), "title": item.get("title")} for item in skills],
+            "selected_skill_rules": [item for item in skills if str(item.get("id") or "") in detailed_skill_ids],
+            "contracts": [{"id": item.get("id")} for item in contracts],
+            "selected_contract_rules": [
+                item for item in contracts if str(item.get("id") or "") in detailed_contract_ids
+            ],
+            "allowed_actions": list(entry.get("allowed_actions") or []),
+            "approval_required": list(entry.get("approval_required") or []),
+        }
+    return compact
 
 
 def _explicit_segments(request: str, catalog: dict[str, Any]) -> list[dict[str, str]]:
@@ -502,7 +613,10 @@ def _decode_plan(raw: str, *, plan_id: str, request: str, constraints: dict[str,
             "capability",
             "request",
         }
-        if not isinstance(item, dict) or set(item) not in {frozenset(legacy_keys), frozenset({*legacy_keys, "structured_command"})}:
+        if not isinstance(item, dict) or set(item) not in {
+            frozenset(legacy_keys),
+            frozenset({*legacy_keys, "structured_command"}),
+        }:
             raise PlanRejected("SUBTASK_SCHEMA_MISMATCH")
         subtask_id = item["subtask_id"]
         segment_id = item["segment_id"]
@@ -537,10 +651,11 @@ def _decode_plan(raw: str, *, plan_id: str, request: str, constraints: dict[str,
                 "arguments",
             }:
                 raise PlanRejected("STRUCTURED_COMMAND_SCHEMA_MISMATCH")
-            registry_version = str(raw_command.get("registry_version") or "")
+            registry_binding = str(raw_command.get("registry_version") or "")
+            registry_version = str(specialist_catalog.get("registry_version") or "")
             tool_name = str(raw_command.get("tool_name") or "")
             arguments = raw_command.get("arguments")
-            if registry_version != str(specialist_catalog.get("registry_version") or ""):
+            if registry_binding not in {_PLANNER_REGISTRY_BINDING, registry_version}:
                 raise PlanRejected("CAPABILITY_REGISTRY_VERSION_MISMATCH")
             if tool_name != capability or tool_contract is None or not tool_contract.get("structured_command"):
                 raise PlanRejected("STRUCTURED_COMMAND_TOOL_INVALID")
@@ -731,9 +846,7 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
         draft = await call.get_active_bitrix_draft(dialog_key)
         if not draft:
             return task, None
-        task = task.model_copy(
-            update={"context": {**task.context, "active_bitrix_draft": _planning_draft_view(draft)}}
-        )
+        task = task.model_copy(update={"context": {**task.context, "active_bitrix_draft": _planning_draft_view(draft)}})
         if not _is_new_request_during_draft(
             task.request,
             draft,
@@ -838,6 +951,7 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                 await self._publish_result(task, draft_guard_result)
                 return draft_guard_result
             catalog = self._catalog()
+            planner_catalog = _planner_capability_catalog(catalog, task.request)
             pending_specialist = str(task.context.get("pending_specialist") or "").strip()
             constraints = _constraints(
                 task.request,
@@ -870,7 +984,7 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                     raw, usage = await self._planner.plan(
                         manifest=self.manifest,
                         task=task,
-                        catalog=catalog,
+                        catalog=planner_catalog,
                         constraints=call_constraints,
                     )
                 except Exception:
@@ -1390,11 +1504,10 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
         remaining_rounds: int,
     ) -> tuple[Plan, str, list[ModelUsageRecord], list[str], list[dict[str, Any]]] | None:
         history = [*list(task.context.get("orchestrator_execution_history") or []), *execution_records]
-        planning_task = task.model_copy(
-            update={"context": {**task.context, "orchestrator_execution_history": history}}
-        )
+        planning_task = task.model_copy(update={"context": {**task.context, "orchestrator_execution_history": history}})
         catalog = self._catalog()
         self._validate_live_catalog(catalog)
+        planner_catalog = _planner_capability_catalog(catalog, task.request)
         constraints = _constraints(
             task.request,
             catalog,
@@ -1423,7 +1536,7 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                 raw, usage = await self._planner.plan(
                     manifest=self.manifest,
                     task=planning_task,
-                    catalog=catalog,
+                    catalog=planner_catalog,
                     constraints=call_constraints,
                 )
             except Exception:

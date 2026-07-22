@@ -7,11 +7,13 @@ from ai_server.agents.bitrix24 import Bitrix24Specialist
 from ai_server.models import AgentManifest, AgentResult, AgentTask, ModelUsageRecord, ToolDefinition, ToolResult
 from ai_server.orchestrators.plan_authoritative import (
     PLAN_SCHEMA,
+    REPAIRABLE_PLAN_REJECTIONS,
     PlanAuthoritativeOrchestrator,
     PlanRejected,
     _constraints,
     _decode_plan,
     _hash,
+    _planner_capability_catalog,
 )
 from ai_server.orchestrators.tools.call_specialist import CallSpecialistTool
 from ai_server.registry import get_agent_manifest
@@ -91,6 +93,73 @@ def test_plan_accepts_exact_versioned_command_and_requires_it_for_structured_too
             request=request,
             constraints=constraints,
         )
+
+
+def test_plan_binds_current_marker_to_authoritative_registry_version():
+    request = "Find employee Borisov"
+    command = {
+        "registry_version": "CURRENT",
+        "tool_name": "bitrix_api",
+        "arguments": {"method": "user.search", "params": {"NAME": "Borisov"}},
+    }
+
+    plan = _decode_plan(
+        _raw_plan(request, command),
+        plan_id="p1",
+        request=request,
+        constraints=_constraints(request, _structured_catalog()),
+    )
+
+    assert plan.subtasks[0].structured_command.registry_version == "registry-v1"
+    assert "CAPABILITY_REGISTRY_VERSION_MISMATCH" not in REPAIRABLE_PLAN_REJECTIONS
+
+
+def test_planner_catalog_keeps_complete_index_but_only_relevant_bitrix_details():
+    catalog = {
+        "bitrix24": {
+            "description": "Bitrix",
+            "capabilities": ["bitrix_warehouse_search", "portal_search", "bitrix_api"],
+            "registry_version": "secret-live-hash",
+            "tools": [
+                {"id": "bitrix_warehouse_search", "description": "warehouse", "parameters": {"type": "object"}},
+                {"id": "portal_search", "description": "portal", "parameters": {"type": "object"}},
+                {"id": "bitrix_api", "description": "api", "parameters": {"type": "object"}},
+            ],
+            "skills": [
+                {"id": "orchestrator_command_contract", "title": "contract", "content": "always"},
+                {"id": "catalog", "title": "warehouse", "content": "warehouse rules"},
+                {"id": "portal_document_search", "title": "documents", "content": "document rules"},
+            ],
+            "contracts": [{"id": "search_intents", "content": {"warehouse": {}}}],
+        },
+        "logistics": {
+            "description": "Logistics",
+            "capabilities": ["vehicle_usage_context"],
+            "tools": [{"id": "vehicle_usage_context", "description": "vehicle", "parameters": {"type": "object"}}],
+            "skills": [],
+            "contracts": [],
+        },
+    }
+
+    compact = _planner_capability_catalog(catalog, "Покажи склад Борисов")
+
+    assert compact["bitrix24"]["registry_binding"] == "CURRENT"
+    assert "registry_version" not in compact["bitrix24"]
+    assert {item["id"] for item in compact["bitrix24"]["tools"]} == {
+        "bitrix_warehouse_search",
+        "portal_search",
+        "bitrix_api",
+    }
+    assert {item["id"] for item in compact["bitrix24"]["tool_contracts"]} == {
+        "bitrix_warehouse_search",
+        "bitrix_api",
+    }
+    assert {item["id"] for item in compact["bitrix24"]["selected_skill_rules"]} == {
+        "orchestrator_command_contract",
+        "catalog",
+    }
+    assert compact["bitrix24"]["selected_contract_rules"] == catalog["bitrix24"]["contracts"]
+    assert compact["logistics"]["tool_contracts"] == catalog["logistics"]["tools"]
 
 
 @pytest.mark.parametrize(
