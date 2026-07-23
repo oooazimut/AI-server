@@ -665,6 +665,75 @@ def test_bitrix_warehouse_search_tool_filters_non_available_products_before_limi
     assert products["has_more"] is True
 
 
+def test_bitrix_warehouse_search_reads_every_page_then_filters_sorts_and_limits():
+    class PagedWarehouseClient(FakeBitrixClient):
+        async def collect_paged(self, method, payload=None, *, list_key=None, limit=None, base_url=None):
+            self.calls.append((method, payload or {}))
+            if method == "catalog.store.list":
+                return [{"id": 10, "title": "Main warehouse", "address": "Main"}]
+            if method == "catalog.storeproduct.list":
+                return [
+                    {"storeId": 10, "productId": product_id, "amount": "1"}
+                    for product_id in range(1, 121)
+                ]
+            if method == "catalog.product.list":
+                ids = list((payload or {}).get("filter", {}).get("id") or [])
+                return [
+                    {
+                        "id": product_id,
+                        "iblockId": 7,
+                        "name": "Амортизатор" if product_id == 120 else f"Товар {121 - product_id:03d}",
+                    }
+                    for product_id in ids
+                ]
+            return []
+
+    client = PagedWarehouseClient()
+    tool = BitrixWarehouseSearchTool(client=client)
+    all_products = anyio_run(
+        tool.execute(
+            {
+                "query": "Main warehouse",
+                "store_id": 10,
+                "list_all": False,
+                "include_products": True,
+                "limit": 10,
+                "product_limit": 50,
+                "product_offset": 0,
+            }
+        )
+    )
+    products = all_products.data["products"]
+
+    assert products["total_rows_seen"] == 120
+    assert products["available_items_with_names"] == 120
+    assert products["has_more"] is True
+    assert len(products["items"]) == 50
+    assert [item["product_name"] for item in products["items"][:3]] == [
+        "Амортизатор",
+        "Товар 002",
+        "Товар 003",
+    ]
+
+    filtered = anyio_run(
+        tool.execute(
+            {
+                "query": "Main warehouse",
+                "store_id": 10,
+                "product_query": "амортизатор",
+                "list_all": False,
+                "include_products": True,
+                "limit": 10,
+                "product_limit": 50,
+                "product_offset": 0,
+            }
+        )
+    )
+
+    assert filtered.data["products"]["available_items_with_names"] == 1
+    assert [item["product_id"] for item in filtered.data["products"]["items"]] == [120]
+
+
 def test_bitrix24_specialist_rejects_any_free_text(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))

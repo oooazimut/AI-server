@@ -25,6 +25,9 @@ class BitrixFormattedResult:
     raw: dict[str, Any] = field(default_factory=dict)
 
 
+WAREHOUSE_RESPONSE_ITEM_LIMIT = 50
+
+
 def _direct_task_create_response(
     *,
     agent_id: str,
@@ -34,11 +37,22 @@ def _direct_task_create_response(
     successful_results = [result for result in tool_results if result.status == "ok"]
     warehouse_results = [result for result in successful_results if result.tool == "bitrix_warehouse_search"]
     if len(warehouse_results) > 1 and len(warehouse_results) == len(successful_results):
+        limited_results, omitted = _limit_multi_warehouse_results(
+            warehouse_results,
+            total_limit=WAREHOUSE_RESPONSE_ITEM_LIMIT,
+        )
+        parts = [
+            _format_warehouse_answer(result.data, portal_base_url=portal_base_url)
+            for result in limited_results
+        ]
+        if omitted:
+            parts.append(
+                f"Ещё {omitted} {_ru_warehouse_word(omitted)} не поместились в общий предел "
+                f"{WAREHOUSE_RESPONSE_ITEM_LIMIT} позиций. Их можно запросить продолжением."
+            )
         return BitrixFormattedResult(
             status="completed",
-            answer="\n\n".join(
-                _format_warehouse_answer(result.data, portal_base_url=portal_base_url) for result in warehouse_results
-            ),
+            answer="\n\n".join(parts),
             model_usage=_local_model_usage(agent_id, "warehouse_multi_response"),
         )
     for result in reversed(tool_results):
@@ -192,6 +206,87 @@ def _direct_task_create_response(
                 model_usage=_local_model_usage(agent_id, "calendar_event_discard_response"),
             )
     return None
+
+
+def _limit_multi_warehouse_results(
+    results: list[ToolResult],
+    *,
+    total_limit: int,
+) -> tuple[list[ToolResult], int]:
+    capacities = [
+        len((result.data.get("products") or {}).get("items") or [])
+        if isinstance(result.data, dict) and isinstance(result.data.get("products"), dict)
+        else 0
+        for result in results
+    ]
+    allocations = _balanced_allocations(capacities, max(1, total_limit))
+    limited: list[ToolResult] = []
+    omitted = 0
+    for result, capacity, allowed in zip(results, capacities, allocations, strict=True):
+        if capacity > 0 and allowed <= 0:
+            omitted += 1
+            continue
+        if capacity <= allowed or not isinstance(result.data, dict):
+            limited.append(result)
+            continue
+        data = dict(result.data)
+        products = dict(data.get("products") or {})
+        items = list(products.get("items") or [])[:allowed]
+        offset = _int_value(products.get("offset")) or 0
+        total = (
+            _int_value(products.get("available_items_with_names"))
+            or _int_value(products.get("available_items_seen"))
+            or capacity
+        )
+        products.update(
+            {
+                "items": items,
+                "limit": allowed,
+                "has_more": offset + len(items) < total,
+            }
+        )
+        data["products"] = products
+        limited.append(result.model_copy(update={"data": data}))
+    return limited, omitted
+
+
+def _balanced_allocations(capacities: list[int], total_limit: int) -> list[int]:
+    allocations = [0] * len(capacities)
+    remaining = max(0, total_limit)
+    active = [index for index, capacity in enumerate(capacities) if capacity > 0]
+    while active and remaining > 0:
+        share, extra = divmod(remaining, len(active))
+        if share == 0:
+            share = 1
+            extra = 0
+        spent = 0
+        next_active: list[int] = []
+        for position, index in enumerate(active):
+            quota = share + (1 if position < extra else 0)
+            take = min(capacities[index] - allocations[index], quota, remaining - spent)
+            allocations[index] += max(0, take)
+            spent += max(0, take)
+            if allocations[index] < capacities[index]:
+                next_active.append(index)
+            if spent >= remaining:
+                break
+        if spent <= 0:
+            break
+        remaining -= spent
+        active = next_active
+    return allocations
+
+
+def _ru_warehouse_word(value: int) -> str:
+    remainder_100 = value % 100
+    remainder_10 = value % 10
+    if 11 <= remainder_100 <= 14:
+        return "складов"
+    if remainder_10 == 1:
+        return "склад"
+    if 2 <= remainder_10 <= 4:
+        return "склада"
+    return "складов"
 
 
 def direct_tool_results_response(

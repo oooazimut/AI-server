@@ -114,6 +114,15 @@ class BitrixRestPort(Protocol):
 
     async def result(self, method: str, params: dict[str, Any]) -> Any: ...
 
+    async def collect_paged(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        list_key: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]: ...
+
 
 class BitrixToolClientPort(BitrixRestPort, BitrixUserPort, Protocol):
     """Full client for BitrixToolset: REST call + user/project lookup."""

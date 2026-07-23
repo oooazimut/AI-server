@@ -13,7 +13,11 @@ from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from ai_server.capability_registry import registry_tool, validate_tool_arguments
-from ai_server.orchestrators.entity_catalog import find_entities_in_text, resolve_entity
+from ai_server.orchestrators.entity_catalog import (
+    find_entities_in_text,
+    normalize_entity_text,
+    resolve_entity,
+)
 from ai_server.orchestrators.orchestrator_policy import bitrix_policy_defaults, bitrix_policy_templates
 from ai_server.utils import MOSCOW_TZ
 
@@ -609,6 +613,263 @@ def _expected_tool(request: str, entity_catalog: dict[str, Any] | None = None) -
     return None
 
 
+def canonicalize_plan(
+    plan: Any | None,
+    *,
+    plan_id: str,
+    task: Any,
+    constraints: dict[str, Any],
+    entity_catalog: dict[str, Any] | None = None,
+) -> Any | None:
+    """Build one authoritative structured plan after the single Pro pass.
+
+    The Pro planner always participates.  For stable Bitrix intents the
+    orchestrator then binds the request to exact tools, entities and defaults
+    without asking the model to repair its own JSON.
+    """
+
+    if constraints.get("conversation_reference_error"):
+        return plan
+    catalog = entity_catalog or {}
+    expected = _expected_tool(task.request, catalog)
+    if (
+        plan is not None
+        and getattr(plan, "state", None) == "EXECUTE"
+        and getattr(plan, "subtasks", None)
+        and all(getattr(item, "specialist_id", "") == "bitrix24" for item in plan.subtasks)
+    ):
+        raw_bitrix_api = any(
+            getattr(getattr(item, "structured_command", None), "tool_name", "") == "bitrix_api"
+            for item in plan.subtasks
+        )
+        if int(getattr(plan, "max_rounds", 1) or 1) > 1 and expected is None and raw_bitrix_api:
+            raise SemanticPolicyViolation("MULTI_ROUND_BITRIX_DISABLED")
+        plan = replace(plan, max_rounds=1)
+    if expected is None:
+        return plan
+    specialist_catalog = constraints.get("capability_catalog", {}).get("bitrix24") or {}
+    tool_contract = registry_tool(specialist_catalog, expected)
+    if not tool_contract or not tool_contract.get("structured_command"):
+        return plan
+
+    if expected == "bitrix_warehouse_search":
+        return _canonical_warehouse_plan(
+            plan_id=plan_id,
+            task=task,
+            constraints=constraints,
+            entity_catalog=catalog,
+            registry_version=str(specialist_catalog.get("registry_version") or "CURRENT"),
+        )
+
+    existing = _existing_command_arguments(plan, expected)
+    if plan is not None and getattr(plan, "state", None) == "EXECUTE" and existing is not None:
+        return replace(plan, max_rounds=1)
+
+    arguments = dict(existing or {})
+    if expected == "task_create_draft":
+        named_users = find_entities_in_text(catalog, "users", task.request)
+        if len(named_users) > 1:
+            return _clarification_plan(
+                plan_id,
+                "Уточните, пожалуйста, для какого сотрудника нужно создать задачу.",
+            )
+        arguments.setdefault("title", _creation_title(task.request, "task_create_draft", named_users))
+        if not str(arguments.get("title") or "").strip():
+            return _clarification_plan(plan_id, "Уточните, пожалуйста, название задачи.")
+    elif expected == "calendar_event_draft":
+        arguments.setdefault("title", _creation_title(task.request, "calendar_event_draft", []))
+        if not str(arguments.get("title") or "").strip():
+            return _clarification_plan(plan_id, "Уточните, пожалуйста, что именно нужно напомнить.")
+    elif expected == "portal_search":
+        arguments.setdefault("query", _search_query(task.request))
+
+    return _single_bitrix_plan(
+        plan_id=plan_id,
+        request=task.request,
+        tool_name=expected,
+        arguments=arguments,
+        registry_version=str(specialist_catalog.get("registry_version") or "CURRENT"),
+    )
+
+
+def _canonical_warehouse_plan(
+    *,
+    plan_id: str,
+    task: Any,
+    constraints: dict[str, Any],
+    entity_catalog: dict[str, Any],
+    registry_version: str,
+) -> Any:
+    request = str(task.request)
+    text = _text(request)
+    list_all = bool(re.search(r"\b(?:все|список)\s+(?:склад|склады|складов)\b", text))
+    product_query = _warehouse_product_query(request)
+    all_scope = bool(
+        product_query
+        and re.search(r"\b(?:на|по)\s+(?:всех\s+)?склад(?:ах|ам)\b", text)
+    )
+    if list_all and not product_query:
+        return _single_bitrix_plan(
+            plan_id=plan_id,
+            request=request,
+            tool_name="bitrix_warehouse_search",
+            arguments={
+                "query": "все",
+                "list_all": True,
+                "include_products": False,
+                "limit": DEFAULT_RESULT_LIMIT,
+                "product_limit": DEFAULT_WAREHOUSE_PRODUCT_LIMIT,
+                "product_offset": 0,
+            },
+            registry_version=registry_version,
+        )
+
+    named_warehouses = find_entities_in_text(entity_catalog, "warehouses", request)
+    warehouses = (
+        list(entity_catalog.get("warehouses") or [])
+        if all_scope and not named_warehouses
+        else named_warehouses
+    )
+    if not warehouses:
+        return _clarification_plan(
+            plan_id,
+            "Уточните, пожалуйста, какой склад нужно проверить.",
+        )
+
+    from ai_server.orchestrators.plan_authoritative import Plan, StructuredCommand, Subtask
+
+    subtasks = []
+    for index, warehouse in enumerate(warehouses, start=1):
+        name = str(warehouse.get("name") or "").strip()
+        store_id = int(warehouse["id"])
+        subrequest = (
+            f"Найди {product_query} на складе {name}"
+            if product_query
+            else f"Покажи склад {name}"
+        )
+        arguments = {
+            "query": name,
+            "store_id": store_id,
+            "list_all": False,
+            "include_products": True,
+            "limit": DEFAULT_RESULT_LIMIT,
+            "product_limit": DEFAULT_WAREHOUSE_PRODUCT_LIMIT,
+            "product_offset": 0,
+        }
+        if product_query:
+            arguments["product_query"] = product_query
+        command = StructuredCommand(
+            registry_version,
+            "bitrix_warehouse_search",
+            arguments,
+        )
+        subtasks.append(
+            Subtask(
+                f"warehouse-{index}",
+                None,
+                "bitrix24",
+                "bitrix_warehouse_search",
+                subrequest,
+                command,
+            )
+        )
+    return Plan(plan_id, "EXECUTE", None, subtasks, 1)
+
+
+def _single_bitrix_plan(
+    *,
+    plan_id: str,
+    request: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+    registry_version: str,
+) -> Any:
+    from ai_server.orchestrators.plan_authoritative import Plan, StructuredCommand, Subtask
+
+    command = StructuredCommand(registry_version, tool_name, arguments)
+    return Plan(
+        plan_id,
+        "EXECUTE",
+        None,
+        [Subtask("canonical-1", None, "bitrix24", tool_name, request, command)],
+        1,
+    )
+
+
+def _clarification_plan(plan_id: str, clarification: str) -> Any:
+    from ai_server.orchestrators.plan_authoritative import Plan
+
+    return Plan(plan_id, "CLARIFICATION_REQUIRED", clarification, [], 1)
+
+
+def _existing_command_arguments(plan: Any | None, tool_name: str) -> dict[str, Any] | None:
+    if plan is None or getattr(plan, "state", None) != "EXECUTE":
+        return None
+    subtasks = list(getattr(plan, "subtasks", []) or [])
+    if len(subtasks) != 1:
+        return None
+    command = getattr(subtasks[0], "structured_command", None)
+    if command is None or str(command.tool_name) != tool_name:
+        return None
+    return dict(command.arguments)
+
+
+def _warehouse_product_query(request: str) -> str:
+    text = _text(request)
+    match = re.search(
+        r"\b(?:найди|найдите|покажи|покажите)\s+(.+?)\s+"
+        r"(?:на|по|в)\s+(?:всех\s+)?склад(?:е|у|ах|ам)\b",
+        text,
+    )
+    if not match:
+        return ""
+    product = match.group(1).strip(" .,:;-")
+    return "" if product in {"склад", "склады", "остатки", "товары"} else product
+
+
+def _creation_title(request: str, tool_name: str, named_users: list[dict[str, Any]]) -> str:
+    text = _text(request)
+    if tool_name == "task_create_draft":
+        text = re.sub(r"^\s*созда(?:й|ть|йте)\s+задач\w*\s*", "", text)
+        if named_users:
+            person_tokens = normalize_entity_text(named_users[0].get("name")).split()[:2]
+            request_tokens = text.split()
+            matched_indexes = [
+                index
+                for index, token in enumerate(request_tokens)
+                if any(_name_token_matches(token, person_token) for person_token in person_tokens)
+            ]
+            if matched_indexes:
+                text = " ".join(request_tokens[max(matched_indexes) + 1 :])
+        text = re.sub(r"^\s*(?:на|для)\s+", "", text)
+    else:
+        text = re.sub(
+            r"^\s*(?:созда(?:й|ть|йте)\s+напоминани\w*|напомни(?:те)?)\s*",
+            "",
+            text,
+        )
+    return text.strip(" .,:;-").capitalize()
+
+
+def _name_token_matches(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    prefix = 0
+    for left_char, right_char in zip(left, right, strict=False):
+        if left_char != right_char:
+            break
+        prefix += 1
+    return prefix >= 5
+
+
+def _search_query(request: str) -> str:
+    text = _text(request)
+    text = re.sub(r"^\s*(?:найди|найдите|покажи|покажите)\s+", "", text)
+    text = re.sub(r"\b(?:на|в)\s+диск(?:е|у)?\b", "", text)
+    text = re.sub(r"\b(?:документ|документы|файл|файлы)\s+(?:по\s+)?", "", text)
+    return text.strip(" .,:;-")
+
+
 def normalize_command_arguments(
     tool_name: str,
     request: str,
@@ -752,6 +1013,7 @@ __all__ = [
     "DEFAULT_TASK_DEADLINE_HOUR",
     "DEFAULT_WAREHOUSE_PRODUCT_LIMIT",
     "SemanticPolicyViolation",
+    "canonicalize_plan",
     "normalize_command_arguments",
     "normalize_plan",
 ]

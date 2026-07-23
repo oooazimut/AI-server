@@ -107,7 +107,12 @@ class BitrixWarehouseSearchTool:
             return access_error
 
         try:
-            raw_stores = await read_client.result("catalog.store.list", {})
+            stores = await _collect_paged_items(
+                read_client,
+                "catalog.store.list",
+                {},
+                list_key="stores",
+            )
         except (BitrixApiError, BitrixConfigError) as exc:
             return ToolResult(
                 status=ToolStatus.NOT_CONFIGURED if isinstance(exc, BitrixConfigError) else ToolStatus.ERROR,
@@ -116,7 +121,6 @@ class BitrixWarehouseSearchTool:
                 data={"query": query},
             )
 
-        stores = _extract_items(raw_stores, "stores")
         matches = (
             [_compact_store(store) for store in stores[:limit]]
             if list_all
@@ -277,7 +281,12 @@ class BitrixWarehouseSearchTool:
             "select": ["storeId", "productId", "amount"],
         }
         try:
-            raw = await client.result("catalog.storeproduct.list", params)
+            rows = await _collect_paged_items(
+                client,
+                "catalog.storeproduct.list",
+                params,
+                list_key="storeProducts",
+            )
         except (BitrixApiError, BitrixConfigError) as exc:
             return {
                 "status": "error",
@@ -286,7 +295,6 @@ class BitrixWarehouseSearchTool:
                 "items": [],
             }
 
-        rows = _extract_items(raw, "storeProducts")
         available_rows = [
             row for row in rows if _positive_amount(_first(row, "amount", "AMOUNT", "quantity", "QUANTITY")) is not None
         ]
@@ -314,6 +322,12 @@ class BitrixWarehouseSearchTool:
                     "raw": row,
                 }
             )
+        named_items.sort(
+            key=lambda item: (
+                str(item.get("product_name") or "").casefold(),
+                _sortable_id(item.get("product_id")),
+            )
+        )
         items = named_items[offset : offset + limit]
         return {
             "status": "ok",
@@ -335,22 +349,26 @@ class BitrixWarehouseSearchTool:
     ) -> dict[str, dict[str, Any]]:
         if not product_ids:
             return {}
-        try:
-            raw = await client.result(
-                "catalog.product.list",
-                {"filter": {"id": product_ids}, "select": ["id", "iblockId", "name"]},
-            )
-        except (BitrixApiError, BitrixConfigError):
-            raw = None
-        products = _extract_items(raw, "products")
         details: dict[str, dict[str, Any]] = {}
-        for product in products:
-            detail = _compact_product(product)
-            product_id = detail.get("id")
-            if product_id not in (None, "") and detail.get("name"):
-                details[str(product_id)] = detail
+        unique_ids = list(dict.fromkeys(product_ids))
+        for start in range(0, len(unique_ids), 50):
+            batch = unique_ids[start : start + 50]
+            try:
+                products = await _collect_paged_items(
+                    client,
+                    "catalog.product.list",
+                    {"filter": {"id": batch}, "select": ["id", "iblockId", "name"]},
+                    list_key="products",
+                )
+            except (BitrixApiError, BitrixConfigError):
+                products = []
+            for product in products:
+                detail = _compact_product(product)
+                product_id = detail.get("id")
+                if product_id not in (None, "") and detail.get("name"):
+                    details[str(product_id)] = detail
         missing_ids = [product_id for product_id in product_ids if str(product_id) not in details]
-        for product_id in missing_ids[:10]:
+        for product_id in missing_ids:
             detail = await self._product_detail(client, product_id)
             if detail.get("name"):
                 details[str(product_id)] = detail
@@ -483,6 +501,29 @@ def _extract_items(raw: Any, preferred_key: str) -> list[dict[str, Any]]:
                 if nested:
                     return nested
     return []
+
+
+async def _collect_paged_items(
+    client: BitrixToolClientPort,
+    method: str,
+    params: dict[str, Any],
+    *,
+    list_key: str,
+) -> list[dict[str, Any]]:
+    """Read every Bitrix page, with a compatibility fallback for test ports."""
+
+    collect_paged = getattr(client, "collect_paged", None)
+    if callable(collect_paged):
+        return await collect_paged(method, params, list_key=list_key)
+    raw = await client.result(method, params)
+    return _extract_items(raw, list_key)
+
+
+def _sortable_id(value: object) -> tuple[int, int | str]:
+    parsed = _safe_int(value)
+    if parsed is not None:
+        return (0, parsed)
+    return (1, str(value or ""))
 
 
 def _first(data: dict[str, Any], *keys: str) -> Any:

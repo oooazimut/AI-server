@@ -2,8 +2,12 @@ from datetime import datetime
 
 import pytest
 
-from ai_server.models import AgentTask
-from ai_server.orchestrators.bitrix_semantics import SemanticPolicyViolation, normalize_plan
+from ai_server.models import AgentTask, UserContext
+from ai_server.orchestrators.bitrix_semantics import (
+    SemanticPolicyViolation,
+    canonicalize_plan,
+    normalize_plan,
+)
 from ai_server.orchestrators.plan_authoritative import Plan, StructuredCommand, Subtask
 from ai_server.utils import MOSCOW_TZ
 
@@ -202,3 +206,138 @@ def test_task_close_control_user_is_resolved_by_orchestrator():
     assert result["operation"] == "prepare"
     assert result["target_user_id"] == 22
     assert result["target_user_name"] == "Борисов Андрей"
+
+
+def test_task_defaults_replace_unnecessary_pro_clarification_without_second_model_call():
+    plan = Plan("p1", "CLARIFICATION_REQUIRED", "Кто ответственный и какой срок?", [], 3)
+    task = AgentTask(
+        task_id="t1",
+        request="Создать задачу сделать тестовый тест",
+        user=UserContext(id="1", display_name="Кулинич Валерий Васильевич"),
+    )
+    entity_catalog = {
+        "status": "ready",
+        "users": [{"id": 1, "name": "Кулинич Валерий Васильевич", "aliases": ["кулинич валерий"]}],
+        "projects": [{"id": 71, "name": "Кулинич Валерий", "aliases": ["кулинич валерий"]}],
+        "warehouses": [],
+    }
+    constraints = {
+        "capability_catalog": {
+            "bitrix24": {
+                "registry_version": "registry-v1",
+                "tools": [
+                    {
+                        "id": "task_create_draft",
+                        "parameters": {"type": "object"},
+                        "structured_command": True,
+                    }
+                ],
+            }
+        }
+    }
+
+    canonical = canonicalize_plan(
+        plan,
+        plan_id="p1",
+        task=task,
+        constraints=constraints,
+        entity_catalog=entity_catalog,
+    )
+    normalized = normalize_plan(
+        canonical,
+        task=task,
+        constraints=constraints,
+        now=datetime(2026, 7, 24, 9, 0, tzinfo=MOSCOW_TZ),
+        entity_catalog=entity_catalog,
+    )
+    arguments = normalized.subtasks[0].structured_command.arguments
+
+    assert normalized.state == "EXECUTE"
+    assert normalized.max_rounds == 1
+    assert arguments["title"] == "Сделать тестовый тест"
+    assert arguments["responsible_id"] == 1
+    assert arguments["group_id"] == 71
+    assert arguments["deadline_iso"] == "2026-07-29T19:00:00+03:00"
+
+
+def test_orchestrator_rebuilds_composite_and_all_warehouse_plans_from_exact_catalog_ids():
+    entity_catalog = {
+        "status": "ready",
+        "users": [],
+        "projects": [],
+        "warehouses": [
+            {"id": 7, "name": "Борисов", "aliases": ["борисов", "борисова"]},
+            {"id": 8, "name": "Карасев", "aliases": ["карасев", "карасева"]},
+            {"id": 9, "name": "Гараж", "aliases": ["гараж"]},
+        ],
+    }
+    constraints = {
+        "capability_catalog": {
+            "bitrix24": {
+                "registry_version": "registry-v1",
+                "tools": [
+                    {
+                        "id": "bitrix_warehouse_search",
+                        "parameters": {"type": "object"},
+                        "structured_command": True,
+                    }
+                ],
+            }
+        }
+    }
+    incomplete = Plan(
+        "p1",
+        "EXECUTE",
+        None,
+        [
+            Subtask(
+                "wrong",
+                None,
+                "bitrix24",
+                "bitrix_warehouse_search",
+                "Покажи склад Гараж",
+                StructuredCommand("CURRENT", "bitrix_warehouse_search", {"store_id": 9}),
+            )
+        ],
+        3,
+    )
+    task = AgentTask(task_id="t1", request="Покажи склад Борисова Карасева и Гараж")
+
+    canonical = canonicalize_plan(
+        incomplete,
+        plan_id="p1",
+        task=task,
+        constraints=constraints,
+        entity_catalog=entity_catalog,
+    )
+    normalized = normalize_plan(
+        canonical,
+        task=task,
+        constraints=constraints,
+        entity_catalog=entity_catalog,
+    )
+
+    assert [item.structured_command.arguments["store_id"] for item in normalized.subtasks] == [7, 8, 9]
+    assert all(item.structured_command.arguments["product_limit"] == 50 for item in normalized.subtasks)
+    assert normalized.max_rounds == 1
+
+    all_task = AgentTask(task_id="t2", request="Найди амортизатор на складах и покажи")
+    all_plan = canonicalize_plan(
+        incomplete,
+        plan_id="p2",
+        task=all_task,
+        constraints=constraints,
+        entity_catalog=entity_catalog,
+    )
+    normalized_all = normalize_plan(
+        all_plan,
+        task=all_task,
+        constraints=constraints,
+        entity_catalog=entity_catalog,
+    )
+
+    assert [item.structured_command.arguments["store_id"] for item in normalized_all.subtasks] == [7, 8, 9]
+    assert all(
+        item.structured_command.arguments["product_query"] == "амортизатор"
+        for item in normalized_all.subtasks
+    )

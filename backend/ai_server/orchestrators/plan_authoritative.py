@@ -31,6 +31,7 @@ from ai_server.models import (
 from ai_server.orchestrators.bitrix_response import render_bitrix_tool_results
 from ai_server.orchestrators.bitrix_semantics import (
     SemanticPolicyViolation,
+    canonicalize_plan,
     normalize_plan,
 )
 from ai_server.orchestrators.conversation_reference import resolve_conversation_reference
@@ -601,20 +602,6 @@ def _decode_plan(raw: str, *, plan_id: str, request: str, constraints: dict[str,
         subtasks.append(Subtask(subtask_id, segment_id, specialist_id, capability, subrequest, structured_command))
     if expected_segments and seen_segments != set(expected_segments):
         raise PlanRejected("SEGMENT_COMPLETENESS_FAILED")
-    required_warehouse_labels = list(constraints.get("required_warehouse_labels") or [])
-    if required_warehouse_labels:
-        label_counts = {label: 0 for label in required_warehouse_labels}
-        for subtask in subtasks:
-            if subtask.specialist_id != "bitrix24" or subtask.capability != "bitrix_warehouse_search":
-                continue
-            subtask_words = set(_normalized_text(subtask.request).split())
-            represented = [label for label in required_warehouse_labels if label in subtask_words]
-            if len(represented) > 1:
-                raise PlanRejected("WAREHOUSE_SEGMENT_INCOMPLETE")
-            if represented:
-                label_counts[represented[0]] += 1
-        if any(count != 1 for count in label_counts.values()):
-            raise PlanRejected("WAREHOUSE_SEGMENT_INCOMPLETE")
     return Plan(plan_id, state, clarification, subtasks, value["max_rounds"])
 
 
@@ -867,19 +854,12 @@ class PlanAuthoritativeOrchestrator(OrchestratorTransportRuntime):
             planner_rejections: list[str] = []
             planner_attempt_audit: list[dict[str, Any]] = []
             plan: Plan | None = None
-            for attempt in range(1, 3):
+            for attempt in range(1, 2):
                 call_constraints = {
                     **constraints,
                     "plan_id": plan_id,
                     "request_hash": _hash(task.request),
                 }
-                if planner_rejections:
-                    call_constraints.update(
-                        {
-                            "repair_reason": planner_rejections[-1],
-                            "repair_attempt": attempt,
-                        }
-                    )
                 try:
                     planner_started_at = _trace_now_iso()
                     planner_t0 = time.monotonic()
@@ -902,12 +882,7 @@ class PlanAuthoritativeOrchestrator(OrchestratorTransportRuntime):
                             "repair_reason": planner_rejections[-1] if planner_rejections else "",
                         },
                     )
-                    if attempt == 1:
-                        raise
-                    reason = "MODEL_REPAIR_UNAVAILABLE"
-                    planner_rejections.append(reason)
-                    planner_attempt_audit.append({"attempt": attempt, "status": "error", "rejection": reason})
-                    break
+                    raise
                 await self._record_timing(
                     task,
                     stage="pro_plan",
@@ -932,9 +907,16 @@ class PlanAuthoritativeOrchestrator(OrchestratorTransportRuntime):
                 validation_started_at = _trace_now_iso()
                 validation_t0 = time.monotonic()
                 try:
-                    plan = _decode_plan(raw, plan_id=plan_id, request=task.request, constraints=constraints)
+                    candidate = _decode_plan(raw, plan_id=plan_id, request=task.request, constraints=constraints)
+                    candidate = canonicalize_plan(
+                        candidate,
+                        plan_id=plan_id,
+                        task=task,
+                        constraints=constraints,
+                        entity_catalog=self._entity_catalog.snapshot() if self._entity_catalog is not None else {},
+                    )
                     plan = normalize_plan(
-                        plan,
+                        candidate,
                         task=task,
                         constraints=constraints,
                         entity_catalog=self._entity_catalog.snapshot() if self._entity_catalog is not None else {},
@@ -952,8 +934,31 @@ class PlanAuthoritativeOrchestrator(OrchestratorTransportRuntime):
                     )
                     attempt_audit.update({"status": "rejected", "rejection": reason})
                     planner_rejections.append(reason)
-                    if attempt == 1 and reason in REPAIRABLE_PLAN_REJECTIONS:
-                        continue
+                    plan = None
+                    try:
+                        fallback = canonicalize_plan(
+                            None,
+                            plan_id=plan_id,
+                            task=task,
+                            constraints=constraints,
+                            entity_catalog=self._entity_catalog.snapshot()
+                            if self._entity_catalog is not None
+                            else {},
+                        )
+                        if fallback is not None:
+                            plan = normalize_plan(
+                                fallback,
+                                task=task,
+                                constraints=constraints,
+                                entity_catalog=self._entity_catalog.snapshot()
+                                if self._entity_catalog is not None
+                                else {},
+                            )
+                            deterministic_route = "orchestrator_canonical_fallback"
+                    except SemanticPolicyViolation as fallback_exc:
+                        fallback_reason = str(fallback_exc)
+                        if fallback_reason not in planner_rejections:
+                            planner_rejections.append(fallback_reason)
                 else:
                     await self._record_timing(
                         task,
@@ -1169,6 +1174,8 @@ class PlanAuthoritativeOrchestrator(OrchestratorTransportRuntime):
             actions.append(ActionRecord(name="pending_specialist_route", status="ok", details=base_meta))
         approvals: list[ActionRecord] = []
         execution_records: list[dict[str, Any]] = []
+        raw_bitrix_results: list[ToolResult] = []
+        bitrix_portal_base_url = ""
         for item, value in zip(plan.subtasks, completed, strict=True):
             if isinstance(value, Exception):
                 attempt_id = f"attempt-{uuid.uuid4().hex}"
@@ -1221,6 +1228,8 @@ class PlanAuthoritativeOrchestrator(OrchestratorTransportRuntime):
                         portal_base_url=str(specialist_metadata.get("portal_base_url") or ""),
                         command_arguments=command_arguments,
                     )
+                    raw_bitrix_results.append(raw_tool_result)
+                    bitrix_portal_base_url = str(specialist_metadata.get("portal_base_url") or "")
                 branch_status = rendered.status
                 branch_answer = rendered.answer
                 if specialist_status in {"needs_human", "needs_clarification", "failed"}:
@@ -1335,10 +1344,22 @@ class PlanAuthoritativeOrchestrator(OrchestratorTransportRuntime):
             )
         render_started_at = _trace_now_iso()
         render_t0 = time.monotonic()
-        answer = (
-            "; ".join(str(item["answer"]).strip() for item in facts if str(item["answer"]).strip())
-            or "Не удалось получить подтверждённый результат специалистов."
+        aggregate_warehouse = (
+            len(raw_bitrix_results) > 1
+            and len(raw_bitrix_results) == len(facts)
+            and all(result.tool == "bitrix_warehouse_search" for result in raw_bitrix_results)
         )
+        if aggregate_warehouse:
+            answer = render_bitrix_tool_results(
+                agent_id=self.manifest.id,
+                tool_results=raw_bitrix_results,
+                portal_base_url=bitrix_portal_base_url,
+            ).answer
+        else:
+            answer = (
+                "; ".join(str(item["answer"]).strip() for item in facts if str(item["answer"]).strip())
+                or "Не удалось получить подтверждённый результат специалистов."
+            )
         usages = list(planner_usages)
         verified_terminal = (
             all(

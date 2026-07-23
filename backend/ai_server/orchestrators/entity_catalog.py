@@ -45,7 +45,18 @@ def _surname_stem(value: str) -> str:
     return token
 
 
-def _aliases(*values: object) -> list[str]:
+def _looks_like_surname(value: str) -> bool:
+    token = normalize_entity_text(value).split(" ")[0]
+    return bool(
+        token
+        and re.search(
+            r"(?:ов|ев|ин|ын|ова|ева|ина|ына|ский|цкий|ская|цкая)$",
+            token,
+        )
+    )
+
+
+def _aliases(*values: object, include_surname_stem: bool = False) -> list[str]:
     aliases: set[str] = set()
     for value in values:
         normalized = normalize_entity_text(value)
@@ -53,7 +64,7 @@ def _aliases(*values: object) -> list[str]:
             continue
         aliases.add(normalized)
         stem = _surname_stem(normalized)
-        if stem:
+        if stem and include_surname_stem and _looks_like_surname(normalized):
             aliases.add(stem)
     return sorted(aliases)
 
@@ -85,7 +96,13 @@ def _user_entry(item: dict[str, Any]) -> dict[str, Any] | None:
     return {
         "id": entity_id,
         "name": full_name or short_name or f"User #{entity_id}",
-        "aliases": _aliases(full_name, short_name, last_name, f"{first_name} {last_name}"),
+        "aliases": _aliases(
+            full_name,
+            short_name,
+            last_name,
+            f"{first_name} {last_name}",
+            include_surname_stem=True,
+        ),
     }
 
 
@@ -99,7 +116,11 @@ def _project_entry(item: dict[str, Any]) -> dict[str, Any] | None:
     opened = str(_first(item, "OPENED", "opened", "VISIBLE", "visible") or "").upper()
     if opened not in {"Y", "YES", "TRUE", "1"}:
         return None
-    return {"id": entity_id, "name": name, "aliases": _aliases(name)}
+    return {
+        "id": entity_id,
+        "name": name,
+        "aliases": _aliases(name, include_surname_stem=True),
+    }
 
 
 def _warehouse_entry(item: dict[str, Any]) -> dict[str, Any] | None:
@@ -108,7 +129,10 @@ def _warehouse_entry(item: dict[str, Any]) -> dict[str, Any] | None:
     if entity_id is None or not name:
         return None
     address = str(_first(item, "ADDRESS", "address") or "").strip()
-    return {"id": entity_id, "name": name, "address": address, "aliases": _aliases(name, address)}
+    aliases = set(_aliases(name, address))
+    if _looks_like_surname(name):
+        aliases.update(_aliases(name, include_surname_stem=True))
+    return {"id": entity_id, "name": name, "address": address, "aliases": sorted(aliases)}
 
 
 class OrchestratorEntityCatalog:
@@ -213,16 +237,29 @@ def resolve_entity(
     normalized = normalize_entity_text(value)
     if not normalized:
         return None, False
-    stem = _surname_stem(normalized)
-    exact: list[dict[str, Any]] = []
-    partial: list[dict[str, Any]] = []
-    for item in catalog.get(entity_type) or []:
-        aliases = [normalize_entity_text(alias) for alias in item.get("aliases") or []]
-        if normalized in aliases or (stem and stem in aliases):
-            exact.append(item)
-        elif any(normalized in alias or alias in normalized or (stem and stem in alias) for alias in aliases):
-            partial.append(item)
-    matches = exact or partial
+    id_match = re.fullmatch(r"(?:id|айди)?\s*(\d+)", normalized)
+    if id_match:
+        wanted = int(id_match.group(1))
+        matches = [item for item in catalog.get(entity_type) or [] if _int(item.get("id")) == wanted]
+        return (matches[0], False) if len(matches) == 1 else (None, len(matches) > 1)
+
+    exact = [
+        item
+        for item in catalog.get(entity_type) or []
+        if normalized == normalize_entity_text(item.get("name"))
+        or normalized in [normalize_entity_text(alias) for alias in item.get("aliases") or []]
+    ]
+    if len(exact) == 1:
+        return exact[0], False
+    if len(exact) > 1:
+        return None, True
+
+    scores = [
+        (_entity_match_score(item, entity_type, normalized), item)
+        for item in catalog.get(entity_type) or []
+    ]
+    best = max((score for score, _ in scores), default=0)
+    matches = [item for score, item in scores if score == best and score > 0]
     if len(matches) == 1:
         return matches[0], False
     return None, len(matches) > 1
@@ -236,24 +273,97 @@ def find_entities_in_text(
     """Find catalog entities explicitly named in free text."""
 
     normalized = normalize_entity_text(value)
-    tokens = normalized.split()
-    matches: list[dict[str, Any]] = []
-    for item in catalog.get(entity_type) or []:
-        aliases = [normalize_entity_text(alias) for alias in item.get("aliases") or []]
-        found = False
-        for alias in aliases:
-            if not alias:
+    scored = [
+        (_entity_match_score(item, entity_type, normalized), item)
+        for item in catalog.get(entity_type) or []
+    ]
+    strong = [(score, item) for score, item in scored if score >= 500]
+    if strong:
+        selected = strong
+    else:
+        best = max((score for score, _ in scored), default=0)
+        selected = [(score, item) for score, item in scored if score == best and score > 0]
+    result: list[dict[str, Any]] = []
+    for score, item in selected:
+        name = normalize_entity_text(item.get("name"))
+        shadowed = any(
+            other_score > score
+            and name
+            and name != normalize_entity_text(other.get("name"))
+            and normalize_entity_text(other.get("name")).startswith(name + " ")
+            for other_score, other in selected
+        )
+        if not shadowed:
+            result.append(item)
+    return result
+
+
+def _entity_match_score(item: dict[str, Any], entity_type: str, normalized: str) -> int:
+    entity_id = _int(item.get("id"))
+    if entity_id is not None and re.search(rf"\b(?:id|айди)\s*{entity_id}\b", normalized):
+        return 10_000
+
+    name = normalize_entity_text(item.get("name"))
+    aliases = {normalize_entity_text(alias) for alias in item.get("aliases") or []}
+    candidates = {name, *aliases}
+    candidates.discard("")
+    phrase_scores: list[int] = []
+    if name and re.search(rf"(?:^|\s){re.escape(name)}(?:$|\s)", normalized):
+        phrase_scores.append(1_000 + 100 * len(name.split()))
+    phrase_scores.extend(
+        900 + 100 * len(alias.split())
+        for alias in aliases
+        if " " in alias and re.search(rf"(?:^|\s){re.escape(alias)}(?:$|\s)", normalized)
+    )
+    if phrase_scores:
+        return max(phrase_scores)
+
+    request_tokens = normalized.split()
+    if entity_type == "users":
+        name_tokens = normalize_entity_text(item.get("name")).split()
+        matched = sum(
+            1
+            for name_token in name_tokens
+            if any(_person_tokens_match(name_token, request_token) for request_token in request_tokens)
+        )
+        if matched >= 2:
+            return 500 + 10 * matched
+    else:
+        for candidate in candidates:
+            if not _looks_like_surname(candidate):
                 continue
-            if " " in alias and re.search(rf"(?:^|\s){re.escape(alias)}(?:$|\s)", normalized):
-                found = True
-                break
-            alias_stem = _surname_stem(alias)
-            if any(token == alias or _surname_stem(token) == alias_stem for token in tokens):
-                found = True
-                break
-        if found:
-            matches.append(item)
-    return matches
+            candidate_stem = _surname_stem(candidate)
+            if any(
+                _looks_like_surname(token) and _surname_stem(token) == candidate_stem
+                for token in request_tokens
+            ):
+                return 900
+
+    partial_scores = [
+        (
+            100
+            if entity_type == "users" and len(normalized.split()) == 1
+            else 100 + 10 * len(candidate.split())
+        )
+        for candidate in candidates
+        if candidate in normalized or normalized in candidate
+    ]
+    return max(partial_scores, default=0)
+
+
+def _person_tokens_match(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    left_stem = _surname_stem(left)
+    right_stem = _surname_stem(right)
+    if _looks_like_surname(left) and _looks_like_surname(right) and left_stem == right_stem:
+        return True
+    prefix = 0
+    for left_char, right_char in zip(left, right, strict=False):
+        if left_char != right_char:
+            break
+        prefix += 1
+    return prefix >= 5 and abs(len(left) - len(right)) <= 2
 
 
 __all__ = [

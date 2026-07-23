@@ -21,6 +21,7 @@ class _DirectoryBitrix:
     async def list_all_users(self, *, limit: int):
         return [
             {"ID": 13, "NAME": "Валерий", "LAST_NAME": "Кулинич", "SECOND_NAME": "Васильевич"},
+            {"ID": 21, "NAME": "Марина", "LAST_NAME": "Кулинич"},
             {"ID": 35, "NAME": "Андрей", "LAST_NAME": "Борисов"},
         ]
 
@@ -32,7 +33,11 @@ class _DirectoryBitrix:
         ]
 
     async def list_catalog_stores(self, *, limit: int):
-        return [{"ID": 501, "TITLE": "Склад Борисова", "ADDRESS": "Борисов"}]
+        return [
+            {"ID": 501, "TITLE": "Склад Борисова", "ADDRESS": "Борисов"},
+            {"ID": 601, "TITLE": "Гараж", "ADDRESS": "Российская, 8"},
+            {"ID": 602, "TITLE": "Гараж Смородин", "ADDRESS": "Кагальницкое шоссе"},
+        ]
 
 
 def _catalog() -> dict:
@@ -155,6 +160,30 @@ def test_calendar_template_is_orchestrator_owned():
     assert result["start_iso"] == "2026-07-29T12:00:00+03:00"
     assert result["end_iso"] == "2026-07-29T12:30:00+03:00"
     assert result["owner_name"] == "Кулинич Валерий Васильевич"
+
+
+def test_exact_warehouse_name_wins_over_longer_partial_name():
+    catalog = _catalog()
+
+    assert [item["id"] for item in find_entities_in_text(catalog, "warehouses", "Покажи склад гараж")] == [601]
+    assert [
+        item["id"]
+        for item in find_entities_in_text(catalog, "warehouses", "Покажи склад гараж смородин")
+    ] == [602]
+
+
+def test_full_employee_name_and_explicit_id_win_over_shared_surname():
+    catalog = _catalog()
+
+    assert [
+        item["id"]
+        for item in find_entities_in_text(catalog, "users", "Создай задачу на кулинич валерия")
+    ] == [13]
+    assert [
+        item["id"]
+        for item in find_entities_in_text(catalog, "users", "кулинич валерий айди 13")
+    ] == [13]
+    assert sorted(item["id"] for item in find_entities_in_text(catalog, "users", "кулинич")) == [13, 21]
 
 
 def test_live_bitrix_specialist_cannot_be_called_without_structured_command():

@@ -478,7 +478,7 @@ def test_duplicate_branch_is_rejected_before_any_specialist_can_run():
         _decode_plan(raw, plan_id="p1", request=request, constraints=constraints)
 
 
-def test_explicit_three_warehouse_request_requires_one_branch_per_label():
+def test_explicit_three_warehouse_request_is_left_for_authoritative_canonicalization():
     request = "Покажи склад Борисова Карасева и Ивашина"
     constraints = _constraints(request, {"bitrix24": {"capabilities": ["bitrix_warehouse_search"]}})
     raw = _plan(
@@ -495,8 +495,8 @@ def test_explicit_three_warehouse_request_requires_one_branch_per_label():
     )
 
     assert constraints["required_warehouse_labels"] == ["борисова", "карасева", "ивашина"]
-    with pytest.raises(PlanRejected, match="WAREHOUSE_SEGMENT_INCOMPLETE"):
-        _decode_plan(raw, plan_id="p1", request=request, constraints=constraints)
+    decoded = _decode_plan(raw, plan_id="p1", request=request, constraints=constraints)
+    assert len(decoded.subtasks) == 1
 
 
 @pytest.mark.parametrize(
@@ -507,7 +507,7 @@ def test_explicit_three_warehouse_request_requires_one_branch_per_label():
         ("Покажи остатки по складам Борисова, Карасева и Ивашина", ["борисова", "карасева", "ивашина"]),
     ],
 )
-def test_warehouse_wording_variants_require_one_validated_branch_per_label(user_text, labels):
+def test_warehouse_wording_variants_are_structurally_decoded_before_canonicalization(user_text, labels):
     constraints = _constraints(user_text, {"bitrix24": {"capabilities": ["bitrix_warehouse_search"]}})
     assert constraints["required_warehouse_labels"] == labels
 
@@ -523,8 +523,8 @@ def test_warehouse_wording_variants_require_one_validated_branch_per_label(user_
             }
         ],
     )
-    with pytest.raises(PlanRejected, match="WAREHOUSE_SEGMENT_INCOMPLETE"):
-        _decode_plan(incomplete, plan_id="p1", request=user_text, constraints=constraints)
+    decoded = _decode_plan(incomplete, plan_id="p1", request=user_text, constraints=constraints)
+    assert len(decoded.subtasks) == 1
 
     complete = _plan(
         user_text,
@@ -927,7 +927,7 @@ class _RepairingPlanner(_Planner):
         return _plan(task.request, plan_id=constraints["plan_id"]), usage
 
 
-def test_repairable_plan_contract_failure_gets_one_changed_method_retry():
+def test_malformed_plan_is_not_retried_or_dispatched():
     planner = _RepairingPlanner()
     subject, specialist = _live_subject(
         AgentResult(status="completed", agent_id="bitrix24", answer="ready"),
@@ -936,12 +936,10 @@ def test_repairable_plan_contract_failure_gets_one_changed_method_retry():
 
     output = asyncio.run(subject.handle(AgentTask(task_id="t1", request="warehouse")))
 
-    assert output.status == "completed"
-    assert len(planner.calls) == 2
+    assert output.status == "failed"
+    assert len(planner.calls) == 1
     assert "repair_reason" not in planner.calls[0]
-    assert planner.calls[1]["repair_reason"] == "PLAN_SCHEMA_MISMATCH"
-    assert planner.calls[1]["repair_attempt"] == 2
-    assert output.metadata["planner_attempts"] == 2
+    assert output.metadata["planner_attempts"] == 1
     assert output.metadata["planner_rejections"] == ["PLAN_SCHEMA_MISMATCH"]
     assert output.metadata["planner_attempt_audit"] == [
         {
@@ -949,18 +947,13 @@ def test_repairable_plan_contract_failure_gets_one_changed_method_retry():
             "response_hash": _hash(json.dumps({"unexpected": True})),
             "status": "rejected",
             "rejection": "PLAN_SCHEMA_MISMATCH",
-        },
-        {
-            "attempt": 2,
-            "response_hash": output.metadata["response_hash"],
-            "status": "accepted",
-        },
+        }
     ]
-    assert len(output.model_usage) == 2
-    assert len(specialist.tasks) == 1
+    assert len(output.model_usage) == 1
+    assert specialist.tasks == []
 
 
-def test_repairable_plan_contract_failure_fails_closed_after_one_retry():
+def test_second_planner_response_is_never_requested():
     planner = _RepairingPlanner(second_valid=False)
     subject, specialist = _live_subject(
         AgentResult(status="completed", agent_id="bitrix24", answer="unexpected"),
@@ -970,14 +963,14 @@ def test_repairable_plan_contract_failure_fails_closed_after_one_retry():
     output = asyncio.run(subject.handle(AgentTask(task_id="t1", request="warehouse")))
 
     assert output.status == "failed"
-    assert len(planner.calls) == 2
+    assert len(planner.calls) == 1
     assert output.metadata["reason"] == "PLAN_SCHEMA_MISMATCH"
-    assert output.metadata["planner_attempts"] == 2
-    assert len(output.model_usage) == 2
+    assert output.metadata["planner_attempts"] == 1
+    assert len(output.model_usage) == 1
     assert specialist.tasks == []
 
 
-def test_repair_provider_error_fails_closed_and_preserves_first_attempt_audit():
+def test_removed_repair_path_cannot_trigger_a_second_provider_error():
     planner = _RepairingPlanner(second_raises=True)
     subject, specialist = _live_subject(
         AgentResult(status="completed", agent_id="bitrix24", answer="unexpected"),
@@ -987,18 +980,10 @@ def test_repair_provider_error_fails_closed_and_preserves_first_attempt_audit():
     output = asyncio.run(subject.handle(AgentTask(task_id="t1", request="warehouse")))
 
     assert output.status == "failed"
-    assert output.metadata["reason"] == "MODEL_REPAIR_UNAVAILABLE"
-    assert output.metadata["planner_attempts"] == 2
-    assert output.metadata["planner_rejections"] == [
-        "PLAN_SCHEMA_MISMATCH",
-        "MODEL_REPAIR_UNAVAILABLE",
-    ]
+    assert output.metadata["reason"] == "PLAN_SCHEMA_MISMATCH"
+    assert output.metadata["planner_attempts"] == 1
+    assert output.metadata["planner_rejections"] == ["PLAN_SCHEMA_MISMATCH"]
     assert output.metadata["planner_attempt_audit"][0]["response_hash"] == _hash(json.dumps({"unexpected": True}))
-    assert output.metadata["planner_attempt_audit"][1] == {
-        "attempt": 2,
-        "status": "error",
-        "rejection": "MODEL_REPAIR_UNAVAILABLE",
-    }
     assert len(output.model_usage) == 1
     assert specialist.tasks == []
 

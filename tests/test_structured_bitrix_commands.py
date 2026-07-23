@@ -4,6 +4,7 @@ import json
 import pytest
 
 from ai_server.agents.bitrix24 import Bitrix24Specialist
+from ai_server.agents.bitrix24.tools.warehouse import BitrixWarehouseSearchTool
 from ai_server.models import AgentManifest, AgentResult, AgentTask, ModelUsageRecord, ToolDefinition, ToolResult
 from ai_server.orchestrators.plan_authoritative import (
     PLAN_SCHEMA,
@@ -268,6 +269,88 @@ def test_specialist_rejects_stale_registry_before_tool_call():
     assert tool.calls == []
 
 
+def test_single_pro_pass_is_canonicalized_before_one_bitrix_execution():
+    class WarehouseClient:
+        def __init__(self):
+            self.calls = []
+
+        async def result(self, method, payload=None, *, base_url=None):
+            self.calls.append((method, payload or {}))
+            if method == "catalog.store.list":
+                return {"stores": [{"id": 10, "title": "Borisov warehouse", "address": "A"}]}
+            if method == "catalog.storeproduct.list":
+                return {"storeProducts": [{"storeId": 10, "productId": 1001, "amount": "7"}]}
+            if method == "catalog.product.list":
+                return {"products": [{"id": 1001, "iblockId": 7, "name": "Cable"}]}
+            return {}
+
+    class ClarifyingPlanner:
+        def __init__(self):
+            self.calls = 0
+
+        async def plan(self, *, task, constraints, **kwargs):
+            self.calls += 1
+            raw = {
+                "schema_version": PLAN_SCHEMA,
+                "plan_id": constraints["plan_id"],
+                "request_hash": constraints["request_hash"],
+                "state": "CLARIFICATION_REQUIRED",
+                "clarification": "Какой склад?",
+                "max_rounds": 3,
+                "subtasks": [],
+            }
+            return json.dumps(raw), ModelUsageRecord(agent_id="planner", provider="test", model="pro")
+
+        async def finalize(self, **kwargs):  # pragma: no cover
+            raise AssertionError("final model must not be called")
+
+    class EntityCatalog:
+        value = {
+            "status": "ready",
+            "version": "entities-v1",
+            "users": [],
+            "projects": [],
+            "warehouses": [{"id": 10, "name": "Borisov warehouse", "aliases": ["borisov warehouse"]}],
+        }
+
+        def snapshot(self):
+            return self.value
+
+        def view_for_request(self, request):
+            return self.value
+
+    client = WarehouseClient()
+    warehouse_tool = BitrixWarehouseSearchTool(client=client)
+    specialist = Bitrix24Specialist(
+        get_agent_manifest("bitrix24"),
+        agent_tools=[warehouse_tool],
+    )
+    manifest = get_agent_manifest("bitrix24")
+    manifest.capabilities = ["bitrix_warehouse_search"]
+    call = CallSpecialistTool({"bitrix24": specialist}, [manifest])
+    planner = ClarifyingPlanner()
+    orchestrator = PlanAuthoritativeOrchestrator(
+        AgentManifest(id="internal_orchestrator", name="Orchestrator", kind="orchestrator", description="test"),
+        agent_tools=[call],
+        planner=planner,
+        llm=planner,
+        entity_catalog=EntityCatalog(),
+    )
+
+    result = asyncio.run(
+        orchestrator.handle(
+            AgentTask(task_id="t1", request="Покажи склад Borisov warehouse")
+        )
+    )
+
+    assert result.status == "completed"
+    assert planner.calls == 1
+    assert result.metadata["planner_attempts"] == 1
+    assert result.metadata["structured_command_rounds"] == 1
+    assert "Cable" in result.answer
+    assert [method for method, _ in client.calls].count("catalog.storeproduct.list") == 1
+
+
 class _StructuredSpecialist:
     def __init__(self):
         self.commands = []
@@ -354,7 +437,7 @@ class _TwoRoundPlanner:
         raise AssertionError("final model must not be called")
 
 
-def test_orchestrator_can_use_first_result_for_one_bounded_followup_command():
+def test_orchestrator_rejects_multi_round_bitrix_negotiation_before_dispatch():
     specialist = _StructuredSpecialist()
     manifest = AgentManifest(id="bitrix24", name="Bitrix", kind="specialist", description="test")
     manifest.capabilities = ["bitrix_api"]
@@ -369,10 +452,10 @@ def test_orchestrator_can_use_first_result_for_one_bounded_followup_command():
 
     result = asyncio.run(orchestrator.handle(AgentTask(task_id="t1", request="Find Borisov tasks")))
 
-    assert result.status == "completed"
-    assert [item["arguments"]["method"] for item in specialist.commands] == ["user.search", "tasks.task.list"]
-    assert len(planner.plan_calls) == 2
-    assert result.metadata["structured_command_rounds"] == 2
+    assert result.status == "failed"
+    assert specialist.commands == []
+    assert len(planner.plan_calls) == 1
+    assert result.metadata["reason"] == "MULTI_ROUND_BITRIX_DISABLED"
 
 
 def test_live_bitrix_catalog_exposes_only_exact_tool_ids_as_planner_capabilities():
