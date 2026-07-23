@@ -36,19 +36,11 @@ def fake_infra(monkeypatch):
             _noop,
         ),
         patch(
-            "ai_server.integrations.postgres.pto_agent.PostgresPtoAgentStore.ensure_schema",
-            _noop,
-        ),
-        patch(
             "ai_server.integrations.postgres.orchestrator_agent.PostgresOrchestratorStore.ensure_schema",
             _noop,
         ),
         patch(
             "ai_server.integrations.postgres.vehicle_usage.PostgresVehicleUsageStore.ensure_schema",
-            _noop,
-        ),
-        patch(
-            "ai_server.integrations.postgres.kartoteka_agent.PostgresKartotekaStore.ensure_schema",
             _noop,
         ),
     ):

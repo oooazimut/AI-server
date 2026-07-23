@@ -70,7 +70,7 @@ VEHICLE_USAGE_STAFF_SYNC_ENABLED=false
 ## Контрольные проверки
 
 ```bash
-systemctl is-active ai-server.service ai-server-worker.service ai-server-scheduler.service
+systemctl is-active ai-server.service ai-server-worker.service
 ```
 
 Команды через Bitrix:

@@ -1,6 +1,5 @@
 from ai_server.registry import (
     get_agent_manifest,
-    get_automation_manifest,
     load_automation_manifests,
     summarize_agents,
     summarize_automations,
@@ -16,8 +15,6 @@ def test_bitrix_automations_are_registered():
         "bitrix_portal_search_indexer",
         "bitrix_search_webhook_indexer",
         "bitrix_reconciler",
-        "bitrix_task_supervisor",
-        "bitrix_task_quality_control",
     }.issubset(ids)
     assert "bitrix_vehicle_usage" not in ids
     assert "bitrix_event_poller" not in ids
@@ -32,16 +29,11 @@ def test_logistics_automations_are_registered():
     assert all(automation.owner_agent_id == "logistics" for automation in automations)
 
 
-def test_quality_control_automation_policy_flags():
-    automation = get_automation_manifest("bitrix_task_quality_control")
+def test_retired_bitrix_business_automations_are_not_registered():
+    ids = {automation.id for automation in load_automation_manifests(agent_id="bitrix24")}
 
-    assert automation is not None
-    assert automation.kind == "business_workflow"
-    assert automation.trigger == "webhook"
-    assert automation.uses_llm is True
-    assert automation.requires_oauth_actor is True
-    assert automation.human_approval_required is True
-    assert "var/quality_control_state.json" in automation.state_paths
+    assert "bitrix_task_supervisor" not in ids
+    assert "bitrix_task_quality_control" not in ids
 
 
 def test_agent_summary_exposes_automation_ids():

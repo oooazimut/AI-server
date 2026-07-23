@@ -1,6 +1,24 @@
 {
   "schema_version": "orchestrator.bitrix_policy.v1",
   "authority": "internal_orchestrator",
+  "defaults": {
+    "result_limit": 10,
+    "warehouse_page_size": 50,
+    "task_deadline_working_days": 3,
+    "task_deadline_hour": 19,
+    "calendar_start_working_days": 3,
+    "calendar_start_hour": 12,
+    "calendar_duration_minutes": 30
+  },
+  "templates": {
+    "task_description": "Краткое содержание: {title}",
+    "task_close_unconfirmed_item": "результат выполнения не указан",
+    "task_close_missing_fields": [
+      "что сделано по задаче",
+      "оборудование/расходники, если использовались",
+      "итог: выполнена полностью, частично или не выполнена"
+    ]
+  },
   "rules": [
     {
       "id": "authority",
@@ -19,7 +37,7 @@
       "content": [
         "Resolve every named warehouse to an exact store_id from entity_catalog before dispatch.",
         "Show/find/list warehouse phrases return warehouse contents by default; list all warehouses only when explicitly requested.",
-        "Use product_limit 50 and product_offset 0 by default. A product phrase means product_query plus include_products=true.",
+        "Use pages of 50 positive-stock product rows: product_limit=50 and product_offset=0 for the first page; continue with offsets 50, 100 and so on in the same numbered branch.",
         "Two or more named warehouses become independent parallel commands, one exact store_id per command."
       ]
     },
@@ -50,7 +68,7 @@
       "markers": ["календар", "напом", "событ", "calendar", "remind", "event"],
       "tools": ["calendar_event_draft", "calendar_event_confirm", "calendar_event_discard"],
       "content": [
-        "If date and time are both omitted, default to three calendar days from now at 12:00 Moscow.",
+        "If date and time are both omitted, default to three working days from now at 12:00 Moscow.",
         "Default duration is 30 minutes and default owner/participant is the requester.",
         "Keep every explicitly supplied date, time, title and participant unchanged.",
         "Writes always use a 15-minute numbered draft and exact numbered confirmation."

@@ -2,14 +2,12 @@ id: bitrix24
 name: Специалист Битрикс24
 version: 0.1.0
 kind: specialist
+reasoning_mode: executor
 audience: employee
 description: Работает с задачами, проектами, CRM, чатами, комментариями, доступом к файлам и локальным индексом портала Битрикс24.
-handoff_description: Использовать для запросов про Битрикс24, задачи, проекты, CRM, поиск/доступ к файлам портала, заявки и комментарии. Смысловой анализ технических документов передавать ПТО.
+handoff_description: Структурированный исполнитель запросов про задачи, проекты, поиск и доступ к данным портала Битрикс24. Смысл запроса и точные параметры определяет Pro-оркестратор.
 entrypoint: backend.ai_server.agents.bitrix24.Bitrix24Specialist
 instructions_file: agents/bitrix24/instructions.md
-skills_path: agents/bitrix24/skills
-contracts_path: agents/bitrix24/contracts
-knowledge_path: agents/bitrix24/knowledge/topics
 automations_path: agents/bitrix24/automations
 capabilities:
   - bitrix24
@@ -19,7 +17,6 @@ capabilities:
   - document_search
   - projects_crm
 tools:
-  - knowledge_base
   - bitrix_api
   - current_user_profile
   - portal_search
@@ -31,7 +28,6 @@ automations:
     description: Принимает сообщения из чата Битрикс24, передаёт обычные запросы Оркестратору и обслуживает подтверждение/отмену ожидающих Bitrix write actions.
     source_project: BitrixAIAgent
     source_modules:
-      - app.agent.runtime_v2
       - app.agent.dialog_state_store
     entrypoint: backend.ai_server.channels.bitrix.BitrixWebhookProcessor
     status_endpoint: /bitrix/status
@@ -85,7 +81,7 @@ automations:
       - processed_webhook_event
     notes:
       - Это транспортный worker, а не чатовый агент.
-      - Через него должны проходить quality-control и поисковые disk-события.
+      - Через него проходят только технические события очереди и обновление поискового индекса.
   - id: bitrix_portal_search_indexer
     name: Периодическая индексация портала Битрикс24
     kind: data_pipeline
@@ -170,67 +166,6 @@ automations:
     emits:
       - reconciled_task_event
       - reconciled_disk_delta
-  - id: bitrix_task_supervisor
-    name: Контроль просроченных задач
-    kind: business_workflow
-    trigger: schedule
-    description: Находит просроченные активные задачи и отправляет уведомления руководителям или ответственным с учётом cooldown.
-    source_project: BitrixAIAgent
-    source_modules:
-      - app.agent.supervisor
-    entrypoint: backend.ai_server.workers.bitrix.supervisor.TaskSupervisorWorker
-    schedule_hint: supervisor interval from settings
-    status_endpoint: /automations/bitrix_task_supervisor
-    enabled_by_default: false
-    human_approval_required: false
-    dependencies:
-      - bitrix_api
-    tools:
-      - bitrix_api
-    data_scopes:
-      - bitrix24_tasks
-      - bitrix24_users
-    state_paths:
-      - var/supervisor_state.json
-    emits:
-      - overdue_tasks_digest
-      - overdue_task_reminder
-    notes:
-      - В боевом режиме пишет уведомления в Битрикс24, поэтому должен идти через policy layer и dry-run настройки.
-  - id: bitrix_task_quality_control
-    name: Контроль качества закрытия задач
-    kind: business_workflow
-    trigger: webhook
-    description: Проверяет результат закрытия задачи, валидирует шаблон, может вернуть задачу в работу, одобрить её или уведомить директора.
-    source_project: BitrixAIAgent
-    source_modules:
-      - app.agent.quality_control
-    entrypoint: backend.ai_server.workers.bitrix.quality_control.handle_quality_control_webhook_event
-    status_endpoint: /automations/bitrix_task_quality_control
-    enabled_by_default: false
-    uses_llm: true
-    requires_oauth_actor: true
-    human_approval_required: true
-    dependencies:
-      - bitrix_webhook_event_queue
-      - bitrix_oauth
-      - llm_gateway
-    tools:
-      - bitrix_api
-      - llm_gateway
-    data_scopes:
-      - bitrix24_tasks
-      - bitrix24_comments
-      - bitrix24_users
-    state_paths:
-      - var/quality_control_state.json
-    emits:
-      - quality_control_checked
-      - quality_control_action_planned
-      - quality_control_action_applied
-    notes:
-      - Это автономная Bitrix-автоматизация, а не отдельный чатовый субагент.
-      - Автоматические write-действия допустимы только через служебного OAuth actor и явную политику.
 data_scopes:
   - bitrix24_tasks
   - bitrix24_crm

@@ -14,25 +14,16 @@ import logging
 import signal
 import sys
 from datetime import datetime, timedelta
-from uuid import uuid4
 
 from ai_server.agent_scheduler import AgentScheduler
-from ai_server.agents.bitrix24 import BitrixLLMService
-from ai_server.agents.diagnost import DiagnostLLMService
-from ai_server.agents.kartoteka.llm import KartotekaLLMService
-from ai_server.agents.logistics import LogisticsLLMService
-from ai_server.agents.logistics.specialist import VehicleUsageSettings
 from ai_server.agents.logistics.tools.vehicle_save import DEFAULT_START_MESSAGE
-from ai_server.agents.pto import PtoLLMService
 from ai_server.attachments import AttachmentService
 from ai_server.channels.bitrix import BitrixChatChannel
 from ai_server.integrations.bitrix.client import BitrixClient
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService
 from ai_server.integrations.postgres.bitrix_agent import PostgresBitrixAgentStore
 from ai_server.integrations.postgres.diagnost_agent import PostgresDiagnostStore
-from ai_server.integrations.postgres.kartoteka_agent import PostgresKartotekaStore
 from ai_server.integrations.postgres.orchestrator_agent import PostgresOrchestratorStore
-from ai_server.integrations.postgres.pto_agent import PostgresPtoAgentStore
 from ai_server.integrations.postgres.vehicle_usage import PostgresVehicleUsageStore
 from ai_server.integrations.redis.agent_queue import RedisAgentQueue
 from ai_server.integrations.redis.conversation_trace import RedisConversationTrace
@@ -41,10 +32,10 @@ from ai_server.integrations.redis.dialog_guard import RedisDialogGuard
 from ai_server.integrations.redis.event_queue import RedisEventQueue
 from ai_server.integrations.redis.outbound_queue import RedisOutboundQueue
 from ai_server.llm import build_orchestrator_llm_client
-from ai_server.models import AgentTask
+from ai_server.orchestrators.bitrix_formatter import format_task_close_report, format_task_close_result_text
+from ai_server.orchestrators.draft_confirmation import draft_confirmation_phrase, matches_draft_confirmation
 from ai_server.orchestrators.entity_catalog import OrchestratorEntityCatalog
-from ai_server.orchestrators.internal import InternalOrchestrator
-from ai_server.orchestrators.plan_authoritative import DeepSeekPlanService
+from ai_server.orchestrators.plan_authoritative import DeepSeekPlanService, PlanAuthoritativeOrchestrator
 from ai_server.registry import load_agent_manifests
 from ai_server.runtime import ensure_runtime_dirs
 from ai_server.settings import get_settings
@@ -56,12 +47,9 @@ from ai_server.utils import MOSCOW_TZ
 from ai_server.workers.bitrix.reconciler import run_reconciler
 from ai_server.workers.bitrix.search_indexer import PortalSearchIndexerWorker
 from ai_server.workers.bitrix.staff_roster_publisher import publish_staff_roster
-from ai_server.workers.bitrix.supervisor import run_task_supervisor
 from ai_server.workers.bitrix.task_close_direct_dispatcher import run_task_close_direct_control_worker
 from ai_server.workers.bitrix.webhook_event_queue import run_webhook_event_worker
 from ai_server.workers.diagnost.event_worker import run_diagnost_event_worker
-from ai_server.workers.diagnost.feedback_receiver import FeedbackReceiverAdapter
-from ai_server.workers.diagnost.feedback_scheduler import run_feedback_scheduler_worker
 from ai_server.workers.logistics.staff_sync import run_staff_sync
 from ai_server.workers.orchestrator.outbound_delivery import run_outbound_delivery_worker
 from ai_server.workers.orchestrator.result_publisher import OrchestratorResultPublisher, SpecialistResultPublisher
@@ -101,26 +89,11 @@ async def main() -> None:
     await bitrix_store.ensure_schema()
     portal_search = bitrix_store
 
-    pto_store = PostgresPtoAgentStore(settings.database_url)
-    await pto_store.ensure_schema()
-
-    kartoteka_store = PostgresKartotekaStore(
-        settings.database_url,
-        protected_user_ids=settings.kartoteka_protected_user_ids,
-        secret_user_ids=settings.kartoteka_secret_user_ids,
-    )
-    await kartoteka_store.ensure_schema()
-
     orchestrator_store = PostgresOrchestratorStore(settings.database_url)
     await orchestrator_store.ensure_schema()
 
     diagnost_store = PostgresDiagnostStore(settings.database_url)
     await diagnost_store.ensure_schema()
-    if not settings.diagnost_feedback_enabled:
-        cancelled_feedback = await diagnost_store.cancel_pending_feedback()
-        if cancelled_feedback:
-            logger.info("Diagnost feedback disabled: cancelled %d pending prompts", cancelled_feedback)
-
     portal_search_indexer = PortalSearchIndexerWorker(
         bitrix,
         portal_search,
@@ -161,9 +134,8 @@ async def main() -> None:
         )
     )
 
+    orchestrator: PlanAuthoritativeOrchestrator | None = None
     if settings.webhook_event_queue_enabled and settings.webhook_event_worker_enabled:
-        bitrix_llm_svc = BitrixLLMService(settings=settings)
-        logistics_llm_svc = LogisticsLLMService()
         entity_catalog = OrchestratorEntityCatalog(
             bitrix,
             refresh_interval_seconds=settings.orchestrator_entity_catalog_refresh_seconds,
@@ -172,21 +144,6 @@ async def main() -> None:
             warehouse_limit=settings.orchestrator_entity_catalog_warehouse_limit,
         )
         await entity_catalog.refresh()
-
-        vu_settings = (
-            VehicleUsageSettings(
-                manager_user_id=settings.vehicle_usage_manager_user_id,
-                max_reminders=settings.vehicle_usage_max_reminders,
-                reminder_interval_minutes=settings.vehicle_usage_reminder_interval_minutes,
-                reminder_delays_minutes=settings.resolved_vehicle_usage_reminder_delays_minutes,
-                allowed_user_ids=frozenset(settings.resolved_vehicle_usage_allowed_user_ids),
-                admin_user_ids=frozenset(settings.resolved_vehicle_usage_admin_user_ids),
-                dry_run=settings.vehicle_usage_dry_run,
-                request_time=settings.vehicle_usage_request_time,
-            )
-            if settings.vehicle_usage_enabled
-            else None
-        )
 
         specialist_deps = SpecialistDeps(
             settings=settings,
@@ -199,18 +156,13 @@ async def main() -> None:
             orchestrator_llm=DeepSeekPlanService(build_orchestrator_llm_client(settings)),
             orchestrator_store=orchestrator_store,
             orchestrator_entity_catalog=entity_catalog,
-            bitrix_llm=bitrix_llm_svc,
+            task_close_report_renderer=format_task_close_report,
+            task_close_result_text_renderer=format_task_close_result_text,
+            draft_confirmation_phrase_renderer=draft_confirmation_phrase,
+            draft_confirmation_matcher=matches_draft_confirmation,
             bitrix_store=bitrix_store,
-            pto_llm=PtoLLMService(),
-            pto_store=pto_store,
-            kartoteka_llm=KartotekaLLMService(),
-            kartoteka_store=kartoteka_store,
-            diagnost_llm=DiagnostLLMService(),
-            diagnost_store=diagnost_store,
             specialist_result_publisher=specialist_result_publisher,
-            logistics_llm=logistics_llm_svc,
             vehicle_usage_store=vehicle_usage_store,
-            logistics_vu_settings=vu_settings,
             channels={"bitrix24": bitrix_channel},
             footer_service=TechnicalFooterService(settings=settings),
             conversation_trace=conversation_trace,
@@ -219,7 +171,7 @@ async def main() -> None:
             result_publisher=result_publisher,
         )
         orch_manifest = next((m for m in manifests if m.kind == "orchestrator"), None)
-        orchestrator = InternalOrchestrator.build(
+        orchestrator = PlanAuthoritativeOrchestrator.build(
             orch_manifest,
             **specialist_deps.as_build_kwargs(),
         )
@@ -382,40 +334,6 @@ async def main() -> None:
                 day_off_minute,
             )
 
-        manager_id = settings.task_proposal_manager_bitrix_id
-        _aq_ref = agent_queue
-
-        async def _run_morning_proposals() -> None:
-            if not manager_id:
-                return
-            proposal_task = AgentTask(
-                task_id=f"morning_proposals_{uuid4().hex[:8]}",
-                request="morning_proposals",
-                context={
-                    "channel_id": "bitrix24",
-                    "recipient_id": str(manager_id),
-                },
-            )
-            await _aq_ref.publish(
-                {
-                    "to": "bitrix24",
-                    "from": "scheduler",
-                    "type": "task",
-                    "payload": proposal_task.model_dump(),
-                    "reply_to": "orchestrator",
-                }
-            )
-
-        if settings.scheduler_enabled:
-            scheduler.add_job_cron(
-                "bitrix24",
-                "morning_proposals",
-                _run_morning_proposals,
-                8,
-                30,
-                replace_existing=False,
-            )
-
         attachment_service = AttachmentService(bitrix)
         transcriber = build_transcriber()
 
@@ -433,7 +351,6 @@ async def main() -> None:
             "errors": 0,
             "last_error": None,
         }
-        feedback_receiver = FeedbackReceiverAdapter(diagnost_store) if settings.diagnost_feedback_enabled else None
         agent_tasks.append(
             asyncio.create_task(
                 run_webhook_event_worker(
@@ -443,7 +360,6 @@ async def main() -> None:
                     transcriber=transcriber,
                     status=_webhook_status,
                     settings=settings,
-                    feedback_receiver=feedback_receiver,
                     conversation_trace=conversation_trace,
                     dialog_guard=dialog_guard,
                     bitrix_sender=bitrix,
@@ -454,7 +370,6 @@ async def main() -> None:
         agent_task_timeout = settings.agent_task_timeout_seconds
         orchestrator_worker_count = max(1, settings.agent_orchestrator_worker_count)
         bitrix_worker_count = max(1, settings.agent_bitrix_worker_count)
-        logistics_worker_count = max(1, settings.agent_logistics_worker_count)
         for index in range(orchestrator_worker_count):
             agent_tasks.append(
                 asyncio.create_task(
@@ -469,8 +384,6 @@ async def main() -> None:
             specialist_id = str(getattr(getattr(sp, "manifest", None), "id", ""))
             if specialist_id == "bitrix24":
                 worker_count = bitrix_worker_count
-            elif specialist_id == "logistics":
-                worker_count = logistics_worker_count
             else:
                 worker_count = 1
             for index in range(worker_count):
@@ -491,15 +404,12 @@ async def main() -> None:
                         diagnost_queue,
                         diagnost_store,
                         conversation_trace=conversation_trace,
-                        feedback_enabled=settings.diagnost_feedback_enabled,
                         trace_snapshot_enabled=settings.diagnost_trace_snapshot_enabled,
                         trace_settle_seconds=settings.diagnost_trace_settle_seconds,
                         high_latency_ms=settings.diagnost_high_latency_ms,
                     )
                 )
             )
-            if settings.diagnost_feedback_enabled:
-                agent_tasks.append(asyncio.create_task(run_feedback_scheduler_worker(diagnost_store, bitrix)))
         else:
             logger.info("Diagnost workers disabled by DIAGNOST_ENABLED=false")
 
@@ -523,7 +433,7 @@ async def main() -> None:
         agent_tasks.append(asyncio.create_task(run_staff_sync(vehicle_usage_store, settings.redis_url)))
     if settings.search_background_periodic_enabled:
         agent_tasks.append(asyncio.create_task(portal_search_indexer.run_periodic()))
-    if settings.bitrix_task_close_control_worker_enabled:
+    if settings.bitrix_task_close_control_worker_enabled and orchestrator is not None:
         _task_close_direct_status: dict = {
             "enabled": settings.bitrix_task_close_control_worker_enabled,
             "running": False,
@@ -538,30 +448,16 @@ async def main() -> None:
         agent_tasks.append(
             asyncio.create_task(
                 run_task_close_direct_control_worker(
-                    bitrix=bitrix,
-                    bitrix_oauth=bitrix_oauth,
                     store=portal_search,
                     settings=settings,
                     status=_task_close_direct_status,
-                    outbound_queue=outbound_queue,
+                    orchestrator_handler=orchestrator.handle,
                 )
             )
         )
-    if settings.supervisor_enabled:
-        _supervisor_status: dict = {
-            "enabled": settings.supervisor_enabled,
-            "running": False,
-            "dry_run": settings.supervisor_dry_run,
-            "interval_seconds": settings.supervisor_interval_seconds,
-            "last_check_at": None,
-            "last_success_at": None,
-            "last_error": None,
-            "next_check_at": None,
-            "runs": 0,
-            "errors": 0,
-        }
-        agent_tasks.append(
-            asyncio.create_task(run_task_supervisor(bitrix, status=_supervisor_status, settings=settings))
+    elif settings.bitrix_task_close_control_worker_enabled:
+        logger.error(
+            "Task-close control worker disabled: the authoritative orchestrator is unavailable"
         )
     if settings.reconcile_enabled:
         _reconciler_status: dict = {

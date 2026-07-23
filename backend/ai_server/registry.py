@@ -6,7 +6,6 @@ from .models import AgentAutomationManifest, AgentManifest, AgentSummary, Automa
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 AGENT_PACKAGE_DIR = PROJECT_ROOT / "agents"
-LEGACY_AGENT_CONFIG_DIR = PROJECT_ROOT / "config" / "agents"
 
 
 def load_agent_manifests() -> list[AgentManifest]:
@@ -37,6 +36,7 @@ def summarize_agents(manifests: list[AgentManifest]) -> list[AgentSummary]:
             id=agent.id,
             name=agent.name,
             kind=agent.kind,
+            reasoning_mode=agent.reasoning_mode,
             capabilities=agent.capabilities,
             tools=agent.tools,
             automations=[automation.id for automation in agent.automations],
@@ -61,8 +61,6 @@ def _manifest_paths() -> list[Path]:
     paths: list[Path] = []
     if AGENT_PACKAGE_DIR.exists():
         paths.extend(sorted(AGENT_PACKAGE_DIR.glob("*/manifest.yaml")))
-    if LEGACY_AGENT_CONFIG_DIR.exists():
-        paths.extend(sorted(LEGACY_AGENT_CONFIG_DIR.glob("*.yaml")))
     return paths
 
 
@@ -111,4 +109,6 @@ def _read_yaml(path: Path) -> dict:
         payload = yaml.safe_load(stream) or {}
     if not isinstance(payload, dict):
         raise ValueError(f"Agent manifest must be a mapping: {path}")
+    if payload.get("kind") in {"orchestrator", "specialist"} and "reasoning_mode" not in payload:
+        raise ValueError(f"Agent manifest must declare reasoning_mode explicitly: {path}")
     return payload

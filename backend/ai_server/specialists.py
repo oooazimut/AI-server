@@ -20,36 +20,28 @@ class SpecialistDeps:
     """
 
     settings: Any  # Settings — typed as Any to avoid a circular import at module level
-    # channel infrastructure — passed through to Bitrix24Specialist and InternalOrchestrator.build()
-    manifests: Any = None  # list[AgentManifest] — needed by InternalOrchestrator.build()
+    # channel infrastructure — passed through to Bitrix24Specialist and PlanAuthoritativeOrchestrator.build()
+    manifests: Any = None  # list[AgentManifest] — needed by PlanAuthoritativeOrchestrator.build()
     bitrix_client: Any = None  # BitrixClient (HTTP REST)
     portal_search_index: Any = None  # PortalSearchIndex
     bitrix_oauth: Any = None  # BitrixOAuthService | None — for OAuth-based Bitrix writes
-    bitrix_bot: Any = None  # BitrixBotPort; defaults to bitrix_client in InternalOrchestrator.build()
+    bitrix_bot: Any = None  # BitrixBotPort; defaults to bitrix_client in PlanAuthoritativeOrchestrator.build()
     # orchestrator
     scheduler: Any = None  # SchedulerPort | None
     orchestrator_llm: Any = None
     orchestrator_store: Any = None  # AgentDialogStorePort | None
     orchestrator_retriever: Any = None  # HybridKnowledgeRetriever | None
     orchestrator_entity_catalog: Any = None  # OrchestratorEntityCatalog | None
+    task_close_report_renderer: Any = None  # Orchestrator-owned four-block report renderer
+    task_close_result_text_renderer: Any = None  # Orchestrator-owned stored-result renderer
+    draft_confirmation_phrase_renderer: Any = None  # Orchestrator-owned confirmation text
+    draft_confirmation_matcher: Any = None  # Orchestrator-owned confirmation recognition
     # bitrix24 specialist
-    bitrix_llm: Any = None
-    bitrix_retriever: Any = None
     bitrix_store: Any = None
-    # pto specialist
-    pto_llm: Any = None
-    pto_store: Any = None  # AgentDialogStorePort | None
-    # logistics specialist
+    # deterministic logistics automation
     vehicle_usage_store: Any = None  # VehicleUsageStorePort | None
-    logistics_llm: Any = None
     logistics_vu_settings: Any = None  # VehicleUsageSettings | None
-    # kartoteka specialist
-    kartoteka_store: Any = None  # PostgresKartotekaStore | None
-    kartoteka_llm: Any = None  # KartotekaAgentLLM | None
-    # diagnost specialist
-    diagnost_store: Any = None  # PostgresDiagnostStore | None
-    diagnost_llm: Any = None  # DiagnostAgentLLM | None
-    # channel delivery (captured by InternalOrchestrator.build, not passed to specialists)
+    # channel delivery (captured by PlanAuthoritativeOrchestrator.build, not passed to specialists)
     channels: Any = None  # dict[str, ChannelPort]
     footer_service: Any = None  # TechnicalFooterService | None
     result_publisher: Any = None  # ResultPublisherPort | None (orchestrator)
@@ -76,6 +68,13 @@ def build_specialist_registry(
         if audience is not None and manifest.audience != audience:
             continue
         cls = _load_entrypoint(manifest.entrypoint)
+        if manifest.reasoning_mode == "executor" and not callable(
+            getattr(cls, "execute_structured_command", None)
+        ):
+            # An executor without a structured entrypoint is not exposed to the
+            # planner.  Falling back to handle(free_text) would silently restore
+            # a second semantic authority inside the specialist.
+            continue
         registry[manifest.id] = cls.build(manifest, **deps)
     return registry
 

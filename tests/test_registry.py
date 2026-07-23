@@ -8,7 +8,13 @@ def test_load_agent_manifests():
         "internal_orchestrator",
         "bitrix24",
         "logistics",
-        "pto",
+        "diagnost",
+    }
+    assert {agent.id for agent in manifests} == {
+        "internal_orchestrator",
+        "bitrix24",
+        "logistics",
+        "diagnost",
     }
 
 
@@ -17,8 +23,10 @@ def test_bitrix_manifest_uses_package_specification():
 
     assert manifest is not None
     assert manifest.instructions_file == "agents/bitrix24/instructions.md"
-    assert manifest.skills_path == "agents/bitrix24/skills"
-    assert manifest.knowledge_path == "agents/bitrix24/knowledge/topics"
+    assert manifest.skills_path is None
+    assert manifest.contracts_path is None
+    assert manifest.knowledge_path is None
+    assert manifest.reasoning_mode == "executor"
     assert "portal_search" in manifest.tools
 
 

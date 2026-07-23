@@ -121,7 +121,7 @@ class TaskCloseControlUpdateTool:
                     "target_user_id": {"type": "integer"},
                     "target_user_name": {
                         "type": "string",
-                        "description": "Exact Bitrix display name when the numeric id is not known.",
+                        "description": "Display label for an exact target_user_id selected by the orchestrator.",
                     },
                     "value": {"type": "string"},
                     "auto_close_time": {"type": "string", "description": "HH:MM, for example 20:00."},
@@ -467,46 +467,11 @@ async def _resolve_target_user(user_client: Any | None, args: dict[str, Any]) ->
             )
         return {"target_user_id": target_user_id, "target_user_name": profile["name"]}
 
-    target_name = str(args.get("target_user_name") or args.get("user_name") or "").strip()
-    if not target_name:
-        return _missing_target_user()
-    search = getattr(user_client, "search_users", None)
-    if not callable(search):
-        return ToolResult(
-            status=ToolStatus.NOT_AVAILABLE,
-            tool=TaskCloseControlUpdateTool.name,
-            error="Bitrix exact-name search is unavailable",
-        )
-    try:
-        raw_users = await search(target_name, limit=20)
-    except Exception:
-        return ToolResult(
-            status=ToolStatus.ERROR,
-            tool=TaskCloseControlUpdateTool.name,
-            error="Could not search Bitrix users",
-        )
-    normalized_name = _normalized_name(target_name)
-    matches: list[dict[str, Any]] = []
-    for raw_user in raw_users if isinstance(raw_users, list) else []:
-        profile = _compact_user(raw_user) if isinstance(raw_user, dict) else None
-        if profile and profile.get("active") and _normalized_name(profile.get("name")) == normalized_name:
-            matches.append(profile)
-    matches = sorted({int(item["user_id"]): item for item in matches}.values(), key=lambda item: int(item["user_id"]))
-    if not matches:
-        return ToolResult(
-            status=ToolStatus.NOT_FOUND,
-            tool=TaskCloseControlUpdateTool.name,
-            error="No active Bitrix user has that exact name",
-            data={"target_user_name": target_name},
-        )
-    if len(matches) > 1:
-        return ToolResult(
-            status=ToolStatus.AMBIGUOUS,
-            tool=TaskCloseControlUpdateTool.name,
-            error="Several active Bitrix users have that exact name; specify the numeric user id",
-            data={"target_user_name": target_name, "matches": matches},
-        )
-    return {"target_user_id": int(matches[0]["user_id"]), "target_user_name": str(matches[0]["name"])}
+    return ToolResult(
+        status=ToolStatus.CONTRACT_VIOLATION,
+        tool=TaskCloseControlUpdateTool.name,
+        error="exact target_user_id selected by the orchestrator is required",
+    )
 
 
 def _populate_change_values(store: Any, *, draft: dict[str, Any], args: dict[str, Any]) -> ToolResult | None:
@@ -605,10 +570,6 @@ def _apply_change(store: Any, *, draft: dict[str, Any], actor_user_id: int | Non
     return ToolResult(
         status=ToolStatus.INVALID_TOOL_CALL, tool=TaskCloseControlUpdateTool.name, error="Invalid draft action"
     )
-
-
-def _normalized_name(value: object) -> str:
-    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
 
 
 async def _release_draft_claim(release: Any, *, dialog_key: str, draft: dict[str, Any]) -> None:

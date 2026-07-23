@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-
 from ai_server.agents.bitrix24.tools.task_create import (
     BitrixTaskCreateDraft,
     build_task_create_draft_from_args,
@@ -36,7 +34,7 @@ def test_draft_not_ready_without_fields():
 
 def test_draft_complete_with_no_deadline():
     draft = build_task_create_draft_from_args(
-        {"title": "Проверить камеру", "responsible_id": 9, "no_deadline": True},
+        {"title": "Проверить камеру", "description": "Проверить камеру", "responsible_id": 9, "no_deadline": True},
         user_id=9,
     )
     assert draft.is_ready
@@ -65,7 +63,7 @@ def test_draft_sets_created_by_from_user():
 
 def test_draft_deadline_iso():
     draft = build_task_create_draft_from_args(
-        {"title": "Задача", "responsible_id": 9, "deadline_iso": "2026-07-01T09:00:00+03:00"},
+        {"title": "Задача", "description": "Описание", "responsible_id": 9, "deadline_iso": "2026-07-01T09:00:00+03:00"},
         user_id=9,
     )
     assert draft.is_ready
@@ -74,7 +72,7 @@ def test_draft_deadline_iso():
 
 def test_draft_deadline_z_suffix():
     draft = build_task_create_draft_from_args(
-        {"title": "Задача", "responsible_id": 9, "deadline_iso": "2026-07-01T09:00:00Z"},
+        {"title": "Задача", "description": "Описание", "responsible_id": 9, "deadline_iso": "2026-07-01T09:00:00Z"},
         user_id=9,
     )
     assert draft.is_ready
@@ -82,7 +80,7 @@ def test_draft_deadline_z_suffix():
 
 def test_draft_responsible_self():
     draft = build_task_create_draft_from_args(
-        {"title": "Задача", "responsible_self": True, "no_deadline": True},
+        {"title": "Задача", "description": "Описание", "responsible_self": True, "no_deadline": True},
         user_id=15,
     )
     assert draft.is_ready
@@ -97,32 +95,34 @@ def test_draft_description_included():
     assert draft.params["fields"]["DESCRIPTION"] == "Подробное описание"
 
 
-def test_draft_default_description_from_title():
+def test_draft_rejects_missing_orchestrator_description():
     draft = build_task_create_draft_from_args(
         {"title": "Проверить связь", "responsible_id": 9, "no_deadline": True},
         user_id=9,
     )
-    assert draft.params["fields"]["DESCRIPTION"] == "Краткое содержание: Проверить связь"
+    assert not draft.is_ready
+    assert any("description" in error for error in draft.contract_errors)
 
 
-def test_draft_default_deadline_when_missing():
+def test_draft_rejects_missing_orchestrator_deadline():
     draft = build_task_create_draft_from_args(
         {"title": "Задача", "responsible_id": 9},
         user_id=9,
     )
-    fields = draft.params["fields"]
-    deadline = datetime.fromisoformat(fields["DEADLINE"])
-    assert draft.is_ready
-    assert "NO_DEADLINE" not in fields
-    assert deadline.hour == 19
-    assert deadline.minute == 0
-    assert deadline.weekday() < 5
-    assert any("Срок по умолчанию" in note for note in draft.notes)
+    assert not draft.is_ready
+    assert any("deadline_iso or no_deadline" in error for error in draft.contract_errors)
 
 
 def test_draft_project_label_stays_in_preview_only():
     draft = build_task_create_draft_from_args(
-        {"title": "Задача", "responsible_id": 9, "group_id": 45, "project_name": "Ларгус 2"},
+        {
+            "title": "Задача",
+            "description": "Описание",
+            "responsible_id": 9,
+            "group_id": 45,
+            "project_name": "Ларгус 2",
+            "no_deadline": True,
+        },
         user_id=9,
     )
 

@@ -1,5 +1,6 @@
 from ai_server.capability_registry import build_capability_registry, registry_tool, validate_tool_arguments
 from ai_server.models import AgentManifest
+from ai_server.orchestrators.orchestrator_policy import bitrix_policy_pack
 from ai_server.registry import get_agent_manifest
 
 
@@ -59,17 +60,11 @@ def test_argument_validation_fails_closed_for_required_type_range_enum_and_unkno
     assert validate_tool_arguments(schema, {"query": "x", "limit": True}) == ["arguments.limit: expected integer"]
 
 
-def test_live_bitrix_registry_contains_search_matrix_and_orchestrator_contract():
+def test_executor_registry_contains_no_semantic_skills_or_contracts():
     manifest = get_agent_manifest("bitrix24")
     registry = build_capability_registry(manifest, [], structured_tool_names=set())
-    contracts = {item["id"]: item["content"] for item in registry["contracts"]}
-    skills = {item["id"]: item["content"] for item in registry["skills"]}
 
-    matrix = contracts["search_intents"]
-    assert {"найди", "покажи", "поищи", "выведи", "ищи"} <= set(matrix["verbs"]["search"])
-    assert matrix["warehouse"]["warehouse_card"]["product_limit"] == 10
-    assert matrix["warehouse"]["list_warehouses"]["include_products"] is False
-    assert "orchestrator_command_contract" in skills
-    assert "structured_command" in skills["orchestrator_command_contract"]
-    assert matrix["warehouse"]["list_warehouses"]["list_all"] is True
-    assert "search_product is not a tool" in matrix["rules"][0]["notes"][-1]
+    assert registry["reasoning_mode"] == "executor"
+    assert registry["contracts"] == []
+    assert registry["skills"] == []
+    assert bitrix_policy_pack()["defaults"]["warehouse_page_size"] == 50

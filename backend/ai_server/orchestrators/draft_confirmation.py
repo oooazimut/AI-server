@@ -1,3 +1,5 @@
+"""Orchestrator-owned recognition of explicit Bitrix draft confirmations."""
+
 from __future__ import annotations
 
 import re
@@ -21,7 +23,7 @@ _REQUIRED_TYPE_WORDS = {
 
 
 def draft_confirmation_phrase(draft_type: str | None) -> str:
-    """The one unambiguous user-facing confirmation phrase for a draft type."""
+    """Return the one unambiguous user-facing confirmation phrase."""
     return _PHRASES.get(str(draft_type or "").strip(), _PHRASES["task_create"])
 
 
@@ -31,14 +33,11 @@ def matches_draft_confirmation(
     *,
     allow_short_command: bool = False,
 ) -> bool:
-    """Accept the displayed confirmation despite harmless voice-recognition noise.
-
-    A plain ``да`` is deliberately insufficient: the draft type must still be
-    evident, so a confirmation for a calendar item cannot create a task.
-    """
+    """Recognize the displayed confirmation despite harmless voice noise."""
     if not isinstance(draft, dict) or not draft:
         return False
-    expected = _normalize(draft_confirmation_phrase(str(draft.get("_draft_type") or "task_create")))
+    draft_type = str(draft.get("_draft_type") or "task_create")
+    expected = _normalize(draft_confirmation_phrase(draft_type))
     actual = _normalize(request)
     if allow_short_command and actual in {"подтвердить", "подтверждаю", "подтверждение"}:
         return True
@@ -46,17 +45,11 @@ def matches_draft_confirmation(
         return True
     expected_words = expected.split()
     actual_words = actual.split()
-    # Voice input commonly drops a comma, one short connective, or changes a
-    # single final letter.  Accept at most one such harmless omission/typo, but
-    # never turn an unrelated "да" into confirmation of a write draft.
     if len(actual_words) < max(2, len(expected_words) - 1) or len(actual_words) > len(expected_words) + 1:
         return False
     if _word_distance(expected_words, actual_words) > 1:
         return False
-    # The action type is a safety boundary.  A voice typo in it is acceptable,
-    # but omitting it must never turn a task confirmation into a calendar or
-    # project confirmation (or vice versa).
-    required = _REQUIRED_TYPE_WORDS.get(str(draft.get("_draft_type") or "task_create"), ("задачи",))
+    required = _REQUIRED_TYPE_WORDS.get(draft_type, ("задачи",))
     return all(any(_character_distance(word, seen) <= 1 for seen in actual_words) for word in required)
 
 
@@ -66,14 +59,17 @@ def _normalize(value: str) -> str:
 
 
 def _word_distance(expected: list[str], actual: list[str]) -> int:
-    """Small edit distance over words, with one-character word typos allowed."""
     rows = list(range(len(actual) + 1))
-    for i, left in enumerate(expected, start=1):
-        previous, rows[0] = rows[0], i
-        for j, right in enumerate(actual, start=1):
-            old = rows[j]
+    for index, left in enumerate(expected, start=1):
+        previous, rows[0] = rows[0], index
+        for inner_index, right in enumerate(actual, start=1):
+            old = rows[inner_index]
             same = left == right or _character_distance(left, right) <= 1
-            rows[j] = min(rows[j] + 1, rows[j - 1] + 1, previous + (0 if same else 2))
+            rows[inner_index] = min(
+                rows[inner_index] + 1,
+                rows[inner_index - 1] + 1,
+                previous + (0 if same else 2),
+            )
             previous = old
     return rows[-1]
 

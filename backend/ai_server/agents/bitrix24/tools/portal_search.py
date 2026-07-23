@@ -80,7 +80,10 @@ class PortalSearchTool:
                     "show_all": {"type": "boolean"},
                     "continuation": {"type": "string", "enum": ["next"]},
                 },
-                "anyOf": [{"required": ["query"]}, {"required": ["continuation"]}],
+                "oneOf": [
+                    {"required": ["query", "scope", "limit", "offset", "show_all"]},
+                    {"required": ["continuation"]},
+                ],
             },
         )
 

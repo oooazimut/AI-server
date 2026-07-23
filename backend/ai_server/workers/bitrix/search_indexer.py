@@ -24,10 +24,6 @@ from ai_server.integrations.bitrix.portal_search import (
 from ai_server.settings import Settings
 from ai_server.utils import MOSCOW_TZ
 from ai_server.workers.bitrix.search_webhook_indexer import prepare_search_webhook_job, process_search_webhook_job
-from ai_server.workers.bitrix.task_close_direct_dispatcher import (
-    auto_close_direct_task_close_reports,
-    dispatch_direct_task_close_drafts,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -308,21 +304,6 @@ class PortalSearchIndexerWorker:
                 self.status["last_metadata_total"] = stats.total
                 if stats.content:
                     self._save_content_status(stats.content)
-                dispatch_stats = await dispatch_direct_task_close_drafts(
-                    bitrix=self.bitrix,
-                    store=self.index,
-                    settings=self._settings,
-                )
-                self.status["last_task_close_direct_dispatch_at"] = _format_time(_now())
-                self.status["last_task_close_direct_dispatch"] = dispatch_stats.as_dict()
-                auto_close_stats = await auto_close_direct_task_close_reports(
-                    bitrix=self.bitrix,
-                    bitrix_oauth=self._bitrix_oauth,
-                    store=self.index,
-                    settings=self._settings,
-                )
-                self.status["last_task_close_direct_auto_close_at"] = _format_time(_now())
-                self.status["last_task_close_direct_auto_close"] = auto_close_stats.as_dict()
                 self._record_success()
                 self._save_state()
                 return stats

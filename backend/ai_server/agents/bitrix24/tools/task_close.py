@@ -23,6 +23,7 @@ from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigErr
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
 from ai_server.integrations.bitrix.portal_search.search_index import PortalSearchIndex
 from ai_server.integrations.bitrix.task_close_direct_queue import (
+    auto_close_direct_close_event_as_unconfirmed,
     complete_direct_close_event,
     discard_direct_close_event,
 )
@@ -98,7 +99,11 @@ class BitrixTaskCloseDraft:
         }
 
 
-def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDraft:
+def build_task_close_draft_from_args(
+    args: dict[str, Any],
+    *,
+    result_text_renderer: Callable[..., str] | None = None,
+) -> BitrixTaskCloseDraft:
     args = args or {}
     task_id = optional_int(args.get("task_id") or args.get("id") or args.get("ID"))
     task_title = compact_text(str(args.get("task_title") or args.get("title") or ""))
@@ -106,8 +111,6 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
     completion_summary = compact_text(
         str(args.get("completion_summary") or args.get("result_text") or args.get("summary") or "")
     )
-    if _task_close_is_close_command_summary(completion_summary, task_id):
-        completion_summary = ""
     unresolved_items = _string_list(args.get("unresolved_items") or args.get("missing_parts"))
     task_points = _string_list(args.get("task_points") or args.get("task_items") or args.get("checklist_items"))
     source_task_description_empty = _truthy(
@@ -169,16 +172,20 @@ def build_task_close_draft_from_args(args: dict[str, Any]) -> BitrixTaskCloseDra
             "not_done_items or unconfirmed_items is required"
         )
 
-    result_text = _result_text(
-        completion_summary=completion_summary,
-        task_points=task_points,
-        equipment_consumables=equipment_consumables,
-        additional_info=additional_info,
-        overall_status_label=overall_status_label,
-        not_done_items=not_done_items,
-        unconfirmed_items=unconfirmed_items,
-        status_reasons=status_reasons,
-    )
+    result_text = ""
+    if result_text_renderer is None:
+        contract_errors.append("orchestrator task-close result renderer is required")
+    else:
+        result_text = result_text_renderer(
+            completion_summary=completion_summary,
+            task_points=task_points,
+            equipment_consumables=equipment_consumables,
+            additional_info=additional_info,
+            overall_status_label=overall_status_label,
+            not_done_items=not_done_items,
+            unconfirmed_items=unconfirmed_items,
+            status_reasons=status_reasons,
+        )
     payload = {
         "_draft_type": TASK_CLOSE_DRAFT_TYPE,
         "task_id": task_id,
@@ -235,10 +242,12 @@ class TaskCloseDraftTool:
         store: TaskDraftStorePort,
         read_client: BitrixToolClientPort | None = None,
         bitrix_oauth: BitrixOAuthService | None = None,
+        result_text_renderer: Callable[..., str] | None = None,
     ) -> None:
         self._store = store
         self._read_client = read_client
         self._bitrix_oauth = bitrix_oauth
+        self._result_text_renderer = result_text_renderer
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -364,7 +373,8 @@ class TaskCloseDraftTool:
             status_was_read = _truthy(enriched_args.get("_verified_remote_status_read"))
             if _truthy(enriched_args.get("_verified_remote_closed")):
                 recovered = build_task_close_draft_from_args(
-                    _merge_task_close_draft_args(claimed_recovery, args, enriched_args)
+                    _merge_task_close_draft_args(claimed_recovery, args, enriched_args),
+                    result_text_renderer=self._result_text_renderer,
                 )
                 if not recovered.is_ready:
                     return ToolResult(
@@ -407,7 +417,10 @@ class TaskCloseDraftTool:
                 draft_id=str(claimed_recovery.get("_draft_id") or ""),
                 claim_token=str(claimed_recovery.get("_draft_claim_token") or ""),
             )
-        draft = build_task_close_draft_from_args(enriched_args)
+        draft = build_task_close_draft_from_args(
+            enriched_args,
+            result_text_renderer=self._result_text_renderer,
+        )
         if not draft.is_ready:
             return ToolResult(
                 status=ToolStatus.CONTRACT_VIOLATION,
@@ -447,7 +460,10 @@ class TaskCloseDraftTool:
                         },
                     },
                 )
-            merged = build_task_close_draft_from_args(_merge_task_close_draft_args(existing, args, draft.payload))
+            merged = build_task_close_draft_from_args(
+                _merge_task_close_draft_args(existing, args, draft.payload),
+                result_text_renderer=self._result_text_renderer,
+            )
             if not merged.is_ready:
                 return ToolResult(
                     status=ToolStatus.CONTRACT_VIOLATION,
@@ -665,6 +681,8 @@ class TaskCloseConfirmTool:
         dry_run: bool = False,
         oauth_required_for_writes: bool = True,
         draft_ttl_minutes: int | None = None,
+        report_renderer: Callable[..., str] | None = None,
+        result_text_renderer: Callable[..., str] | None = None,
     ) -> None:
         self._store = store
         self._write_client = write_client
@@ -672,12 +690,23 @@ class TaskCloseConfirmTool:
         self._dry_run = dry_run
         self._oauth_required_for_writes = oauth_required_for_writes
         self._draft_ttl_minutes = draft_ttl_minutes
+        self._report_renderer = report_renderer
+        self._result_text_renderer = result_text_renderer
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name=self.name,
             description=("Confirm and execute the pending task closing draft as the current Bitrix OAuth user."),
-            parameters={"type": "object", "properties": {}, "required": []},
+            parameters={
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["user_confirm", "auto_unconfirmed"],
+                    }
+                },
+                "required": ["mode"],
+            },
         )
 
     async def execute(
@@ -688,6 +717,12 @@ class TaskCloseConfirmTool:
         dialog_key: str | None = None,
         dialog_id: str | None = None,
     ) -> ToolResult:
+        if str(args.get("mode") or "user_confirm") == "auto_unconfirmed":
+            return await self._execute_auto_unconfirmed(
+                user_id=user_id,
+                dialog_key=dialog_key,
+                dialog_id=dialog_id,
+            )
         if not dialog_key:
             return ToolResult(
                 status=ToolStatus.INVALID_TOOL_CALL,
@@ -736,6 +771,13 @@ class TaskCloseConfirmTool:
                     error="System Bitrix write_client is required to attach protected task close report.",
                     data={"draft": draft},
                 )
+            if compact_text(str(draft.get("result_text") or "")) and self._report_renderer is None:
+                return ToolResult(
+                    status=ToolStatus.NOT_CONFIGURED,
+                    tool=self.name,
+                    error="Orchestrator task-close report renderer is required.",
+                    data={"draft": draft},
+                )
             claimed = None
             try:
                 oauth_client = await self._bitrix_oauth.client_for_user(user_id)
@@ -752,6 +794,7 @@ class TaskCloseConfirmTool:
                     close_call=oauth_client.call,
                     report_call=self._write_client.call if self._write_client is not None else None,
                     draft=draft,
+                    report_renderer=self._report_renderer,
                     claim_guard=lambda: renew_exact_draft_claim(self._store, dialog_key=dialog_key, draft=claimed),
                 )
             except BitrixOAuthTokenMissing as exc:
@@ -817,6 +860,7 @@ class TaskCloseConfirmTool:
                 close_call=self._write_client.call,
                 report_call=self._write_client.call,
                 draft=draft,
+                report_renderer=self._report_renderer,
                 claim_guard=lambda: renew_exact_draft_claim(self._store, dialog_key=dialog_key, draft=claimed),
             )
         except Exception as exc:
@@ -835,6 +879,140 @@ class TaskCloseConfirmTool:
             expected_claim_token=str(claimed.get("_draft_claim_token") or ""),
         )
         return ToolResult(status=ToolStatus.OK, tool=self.name, data={**result, "draft": draft})
+
+    async def _execute_auto_unconfirmed(
+        self,
+        *,
+        user_id: int | None,
+        dialog_key: str | None,
+        dialog_id: str | None,
+    ) -> ToolResult:
+        """Execute one expired draft selected by the orchestrator, with no semantic inference here."""
+
+        if not dialog_key:
+            return ToolResult(
+                status=ToolStatus.INVALID_TOOL_CALL,
+                tool=self.name,
+                error="task_close_confirm auto-finalize requires dialog_key",
+            )
+        if context_error := _write_context_error(user_id=user_id, dialog_id=dialog_id):
+            return ToolResult(status=ToolStatus.DENIED, tool=self.name, error=context_error)
+        getter = getattr(self._store, "get_task_draft_for_finalizer", None)
+        draft = await getter(dialog_key) if callable(getter) else None
+        if not isinstance(draft, dict) or draft.get("_draft_type") != TASK_CLOSE_DRAFT_TYPE:
+            return ToolResult(
+                status=ToolStatus.NOT_FOUND,
+                tool=self.name,
+                error="no expired task closing draft found for this dialog",
+            )
+        if self._dry_run:
+            return ToolResult(status=ToolStatus.DRY_RUN, tool=self.name, data={"draft": draft})
+        if (
+            self._bitrix_oauth is None
+            or self._write_client is None
+            or self._report_renderer is None
+            or self._result_text_renderer is None
+        ):
+            return ToolResult(
+                status=ToolStatus.NOT_CONFIGURED,
+                tool=self.name,
+                error="OAuth, protected report writer and orchestrator renderers are required for task auto-finalize",
+                data={"draft": draft},
+            )
+        draft_id = str(draft.get("_draft_id") or "")
+        draft_version = optional_int(draft.get("_draft_version"))
+        claim = getattr(self._store, "claim_expired_task_draft", None)
+        if not callable(claim) or not draft_id or draft_version is None:
+            return ToolResult(
+                status=ToolStatus.DENIED,
+                tool=self.name,
+                error="expired task close draft cannot be claimed exactly",
+            )
+        claimed = await claim(
+            dialog_key,
+            expected_draft_id=draft_id,
+            expected_version=draft_version,
+            expected_type=TASK_CLOSE_DRAFT_TYPE,
+        )
+        if not isinstance(claimed, dict):
+            return ToolResult(
+                status=ToolStatus.DENIED,
+                tool=self.name,
+                error="task close draft changed or is already being finalized",
+            )
+        prepared = _auto_unconfirmed_task_close_draft(
+            draft,
+            result_text_renderer=self._result_text_renderer,
+        )
+        try:
+            oauth_client = await self._bitrix_oauth.client_for_user(user_id)
+            result = await _execute_task_close(
+                close_call=oauth_client.call,
+                report_call=self._write_client.call,
+                draft=prepared,
+                report_renderer=self._report_renderer,
+                claim_guard=lambda: renew_exact_draft_claim(
+                    self._store,
+                    dialog_key=dialog_key,
+                    draft=claimed,
+                    expected_status="finalizing",
+                ),
+            )
+        except (BitrixOAuthTokenMissing, BitrixConfigError) as exc:
+            await self._store.release_task_draft(
+                dialog_key,
+                draft_id=draft_id,
+                claim_token=str(claimed.get("_draft_claim_token") or ""),
+            )
+            return ToolResult(status=ToolStatus.NOT_CONFIGURED, tool=self.name, error=str(exc), data={"draft": draft})
+        except BitrixApiError as exc:
+            outcome = bitrix_mutation_outcome(exc)
+            if outcome == "rejected":
+                await self._store.release_task_draft(
+                    dialog_key,
+                    draft_id=draft_id,
+                    claim_token=str(claimed.get("_draft_claim_token") or ""),
+                )
+            return ToolResult(
+                status=ToolStatus.ERROR,
+                tool=self.name,
+                error=str(exc),
+                data={"draft": draft, "mutation_outcome": outcome},
+            )
+        except Exception as exc:
+            return ToolResult(
+                status=ToolStatus.ERROR,
+                tool=self.name,
+                error=f"{type(exc).__name__}: {exc}",
+                data={"draft": draft, "mutation_outcome": "unknown"},
+            )
+        close_event_key = str(draft.get("_direct_close_close_event_key") or "").strip()
+        task_id = optional_int(draft.get("task_id"))
+        if task_id is not None and close_event_key:
+            auto_close_direct_close_event_as_unconfirmed(
+                self._store,
+                task_id=task_id,
+                close_event_key=close_event_key,
+                now_iso=datetime.now(MOSCOW_TZ).isoformat(timespec="seconds"),
+                payload_updates={
+                    "auto_close_report_method": result.get("report_method"),
+                    "auto_close_report_file_name": result.get("report_file_name"),
+                    "auto_close_actor_mode": "oauth_user",
+                },
+                actor_user_id=user_id,
+            )
+        await self._store.delete_task_draft(
+            dialog_key,
+            status="finalized",
+            expected_draft_id=draft_id,
+            expected_version=draft_version,
+            expected_claim_token=str(claimed.get("_draft_claim_token") or ""),
+        )
+        return ToolResult(
+            status=ToolStatus.OK,
+            tool=self.name,
+            data={**result, "draft": prepared, "auto_finalize_mode": "unconfirmed"},
+        )
 
 
 class TaskCloseDiscardTool:
@@ -1033,6 +1211,7 @@ async def _execute_task_close(
     close_call: Callable[[str, dict[str, Any]], Awaitable[Any]],
     report_call: Callable[[str, dict[str, Any]], Awaitable[Any]] | None,
     draft: dict[str, Any],
+    report_renderer: Callable[..., str] | None,
     claim_guard: Callable[[], Awaitable[bool]] | None = None,
 ) -> dict[str, Any]:
     task_id = optional_int(draft.get("task_id"))
@@ -1060,8 +1239,15 @@ async def _execute_task_close(
     if result_text:
         if report_call is None:
             raise BitrixConfigError("system Bitrix write_client is required to attach protected task close report.")
+        if report_renderer is None:
+            raise BitrixConfigError("orchestrator task-close report renderer is required.")
         report_file_name = _report_file_name(task_id)
-        report_file_content = _report_file_content(task_id=task_id, action=action, draft=draft)
+        report_file_content = _report_file_content(
+            task_id=task_id,
+            action=action,
+            draft=draft,
+            report_renderer=report_renderer,
+        )
         existing_report = await _find_existing_report_file(report_call, task_id=task_id, file_name=report_file_name)
         if existing_report is not None:
             disk_file_id = _report_disk_file_id(existing_report)
@@ -1143,6 +1329,36 @@ def _complete_direct_close_queue_from_draft(
     )
 
 
+def _auto_unconfirmed_task_close_draft(
+    draft: dict[str, Any],
+    *,
+    result_text_renderer: Callable[..., str] | None,
+) -> dict[str, Any]:
+    missing_as_unknown = [f"Не подтверждено: {item}" for item in _string_list(draft.get("missing_fields"))]
+    prepared = build_task_close_draft_from_args(
+        {
+            **draft,
+            "overall_status": "unconfirmed",
+            "unconfirmed_items": _unique_strings(
+                [
+                    *_string_list(draft.get("unconfirmed_items")),
+                    *_string_list(draft.get("unresolved_items")),
+                    *missing_as_unknown,
+                    "Черновик не подтверждён до контрольного времени.",
+                ]
+            ),
+        },
+        result_text_renderer=result_text_renderer,
+    ).payload
+    for key, value in draft.items():
+        if key.startswith("_draft_") or key.startswith("_direct_close_"):
+            prepared[key] = value
+    prepared["_direct_close_auto_closed"] = True
+    prepared["ai_close_incomplete"] = True
+    prepared["ai_close_marker"] = INCOMPLETE_CLOSE_MARKER
+    return prepared
+
+
 def _discard_direct_close_queue_from_draft(
     store: Any,
     draft: dict[str, Any],
@@ -1216,11 +1432,10 @@ def _clean_task_description(description: object) -> str:
 
 
 def _task_close_has_user_result(args: dict[str, Any]) -> bool:
-    task_id = optional_int(args.get("task_id") or args.get("id") or args.get("ID"))
     completion_summary = compact_text(
         str(args.get("completion_summary") or args.get("result_text") or args.get("summary") or "")
     )
-    if completion_summary and not _task_close_is_close_command_summary(completion_summary, task_id):
+    if completion_summary:
         return True
     if compact_text(str(args.get("equipment_consumables") or args.get("equipment") or args.get("consumables") or "")):
         return True
@@ -1233,84 +1448,6 @@ def _task_close_has_user_result(args: dict[str, Any]) -> bool:
     return bool(
         _string_list(args.get("not_done_items") or args.get("unfinished_items") or args.get("incomplete_items"))
     )
-
-
-_TASK_CLOSE_COMMAND_SUMMARIES = frozenset(
-    {
-        "закрой",
-        "закрой задачу",
-        "закрой эту задачу",
-        "закройте задачу",
-        "закрыть",
-        "закрыть задачу",
-        "задачу закрыть",
-        "закрываем задачу",
-        "отметь задачу выполненной",
-        "отметить задачу выполненной",
-        "пометь задачу выполненной",
-        "пометить задачу выполненной",
-        "close",
-        "close task",
-        "complete task",
-        "mark task complete",
-        "mark task completed",
-    }
-)
-
-
-def _task_close_is_close_command_summary(value: str, task_id: int | None) -> bool:
-    text = compact_text(str(value or "")).casefold().replace("ё", "е")
-    if not text:
-        return False
-    if task_id is not None:
-        text = re.sub(rf"(?<!\d)#?{re.escape(str(task_id))}(?!\d)", " ", text)
-    text = re.sub(r"[\"'`«»“”№#.,;:!?()\[\]\-]+", " ", text)
-    ignored_tokens = {"bitrix", "битрикс", "пожалуйста"}
-    text = compact_text(" ".join(token for token in text.split() if token not in ignored_tokens))
-    return text in _TASK_CLOSE_COMMAND_SUMMARIES
-
-
-def _result_text(
-    *,
-    completion_summary: str,
-    task_points: list[str],
-    equipment_consumables: str,
-    additional_info: str,
-    overall_status_label: str,
-    not_done_items: list[str],
-    unconfirmed_items: list[str],
-    status_reasons: list[str],
-) -> str:
-    lines: list[str] = []
-    if completion_summary:
-        lines.append(completion_summary)
-    if task_points:
-        lines.append("")
-        lines.append("Пункты задачи:")
-        lines.extend(f"- {item}" for item in task_points)
-    if equipment_consumables:
-        lines.append("")
-        lines.append(f"Оборудование, расходники: {equipment_consumables}")
-    if additional_info:
-        lines.append("")
-        lines.append(f"Дополнительная информация: {additional_info}")
-    if overall_status_label:
-        lines.append("")
-        lines.append(f"Общий итог: {overall_status_label}")
-    if status_reasons:
-        lines.append("")
-        lines.append("Причины неполного выполнения:")
-        lines.extend(f"- {item}" for item in status_reasons)
-    if not_done_items or unconfirmed_items:
-        lines.append("")
-        lines.append(f"Статус AI-закрытия: {_ai_close_human_status(not_done_items, unconfirmed_items)}")
-    if not_done_items:
-        lines.append("Невыполненные пункты:")
-        lines.extend(f"- {item}" for item in not_done_items)
-    if unconfirmed_items:
-        lines.append("Неподтверждённые пункты:")
-        lines.extend(f"- {item}" for item in unconfirmed_items)
-    return "\n".join(lines).strip()
 
 
 def _merge_task_close_draft_args(
@@ -1620,7 +1757,13 @@ def _report_file_status(draft: dict[str, Any]) -> str:
     return "ok"
 
 
-def _report_file_content(*, task_id: int, action: str, draft: dict[str, Any]) -> str:
+def _report_file_content(
+    *,
+    task_id: int,
+    action: str,
+    draft: dict[str, Any],
+    report_renderer: Callable[..., str],
+) -> str:
     task_title = compact_text(str(draft.get("task_title") or ""))
     completion_summary = compact_text(str(draft.get("completion_summary") or draft.get("result_text") or ""))
     equipment_consumables = compact_text(str(draft.get("equipment_consumables") or ""))
@@ -1636,7 +1779,7 @@ def _report_file_content(*, task_id: int, action: str, draft: dict[str, Any]) ->
             problem_types.append("not_done")
         if unconfirmed_items:
             problem_types.append("unconfirmed")
-    human_report = format_task_close_draft_message(
+    human_report = report_renderer(
         draft,
         heading=f"Задача #{task_id}: {task_title or f'#{task_id}'}",
         include_instruction=False,
@@ -1680,274 +1823,6 @@ def _report_file_content(*, task_id: int, action: str, draft: dict[str, Any]) ->
     return "\n".join(lines).strip() + "\n"
 
 
-def format_task_close_draft_message(
-    draft: dict[str, Any],
-    *,
-    preview: dict[str, Any] | None = None,
-    intro_lines: list[str] | None = None,
-    heading: str | None = None,
-    include_instruction: bool = True,
-) -> str:
-    preview = preview if isinstance(preview, dict) else {}
-    task_id = _draft_text(draft.get("task_id"))
-    task_title = _draft_text(preview.get("task_title")) or _draft_text(draft.get("task_title")) or f"задача #{task_id}"
-    raw_result_text = (
-        _draft_text(preview.get("completion_summary"))
-        or _draft_text(draft.get("completion_summary"))
-        or _draft_text(draft.get("result_text"))
-    )
-    result_text = "" if _task_close_is_placeholder_summary(raw_result_text) else raw_result_text
-    task_points = _string_list(preview.get("task_points") or draft.get("task_points"))
-    source_task_description_empty = bool(
-        preview.get("source_task_description_empty") or draft.get("source_task_description_empty")
-    )
-    equipment = _draft_text(preview.get("equipment_consumables")) or _draft_text(draft.get("equipment_consumables"))
-    additional_info = _draft_text(preview.get("additional_info")) or _draft_text(draft.get("additional_info"))
-    overall_status = _draft_text(preview.get("overall_status")) or _draft_text(draft.get("overall_status"))
-    overall = _draft_text(preview.get("overall_status_label")) or _draft_text(draft.get("overall_status_label"))
-    if overall.casefold() == "результат не подтверждён" and not result_text:
-        overall = ""
-    not_done = _string_list(preview.get("not_done_items") or draft.get("not_done_items"))
-    unconfirmed = _string_list(preview.get("unconfirmed_items") or draft.get("unconfirmed_items"))
-    status_reasons = _string_list(preview.get("status_reasons") or draft.get("status_reasons"))
-    unresolved = _string_list(preview.get("unresolved_items") or draft.get("unresolved_items"))
-    if not unconfirmed and unresolved:
-        unconfirmed = unresolved
-    unconfirmed = _task_close_visible_unconfirmed(unconfirmed, task_points=task_points, result_text=result_text)
-
-    lines: list[str] = [line for line in (intro_lines or []) if str(line).strip()]
-    if lines:
-        lines.append("")
-    lines.extend([heading or f"Черновик #{task_id or '?'}: {task_title}", ""])
-    lines.append("1. Выполняемые работы")
-    if source_task_description_empty:
-        result_items = _task_close_display_items(result_text)
-        if result_items:
-            lines.extend(f"1.{index} {item}" for index, item in enumerate(result_items, start=1))
-            lines.append(f"1.{len(result_items) + 1} Еще работы - ... ???")
-        else:
-            lines.append("1.1 Еще работы - ... ???")
-    elif task_points:
-        lines.extend(
-            f"1.{index} {item} - {_task_close_point_status(item, result_text, not_done, unconfirmed)}"
-            for index, item in enumerate(task_points, start=1)
-        )
-        lines.append(f"1.{len(task_points) + 1} Еще работы - ... ???")
-    elif result_text:
-        result_items = _task_close_display_items(result_text)
-        lines.extend(f"1.{index} {item}" for index, item in enumerate(result_items, start=1))
-        lines.append(f"1.{len(result_items) + 1} Еще работы - ... ???")
-    else:
-        lines.append("1.1 Еще работы - ... ???")
-
-    lines.append("")
-    lines.append("2. Использовано материалов, оборудование")
-    if _task_close_no_equipment_value(equipment):
-        lines.append("   (перечисли, что использовали, или укажи: [ВЫБРАНО: не использовалось])")
-    else:
-        lines.append("   (перечисли, что использовали, или укажи: не использовалось)")
-        equipment_items = _task_close_display_items(equipment)
-        if equipment_items:
-            lines.extend(f"2.{index} {item}" for index, item in enumerate(equipment_items, start=1))
-            lines.append(f"2.{len(equipment_items) + 1} Еще материалы - ... ???")
-
-    lines.append("")
-    lines.append("3. Статус выполнения работ")
-    lines.append(f"   {_task_close_status_prompt(overall_status or overall)}")
-    if status_reasons:
-        for index, item in enumerate(status_reasons, start=1):
-            lines.append(f"3.{index} причина: {item}")
-        lines.append(f"3.{len(status_reasons) + 1} Еще причины невыполнения - ... ???")
-    elif _task_close_status_needs_reason(overall_status or overall):
-        lines.append("3.1 Еще причины невыполнения - ... ???")
-
-    lines.append("")
-    lines.append("4. Дополнительная информация")
-    if _task_close_absent_value(additional_info):
-        lines.append("   (если есть - укажи; если нет - укажи: [ВЫБРАНО: отсутствует])")
-    else:
-        lines.append("   (если есть - укажи; если нет - укажи: отсутствует)")
-    additional_items = _task_close_display_items(additional_info)
-    if additional_items and not _task_close_absent_value(additional_info):
-        lines.extend(f"4.{index} {item}" for index, item in enumerate(additional_items, start=1))
-        lines.append(f"4.{len(additional_items) + 1} Еще информация - ... ???")
-
-    if include_instruction:
-        lines.extend(
-            [
-                "",
-                "Внести изменения (укажите пункт или подпункт и нужную информацию) либо подтвердить закрытие.",
-            ]
-        )
-    return "\n".join(lines)
-
-
-def _draft_text(value: object) -> str:
-    return compact_text(str(value or ""))
-
-
-def _task_close_status_prompt(status: str) -> str:
-    normalized = _task_close_normalized_status(status)
-    options = [
-        ("completed", "выполнено полностью"),
-        ("partial", "выполнено частично"),
-        ("not_done", "не выполнено"),
-    ]
-    rendered = [f"[ВЫБРАНО: {label}]" if normalized == key else label for key, label in options]
-    return (
-        f"({' / '.join(rendered)}; если выполнено частично или не выполнено - укажи причину неполного выполнения работ)"
-    )
-
-
-def _task_close_normalized_status(status: str) -> str:
-    text = compact_text(status).casefold()
-    if text in {"completed", "complete", "done"} or "полностью" in text:
-        return "completed"
-    if text in {"partial", "partially_done", "partly_done"} or "частич" in text:
-        return "partial"
-    if text in {"not_done", "not_completed", "not done"} or "не выполн" in text or "не сделан" in text:
-        return "not_done"
-    return ""
-
-
-def _task_close_status_needs_reason(status: str) -> bool:
-    return _task_close_normalized_status(status) in {"partial", "not_done"}
-
-
-def _task_close_absent_value(value: str) -> bool:
-    text = compact_text(value).casefold()
-    return text in {"отсутствует", "нет", "не было", "нет дополнительной информации"}
-
-
-def _task_close_no_equipment_value(value: str) -> bool:
-    text = compact_text(value).casefold().strip(" .;:-")
-    if not text:
-        return False
-    if text in {
-        "не использовалось",
-        "не использовались",
-        "не использовали",
-        "не применялось",
-        "не применяли",
-        "не было",
-        "нет",
-        "ничего",
-        "без материалов",
-        "без оборудования",
-        "материалы не использовались",
-        "оборудование не использовалось",
-    }:
-        return True
-    return ("не использ" in text or "не примен" in text) and not any(char.isdigit() for char in text)
-
-
-def _task_close_is_placeholder_summary(value: str) -> bool:
-    text = compact_text(value)
-    if not text:
-        return False
-    lowered = text.casefold()
-    if "статус ai-закрытия" in lowered:
-        return True
-    if "результат выполнения не указан" in lowered:
-        return True
-    return "общий итог: результат не подтвержд" in lowered and (
-        lowered.startswith("пункты задачи:") or "неподтверждённые пункты" in lowered
-    )
-
-
-def _task_close_visible_unconfirmed(
-    values: list[str],
-    *,
-    task_points: list[str],
-    result_text: str,
-) -> list[str]:
-    point_keys = {item.casefold() for item in task_points}
-    visible: list[str] = []
-    for value in values:
-        key = value.casefold()
-        if key in {"результат выполнения не указан", "result is not specified"}:
-            continue
-        if ("результат закрытия" in key and "не подтверж" in key) or "ai-черновик" in key or "ai draft" in key:
-            continue
-        if key in point_keys:
-            if result_text and _task_close_result_explicitly_marks_unconfirmed(value, result_text):
-                visible.append(value)
-            continue
-        visible.append(value)
-    return visible
-
-
-def _task_close_result_explicitly_marks_unconfirmed(point: str, result_text: str) -> bool:
-    point_cf = point.casefold()
-    for clause in re.split(r"(?:\r?\n)+|[.;]+|,(?=\s*\d+\.\d+)", result_text):
-        clause_cf = clause.casefold()
-        if not any(marker in clause_cf for marker in ("не подтверж", "неизвест", "не провер", "unconfirmed")):
-            continue
-        if _task_close_texts_overlap(point_cf, clause):
-            return True
-    return False
-
-
-def _task_close_display_items(value: str) -> list[str]:
-    text = compact_text(value)
-    if not text:
-        return []
-    raw_parts = re.split(r"(?:\r?\n)+|(?:^|\s)(?:\d+[.)]|[-*•])\s+|[,;]+", text)
-    parts = _unique_strings([part.strip(" .;:-") for part in raw_parts])
-    return parts[:12] if len(parts) > 1 else ([text] if text else [])
-
-
-def _task_close_point_status(
-    point: str,
-    result_text: str,
-    not_done: list[str],
-    unconfirmed: list[str],
-) -> str:
-    point_cf = point.casefold()
-    for item in not_done:
-        if _task_close_texts_overlap(point_cf, item):
-            return "не выполнено"
-    for item in unconfirmed:
-        if _task_close_texts_overlap(point_cf, item):
-            return "не подтверждено"
-    completed_label = _task_close_point_completed_label(point, result_text)
-    if completed_label:
-        return completed_label
-    return "... ???"
-
-
-def _task_close_point_completed_label(point: str, result_text: str) -> str:
-    if not result_text:
-        return ""
-    point_cf = point.casefold()
-    clauses = re.split(r"(?:\r?\n)+|[.;]+|,(?=\s*\d+\.\d+)", result_text)
-    for clause in clauses:
-        clause_cf = clause.casefold()
-        if "не выполн" in clause_cf or "не подтверж" in clause_cf:
-            continue
-        if ("выполн" in clause_cf or "сделан" in clause_cf or "готов" in clause_cf) and _task_close_texts_overlap(
-            point_cf, clause
-        ):
-            return "выполнено полностью" if "полностью" in clause_cf else "выполнено"
-    return ""
-
-
-def _task_close_texts_overlap(point_cf: str, value: str) -> bool:
-    value_cf = value.casefold()
-    if point_cf and point_cf in value_cf:
-        return True
-    words = [word for word in re.findall(r"[0-9A-Za-zА-Яа-яЁё]+", point_cf) if len(word) >= 5]
-    return bool(words and any(word in value_cf for word in words[:4]))
-
-
-def _ai_close_human_status(not_done_items: list[str], unconfirmed_items: list[str]) -> str:
-    if not_done_items and unconfirmed_items:
-        return "выполнена частично, неподтвержденная"
-    if not_done_items:
-        return "выполнена частично"
-    return "неподтвержденная"
-
-
 def _string_list(value: object) -> list[str]:
     if value is None:
         return []
@@ -1962,22 +1837,12 @@ def _string_list(value: object) -> list[str]:
 
 def _close_action(value: object) -> str:
     text = str(value or "complete").strip().casefold()
-    return "approve" if text in {"approve", "accept", "принять", "утвердить"} else "complete"
+    return "approve" if text == "approve" else "complete"
 
 
 def _overall_status(value: object) -> str:
     text = str(value or "").strip().casefold()
-    if not text:
-        return ""
-    if text in {"completed", "complete", "done", "выполнено", "готово", "полностью", "выполнена полностью"}:
-        return "completed"
-    if text in {"partial", "partially_done", "partly_done", "частично", "выполнена частично"}:
-        return "partial"
-    if text in {"not_done", "not_completed", "not done", "не выполнено", "не сделано", "не выполнена"}:
-        return "not_done"
-    if text in {"unconfirmed", "unknown", "unclear", "не подтверждено", "неизвестно", "непонятно"}:
-        return "unconfirmed"
-    return text
+    return text if text in {"completed", "partial", "not_done", "unconfirmed"} else ""
 
 
 def _overall_status_label(status: str) -> str:
@@ -2025,22 +1890,7 @@ def _write_context_error(*, user_id: int | None, dialog_id: str | None) -> str:
 
 def _report_incident_action(value: object) -> str:
     text = str(value or "").strip().casefold()
-    if text in {"restore", "1", "one", "first", "первый", "первый вариант", "восстановить", "вернуть"}:
-        return "restore"
-    if text in {
-        "accept_missing",
-        "accept",
-        "2",
-        "two",
-        "second",
-        "второй",
-        "второй вариант",
-        "удалить",
-        "всё в порядке",
-        "все в порядке",
-    }:
-        return "accept_missing"
-    return ""
+    return text if text in {"restore", "accept_missing"} else ""
 
 
 def _select_report_file(files: list[dict[str, Any]], file_name: str) -> dict[str, Any] | None:

@@ -10,7 +10,7 @@ import anyio
 from ai_server.agent_queue_utils import agent_queue_partition_key
 from ai_server.integrations.memory.agent_queue import InMemoryAgentQueue
 from ai_server.integrations.redis.agent_queue import RedisAgentQueue
-from ai_server.orchestrators.internal import InternalOrchestrator
+from ai_server.orchestrators.internal import OrchestratorTransportRuntime
 
 
 def _run(coro):
@@ -185,7 +185,7 @@ def test_memory_agent_queue_removes_pending_by_partition():
 def test_five_orchestrator_workers_can_claim_five_numbered_branches():
     async def _impl() -> list[str]:
         queue = InMemoryAgentQueue()
-        orchestrator = InternalOrchestrator(
+        orchestrator = OrchestratorTransportRuntime(
             SimpleNamespace(id="internal_orchestrator"),
             agent_tools=[],
             llm=None,
@@ -204,7 +204,7 @@ def test_five_orchestrator_workers_can_claim_five_numbered_branches():
 def test_same_numbered_branch_remains_serialized_while_active():
     async def _impl() -> tuple[dict | None, dict | None]:
         queue = InMemoryAgentQueue()
-        orchestrator = InternalOrchestrator(
+        orchestrator = OrchestratorTransportRuntime(
             SimpleNamespace(id="internal_orchestrator"),
             agent_tools=[],
             llm=None,

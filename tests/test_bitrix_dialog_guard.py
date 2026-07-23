@@ -6,8 +6,8 @@ from typing import Any
 import anyio
 
 from ai_server.models import AgentResult, AgentTask
-from ai_server.orchestrators.internal import InternalOrchestrator
-from ai_server.workers.bitrix.webhook_event_queue import _handle_dialog_guard, _route_event
+from ai_server.orchestrators.internal import OrchestratorTransportRuntime
+from ai_server.workers.bitrix.webhook_event_queue import _route_event
 from tests.fakes import FakeOrchestratorStore
 
 
@@ -57,33 +57,6 @@ def _task(text: str = "Bitrix show warehouse Borisov") -> AgentTask:
     )
 
 
-def test_route_event_prompts_when_dialog_active_too_long():
-    guard = FakeDialogGuard(active={"age_seconds": 120, "task_id": "old"})
-    queue = RecordingAgentQueue()
-    sender = RecordingBitrixSender()
-
-    result = _run(
-        _route_event(
-            event_id=1,
-            event_type="ONIMBOTV2MESSAGEADD",
-            payload=_payload("Bitrix show warehouse Borisov"),
-            agent_queue=queue,
-            attachment_service=FakeAttachmentService(),
-            transcriber=FakeTranscriber(),
-            settings=_settings(),
-            dialog_guard=guard,
-            bitrix_sender=sender,
-        )
-    )
-
-    assert result["routed_to"] == "dialog_guard"
-    assert result["action"] == "stuck_prompt"
-    assert queue.published == []
-    assert guard.pending is not None
-    assert "сбросить предыдущий запрос" in sender.messages[0][1]
-    assert "выполнить после предыдущего" in sender.messages[0][1]
-
-
 def test_route_event_assigns_numbered_branch_before_orchestrator_queue():
     store = FakeOrchestratorStore()
     queue = RecordingAgentQueue()
@@ -119,7 +92,7 @@ def test_route_event_assigns_numbered_branch_before_orchestrator_queue():
     assert contexts[0]["dialog_key"] != contexts[1]["dialog_key"]
 
 
-def test_task_update_is_fanned_out_to_quality_control_and_search_refresh():
+def test_task_update_goes_only_to_search_refresh():
     queue = RecordingAgentQueue()
     payload = {"event": "ONTASKUPDATE", "data": {"FIELDS_AFTER": {"ID": "8413"}}}
 
@@ -135,9 +108,9 @@ def test_task_update_is_fanned_out_to_quality_control_and_search_refresh():
         )
     )
 
-    assert result["routed_to"] == ["bitrix24", "index_refresher"]
-    assert [item["to"] for item in queue.published] == ["bitrix24", "index_refresher"]
-    assert queue.published[1]["payload"] == payload
+    assert result["routed_to"] == "index_refresher"
+    assert [item["to"] for item in queue.published] == ["index_refresher"]
+    assert queue.published[0]["payload"] == payload
 
 
 def test_comment_and_catalog_events_go_to_search_refresh():
@@ -164,89 +137,10 @@ def test_comment_and_catalog_events_go_to_search_refresh():
         assert [item["to"] for item in queue.published] == ["index_refresher"]
 
 
-def test_dialog_guard_reset_publishes_pending_task_and_increments_generation():
-    pending = _task("Bitrix find project Largus")
-    guard = FakeDialogGuard(active={"age_seconds": 130, "task_id": "old"}, pending=pending)
-    queue = RecordingAgentQueue()
-    sender = RecordingBitrixSender()
-
-    result = _run(
-        _handle_dialog_guard(
-            _task("сбросить предыдущий запрос"),
-            agent_queue=queue,
-            settings=_settings(),
-            dialog_guard=guard,
-            bitrix_sender=sender,
-            conversation_trace=None,
-            event_id=2,
-            event_type="ONIMBOTV2MESSAGEADD",
-            partition_key="chat:77:user:9",
-        )
-    )
-
-    assert result["action"] == "reset_previous"
-    assert guard.generation == 1
-    assert queue.removed == [("orchestrator", "dialog:chat:77:user:9"), ("bitrix24", "dialog:chat:77:user:9")]
-    assert queue.published[0]["payload"]["request"] == "Bitrix find project Largus"
-    assert queue.published[0]["payload"]["context"]["dialog_cancel_generation"] == 1
-    assert "Сбросил предыдущий запрос" in sender.messages[0][1]
-
-
-def test_dialog_guard_wait_publishes_pending_after_previous():
-    pending = _task("Bitrix find project Largus")
-    guard = FakeDialogGuard(active={"age_seconds": 130, "task_id": "old"}, pending=pending)
-    queue = RecordingAgentQueue()
-    sender = RecordingBitrixSender()
-
-    result = _run(
-        _handle_dialog_guard(
-            _task("дождаться предыдущего ответа"),
-            agent_queue=queue,
-            settings=_settings(),
-            dialog_guard=guard,
-            bitrix_sender=sender,
-            conversation_trace=None,
-            event_id=2,
-            event_type="ONIMBOTV2MESSAGEADD",
-            partition_key="chat:77:user:9",
-        )
-    )
-
-    assert result["action"] == "wait_previous"
-    assert guard.generation == 0
-    assert queue.published[0]["payload"]["request"] == "Bitrix find project Largus"
-    assert queue.published[0]["payload"]["context"]["dialog_cancel_generation"] == 0
-    assert "после предыдущего" in sender.messages[0][1]
-
-
-def test_dialog_guard_reprompts_unknown_choice():
-    guard = FakeDialogGuard(pending=_task("Bitrix find project Largus"))
-    queue = RecordingAgentQueue()
-    sender = RecordingBitrixSender()
-
-    result = _run(
-        _handle_dialog_guard(
-            _task("да"),
-            agent_queue=queue,
-            settings=_settings(),
-            dialog_guard=guard,
-            bitrix_sender=sender,
-            conversation_trace=None,
-            event_id=2,
-            event_type="ONIMBOTV2MESSAGEADD",
-            partition_key="chat:77:user:9",
-        )
-    )
-
-    assert result["action"] == "clarify_choice"
-    assert queue.published == []
-    assert "Ответьте одной из фраз" in sender.messages[0][1]
-
-
 def test_orchestrator_suppresses_stale_outbound_answer():
     channel = RecordingChannel()
     guard = FakeDialogGuard(generation=1)
-    orchestrator = InternalOrchestrator(
+    orchestrator = OrchestratorTransportRuntime(
         SimpleNamespace(id="internal_orchestrator"),
         agent_tools=[],
         llm=None,

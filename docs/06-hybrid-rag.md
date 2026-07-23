@@ -1,86 +1,44 @@
 # Hybrid RAG
 
-## Что считаем RAG
+## Граница ответственности
 
-RAG/knowledge - это слой фактов и источников, на которые специалист опирается при ответе или выборе действия.
+Смысловые знания, пользовательские сценарии и правила выбора инструмента
+принадлежат `internal_orchestrator`. Bitrix-исполнитель не загружает собственные
+skills или knowledge topics и не применяет RAG для переосмысления команды.
 
-Для Битрикс24-специалиста это сейчас:
+## Поисковый индекс портала
 
-```text
-agents/bitrix24/knowledge/topics/*.md
-```
+Локальный индекс Bitrix/PostgreSQL — это источник данных, а не второй
+рассуждающий агент. Фоновые Bitrix workers синхронизируют задачи, проекты, диск,
+метаданные и доступный текст документов. Оркестратор формирует точный запрос,
+а Bitrix:
 
-Здесь лежат перенесенные знания старого `BitrixAIAgent`: задачи, документы, REST, проекты и CRM.
+- проверяет пользователя, OAuth и права;
+- выполняет поиск с переданными фильтрами;
+- возвращает структурированные результаты без изменения намерения.
 
-## Что считаем Skills
+## Гибридный поиск
 
-Skills - это процедурные сценарии, то есть инструкции как действовать в типовом кейсе.
-
-```text
-agents/bitrix24/skills/*.md
-```
-
-Например `tasks_create_edit.md` говорит, какие поля проверить перед созданием задачи и почему write-действие должно идти через подтверждение.
-
-## Почему гибрид
-
-В production одного vector search обычно мало. Нужна комбинация:
+Для поиска по корпоративным данным могут совместно использоваться:
 
 ```text
 keyword/BM25-like search
 + vector search
-+ metadata filters
-+ access policies
++ metadata and ACL filters
 + optional rerank
 ```
 
-Точный поиск важен для ID, REST-методов, названий полей, дат и имен файлов. Vector search полезен для смысловых запросов, когда пользователь формулирует не теми словами, что в документе.
+Точный поиск нужен для ID, имён, дат и названий файлов. Векторный поиск полезен
+для смысловой близости. Финальное решение о составе запроса и ответа остаётся
+за оркестратором.
 
-## Текущий MVP
+## Текущая реализация
 
-Сейчас реализован `HybridKnowledgeRetriever`:
+`HybridKnowledgeRetriever` поддерживает keyword-score, подключаемый
+`EmbeddingProvider`, общий score и ручную проверку через
+`GET /agents/{agent_id}/knowledge/search?q=...`. Для Bitrix-пакета этот endpoint
+не создаёт самостоятельный смысловой контур: у манифеста Bitrix отсутствуют
+knowledge/skills paths.
 
-- keyword-score по токенам и секциям markdown;
-- vector-score через pluggable `EmbeddingProvider`;
-- production provider по умолчанию: `FastEmbedEmbeddingProvider`;
-- общий итоговый score;
-- endpoint ручной проверки: `GET /agents/{agent_id}/knowledge/search?q=...`.
-
-В backend больше нет тихого hashing fallback. Если embeddings не настроены, это ошибка конфигурации, которую нужно исправлять явно. Unit-тесты используют отдельный `FakeEmbeddingProvider` из папки `tests`, чтобы не скачивать модель и не зависеть от внешнего состояния.
-
-## Как включить реальные локальные embeddings
-
-Установить optional retrieval-зависимости:
-
-```powershell
-uv sync --extra dev --extra retrieval
-```
-
-Включить fastembed-провайдер:
-
-```env
-AI_SERVER_EMBEDDINGS_PROVIDER=fastembed
-AI_SERVER_FASTEMBED_MODEL=
-AI_SERVER_FASTEMBED_CACHE_DIR=var/embedding_models
-```
-
-`AI_SERVER_FASTEMBED_MODEL` можно оставить пустым, тогда `fastembed` возьмет модель по умолчанию. Для production на русском контенте нужно отдельно выбрать и закрепить multilingual embedding model, затем зафиксировать ее в env/config.
-
-## Будущий production-вариант
-
-```text
-knowledge sources
-  ↓
-chunking
-  ↓
-embeddings
-  ↓
-pgvector / Qdrant
-  ↓
-hybrid search: BM25 + vector
-  ↓
-access filters + rerank
-  ↓
-context for specialist
-```
-
+Если embeddings не настроены, backend возвращает явную ошибку конфигурации.
+Unit-тесты используют `FakeEmbeddingProvider`, не скачивая модель.

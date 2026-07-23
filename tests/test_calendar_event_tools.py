@@ -22,13 +22,18 @@ def _exec(tool, args, *, user_id=None, dialog_key=None, dialog_id=None):
     return anyio.run(_run)
 
 
-def test_calendar_draft_uses_date_only_default_noon():
+def test_calendar_draft_executes_exact_orchestrator_times():
     store = FakeTaskDraftStore()
     tool = CalendarEventDraftTool(store=store)
 
     result = _exec(
         tool,
-        {"title": "позвонить Борисову", "date_iso": "2026-07-09", "description": "Позвонить Борисову"},
+        {
+            "title": "позвонить Борисову",
+            "description": "Позвонить Борисову",
+            "start_iso": "2026-07-09T12:00:00+03:00",
+            "end_iso": "2026-07-09T12:30:00+03:00",
+        },
         user_id=13,
         dialog_key="d:13",
         dialog_id="chat4321",
@@ -53,7 +58,8 @@ def test_calendar_draft_uses_owner_name_for_single_participant_preview():
         tool,
         {
             "title": "позвонить Борисову",
-            "date_iso": "2026-07-09",
+            "start_iso": "2026-07-09T12:00:00+03:00",
+            "end_iso": "2026-07-09T12:30:00+03:00",
             "owner_name": "Коверга Дмитрий Владимирович",
         },
         user_id=13,

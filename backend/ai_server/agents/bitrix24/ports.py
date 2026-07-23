@@ -86,26 +86,3 @@ class TaskDraftStorePort(Protocol):
         expected_version: int | None = None,
         expected_claim_token: str = "",
     ) -> None: ...
-
-
-class ProposalStorePort(Protocol):
-    """Port for incomplete-proposal persistence and context loading."""
-
-    def save_proposal(
-        self,
-        *,
-        task_id: int,
-        task_title: str,
-        missing_parts: str,
-        responsible_id: int | None,
-        responsible_dialog_id: str,
-        scheduled_for: str,
-    ) -> int: ...
-
-    def delete_proposal(self, proposal_id: int) -> None: ...
-
-    def update_responsible_response(self, proposal_id: int, response_text: str) -> None: ...
-
-    def get_proposals_for_manager(self) -> list[dict[str, Any]]: ...
-
-    def get_pending_for_responsible(self, responsible_id: int) -> dict[str, Any] | None: ...

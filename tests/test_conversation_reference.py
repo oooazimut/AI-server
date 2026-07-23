@@ -33,18 +33,20 @@ def test_new_branch_uses_visible_number_and_explicit_continuation_reuses_it():
     asyncio.run(run())
 
 
-def test_short_continuation_without_number_is_restricted_even_with_one_branch():
+def test_unnumbered_continuation_text_starts_a_new_branch():
     async def run():
         store = FakeOrchestratorStore()
-        await resolve_conversation_reference(_task("Покажи склад Борисова"), store)
-        restricted = await resolve_conversation_reference(_task("Покажи следующую страницу"), store)
-        assert "укажите номер диалога" in restricted.error.casefold()
-        assert restricted.task.context["conversation_reference_dispatch_allowed"] is False
+        first = await resolve_conversation_reference(_task("Покажи склад Борисова"), store)
+        second = await resolve_conversation_reference(_task("Покажи следующую страницу"), store)
+        assert second.error == ""
+        assert second.task.context["conversation_number"] == 102
+        assert second.task.context["dialog_key"] != first.task.context["dialog_key"]
+        assert second.task.context["conversation_reference_explicit"] is False
 
     asyncio.run(run())
 
 
-def test_continuation_accepts_plain_visible_number_at_the_end():
+def test_trailing_number_is_request_data_and_starts_a_new_branch():
     async def run():
         store = FakeOrchestratorStore()
         first = await resolve_conversation_reference(_task("Покажи склад Борисова"), store)
@@ -52,9 +54,10 @@ def test_continuation_accepts_plain_visible_number_at_the_end():
         continued = await resolve_conversation_reference(_task("Покажи следующую страницу 101"), store)
 
         assert continued.error == ""
-        assert continued.task.request == "Покажи следующую страницу"
-        assert continued.task.context["dialog_key"] == first.task.context["dialog_key"]
-        assert continued.task.context["conversation_reference_explicit"] is True
+        assert continued.task.request == "Покажи следующую страницу 101"
+        assert continued.task.context["conversation_number"] == 102
+        assert continued.task.context["dialog_key"] != first.task.context["dialog_key"]
+        assert continued.task.context["conversation_reference_explicit"] is False
 
     asyncio.run(run())
 
@@ -65,7 +68,7 @@ def test_two_explicit_numbers_load_their_own_dialog_branches():
         first = await resolve_conversation_reference(_task("Покажи склад Борисова"), store)
         second = await resolve_conversation_reference(_task("Покажи склад Карасева"), store)
 
-        continued = await resolve_conversation_reference(_task("следующая 102"), store)
+        continued = await resolve_conversation_reference(_task("102 следующая"), store)
 
         assert first.task.context["conversation_number"] == 101
         assert second.task.context["conversation_number"] == 102
@@ -162,7 +165,7 @@ def test_every_unnumbered_user_turn_gets_a_new_number_without_intent_classificat
 
 
 def test_internal_task_without_user_chat_key_is_not_numbered():
-    task = AgentTask(task_id="internal", request="quality_control", context={"bitrix_event_type": "ONTASKUPDATE"})
+    task = AgentTask(task_id="internal", request="refresh_index", context={"bitrix_event_type": "ONTASKUPDATE"})
 
     resolved = asyncio.run(resolve_conversation_reference(task, FakeOrchestratorStore()))
 
@@ -195,7 +198,7 @@ def test_composite_dialog_keeps_one_root_and_never_requires_a_part_number():
     async def run():
         store = FakeOrchestratorStore()
         root = await resolve_conversation_reference(_task("Покажи склады Борисова и Карасева"), store)
-        continued = await resolve_conversation_reference(_task("Покажи следующую страницу склада Борисова 101"), store)
+        continued = await resolve_conversation_reference(_task("101 покажи следующую страницу склада Борисова"), store)
 
         assert continued.error == ""
         assert continued.task.context["dialog_key"] == root.task.context["dialog_key"]

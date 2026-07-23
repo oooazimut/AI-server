@@ -21,7 +21,7 @@ def test_settings_loads_layered_env_files(monkeypatch, tmp_path):
     assert settings.llm_configured is True
 
 
-def test_llm_defaults_to_deepseek_flash(monkeypatch):
+def test_llm_defaults_to_deepseek_pro(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.delenv("AI_SERVER_LLM_PROVIDER", raising=False)
     monkeypatch.delenv("AI_SERVER_LLM_MODEL", raising=False)
@@ -33,7 +33,7 @@ def test_llm_defaults_to_deepseek_flash(monkeypatch):
     settings = get_settings()
 
     assert settings.llm_provider == "deepseek"
-    assert settings.llm_model == "deepseek-v4-flash"
+    assert settings.llm_model == "deepseek-v4-pro"
     assert settings.llm_configured is False
 
 
@@ -65,19 +65,15 @@ def test_bitrix_oauth_bot_settings_can_be_loaded(monkeypatch):
     assert settings.bitrix_bot_oauth_user_id == 9
 
 
-def test_structured_bitrix_commands_have_global_and_per_tool_rollback(monkeypatch):
+def test_old_bitrix_brain_rollback_flags_do_not_restore_unstructured_mode(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("BITRIX_STRUCTURED_COMMANDS_ENABLED", "true")
     monkeypatch.setenv("BITRIX_STRUCTURED_COMMAND_TOOLS", "bitrix_warehouse_search, bitrix_my_tasks")
 
     settings = get_settings()
 
-    assert settings.resolved_bitrix_structured_command_tools(
-        {"bitrix_warehouse_search", "bitrix_my_tasks", "bitrix_api"}
-    ) == {"bitrix_warehouse_search", "bitrix_my_tasks"}
-
-    monkeypatch.setenv("BITRIX_STRUCTURED_COMMANDS_ENABLED", "false")
-    assert get_settings().resolved_bitrix_structured_command_tools({"bitrix_warehouse_search"}) == set()
+    assert not hasattr(settings, "resolved_bitrix_structured_command_tools")
+    assert not hasattr(settings, "bitrix_structured_commands_enabled")
 
 
 def test_bitrix_draft_ttl_defaults_to_fifteen_minutes_and_allows_override(monkeypatch):
@@ -135,23 +131,19 @@ def test_agent_worker_count_settings(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.delenv("AGENT_ORCHESTRATOR_WORKER_COUNT", raising=False)
     monkeypatch.delenv("AGENT_BITRIX_WORKER_COUNT", raising=False)
-    monkeypatch.delenv("AGENT_LOGISTICS_WORKER_COUNT", raising=False)
 
     defaults = get_settings()
 
-    assert defaults.agent_orchestrator_worker_count == 1
+    assert defaults.agent_orchestrator_worker_count == 5
     assert defaults.agent_bitrix_worker_count == 1
-    assert defaults.agent_logistics_worker_count == 1
 
     monkeypatch.setenv("AGENT_ORCHESTRATOR_WORKER_COUNT", "3")
     monkeypatch.setenv("AGENT_BITRIX_WORKER_COUNT", "4")
-    monkeypatch.setenv("AGENT_LOGISTICS_WORKER_COUNT", "2")
 
     overridden = get_settings()
 
     assert overridden.agent_orchestrator_worker_count == 3
     assert overridden.agent_bitrix_worker_count == 4
-    assert overridden.agent_logistics_worker_count == 2
 
 
 def test_diagnost_can_be_disabled(monkeypatch):
@@ -163,16 +155,14 @@ def test_diagnost_can_be_disabled(monkeypatch):
     assert settings.diagnost_enabled is False
 
 
-def test_diagnost_trace_is_on_and_feedback_is_off_by_default(monkeypatch):
+def test_diagnost_trace_is_on_by_default(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    monkeypatch.delenv("DIAGNOST_FEEDBACK_ENABLED", raising=False)
     monkeypatch.delenv("DIAGNOST_TRACE_SNAPSHOT_ENABLED", raising=False)
     monkeypatch.delenv("CONVERSATION_TRACE_ENABLED", raising=False)
     monkeypatch.delenv("LEARNING_EVENTS_ENABLED", raising=False)
 
     settings = get_settings()
 
-    assert settings.diagnost_feedback_enabled is False
     assert settings.diagnost_trace_snapshot_enabled is True
     assert settings.conversation_trace_enabled is True
     assert settings.learning_events_enabled is False

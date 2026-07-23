@@ -8,32 +8,8 @@ from dataclasses import dataclass as _dataclass
 from pathlib import Path
 from typing import Any
 
-from ai_server.agents.bitrix24 import (
-    BitrixLLMDecision,
-    BitrixLLMDecisionResult,
-    BitrixLLMFinalResult,
-    BitrixLLMToolCall,
-)
-from ai_server.agents.logistics import (
-    LogisticsLLMDecision,
-    LogisticsLLMDecisionResult,
-    LogisticsLLMFinalResult,
-    LogisticsLLMToolCall,
-)
-from ai_server.agents.pto import (
-    PtoLLMDecision,
-    PtoLLMDecisionResult,
-    PtoLLMFinalResult,
-    PtoLLMToolCall,
-)
 from ai_server.llm import LLMCompletion
 from ai_server.models import ModelUsageRecord
-from ai_server.orchestrators.orchestrator_llm import (
-    OrchestratorDecision,
-    OrchestratorDecisionResult,
-    OrchestratorFinalResult,
-    OrchestratorToolCall,
-)
 
 
 class RecordingLLMClient:
@@ -48,8 +24,6 @@ class RecordingLLMClient:
             model_usage=ModelUsageRecord(agent_id=kwargs["agent_id"], provider="fake", model="fake"),
             raw={},
         )
-
-
 @_dataclass
 class PendingControlDecision:
     decision: str
@@ -84,56 +58,6 @@ class FakeEmbeddingProvider:
         return {index: value / norm for index, value in vector.items()}
 
 
-class FakeBitrixLLM:
-    def __init__(
-        self,
-        *,
-        tool_calls: list[BitrixLLMToolCall] | None = None,
-        tool_call_steps: list[list[BitrixLLMToolCall]] | None = None,
-        decision_status: str = "completed",
-        decision_answer: str = "",
-        final_status: str = "completed",
-        final_answer: str = "Готово.",
-        confidence: float = 0.82,
-    ) -> None:
-        self.tool_calls = tool_calls or [BitrixLLMToolCall(name="none")]
-        self.tool_call_steps = tool_call_steps
-        self.decision_status = decision_status
-        self.decision_answer = decision_answer
-        self.final_status = final_status
-        self.final_answer = final_answer
-        self.confidence = confidence
-        self.decide_calls = []
-        self.compose_calls = []
-
-    async def decide(self, **kwargs):
-        self.decide_calls.append(kwargs)
-        if self.tool_call_steps is not None:
-            index = min(len(self.decide_calls) - 1, len(self.tool_call_steps) - 1)
-            tool_calls = self.tool_call_steps[index]
-        elif len(self.decide_calls) == 1:
-            tool_calls = self.tool_calls
-        else:
-            tool_calls = [BitrixLLMToolCall(name="none")]
-        return BitrixLLMDecisionResult(
-            decision=BitrixLLMDecision(
-                status=self.decision_status,
-                answer=self.decision_answer,
-                confidence=self.confidence,
-                tool_calls=tool_calls,
-            ),
-            model_usage=_fake_usage(),
-        )
-
-    async def compose(self, **kwargs):
-        self.compose_calls.append(kwargs)
-        return BitrixLLMFinalResult(
-            status=self.final_status,
-            answer=self.final_answer,
-            model_usage=_fake_usage(),
-        )
-
-
 class FakePendingControlLLM:
     def __init__(
         self,
@@ -159,94 +83,6 @@ class FakePendingControlLLM:
                 reasoning=self.reasoning,
             ),
             model_usage=_fake_usage(agent_id="bitrix24_pending_control"),
-        )
-
-
-class FakePtoLLM:
-    def __init__(
-        self,
-        *,
-        tool_calls: list[PtoLLMToolCall] | None = None,
-        tool_call_steps: list[list[PtoLLMToolCall]] | None = None,
-        decision_status: str = "completed",
-        decision_answer: str = "",
-        final_status: str = "completed",
-        final_answer: str = "Готово.",
-        confidence: float = 0.82,
-    ) -> None:
-        self.tool_calls = tool_calls or [PtoLLMToolCall(name="none")]
-        self.tool_call_steps = tool_call_steps
-        self.decision_status = decision_status
-        self.decision_answer = decision_answer
-        self.final_status = final_status
-        self.final_answer = final_answer
-        self.confidence = confidence
-        self.decide_calls = []
-        self.compose_calls = []
-
-    async def decide(self, **kwargs):
-        self.decide_calls.append(kwargs)
-        if self.tool_call_steps is not None:
-            index = min(len(self.decide_calls) - 1, len(self.tool_call_steps) - 1)
-            tool_calls = self.tool_call_steps[index]
-        elif len(self.decide_calls) == 1:
-            tool_calls = self.tool_calls
-        else:
-            tool_calls = [PtoLLMToolCall(name="none")]
-        return PtoLLMDecisionResult(
-            decision=PtoLLMDecision(
-                status=self.decision_status,
-                answer=self.decision_answer,
-                confidence=self.confidence,
-                tool_calls=tool_calls,
-            ),
-            model_usage=_fake_usage(agent_id="pto"),
-        )
-
-    async def compose(self, **kwargs):
-        self.compose_calls.append(kwargs)
-        return PtoLLMFinalResult(
-            status=self.final_status,
-            answer=self.final_answer,
-            model_usage=_fake_usage(agent_id="pto"),
-        )
-
-
-class FakeLogisticsLLM:
-    def __init__(
-        self,
-        *,
-        tool_call_steps: list[list[LogisticsLLMToolCall]] | None = None,
-        final_status: str = "completed",
-        final_answer: str = "Готово.",
-        confidence: float = 0.84,
-    ) -> None:
-        self.tool_call_steps = tool_call_steps or [[LogisticsLLMToolCall(name="none")]]
-        self.final_status = final_status
-        self.final_answer = final_answer
-        self.confidence = confidence
-        self.decide_calls = []
-        self.compose_calls = []
-
-    async def decide(self, **kwargs):
-        self.decide_calls.append(kwargs)
-        index = min(len(self.decide_calls) - 1, len(self.tool_call_steps) - 1)
-        return LogisticsLLMDecisionResult(
-            decision=LogisticsLLMDecision(
-                status="completed",
-                answer="",
-                confidence=self.confidence,
-                tool_calls=self.tool_call_steps[index],
-            ),
-            model_usage=_fake_usage(agent_id="logistics"),
-        )
-
-    async def compose(self, **kwargs):
-        self.compose_calls.append(kwargs)
-        return LogisticsLLMFinalResult(
-            status=self.final_status,
-            answer=self.final_answer,
-            model_usage=_fake_usage(agent_id="logistics"),
         )
 
 
@@ -991,81 +827,9 @@ def _fake_usage(*, agent_id: str = "bitrix24") -> ModelUsageRecord:
     return ModelUsageRecord(
         agent_id=agent_id,
         provider="fake",
-        model="fake-bitrix-llm",
+        model="fake-bitrix-executor",
         status="used",
     )
-
-
-class FakeInternalOrchestratorLLM:
-    def __init__(
-        self,
-        *,
-        call_specialists: list[str] | None = None,
-        status: str = "completed",
-        answer: str = "",
-        confidence: float = 0.9,
-        synthesized_answer: str = "",
-    ) -> None:
-        self.call_specialists = call_specialists or []
-        self.status = status
-        self.answer = answer
-        self.confidence = confidence
-        self.synthesized_answer = synthesized_answer
-        self.decide_calls: list[dict] = []
-        self.compose_calls: list[dict] = []
-
-    def _make_usage(self) -> ModelUsageRecord:
-        return ModelUsageRecord(
-            agent_id="internal_orchestrator",
-            provider="fake",
-            model="fake-orchestrator-llm",
-            status="used",
-        )
-
-    async def decide(self, *, task, tool_results=None, **kwargs):
-        self.decide_calls.append({"task": task, "tool_results": tool_results or [], **kwargs})
-        existing = tool_results or []
-        if existing or not self.call_specialists:
-            # Уже есть результаты или нечего вызывать — завершить цикл
-            tool_calls = [OrchestratorToolCall(name="none")]
-        else:
-            tool_calls = [
-                OrchestratorToolCall(
-                    name="call_specialist",
-                    args={"specialist_id": sid, "request": task.request},
-                )
-                for sid in self.call_specialists
-            ]
-        return OrchestratorDecisionResult(
-            decision=OrchestratorDecision(
-                status=self.status,
-                answer=self.answer,
-                tool_calls=tool_calls,
-                confidence=self.confidence,
-            ),
-            model_usage=self._make_usage(),
-        )
-
-    async def compose(self, *, tool_results=None, **kwargs):
-        self.compose_calls.append({"tool_results": tool_results or [], **kwargs})
-        successful = [tr for tr in (tool_results or []) if getattr(tr, "status", None) == "ok"]
-        if not successful:
-            # Нет успешных специалистов — прямой ответ или ошибка
-            return OrchestratorFinalResult(
-                answer=self.answer or "",
-                status=self.status if self.answer else "failed",
-                model_usage=self._make_usage(),
-            )
-        if self.synthesized_answer and len(successful) > 1:
-            answer = self.synthesized_answer
-        else:
-            data = successful[0].data or {}
-            answer = data.get("answer", self.answer)
-        return OrchestratorFinalResult(
-            answer=answer,
-            status=self.status,
-            model_usage=self._make_usage(),
-        )
 
 
 class FakeTaskDraftStore:
@@ -1412,50 +1176,4 @@ class FakeTaskDraftStore:
                 "actor_user_id": updated_by,
                 "payload": {"user_id": user_id, "active": active},
             }
-        )
-
-
-class FakeProposalStore:
-    def __init__(self) -> None:
-        self._proposals: dict[int, dict[str, Any]] = {}
-        self._next_id = 1
-
-    def save_proposal(
-        self,
-        *,
-        task_id: int,
-        task_title: str,
-        missing_parts: str,
-        responsible_id: int | None,
-        responsible_dialog_id: str,
-        scheduled_for: str,
-    ) -> int:
-        pid = self._next_id
-        self._next_id += 1
-        self._proposals[pid] = {
-            "id": pid,
-            "task_id": task_id,
-            "task_title": task_title,
-            "missing_parts": missing_parts,
-            "responsible_id": responsible_id,
-            "responsible_dialog_id": responsible_dialog_id,
-            "scheduled_for": scheduled_for,
-            "status": "awaiting_response",
-        }
-        return pid
-
-    def delete_proposal(self, proposal_id: int) -> None:
-        self._proposals.pop(proposal_id, None)
-
-    def update_responsible_response(self, proposal_id: int, response_text: str) -> None:
-        if proposal_id in self._proposals:
-            self._proposals[proposal_id]["responsible_response"] = response_text
-
-    def get_proposals_for_manager(self) -> list[dict[str, Any]]:
-        return list(self._proposals.values())
-
-    def get_pending_for_responsible(self, responsible_id: int) -> dict[str, Any] | None:
-        return next(
-            (p for p in self._proposals.values() if p.get("responsible_id") == responsible_id),
-            None,
         )

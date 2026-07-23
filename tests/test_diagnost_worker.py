@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import anyio
 
-from ai_server.models import AgentResult, AgentTask, UserContext
+from ai_server.models import AgentResult, AgentTask
 from ai_server.workers.diagnost.event_worker import _trace_incident_reasons, run_diagnost_event_worker
 
 
@@ -123,55 +123,6 @@ def test_worker_no_incident_on_high_confidence():
     _run_one(queue, store, confidence_threshold=0.5)
 
     store.save_incident.assert_not_called()
-
-
-def test_worker_uses_recipient_id_for_feedback_prompt():
-    task = AgentTask(
-        task_id="task-feedback",
-        request="тест",
-        user=UserContext(id="1", channel="bitrix24_chat"),
-        context={
-            "dialog_key": "chat:4321:user:1",
-            "dialog_id": "chat4321",
-            "recipient_id": "chat4321",
-        },
-    )
-    result = _make_result(status="completed", confidence=0.9)
-    queue = AsyncMock()
-    queue.claim_next = AsyncMock(side_effect=[_msg(task, result), None, None, None])
-    queue.ack = AsyncMock()
-    store = AsyncMock()
-    store.save_event = AsyncMock()
-    store.save_incident = AsyncMock()
-    store.create_pending_feedback = AsyncMock()
-
-    _run_one(queue, store, feedback_enabled=True)
-
-    store.create_pending_feedback.assert_awaited_once_with(
-        "task-feedback",
-        "1",
-        "chat4321",
-        channel="bitrix24_chat",
-    )
-
-
-def test_worker_does_not_schedule_feedback_by_default():
-    task = AgentTask(
-        task_id="task-no-feedback",
-        request="test",
-        user=UserContext(id="1", channel="bitrix24_chat"),
-        context={"recipient_id": "chat1"},
-    )
-    queue = AsyncMock()
-    queue.claim_next = AsyncMock(side_effect=[_msg(task, _make_result()), None, None])
-    queue.ack = AsyncMock()
-    store = AsyncMock()
-    store.save_event = AsyncMock()
-    store.create_pending_feedback = AsyncMock()
-
-    _run_one(queue, store)
-
-    store.create_pending_feedback.assert_not_called()
 
 
 def test_trace_incidents_cover_delivery_and_latency():

@@ -32,10 +32,6 @@ class RuntimePaths:
         return self.root / "embedding_models"
 
     @property
-    def quality_control_state(self) -> Path:
-        return self.root / "quality_control_state.json"
-
-    @property
     def learning_events_log(self) -> Path:
         return self.root / "learning_events.jsonl"
 
@@ -50,10 +46,6 @@ class RuntimePaths:
     @property
     def search_indexer_state(self) -> Path:
         return self.root / "search_indexer_state.json"
-
-    @property
-    def supervisor_state(self) -> Path:
-        return self.root / "supervisor_state.json"
 
     @property
     def tmp_dir(self) -> Path:

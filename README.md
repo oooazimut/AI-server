@@ -6,7 +6,8 @@
 
 - `internal_orchestrator` - Переговорщик: входная точка, маршрутизатор и голос
   системы для сотрудников;
-- `bitrix24` - узкий специалист по Битрикс24 со своими instructions, skills, knowledge topics и tools.
+- `bitrix24` - исполнитель точных структурированных команд Битрикс24 без
+  собственных skills, knowledge topics и смыслового разбора.
 
 ## Архитектура
 
@@ -41,8 +42,6 @@ agents/
   bitrix24/
     manifest.yaml
     instructions.md
-    skills/
-    knowledge/topics/
     automations/
   logistics/
     manifest.yaml
@@ -78,31 +77,18 @@ uvicorn --app-dir backend ai_server.main:app --reload
 ```text
 GET  http://127.0.0.1:8000/health
 GET  http://127.0.0.1:8000/agents
-GET  http://127.0.0.1:8000/agents/bitrix24/skills
 GET  http://127.0.0.1:8000/agents/bitrix24/automations
 GET  http://127.0.0.1:8000/automations
 GET  http://127.0.0.1:8000/bitrix/status
 GET  http://127.0.0.1:8000/bitrix/search/status
 GET  http://127.0.0.1:8000/bitrix/search/indexer/status
-GET  http://127.0.0.1:8000/bitrix/quality-control/status
 GET  http://127.0.0.1:8000/bitrix/oauth/status
 GET  http://127.0.0.1:8000/logistics/vehicle-usage/status
-GET  http://127.0.0.1:8000/bitrix/search?q=...
-POST http://127.0.0.1:8000/bitrix/search/reindex
-POST http://127.0.0.1:8000/bitrix/search/reindex-delta
-POST http://127.0.0.1:8000/bitrix/search/reindex-content
+GET  http://127.0.0.1:8000/admin/bitrix/search?q=...  (X-Admin-Secret)
+POST http://127.0.0.1:8000/admin/bitrix/search/reindex  (X-Admin-Secret)
+POST http://127.0.0.1:8000/admin/bitrix/search/reindex-delta  (X-Admin-Secret)
+POST http://127.0.0.1:8000/admin/bitrix/search/reindex-content  (X-Admin-Secret)
 POST http://127.0.0.1:8000/bitrix/events
-POST http://127.0.0.1:8000/logistics/vehicle-usage/run-once
-POST http://127.0.0.1:8000/orchestrator/test
-```
-
-Пример `POST /orchestrator/test`:
-
-```json
-{
-  "text": "Найди просроченные задачи в Битриксе",
-  "user_id": "9"
-}
 ```
 
 
@@ -121,23 +107,23 @@ AI_SERVER_FASTEMBED_CACHE_DIR=var/embedding_models
 
 ## LLM model
 
-Модель верхнего уровня зафиксирована в конфиге как `deepseek-v4-flash`.
-Bitrix24-специалист работает как LLM-субагент: сначала модель выбирает tool calls
-и передаёт структурированные аргументы, затем backend-tools выполняют только
-валидацию, policy/OAuth и конкретные Bitrix REST действия. Backend не должен
-выбирать бизнес-сценарий вместо LLM-субагента.
+Единственный автономный агент — `internal_orchestrator`. Он всегда использует
+Pro-модель, определяет смысл запроса и передаёт Bitrix-исполнителю точную
+структурированную команду. Bitrix не имеет собственного LLM и выполняет только
+контракт, ACL/OAuth и конкретные REST-действия.
 
 ```env
 AI_SERVER_ENV_FILE=.env,.env.local
 AI_SERVER_LLM_PROVIDER=deepseek
-AI_SERVER_LLM_MODEL=deepseek-v4-flash
+AI_SERVER_LLM_MODEL=deepseek-v4-pro
+AI_SERVER_ORCHESTRATOR_LLM_MODEL=deepseek-v4-pro
 AI_SERVER_LLM_BASE_URL=
 AI_SERVER_LLM_API_KEY=
 AI_SERVER_LLM_MAX_TOKENS=3000
 ```
 
-`GET /health` показывает `llm_provider`, `llm_model` и `llm_configured`, но не
-показывает ключи.
+`GET /health` показывает провайдера, фактическую модель оркестратора, политику
+`pro_only_fail_closed` и готовность LLM, но не показывает ключи.
 
 Если нужно наложить env-файлы старого `BitrixAIAgent` и локальные секреты нового
 сервера, укажите их через запятую или точку с запятой:
@@ -151,8 +137,7 @@ AI_SERVER_ENV_FILE=C:\Users\office3pc\PyProjects\BitrixAIAgent\.env,C:\Users\off
 Для внутренних каналов можно включить короткий технический footer только для
 админов и директора. Footer строится не от "агента вообще", а от фактических
 `model_usage` текущего ответа: какие агенты, провайдеры и модели участвовали.
-Если сработало только системное действие без LLM, например подтверждение уже
-ожидающего pending-действия, footer так и пишет, что LLM не использовалась.
+Footer отражает фактически использованную оркестратором модель.
 Клиентские каналы не должны подключать этот footer.
 
 ```env
@@ -251,7 +236,6 @@ uv run python scripts/smoke_bitrix_task_create_flow.py `
 ```text
 GET http://127.0.0.1:8000/bitrix/status
 GET http://127.0.0.1:8000/bitrix/webhook-events/status
-GET http://127.0.0.1:8000/bitrix/quality-control/status
 ```
 
 ## Bitrix OAuth local app
@@ -283,19 +267,19 @@ POST http://127.0.0.1:8000/bitrix/install
 
 ## Bitrix portal search
 
-Новый сервер умеет читать и обновлять локальный индекс портала
-`var/search_index.sqlite`. После cutover-миграции старого `BitrixAIAgent/var`
-доступны:
+Новый сервер умеет читать и обновлять PostgreSQL-индекс портала. После
+индексации доступны:
 
 ```text
 GET http://127.0.0.1:8000/bitrix/search/status
 GET http://127.0.0.1:8000/bitrix/search/indexer/status
-GET http://127.0.0.1:8000/bitrix/search?q=договор&scope=documents
-POST http://127.0.0.1:8000/bitrix/search/reindex
-POST http://127.0.0.1:8000/bitrix/search/reindex-delta
-POST http://127.0.0.1:8000/bitrix/search/reindex-content
+GET http://127.0.0.1:8000/admin/bitrix/search?q=договор&scope=documents
+POST http://127.0.0.1:8000/admin/bitrix/search/reindex
+POST http://127.0.0.1:8000/admin/bitrix/search/reindex-delta
+POST http://127.0.0.1:8000/admin/bitrix/search/reindex-content
 ```
 
+Эти административные запросы требуют заголовок `X-Admin-Secret`.
 Поддерживаемые scope: `all`, `documents`, `files`, `tasks`, `projects`.
 
 Фоновый индексатор metadata/delta/content включается явно:
@@ -309,47 +293,19 @@ SEARCH_CONTENT_MAX_BYTES=20971520
 SEARCH_CONTENT_ALLOWED_EXTENSIONS=.txt,.csv,.doc,.docx,.xlsx,.xls,.pdf
 ```
 
-`portal_search` также подключён как Bitrix tool и используется Bitrix24-специалистом
-для запросов про документы, файлы, договоры и портал.
+`portal_search` подключён как структурированный Bitrix tool для документов и
+файлов. Смысл запроса, точные параметры и формат ответа определяет только
+оркестратор; Bitrix проверяет доступ текущего пользователя и выполняет команду.
 
-## Bitrix quality control
-
-Webhook-контроль качества закрытия задач перенесён в новый LLM-driven
-worker-контур. Transport-часть слушает `onTaskUpdate` через общую очередь
-`/bitrix/events` и передаёт LLM quality-control агенту только событие и ID
-задачи. Дальше уже модель выбирает tools: читает карточку задачи через
-`bitrix_task_get`, читает результаты через `bitrix_task_results_list`, принимает
-решение и вызывает `quality_control_action`. Backend-tools выполняют REST,
-dedupe, dry-run, policy/OAuth-actor и state.
-
-```env
-QUALITY_CONTROL_WEBHOOK_ENABLED=true
-QUALITY_CONTROL_DRY_RUN=true
-QUALITY_CONTROL_AUTO_MANAGE_PROJECT_ID=
-QUALITY_CONTROL_ACTOR_USER_ID=
-QUALITY_CONTROL_NOTIFY_DIRECTOR=true
-QUALITY_CONTROL_NOTIFY_RESPONSIBLE=true
-QUALITY_CONTROL_SMART_ENABLED=true
-```
-
-Для боевого режима (`QUALITY_CONTROL_DRY_RUN=false`) обязателен
-`QUALITY_CONTROL_ACTOR_USER_ID`: этот пользователь должен быть один раз
-авторизован через Bitrix OAuth, иначе фоновые write-действия не будут
-выполняться.
-
-Шаблоны результата задачи вынесены в `config/result_templates.example.json`.
-Сейчас перенесён один старый шаблон `default_result_v1`: первая строка результата
-должна явно отвечать, сделал исполнитель всё или не всё, а дальше описывается
-результат или причины неполного выполнения. Quality-control LLM получает этот
-каталог в контексте проверки.
+События закрытия задач также передаются оркестратору. Старые самостоятельные
+Bitrix quality-control и supervisor удалены.
 
 ## Logistics vehicle usage
 
-Утренний учёт служебных автомобилей перенесён в отдельного LLM-субагента
-`logistics`. Worker отвечает за расписание и dedupe, а Логист сам выбирает
-read/write tools по структурированным данным, формулирует текст для
-Переговорщика, разбирает ответы и готовит текст эскалации. Отправка сообщений
-людям остаётся в канальном runtime.
+Утренний учёт служебных автомобилей по умолчанию выключен. При явном включении
+его worker выполняет только детерминированное расписание, dedupe, отправку
+заранее заданных сообщений и сохранение данных; самостоятельный LLM-специалист
+`logistics` в runtime не создаётся.
 
 ```env
 VEHICLE_USAGE_ENABLED=false
@@ -371,50 +327,21 @@ VEHICLE_USAGE_STAFF_ROSTER=1|15|Иван Петров;2|16|Пётр Иванов
 
 ```text
 GET  http://127.0.0.1:8000/logistics/vehicle-usage/status
-POST http://127.0.0.1:8000/logistics/vehicle-usage/run-once
 ```
 
 ## Bitrix task closure from chat
 
-Закрытие задачи по сообщению человека идёт через общий чатовый контур:
-`internal_orchestrator -> LLM Bitrix24 -> task_closure -> pending confirmation`.
-Битрикс-субагент сам выделяет `task_id` или `task_query` и `result_text`; если
-данных не хватает, он должен спросить уточнение, а не перекладывать догадку на
-tool.
+Закрытие задачи по сообщению человека идёт через общий контур:
+`internal_orchestrator -> structured Bitrix command -> numbered draft ->
+confirmation`. Оркестратор определяет задачу, формирует четыре блока результата
+и выбирает точные операции. Bitrix исполняет их после подтверждения и применяет
+guardrails: OAuth/write-policy, проверку черновика и идемпотентность.
 
-После подтверждения pending `ai_server.task_closure` снова запускает
-Битрикс-специалиста в режиме `task_closure`: модель читает задачу через простые
-Bitrix tools, сама оценивает результат, сама выбирает write-tools
-(`result_add`, `complete`, `approve`, `comment`, `renew` и т.п.). Backend только
-исполняет tools и применяет guardrails: OAuth/write-policy, ограничение проекта,
-проверку, что запись идёт по уже прочитанной задаче.
+## Document contour
 
-## Document contour and PTO
-
-Документы разделены по ответственности:
-
-- `bitrix24` отвечает за транспорт: поиск файлов портала, доступ к Bitrix Disk,
-  вложения задач и индекс.
-- `pto` отвечает за смысловую работу с техническими документами: чтение,
-  сравнение, замечания, комплектность, сметы/ведомости как ПТО-документы.
-
-Текущий ПТО-контур read-only/analysis: `portal_document_search`,
-`document_read`, `spreadsheet_compare`. Создание, редактирование и загрузка
-документов будут отдельным write-контуром с подтверждениями.
-
-Старый прямой `/agent/documents/compare` намеренно не выполняет сравнение в
-обход субагента. Этот сценарий должен идти через Оркестратора и ПТО-специалиста:
-модель выбирает документы, вызывает простые инструменты чтения/сравнения и
-формирует вывод.
-
-## Legacy route aliases
-
-Для переходного периода добавлены совместимые старые пути `/agent/...`:
-`/agent/status`, `/agent/vehicles/status`, `/agent/webhook-events/status`,
-`/agent/search/status`, `/agent/search/indexer/status`,
-`/agent/reconcile/status`, `/agent/search`, `/agent/search/reindex`,
-`/agent/search/reindex-content`, `/agent/tools`, `/agent/search/readiness`,
-`/agent/search/production-status`, `/agent/test`.
+Поиск документов Bitrix выполняется структурированными инструментами
+`bitrix24`. Смысл запроса, параметры и формат ответа определяет Pro-оркестратор.
+Старые ПТО/Картотека LLM-прототипы и совместимые `/agent/...` маршруты удалены.
 
 ## Admin skills/RAG editor
 

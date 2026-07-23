@@ -162,6 +162,14 @@ class CallSpecialistTool:
                 tool=self.name,
                 error=f"Специалист '{specialist_id}' не найден",
             )
+        manifest = self._manifests.get(specialist_id)
+        if manifest is None or manifest.reasoning_mode == "executor":
+            return ToolResult(
+                status=ToolStatus.INVALID_TOOL_CALL,
+                tool=self.name,
+                error="Executor specialists accept only an exact structured command from the orchestrator.",
+                data={"reason": "ORCHESTRATOR_STRUCTURED_COMMAND_REQUIRED"},
+            )
 
         context: dict[str, Any] = {}
         if dialog_key:
@@ -229,17 +237,13 @@ class CallSpecialistTool:
                 tool=self.name,
                 error=f"unknown specialist: {specialist_id}",
             )
-        registry = self.capability_registry(specialist_id)
-        requires_structured = specialist_id == "bitrix24" and any(
-            bool(item.get("structured_command"))
-            for item in (registry or {}).get("tools") or []
-            if isinstance(item, dict)
-        )
+        manifest = self._manifests.get(specialist_id)
+        requires_structured = manifest is None or manifest.reasoning_mode == "executor"
         if requires_structured and not isinstance(structured_command, dict):
             return ToolResult(
                 status=ToolStatus.INVALID_TOOL_CALL,
                 tool=self.name,
-                error="Bitrix requires one exact structured command from the orchestrator.",
+                error=f"Executor specialist {specialist_id} requires one exact structured command from the orchestrator.",
                 data={"reason": "ORCHESTRATOR_STRUCTURED_COMMAND_REQUIRED"},
             )
 

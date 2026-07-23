@@ -167,28 +167,25 @@ def test_build_orchestrator_llm_client_uses_orchestrator_settings(monkeypatch):
     assert client._reasoning is True
 
 
-def test_build_orchestrator_llm_client_falls_back_to_main_settings(monkeypatch):
+def test_build_orchestrator_llm_client_defaults_to_pro_settings(monkeypatch):
     settings = _settings(monkeypatch)
 
     client = build_orchestrator_llm_client(settings)
 
-    assert client._model == settings.llm_model
+    assert client._model == settings.orchestrator_llm_model
+    assert client._model == "deepseek-v4-pro"
+    assert client._fallback_model == ""
     assert client._reasoning is False
 
 
-def test_build_orchestrator_llm_client_uses_flash_model_when_routing_enabled(monkeypatch):
+def test_build_orchestrator_llm_client_rejects_flash(monkeypatch):
     settings = _settings(
         monkeypatch,
-        AI_SERVER_LLM_ROUTING_ENABLED="true",
-        AI_SERVER_LLM_FLASH_MODEL="deepseek-v4-flash",
-        AI_SERVER_LLM_PRO_MODEL="deepseek-v4-pro",
+        AI_SERVER_ORCHESTRATOR_LLM_MODEL="deepseek-v4-flash",
     )
 
-    client = build_orchestrator_llm_client(settings)
-
-    assert client._model == "deepseek-v4-flash"
-    assert client._fallback_model == "deepseek-v4-pro"
-    assert client._reasoning is False
+    with pytest.raises(LLMError, match="Flash"):
+        build_orchestrator_llm_client(settings)
 
 
 def test_complete_falls_back_to_pro_model_when_flash_returns_invalid_json(monkeypatch):

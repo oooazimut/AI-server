@@ -1,4 +1,4 @@
-from ai_server.agents.bitrix24.llm import _format_warehouse_answer
+from ai_server.orchestrators.bitrix_formatter import _format_warehouse_answer
 
 
 def test_warehouse_page_uses_absolute_item_numbers_after_offset():

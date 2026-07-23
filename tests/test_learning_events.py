@@ -4,7 +4,6 @@ from fastapi.testclient import TestClient
 from ai_server.learning import EventStream, LearningEventRecorder
 from ai_server.main import app
 from ai_server.models import ActionRecord, AgentResult, AgentTask, ModelUsageRecord, UserContext
-from ai_server.orchestrators.internal import InternalOrchestrator
 
 
 def test_learning_recorder_records_agent_result_and_feedback(tmp_path):
@@ -93,61 +92,45 @@ def test_orchestrator_calls_result_publisher(monkeypatch):
     monkeypatch.setenv("AGENT_DRY_RUN", "true")
     monkeypatch.setenv("AI_SERVER_TECH_FOOTER_ENABLED", "false")
 
-    class FakeOrchestratorLLM:
-        async def decide(self, **kwargs):
-            from ai_server.models import ModelUsageRecord
-            from ai_server.orchestrators.orchestrator_llm import OrchestratorDecision, OrchestratorDecisionResult
-
-            return OrchestratorDecisionResult(
-                decision=OrchestratorDecision(status="completed", answer="", tool_calls=[], confidence=0.9),
-                model_usage=ModelUsageRecord(agent_id="internal_orchestrator", provider="test", model="test"),
-            )
-
-        async def compose(self, **kwargs):
-            from ai_server.models import ModelUsageRecord
-            from ai_server.orchestrators.orchestrator_llm import OrchestratorFinalResult
-
-            return OrchestratorFinalResult(
-                answer="Готово",
-                status="completed",
-                model_usage=ModelUsageRecord(agent_id="internal_orchestrator", provider="test", model="test"),
-            )
+    import json
 
     from ai_server.models import AgentManifest
-    from ai_server.orchestrators.tools import CallSpecialistTool
+    from ai_server.orchestrators.plan_authoritative import PLAN_SCHEMA, PlanAuthoritativeOrchestrator, _hash
+
+    class Planner:
+        async def plan(self, *, task, constraints, **kwargs):
+            return json.dumps(
+                {
+                    "schema_version": PLAN_SCHEMA,
+                    "plan_id": constraints["plan_id"],
+                    "request_hash": _hash(task.request),
+                    "state": "NOT_SUPPORTED",
+                    "clarification": None,
+                    "max_rounds": 1,
+                    "subtasks": [],
+                }
+            ), ModelUsageRecord(agent_id="internal_orchestrator", provider="test", model="pro-test")
+
+        async def finalize(self, **kwargs):
+            raise AssertionError("finalize is not needed for NOT_SUPPORTED")
 
     publisher = AsyncMock()
-    orch_manifest = AgentManifest(
-        id="internal_orchestrator", name="Переговорщик", kind="orchestrator", description="test"
-    )
-    orchestrator = InternalOrchestrator(
-        orch_manifest,
-        agent_tools=[CallSpecialistTool({}, [])],
-        llm=FakeOrchestratorLLM(),
+    planner = Planner()
+    orchestrator = PlanAuthoritativeOrchestrator(
+        AgentManifest(id="internal_orchestrator", name="Orchestrator", kind="orchestrator", description="test"),
+        agent_tools=[],
+        llm=planner,
+        planner=planner,
         result_publisher=publisher,
     )
-
-    task = AgentTask(
-        task_id="test-task",
-        source="bitrix24_chat",
-        request="Покажи задачи в Битриксе",
-        user=UserContext(id="9", channel="bitrix24_chat", raw={"dialog_id": "chat99"}),
-        context={
-            "dialog_key": "chat:77:user:9",
-            "dialog_id": "chat99",
-            "channel_id": "bitrix24",
-            "recipient_id": "chat99",
-        },
-    )
+    task = AgentTask(task_id="test-task", request="unsupported test request")
     anyio.run(orchestrator.handle, task)
-
     publisher.publish.assert_called_once()
-    call_task, call_result = publisher.publish.call_args.args
-    assert call_task.task_id == "test-task"
-    assert call_result.answer == "Готово"
+    assert publisher.publish.call_args.args[0].task_id == "test-task"
+    assert publisher.publish.call_args.args[1].status == "completed"
 
 
-def test_learning_status_endpoint(monkeypatch, tmp_path):
+def test_removed_learning_status_endpoint(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     monkeypatch.setenv("WEBHOOK_SECRET", "")
@@ -155,8 +138,7 @@ def test_learning_status_endpoint(monkeypatch, tmp_path):
     with TestClient(app) as client:
         status = client.get("/learning/status")
 
-    assert status.status_code == 200
-    assert "diagnost" in status.json()["status"].lower()
+    assert status.status_code == 404
 
 
 def test_event_stream_subscriber_called(tmp_path):

@@ -15,11 +15,14 @@ from ai_server.agents.bitrix24.tools.draft_lifecycle import (
 from ai_server.agents.bitrix24.tools.task_close import (
     INCOMPLETE_CLOSE_MARKER,
     TASK_CLOSE_DRAFT_TYPE,
-    TaskCloseConfirmTool,
     TaskCloseDiscardTool,
-    TaskCloseDraftTool,
     TaskCloseReportIncidentTool,
-    format_task_close_draft_message,
+)
+from ai_server.agents.bitrix24.tools.task_close import (
+    TaskCloseConfirmTool as _TaskCloseConfirmTool,
+)
+from ai_server.agents.bitrix24.tools.task_close import (
+    TaskCloseDraftTool as _TaskCloseDraftTool,
 )
 from ai_server.integrations.bitrix.task_close_direct_queue import (
     TASK_CLOSE_DIRECT_STATUS_ACTIVE,
@@ -32,8 +35,20 @@ from ai_server.integrations.bitrix.task_close_reports import (
     task_close_report_state_key,
 )
 from ai_server.models import ToolStatus
+from ai_server.orchestrators.bitrix_formatter import format_task_close_report, format_task_close_result_text
 from ai_server.settings import get_settings
 from tests.fakes import FakePortalSearchIndex, FakeTaskDraftStore
+
+
+def TaskCloseDraftTool(*args, **kwargs):
+    kwargs.setdefault("result_text_renderer", format_task_close_result_text)
+    return _TaskCloseDraftTool(*args, **kwargs)
+
+
+def TaskCloseConfirmTool(*args, **kwargs):
+    kwargs.setdefault("report_renderer", format_task_close_report)
+    kwargs.setdefault("result_text_renderer", format_task_close_result_text)
+    return _TaskCloseConfirmTool(*args, **kwargs)
 
 
 class DirectCloseDraftStore(FakeTaskDraftStore):
@@ -74,7 +89,7 @@ class _TaskDetailClient:
 
 
 def test_task_close_file_formatter_hides_unanswered_unconfirmed_task_points():
-    text = format_task_close_draft_message(
+    text = format_task_close_report(
         {
             "_draft_type": TASK_CLOSE_DRAFT_TYPE,
             "task_id": 139,
@@ -149,7 +164,7 @@ def test_close_draft_with_only_task_id_loads_task_points_and_missing_fields():
     assert result.data["preview"]["task_points"] == ["Проверить камеру на входе", "Проверить архив"]
 
 
-def test_close_draft_ignores_plain_close_command_summary_for_empty_task():
+def test_close_draft_trusts_orchestrator_supplied_completion_summary():
     store = FakeTaskDraftStore()
     client = _TaskDetailClient(
         {
@@ -171,13 +186,10 @@ def test_close_draft_ignores_plain_close_command_summary_for_empty_task():
 
     assert result.status == ToolStatus.OK
     draft = store._drafts["d:13"]
-    assert draft["completion_summary"] == ""
+    assert draft["completion_summary"] == "закрой задачу 139"
     assert draft["task_points"] == []
     assert draft["source_task_description_empty"] is True
-    assert draft["overall_status"] == "unconfirmed"
-    assert draft["unconfirmed_items"]
-    assert "закрой" not in " ".join(draft["unconfirmed_items"]).casefold()
-    assert result.data["preview"]["completion_summary"] == ""
+    assert result.data["preview"]["completion_summary"] == "закрой задачу 139"
 
 
 def test_close_draft_splits_plain_comma_description_into_task_points():
@@ -857,6 +869,7 @@ def test_close_confirm_uses_oauth_close_then_system_report_file():
         write_client=system_client,
         bitrix_oauth=oauth,
         oauth_required_for_writes=True,
+        report_renderer=format_task_close_report,
     )
     result = _exec(tool, {}, user_id=13, dialog_key="d:13", dialog_id="chat4321")
 
@@ -915,6 +928,7 @@ def test_close_confirm_updates_existing_system_report_file_version():
         write_client=system_client,
         bitrix_oauth=oauth,
         oauth_required_for_writes=True,
+        report_renderer=format_task_close_report,
     )
     result = _exec(tool, {}, user_id=13, dialog_key="d:13", dialog_id="chat4321")
 
@@ -968,6 +982,7 @@ def test_close_confirm_already_closed_draft_skips_reclosing_and_adds_report_file
         write_client=system_client,
         bitrix_oauth=oauth,
         oauth_required_for_writes=True,
+        report_renderer=format_task_close_report,
     )
     result = _exec(tool, {}, user_id=13, dialog_key="d:13", dialog_id="chat4321")
 
@@ -1026,6 +1041,7 @@ def test_close_confirm_direct_close_draft_skips_reclosing_and_completes_queue():
         write_client=system_client,
         bitrix_oauth=oauth,
         oauth_required_for_writes=True,
+        report_renderer=format_task_close_report,
     )
     result = _exec(tool, {}, user_id=13, dialog_key="d:13", dialog_id="chat4321")
 
@@ -1127,6 +1143,7 @@ def test_close_confirm_can_approve_task():
         write_client=system_client,
         bitrix_oauth=oauth,
         oauth_required_for_writes=True,
+        report_renderer=format_task_close_report,
     )
     result = _exec(tool, {}, user_id=13, dialog_key="d:13", dialog_id="chat4321")
 
@@ -1277,6 +1294,63 @@ def test_task_close_report_incident_accept_missing_clears_index_metadata(monkeyp
     assert task.metadata["ai_close_report_files"] == []
     assert task.metadata["ai_close_incomplete"] is False
     assert "AI_SERVER_TASK_CLOSE_INCOMPLETE" not in task.body
+
+
+def test_auto_unconfirmed_confirm_executes_only_the_exact_expired_draft():
+    store = DirectCloseDraftStore()
+    anyio.run(
+        lambda: store.save_task_draft(
+            "d:13",
+            {
+                "_draft_type": TASK_CLOSE_DRAFT_TYPE,
+                "task_id": 139,
+                "task_title": "Task",
+                "action": "complete",
+                "already_closed": True,
+                "result_text": "Known result",
+                "missing_fields": ["photo"],
+                "_direct_close_close_event_key": "event-a",
+            },
+        )
+    )
+    store.upsert_task_close_processing_state(
+        task_id=139,
+        state_key=direct_close_state_key("event-a"),
+        status=TASK_CLOSE_DIRECT_STATUS_ACTIVE,
+        payload={"close_event_key": "event-a"},
+    )
+    oauth_client = AsyncMock()
+    oauth_client.call = AsyncMock(return_value={"result": True})
+    system_client = AsyncMock()
+    system_client.call = AsyncMock(
+        side_effect=[
+            {"result": []},
+            {"result": {"ATTACHMENT_ID": 5509, "FILE_ID": 62357, "NAME": "AI-close-139-unconfirmed.txt"}},
+        ]
+    )
+    tool = TaskCloseConfirmTool(
+        store=store,
+        write_client=system_client,
+        bitrix_oauth=FakeBitrixOAuth(oauth_client),
+        oauth_required_for_writes=True,
+        report_renderer=format_task_close_report,
+    )
+
+    result = _exec(
+        tool,
+        {"mode": "auto_unconfirmed"},
+        user_id=13,
+        dialog_key="d:13",
+        dialog_id="13",
+    )
+
+    assert result.status == ToolStatus.OK
+    assert result.data["auto_finalize_mode"] == "unconfirmed"
+    assert result.data["draft"]["overall_status"] == "unconfirmed"
+    assert "d:13" not in store._drafts
+    assert oauth_client.call.await_count == 0
+    state = store.get_task_close_processing_state(task_id=139, state_key=direct_close_state_key("event-a"))
+    assert state["status"] == "auto_closed_unconfirmed"
 
 
 class FakeBitrixOAuth:

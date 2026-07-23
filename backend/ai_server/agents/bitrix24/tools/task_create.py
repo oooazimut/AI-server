@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta
+from datetime import datetime
 from typing import Any
 
 from ai_server.agents.bitrix24.ports import TaskDraftStorePort
@@ -16,8 +16,6 @@ from ai_server.agents.bitrix24.tools.draft_lifecycle import (
     resolve_unknown_draft_claim,
 )
 from ai_server.agents.bitrix24.tools.project_create import build_project_create_draft_from_args
-from ai_server.agents.bitrix24.tools.read_client import resolve_current_user_read_client
-from ai_server.agents.bitrix24.tools.tasks import _search_projects_snapshot
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
 from ai_server.integrations.bitrix.oauth import BitrixOAuthService, BitrixOAuthTokenMissing
 from ai_server.models import ToolDefinition, ToolResult, ToolStatus
@@ -25,8 +23,6 @@ from ai_server.tools.bitrix_policy import apply_write_policy
 from ai_server.tools.bitrix_ports import BitrixWritePort
 from ai_server.utils import MOSCOW_TZ, compact_text, optional_int, unique
 
-DEFAULT_TASK_DEADLINE_WORKING_DAYS = 3
-DEFAULT_TASK_DEADLINE_HOUR = 19
 TASK_CREATE_DRAFT_TYPE = "task_create"
 
 
@@ -69,7 +65,7 @@ def build_task_create_draft_from_args(args: dict[str, Any], *, user_id: int | No
         if responsible_id is not None:
             responsible_note = "Ответственным выбран пользователь Bitrix из текущего диалога."
         else:
-            responsible_note = "LLM выбрала текущего пользователя, но канал не передал Bitrix user id."
+            responsible_note = "Оркестратор выбрал текущего пользователя, но канал не передал Bitrix user id."
     if not responsible_label and responsible_id is not None:
         responsible_label = "указанный сотрудник"
 
@@ -81,7 +77,10 @@ def build_task_create_draft_from_args(args: dict[str, Any], *, user_id: int | No
 
     if title:
         fields["TITLE"] = title
-        fields["DESCRIPTION"] = description or _default_description(title)
+        if description:
+            fields["DESCRIPTION"] = description
+        else:
+            contract_errors.append("task_create_draft.description is required")
     else:
         contract_errors.append("task_create_draft.title is required")
 
@@ -122,20 +121,14 @@ class TaskCreateDraftTool:
     def __init__(
         self,
         store: TaskDraftStorePort,
-        project_client: Any | None = None,
-        portal_search: Any | None = None,
-        bitrix_oauth: BitrixOAuthService | None = None,
     ) -> None:
         self._store = store
-        self._project_client = project_client
-        self._portal_search = portal_search
-        self._bitrix_oauth = bitrix_oauth
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="task_create_draft",
             description=(
-                "Prepare a Bitrix task creation draft from fields already understood by the LLM. "
+                "Prepare a Bitrix task creation draft from exact fields supplied by the orchestrator. "
                 "Call only after all required fields are collected. "
                 "The draft is saved and will be shown back on the next turn for confirmation."
             ),
@@ -156,9 +149,10 @@ class TaskCreateDraftTool:
                     "_default_personal_project_owner_id": {"type": "integer"},
                     "_default_personal_project_missing": {"type": "boolean"},
                 },
-                "required": ["title"],
+                "required": ["title", "description"],
                 "allOf": [
                     {"anyOf": [{"required": ["responsible_id"]}, {"required": ["responsible_self"]}]},
+                    {"anyOf": [{"required": ["deadline_iso"]}, {"required": ["no_deadline"]}]},
                 ],
             },
         )
@@ -190,28 +184,19 @@ class TaskCreateDraftTool:
             )
             if project_create_result is not None:
                 return project_create_result
-        resolved_args, project_note, project_error = await _args_with_resolved_project(
-            args,
-            project_client=self._project_client,
-            portal_search=self._portal_search,
-            bitrix_oauth=self._bitrix_oauth,
-            user_id=user_id,
+        resolved_args = dict(args)
+        group_id = optional_int(resolved_args.get("group_id"))
+        project_name = compact_text(
+            str(resolved_args.get("project_name") or resolved_args.get("group_name") or "")
         )
-        if project_error is not None:
-            if (
-                project_error.status == ToolStatus.NOT_FOUND
-                and project_error.data.get("allow_personal_project_creation") is True
-            ):
-                project_create_result = await _prepare_missing_default_personal_project(
-                    store=self._store,
-                    args=resolved_args,
-                    user_id=user_id,
-                    dialog_key=dialog_key,
-                    dialog_id=dialog_id,
-                )
-                if project_create_result is not None:
-                    return project_create_result
-            return project_error
+        if project_name and group_id is None:
+            return ToolResult(
+                status=ToolStatus.CONTRACT_VIOLATION,
+                tool=self.name,
+                error="task_create_draft requires exact group_id selected by the orchestrator",
+            )
+        if group_id is not None and project_name:
+            resolved_args["_resolved_project"] = {"id": group_id, "name": project_name}
         draft = build_task_create_draft_from_args(resolved_args, user_id=user_id)
         if not draft.is_ready:
             return ToolResult(
@@ -226,9 +211,6 @@ class TaskCreateDraftTool:
             stored_params["_resolved_project"] = dict(resolved_project)
         if dialog_key:
             await self._store.save_task_draft(dialog_key, stored_params)
-        notes = list(draft.notes)
-        if project_note:
-            notes.append(project_note)
         return ToolResult(
             status=ToolStatus.OK,
             tool=self.name,
@@ -236,7 +218,7 @@ class TaskCreateDraftTool:
                 "summary": draft.summary,
                 "params": stored_params,
                 "preview": draft.preview,
-                "notes": notes,
+                "notes": list(draft.notes),
             },
         )
 
@@ -497,147 +479,6 @@ class TaskDraftDiscardTool:
         )
 
 
-async def _args_with_resolved_project(
-    args: dict[str, Any],
-    *,
-    project_client: Any | None,
-    portal_search: Any | None,
-    bitrix_oauth: BitrixOAuthService | None,
-    user_id: int | None,
-) -> tuple[dict[str, Any], str, ToolResult | None]:
-    resolved_args = dict(args or {})
-    if optional_int(resolved_args.get("group_id")) is not None:
-        return resolved_args, "", None
-    project_name = compact_text(str(resolved_args.get("project_name") or resolved_args.get("group_name") or ""))
-    default_personal_project = _truthy(resolved_args.get("_default_personal_project"))
-    if not project_name:
-        return resolved_args, "", None
-
-    read_client = project_client
-    if bitrix_oauth is not None:
-        read_client, _access_actor, access_error = await resolve_current_user_read_client(
-            TaskCreateDraftTool.name,
-            fallback_client=project_client,
-            bitrix_oauth=bitrix_oauth,
-            user_id=user_id,
-        )
-        if access_error is not None:
-            return resolved_args, "", access_error
-
-    snapshot_projects = _search_projects_snapshot(portal_search, project_name, limit=10)
-    if snapshot_projects is not None:
-        exact_snapshot = _matching_projects(snapshot_projects, project_name)
-        if len(exact_snapshot) == 1:
-            return _bind_resolved_project(resolved_args, project=exact_snapshot[0], project_name=project_name)
-        if len(exact_snapshot) > 1:
-            return (
-                resolved_args,
-                "",
-                _project_resolution_error(
-                    f"exact indexed Bitrix project is ambiguous: {project_name}",
-                    resolved_args,
-                ),
-            )
-
-    if read_client is None:
-        label = "default personal project" if default_personal_project else "explicit project"
-        return (
-            resolved_args,
-            "",
-            _project_resolution_error(
-                f"{label} requires Bitrix project resolver",
-                resolved_args,
-            ),
-        )
-    try:
-        projects = await read_client.search_projects(project_name, limit=10)
-    except BitrixConfigError as exc:
-        return (
-            resolved_args,
-            "",
-            _project_resolution_error(
-                str(exc),
-                resolved_args,
-                status=ToolStatus.NOT_CONFIGURED,
-            ),
-        )
-    except BitrixApiError as exc:
-        return (
-            resolved_args,
-            "",
-            _project_resolution_error(
-                str(exc),
-                resolved_args,
-                status=ToolStatus.ERROR,
-            ),
-        )
-    except Exception as exc:
-        return (
-            resolved_args,
-            "",
-            _project_resolution_error(
-                f"{type(exc).__name__}: {exc}",
-                resolved_args,
-                status=ToolStatus.ERROR,
-            ),
-        )
-    exact_projects = _matching_projects(projects, project_name)
-    if len(exact_projects) != 1:
-        label = "personal Bitrix project" if default_personal_project else "exact Bitrix project"
-        resolution = "not found" if not exact_projects else "ambiguous"
-        return (
-            resolved_args,
-            "",
-            _project_resolution_error(
-                f"{label} {resolution}: {project_name}",
-                resolved_args,
-                allow_personal_project_creation=default_personal_project and not exact_projects,
-            ),
-        )
-    return _bind_resolved_project(resolved_args, project=exact_projects[0], project_name=project_name)
-
-
-def _bind_resolved_project(
-    resolved_args: dict[str, Any],
-    *,
-    project: dict[str, Any],
-    project_name: str,
-) -> tuple[dict[str, Any], str, ToolResult | None]:
-    project_id = optional_int(project.get("ID") or project.get("id"))
-    if project_id is None:
-        return (
-            resolved_args,
-            "",
-            _project_resolution_error(
-                f"Bitrix project has no numeric ID: {project_name}",
-                resolved_args,
-            ),
-        )
-    resolved_name = compact_text(str(project.get("NAME") or project.get("name") or project_name))
-    resolved_args["group_id"] = project_id
-    resolved_args["project_name"] = resolved_name or project_name
-    resolved_args["_resolved_project"] = {"id": project_id, "name": resolved_args["project_name"]}
-    return resolved_args, f"Точный проект: {resolved_args['project_name']} (#{project_id}).", None
-
-
-def _project_resolution_error(
-    error: str,
-    args: dict[str, Any],
-    *,
-    status: ToolStatus = ToolStatus.NOT_FOUND,
-    allow_personal_project_creation: bool = False,
-) -> ToolResult:
-    return ToolResult(
-        status=status,
-        tool=TaskCreateDraftTool.name,
-        error=error,
-        data={
-            "args": args,
-            "allow_personal_project_creation": allow_personal_project_creation,
-        },
-    )
-
-
 async def _validate_resolved_project_reference(client: Any, reference: object) -> ToolResult | None:
     if not isinstance(reference, dict):
         return None
@@ -794,35 +635,15 @@ def _matching_projects(projects: object, project_name: str) -> list[dict[str, An
 
 def _deadline_from_args(args: dict[str, Any]) -> tuple[str | None, str, bool, str]:
     if _truthy(args.get("no_deadline")):
-        return None, "LLM explicitly selected no_deadline.", True, ""
+        return None, "Orchestrator explicitly selected no_deadline.", True, ""
     raw_deadline = str(args.get("deadline") or args.get("deadline_iso") or "").strip()
     if not raw_deadline:
-        return (
-            _default_deadline_iso(),
-            "Срок по умолчанию: три рабочих дня от даты создания, 19:00 МСК.",
-            False,
-            "",
-        )
+        return None, "", False, "task_create_draft.deadline_iso or no_deadline is required"
     try:
         datetime.fromisoformat(raw_deadline.replace("Z", "+00:00"))
     except ValueError:
         return None, "", False, "task_create_draft.deadline_iso must be ISO 8601"
-    return raw_deadline, "LLM provided deadline_iso.", False, ""
-
-
-def _default_deadline_iso(*, now: datetime | None = None) -> str:
-    current = (now or datetime.now(MOSCOW_TZ)).astimezone(MOSCOW_TZ)
-    day = current.date()
-    remaining = DEFAULT_TASK_DEADLINE_WORKING_DAYS
-    while remaining > 0:
-        day += timedelta(days=1)
-        if day.weekday() < 5:
-            remaining -= 1
-    return datetime.combine(day, time(DEFAULT_TASK_DEADLINE_HOUR, 0), tzinfo=MOSCOW_TZ).isoformat()
-
-
-def _default_description(title: str) -> str:
-    return f"Краткое содержание: {title}"
+    return raw_deadline, "Orchestrator provided deadline_iso.", False, ""
 
 
 def _draft_preview(fields: dict[str, Any], *, responsible_label: str = "", project_label: str = "") -> dict[str, str]:

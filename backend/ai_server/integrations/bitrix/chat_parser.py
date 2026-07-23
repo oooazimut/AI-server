@@ -16,8 +16,6 @@ from ai_server.integrations.bitrix.events import parse_incoming_message
 from ai_server.models import AgentTask, UserContext
 from ai_server.transcription import TranscriptionResult
 
-_TASK_QUALITY_WEBHOOK_EVENTS = {"ONTASKUPDATE"}
-
 
 def make_dialog_key(*, chat_id: int | None = None, dialog_id: str = "", user_id: int | None = None) -> str:
     resolved = user_id or 0
@@ -85,21 +83,6 @@ async def build_agent_task_from_bitrix_chat(
     )
 
 
-def build_agent_task_from_task_event(payload: dict[str, Any]) -> AgentTask:
-    """Build a quality-control AgentTask from a Bitrix task webhook payload."""
-    event_type = str(payload.get("event") or payload.get("EVENT") or "").upper()
-    task_id = _extract_task_id_from_event(payload)
-    return AgentTask(
-        task_id=uuid4().hex,
-        source="bitrix_task_webhook",
-        request="quality_control",
-        context={
-            "bitrix_event_type": event_type,
-            "task_id": task_id,
-        },
-    )
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -140,45 +123,9 @@ async def _prepare_attachments(
     }
 
 
-def _extract_task_id_from_event(payload: dict[str, Any]) -> int | None:
-    data = _dict_value(_first_ci(payload, "data", "DATA"))
-    fields_after = _dict_value(_first_ci(data, "FIELDS_AFTER", "fieldsAfter"))
-    fields_before = _dict_value(_first_ci(data, "FIELDS_BEFORE", "fieldsBefore"))
-    for container in (fields_after, fields_before, data, payload):
-        task_id = _to_int(_first_ci(container, "ID", "id", "TASK_ID", "taskId", "task_id"))
-        if task_id is not None:
-            return task_id
-    return None
-
-
 def _merge_text_and_transcription(text: str, transcription: str) -> str:
     cleaned_text = text.strip()
     cleaned_transcription = transcription.strip()
     if cleaned_text and cleaned_transcription:
         return f"{cleaned_text}\n\nРасшифровка голосового сообщения:\n{cleaned_transcription}"
     return cleaned_transcription or cleaned_text
-
-
-def _dict_value(value: object) -> dict[str, Any]:
-    return value if isinstance(value, dict) else {}
-
-
-def _first_ci(data: dict[str, Any], *keys: str) -> object | None:
-    for key in keys:
-        if key in data and data[key] is not None:
-            return data[key]
-    lowered = {str(k).lower(): v for k, v in data.items()}
-    for key in keys:
-        v = lowered.get(key.lower())
-        if v is not None:
-            return v
-    return None
-
-
-def _to_int(value: object) -> int | None:
-    if value is None or value == "":
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None

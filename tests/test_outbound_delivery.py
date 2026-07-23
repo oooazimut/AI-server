@@ -7,7 +7,7 @@ import anyio
 
 from ai_server.integrations.redis.outbound_queue import RedisOutboundQueue, outbound_delivery_key
 from ai_server.models import AgentResult, AgentTask
-from ai_server.orchestrators.internal import InternalOrchestrator
+from ai_server.orchestrators.internal import OrchestratorTransportRuntime
 from ai_server.workers.orchestrator.outbound_delivery import deliver_outbound_once
 
 
@@ -196,7 +196,7 @@ def test_orchestrator_queues_outbound_without_contacting_channel() -> None:
     channel.send = AsyncMock()
     outbox = MagicMock()
     outbox.enqueue = AsyncMock(return_value=("delivery-id", True))
-    orchestrator = InternalOrchestrator(
+    orchestrator = OrchestratorTransportRuntime(
         SimpleNamespace(id="internal_orchestrator"),
         agent_tools=[],
         llm=None,

@@ -328,9 +328,7 @@ def _agent_label(agent_id: str) -> str:
         "internal_orchestrator": "оркестр",
         "bitrix24": "Bitrix",
         "diagnost": "диагност",
-        "kartoteka": "картотека",
         "logistics": "логистика",
-        "pto": "ПТО",
     }
     return labels.get(agent_id, agent_id)
 

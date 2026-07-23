@@ -19,6 +19,7 @@ class ToolStatus(StrEnum):
 
 
 AgentKind = Literal["orchestrator", "operator", "specialist"]
+AgentReasoningMode = Literal["autonomous", "executor"]
 AgentAutomationKind = Literal[
     "channel_adapter",
     "event_worker",
@@ -71,6 +72,7 @@ class AgentManifest(BaseModel):
     id: str
     name: str
     kind: AgentKind
+    reasoning_mode: AgentReasoningMode = "autonomous"
     description: str
     version: str = "0.1.0"
     handoff_description: str = ""
@@ -94,6 +96,7 @@ class AgentSummary(BaseModel):
     id: str
     name: str
     kind: AgentKind
+    reasoning_mode: AgentReasoningMode
     capabilities: list[str]
     tools: list[str]
     automations: list[str] = Field(default_factory=list)

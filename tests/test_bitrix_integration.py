@@ -16,7 +16,7 @@ from ai_server.settings import get_settings
 from ai_server.tools.bitrix_policy import apply_write_policy
 from ai_server.transcription import TranscriptionResult
 from scripts.create_bitrix_dev_chat import chat_reference, create_chat, sanitize_result
-from tests.fakes import FakeBitrixLLM, FakePortalSearchIndex
+from tests.fakes import FakePortalSearchIndex
 
 
 def _bitrix_v2_message_payload() -> dict:
@@ -148,10 +148,9 @@ def test_build_agent_task_from_bitrix_chat_transcribes_voice(tmp_path):
     assert task.context["transcriptions"][0]["text"] == "Создай задачу по камере"
 
 
-def test_bitrix_api_tool_write_executes_directly_when_oauth_not_required():
-    """Legacy mode may execute write methods via write_client.call()."""
+def test_bitrix_api_tool_generic_write_is_denied_even_without_oauth_requirement():
     fake_bitrix = FakeBitrixClient()
-    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=False)
+    tool = BitrixApiTool(client=fake_bitrix)
 
     result = anyio_run(
         tool.execute(
@@ -164,19 +163,17 @@ def test_bitrix_api_tool_write_executes_directly_when_oauth_not_required():
         )
     )
 
-    assert result.status == ToolStatus.OK
-    assert any(method == "crm.deal.update" for method, _ in fake_bitrix.calls)
+    assert result.status == ToolStatus.DENIED
+    assert fake_bitrix.calls == []
 
 
-def test_bitrix_api_tool_write_uses_oauth_when_required():
+def test_bitrix_api_tool_generic_write_is_denied_before_oauth():
     fallback_bitrix = FakeBitrixClient()
     oauth_bitrix = FakeBitrixClient()
     oauth = FakeBitrixOAuth(oauth_bitrix)
     tool = BitrixApiTool(
         client=fallback_bitrix,
-        write_client=fallback_bitrix,
         bitrix_oauth=oauth,
-        oauth_required_for_writes=True,
     )
 
     result = anyio_run(
@@ -191,15 +188,15 @@ def test_bitrix_api_tool_write_uses_oauth_when_required():
         )
     )
 
-    assert result.status == ToolStatus.OK
-    assert oauth.user_ids == [9]
-    assert any(method == "crm.deal.update" for method, _ in oauth_bitrix.calls)
+    assert result.status == ToolStatus.DENIED
+    assert oauth.user_ids == []
+    assert oauth_bitrix.calls == []
     assert fallback_bitrix.calls == []
 
 
 def test_bitrix_api_tool_required_oauth_blocks_missing_dialog_id():
     fake_bitrix = FakeBitrixClient()
-    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=True)
+    tool = BitrixApiTool(client=fake_bitrix)
 
     result = anyio_run(
         tool.execute(
@@ -219,7 +216,7 @@ def test_bitrix_api_tool_required_oauth_blocks_missing_dialog_id():
 
 def test_bitrix_api_tool_required_oauth_does_not_fallback_to_write_client():
     fake_bitrix = FakeBitrixClient()
-    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=True)
+    tool = BitrixApiTool(client=fake_bitrix)
 
     result = anyio_run(
         tool.execute(
@@ -233,45 +230,45 @@ def test_bitrix_api_tool_required_oauth_does_not_fallback_to_write_client():
         )
     )
 
-    assert result.status == ToolStatus.NOT_CONFIGURED
+    assert result.status == ToolStatus.DENIED
     assert fake_bitrix.calls == []
 
 
 def test_bitrix_api_tool_dry_run_blocks_write():
     fake_bitrix = FakeBitrixClient()
-    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, dry_run=True)
+    tool = BitrixApiTool(client=fake_bitrix)
 
     result = anyio_run(
         tool.execute({"method": "crm.deal.update", "params": {"id": 1, "fields": {"TITLE": "Тест"}}}, user_id=9)
     )
 
-    assert result.status == ToolStatus.DRY_RUN
+    assert result.status == ToolStatus.DENIED
     assert fake_bitrix.calls == []
 
 
 def test_bitrix_api_tool_write_no_write_client_returns_not_configured():
     fake_bitrix = FakeBitrixClient()
-    tool = BitrixApiTool(client=fake_bitrix, write_client=None, oauth_required_for_writes=False)
+    tool = BitrixApiTool(client=fake_bitrix)
 
     result = anyio_run(
         tool.execute({"method": "crm.deal.update", "params": {"id": 1, "fields": {"TITLE": "Тест"}}}, user_id=9)
     )
 
-    assert result.status == ToolStatus.NOT_CONFIGURED
+    assert result.status == ToolStatus.DENIED
 
 
 def test_bitrix_api_tool_write_empty_params_returns_invalid():
     fake_bitrix = FakeBitrixClient()
-    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=False)
+    tool = BitrixApiTool(client=fake_bitrix)
 
     result = anyio_run(tool.execute({"method": "crm.deal.update", "params": {}}))
 
-    assert result.status == ToolStatus.INVALID_TOOL_CALL
+    assert result.status == ToolStatus.DENIED
 
 
 def test_bitrix_api_tool_denied_method():
     fake_bitrix = FakeBitrixClient()
-    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix)
+    tool = BitrixApiTool(client=fake_bitrix)
 
     result = anyio_run(tool.execute({"method": "user.delete", "params": {"ID": 9}}))
 
@@ -281,7 +278,7 @@ def test_bitrix_api_tool_denied_method():
 
 def test_bitrix_api_tool_denies_direct_project_creation():
     fake_bitrix = FakeBitrixClient()
-    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=False)
+    tool = BitrixApiTool(client=fake_bitrix)
 
     result = anyio_run(tool.execute({"method": "sonet_group.create", "params": {"fields": {"NAME": "Проект"}}}))
 
@@ -292,7 +289,7 @@ def test_bitrix_api_tool_denies_direct_project_creation():
 
 def test_bitrix_api_tool_denies_direct_task_creation():
     fake_bitrix = FakeBitrixClient()
-    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=False)
+    tool = BitrixApiTool(client=fake_bitrix)
 
     result = anyio_run(tool.execute({"method": "tasks.task.add", "params": {"fields": {"TITLE": "Тест"}}}))
 
@@ -310,7 +307,7 @@ def test_bitrix_api_tool_denies_direct_task_closing_methods():
 
     for method, params in close_methods:
         fake_bitrix = FakeBitrixClient()
-        tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=False)
+        tool = BitrixApiTool(client=fake_bitrix)
 
         result = anyio_run(tool.execute({"method": method, "params": params}))
 
@@ -322,7 +319,7 @@ def test_bitrix_api_tool_denies_direct_task_closing_methods():
 
 def test_bitrix_api_tool_denies_direct_calendar_event_creation():
     fake_bitrix = FakeBitrixClient()
-    tool = BitrixApiTool(client=fake_bitrix, write_client=fake_bitrix, oauth_required_for_writes=False)
+    tool = BitrixApiTool(client=fake_bitrix)
 
     result = anyio_run(tool.execute({"method": "calendar.event.add", "params": {"name": "Позвонить"}}))
 
@@ -331,7 +328,7 @@ def test_bitrix_api_tool_denies_direct_calendar_event_creation():
     assert fake_bitrix.calls == []
 
 
-def test_bitrix_api_tool_sonet_group_get_normalizes_hyphenated_project_name():
+def test_bitrix_api_tool_executes_exact_read_once_without_name_fallback():
     class FakeProjectClient:
         def __init__(self) -> None:
             self.calls = []
@@ -354,10 +351,9 @@ def test_bitrix_api_tool_sonet_group_get_normalizes_hyphenated_project_name():
     result = anyio_run(tool.execute({"method": "sonet_group.get", "params": {"FILTER": {"%NAME": "Ларгус-2"}}}))
 
     assert result.status == ToolStatus.OK
-    assert result.data["result"] == [{"ID": "45", "NAME": "Ларгус 2"}]
+    assert result.data["result"] == []
     assert fake_bitrix.calls == [
         ("sonet_group.get", {"FILTER": {"%NAME": "Ларгус-2"}}),
-        ("sonet_group.get", {"FILTER": {}, "ORDER": {"NAME": "ASC"}}),
     ]
 
 
@@ -393,7 +389,17 @@ def test_bitrix_warehouse_search_tool_finds_store_and_products():
     tool = BitrixWarehouseSearchTool(client=fake_bitrix)
 
     result = anyio_run(
-        tool.execute({"query": "Borisov warehouse", "include_products": True, "limit": 5, "product_limit": 5})
+        tool.execute(
+            {
+                "query": "Borisov warehouse",
+                "store_id": 10,
+                "list_all": False,
+                "include_products": True,
+                "limit": 5,
+                "product_limit": 5,
+                "product_offset": 0,
+            }
+        )
     )
 
     assert result.status == ToolStatus.OK
@@ -409,7 +415,18 @@ def test_bitrix_warehouse_search_tool_lists_all_stores_without_literal_name_sear
     fake_bitrix = FakeBitrixClient()
     tool = BitrixWarehouseSearchTool(client=fake_bitrix)
 
-    result = anyio_run(tool.execute({"query": "все", "list_all": True, "include_products": False, "limit": 10}))
+    result = anyio_run(
+        tool.execute(
+            {
+                "query": "все",
+                "list_all": True,
+                "include_products": False,
+                "limit": 10,
+                "product_limit": 50,
+                "product_offset": 0,
+            }
+        )
+    )
 
     assert result.status == ToolStatus.OK
     assert [item["id"] for item in result.data["matches"]] == [10, 11]
@@ -425,7 +442,15 @@ def test_bitrix_warehouse_search_tool_uses_oauth_client_for_live_reads():
 
     result = anyio_run(
         tool.execute(
-            {"query": "Borisov warehouse", "include_products": True, "limit": 5, "product_limit": 5},
+                {
+                    "query": "Borisov warehouse",
+                    "store_id": 10,
+                    "list_all": False,
+                    "include_products": True,
+                    "limit": 5,
+                    "product_limit": 5,
+                    "product_offset": 0,
+                },
             user_id=13,
         )
     )
@@ -445,7 +470,19 @@ def test_bitrix_warehouse_search_tool_oauth_read_denies_live_lookup_without_user
     oauth_bitrix = FakeBitrixClient()
     tool = BitrixWarehouseSearchTool(client=fallback_bitrix, bitrix_oauth=FakeBitrixOAuth(oauth_bitrix))
 
-    result = anyio_run(tool.execute({"query": "Borisov warehouse", "include_products": True}))
+    result = anyio_run(
+        tool.execute(
+            {
+                "query": "Borisov warehouse",
+                "store_id": 10,
+                "list_all": False,
+                "include_products": True,
+                "limit": 5,
+                "product_limit": 5,
+                "product_offset": 0,
+            }
+        )
+    )
 
     assert result.status == ToolStatus.DENIED
     assert fallback_bitrix.calls == []
@@ -483,7 +520,17 @@ def test_bitrix_warehouse_search_tool_live_verifies_stock_instead_of_serving_sta
     tool = BitrixWarehouseSearchTool(client=fake_bitrix, portal_search=index)
 
     result = anyio_run(
-        tool.execute({"query": "Borisov warehouse", "include_products": True, "limit": 5, "product_limit": 5})
+        tool.execute(
+            {
+                "query": "Borisov warehouse",
+                "store_id": 10,
+                "list_all": False,
+                "include_products": True,
+                "limit": 5,
+                "product_limit": 5,
+                "product_offset": 0,
+            }
+        )
     )
 
     assert result.status == ToolStatus.OK
@@ -509,7 +556,20 @@ def test_bitrix_warehouse_uses_live_oauth_acl_before_returning_data():
     )
     tool = BitrixWarehouseSearchTool(client=fallback_bitrix, portal_search=index, bitrix_oauth=oauth)
 
-    result = anyio_run(tool.execute({"query": "Borisov warehouse", "limit": 5}, user_id=13))
+    result = anyio_run(
+        tool.execute(
+            {
+                "query": "Borisov warehouse",
+                "store_id": 10,
+                "list_all": False,
+                "include_products": False,
+                "limit": 5,
+                "product_limit": 50,
+                "product_offset": 0,
+            },
+            user_id=13,
+        )
+    )
 
     assert result.status == ToolStatus.OK
     assert result.data["source"] == "live_bitrix_rest"
@@ -536,7 +596,19 @@ def test_bitrix_warehouse_snapshot_oauth_denies_without_user_id():
         bitrix_oauth=FakeBitrixOAuth(oauth_bitrix),
     )
 
-    result = anyio_run(tool.execute({"query": "Borisov warehouse", "limit": 5}))
+    result = anyio_run(
+        tool.execute(
+            {
+                "query": "Borisov warehouse",
+                "store_id": 10,
+                "list_all": False,
+                "include_products": False,
+                "limit": 5,
+                "product_limit": 50,
+                "product_offset": 0,
+            }
+        )
+    )
 
     assert result.status == ToolStatus.DENIED
     assert fallback_bitrix.calls == []
@@ -572,7 +644,17 @@ def test_bitrix_warehouse_search_tool_filters_non_available_products_before_limi
     tool = BitrixWarehouseSearchTool(client=fake_bitrix)
 
     result = anyio_run(
-        tool.execute({"query": "Borisov warehouse", "include_products": True, "limit": 5, "product_limit": 1})
+        tool.execute(
+            {
+                "query": "Borisov warehouse",
+                "store_id": 10,
+                "list_all": False,
+                "include_products": True,
+                "limit": 5,
+                "product_limit": 1,
+                "product_offset": 0,
+            }
+        )
     )
 
     assert result.status == ToolStatus.OK
@@ -583,9 +665,8 @@ def test_bitrix_warehouse_search_tool_filters_non_available_products_before_limi
     assert products["has_more"] is True
 
 
-def test_bitrix24_specialist_skips_quality_control_when_disabled(monkeypatch, tmp_path):
+def test_bitrix24_specialist_rejects_any_free_text(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
-    monkeypatch.setenv("QUALITY_CONTROL_WEBHOOK_ENABLED", "false")
     monkeypatch.setenv("AI_SERVER_VAR_DIR", str(tmp_path / "var"))
     settings = get_settings()
     manifest = get_agent_manifest("bitrix24")
@@ -594,18 +675,16 @@ def test_bitrix24_specialist_skips_quality_control_when_disabled(monkeypatch, tm
         manifest,
         bitrix_task_client=fake_bitrix,
         settings=settings,
-        llm=FakeBitrixLLM(),
     )
 
     task = AgentTask(
-        task_id="qc_test",
-        request="quality_control",
-        context={"bitrix_event_type": "ONTASKUPDATE", "task_id": 8413},
+        task_id="free_text_test",
+        request="покажи задачи",
     )
     result = anyio_run(specialist.handle(task))
 
-    assert result.status == "completed"
-    assert "quality_control_disabled" in result.answer
+    assert result.status == "failed"
+    assert result.metadata["reason"] == "ORCHESTRATOR_STRUCTURED_COMMAND_REQUIRED"
     assert fake_bitrix.calls == []
 
 

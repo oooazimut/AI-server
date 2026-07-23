@@ -14,7 +14,7 @@ class PostgresAgentSchema:
     before creating their own tables. Provides async dialog_history methods so that
     BaseSpecialist.handle() never blocks the event loop.
 
-    Sync vehicle/proposal methods in subclasses use ``_sync_connect()``
+    Synchronous compatibility methods in subclasses use ``_sync_connect()``
     (existing psycopg sync API — acceptable for infrequent writes).
     """
 

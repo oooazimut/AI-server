@@ -173,17 +173,12 @@ class OpenAICompatibleLLMClient:
         return data
 
 
-def build_llm_client(settings: Settings | None = None) -> OpenAICompatibleLLMClient:
-    return OpenAICompatibleLLMClient(settings or get_settings())
-
-
 def build_orchestrator_llm_client(settings: Settings) -> OpenAICompatibleLLMClient:
-    model = settings.orchestrator_llm_model or None
-    fallback_model = None
-    if settings.llm_routing_enabled and not model and not settings.orchestrator_llm_reasoning:
-        model = settings.llm_flash_model or settings.llm_model
-        if settings.llm_flash_fallback_to_pro:
-            fallback_model = settings.llm_pro_model or settings.llm_model
+    model = settings.orchestrator_llm_model.strip()
+    if not model:
+        raise LLMError("AI_SERVER_ORCHESTRATOR_LLM_MODEL must name the Pro orchestrator model")
+    if "flash" in model.casefold():
+        raise LLMError("The orchestrator cannot run on a Flash model")
     return OpenAICompatibleLLMClient(
         settings,
         model=model,
@@ -191,7 +186,7 @@ def build_orchestrator_llm_client(settings: Settings) -> OpenAICompatibleLLMClie
         api_key=settings.orchestrator_llm_api_key or None,
         reasoning=settings.orchestrator_llm_reasoning,
         reasoning_effort=settings.orchestrator_llm_reasoning_effort or None,
-        fallback_model=fallback_model,
+        fallback_model=None,
         timeout_seconds=settings.orchestrator_llm_timeout_seconds,
     )
 

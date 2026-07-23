@@ -9,7 +9,7 @@
   {"request": "Покажи просроченные задачи", "tool": "bitrix_task_search", "input": {}, "expected": {"scope": "my", "status": "overdue", "limit": 10}},
   {"request": "Создай задачу проверить договор", "tool": "task_create_draft", "input": {"title": "Проверить договор"}, "expected": {"responsible_self": true, "deadline_iso": "2026-07-29T19:00:00+03:00"}},
   {"request": "Создай задачу Борисову", "tool": "task_create_draft", "input": {"title": "Задача", "responsible_id": 17, "deadline_iso": "2026-08-01T18:00:00+03:00"}, "expected": {"responsible_id": 17, "deadline_iso": "2026-08-01T18:00:00+03:00"}},
-  {"request": "Напомни позвонить Борисову", "tool": "calendar_event_draft", "input": {"title": "Позвонить Борисову"}, "expected": {"start_iso": "2026-07-27T12:00:00+03:00", "end_iso": "2026-07-27T12:30:00+03:00"}},
+  {"request": "Напомни позвонить Борисову", "tool": "calendar_event_draft", "input": {"title": "Позвонить Борисову"}, "expected": {"start_iso": "2026-07-29T12:00:00+03:00", "end_iso": "2026-07-29T12:30:00+03:00"}},
   {"request": "Напомни завтра в 16:00 позвонить", "tool": "calendar_event_draft", "input": {"title": "Позвонить", "start_iso": "2026-07-25T16:00:00+03:00"}, "expected": {"start_iso": "2026-07-25T16:00:00+03:00"}},
   {"request": "Найди договор на диске", "tool": "portal_search", "input": {"query": "договор"}, "expected": {"scope": "documents", "limit": 10}},
   {"request": "Найди файл акт КС-2", "tool": "portal_search", "input": {"query": "акт КС-2", "limit": 5}, "expected": {"scope": "documents", "limit": 5}}

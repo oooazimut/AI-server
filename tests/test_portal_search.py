@@ -4,7 +4,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from ai_server.agents.bitrix24 import Bitrix24Specialist, BitrixLLMToolCall
+from ai_server.agents.bitrix24 import Bitrix24Specialist
 from ai_server.agents.bitrix24.tools import PortalSearchTool
 from ai_server.integrations.bitrix.client import BitrixApiError
 from ai_server.integrations.bitrix.portal_search import (
@@ -27,13 +27,12 @@ from ai_server.integrations.bitrix.task_close_reports import task_close_report_s
 from ai_server.main import app
 from ai_server.models import AgentTask
 from ai_server.registry import get_agent_manifest
-from ai_server.retrieval import HybridKnowledgeRetriever
 from ai_server.settings import get_settings
 from ai_server.workers.bitrix.search_webhook_indexer import (
     prepare_search_webhook_job,
     process_search_webhook_job,
 )
-from tests.fakes import FakeBitrixLLM, FakeEmbeddingProvider, FakeOrchestratorStore, FakePortalSearchIndex
+from tests.fakes import FakeOrchestratorStore, FakePortalSearchIndex
 
 
 def _create_index() -> FakePortalSearchIndex:
@@ -498,11 +497,16 @@ def test_portal_search_tool_denies_task_scope():
 
 def test_bitrix_search_endpoint(monkeypatch):
     monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("ADMIN_API_SECRET", "test-admin-secret")
     index = _create_index()
 
     with TestClient(app) as client:
         app.state.portal_search = index
-        response = client.get("/bitrix/search", params={"q": "транзит договор", "scope": "documents"})
+        response = client.get(
+            "/admin/bitrix/search",
+            params={"q": "транзит договор", "scope": "documents"},
+            headers={"X-Admin-Secret": "test-admin-secret"},
+        )
         status = client.get("/bitrix/search/status")
 
     assert response.status_code == 200
@@ -510,29 +514,37 @@ def test_bitrix_search_endpoint(monkeypatch):
     assert status.json()["total_items"] == 2
 
 
-def test_bitrix_specialist_uses_portal_search_for_document_requests():
-    manifest = get_agent_manifest("bitrix24")
-    assert manifest is not None
-    index = _create_index()
-    specialist = Bitrix24Specialist(
-        manifest,
-        retriever=HybridKnowledgeRetriever(embedding_provider=FakeEmbeddingProvider()),
-        agent_tools=[PortalSearchTool(portal_search=index, bitrix_files=_FakeBitrixFiles())],
-        llm=FakeBitrixLLM(
-            tool_calls=[
-                BitrixLLMToolCall(
-                    name="portal_search",
-                    args={"query": "договор Транзит", "scope": "documents", "limit": 5},
-                )
-            ]
-        ),
-    )
+def test_bitrix_admin_search_fails_closed_without_admin_secret(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.delenv("ADMIN_API_SECRET", raising=False)
 
-    result = anyio_run(specialist.handle(AgentTask(task_id="t1", request="Найди договор Транзит на портале")))
+    with TestClient(app) as client:
+        app.state.portal_search = _create_index()
+        response = client.get("/admin/bitrix/search", params={"q": "договор"})
 
-    action = next(item for item in result.actions_taken if item.name == "portal_search")
-    assert action.status == "ok"
-    assert action.details["data"]["results"][0]["entity_id"] == "101"
+    assert response.status_code == 404
+
+
+def test_bitrix_admin_search_rejects_wrong_admin_secret(monkeypatch):
+    monkeypatch.setenv("AI_SERVER_ENV_FILE", "")
+    monkeypatch.setenv("ADMIN_API_SECRET", "correct-secret")
+
+    with TestClient(app) as client:
+        app.state.portal_search = _create_index()
+        response = client.get(
+            "/admin/bitrix/search",
+            params={"q": "договор"},
+            headers={"X-Admin-Secret": "wrong-secret"},
+        )
+
+    assert response.status_code == 403
+
+
+def test_bitrix_specialist_rejects_free_text_document_search():
+    specialist = Bitrix24Specialist(get_agent_manifest("bitrix24"))
+    result = anyio_run(specialist.handle(AgentTask(task_id="t1", request="find a document")))
+    assert result.status == "failed"
+    assert result.metadata["reason"] == "ORCHESTRATOR_STRUCTURED_COMMAND_REQUIRED"
 
 
 def test_portal_metadata_sync_indexes_tasks_projects_and_disk(monkeypatch):

@@ -25,7 +25,8 @@ def test_health_includes_config_flags():
     assert "bitrix_configured" in data
     assert "llm_configured" in data
     assert "logistics_vehicle_usage_enabled" in data
-    assert data["orchestrator_entity_catalog_status"] in {"disabled", "ready", "stale", "error"}
+    assert data["orchestrator_entity_catalog_status"] in {"worker_owned", "ready", "stale", "error"}
+    assert data["orchestrator_runtime_owner"] == "ai-server-worker"
     assert set(data["orchestrator_entity_catalog_counts"]) == {"users", "projects", "warehouses"}
 
 
@@ -55,7 +56,8 @@ def test_agents_list():
     assert isinstance(data, list)
     ids = [a["id"] for a in data]
     assert "bitrix24" in ids
-    assert "pto" in ids
+    assert "internal_orchestrator" in ids
+    assert "pto" not in ids
     assert "logistics" in ids
 
 
@@ -117,16 +119,13 @@ def test_automations_unknown_agent_404():
     assert response.status_code == 404
 
 
-def test_legacy_documents_compare_returns_409():
+def test_removed_legacy_documents_compare_returns_404():
     with TestClient(app) as client:
         response = client.post("/agent/documents/compare")
-    assert response.status_code == 409
+    assert response.status_code == 404
 
 
-def test_legacy_agent_tools_returns_list():
+def test_removed_legacy_agent_tools_returns_404():
     with TestClient(app) as client:
         response = client.get("/agent/tools")
-    assert response.status_code == 200
-    data = response.json()
-    assert "tools" in data
-    assert isinstance(data["tools"], list)
+    assert response.status_code == 404

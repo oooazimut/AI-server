@@ -89,10 +89,6 @@ class BitrixBotPort(Protocol):
     ) -> Any: ...
 
 
-class BitrixSupervisorPort(BitrixTaskPort, BitrixUserPort, Protocol):
-    """Combined port for the task supervisor (needs tasks + user lookup/notify)."""
-
-
 class BitrixDiskPort(Protocol):
     """File and storage access."""
 

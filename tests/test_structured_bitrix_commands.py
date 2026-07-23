@@ -17,7 +17,6 @@ from ai_server.orchestrators.plan_authoritative import (
 )
 from ai_server.orchestrators.tools.call_specialist import CallSpecialistTool
 from ai_server.registry import get_agent_manifest
-from tests.fakes import FakeBitrixLLM
 
 
 def _structured_catalog():
@@ -219,18 +218,16 @@ class _RecordingWarehouseTool:
         )
 
 
-def _direct_specialist(tool, llm):
+def _direct_specialist(tool):
     return Bitrix24Specialist(
         get_agent_manifest("bitrix24"),
         agent_tools=[tool],
-        llm=llm,
     )
 
 
 def test_specialist_executes_exact_arguments_once_without_bitrix_llm_reinterpretation():
     tool = _RecordingWarehouseTool()
-    llm = FakeBitrixLLM()
-    specialist = _direct_specialist(tool, llm)
+    specialist = _direct_specialist(tool)
     registry = specialist.capability_registry()
     arguments = {"query": "Borisov", "include_products": False, "limit": 7}
 
@@ -247,16 +244,13 @@ def test_specialist_executes_exact_arguments_once_without_bitrix_llm_reinterpret
 
     assert result.status == "completed"
     assert tool.calls == [arguments]
-    assert llm.decide_calls == []
-    assert llm.compose_calls == []
     assert result.metadata["structured_command"] is True
     assert result.metadata["command_arguments"] == arguments
 
 
-def test_specialist_rejects_stale_registry_before_tool_or_llm_call():
+def test_specialist_rejects_stale_registry_before_tool_call():
     tool = _RecordingWarehouseTool()
-    llm = FakeBitrixLLM()
-    specialist = _direct_specialist(tool, llm)
+    specialist = _direct_specialist(tool)
 
     result = asyncio.run(
         specialist.execute_structured_command(
@@ -272,8 +266,6 @@ def test_specialist_rejects_stale_registry_before_tool_or_llm_call():
     assert result.status == "failed"
     assert result.metadata["reason"] == "CAPABILITY_REGISTRY_VERSION_MISMATCH"
     assert tool.calls == []
-    assert llm.decide_calls == []
-    assert llm.compose_calls == []
 
 
 class _StructuredSpecialist:

@@ -1,40 +1,19 @@
 id: diagnost
-name: ИИ-Диагност
-version: 0.1.0
-kind: specialist
+name: Техническая диагностика
+version: 0.2.0
+kind: operator
+reasoning_mode: executor
 audience: employee
-
-description: >
-  Анализирует качество работы системы: находит инциденты, исследует паттерны ошибок,
-  формирует отчёты. Работает только с диагностическим хранилищем.
-
-handoff_description: >
-  Использовать для анализа качества ответов системы, просмотра инцидентов и отчётов по ошибкам.
-  Не работает с Bitrix или бизнес-данными.
-
-entrypoint: backend.ai_server.agents.diagnost.DiagnostSpecialist
-instructions_file: agents/diagnost/instructions.md
-knowledge_path: agents/diagnost/knowledge
-skills_path: agents/diagnost/skills
-
-capabilities:
-  - system_diagnostics
-  - incident_management
-
-tools:
-  - diagnost_search_events
-  - diagnost_get_incident
-  - diagnost_list_incidents
-  - diagnost_create_incident
-  - diagnost_error_report
-
+description: Технический сбор трасс, результатов и инцидентов без LLM и без перехвата пользовательских сообщений.
 automations:
   - id: diagnost_event_worker
-    name: Воркер событий диагноста
+    name: Сборщик диагностических событий
     kind: event_worker
     trigger: queue
     enabled_by_default: true
     uses_llm: false
-    description: >
-      Читает agent_result события из RedisDiagnostQueue и сохраняет в PostgresDiagnostStore.
-      Автоматически создаёт инциденты при failed-статусе или низком confidence.
+    description: Сохраняет результаты и снимки трасс, создаёт технические инциденты по строгим признакам.
+    entrypoint: backend.ai_server.workers.diagnost.event_worker.run_diagnost_event_worker
+    dependencies:
+      - redis
+      - postgresql

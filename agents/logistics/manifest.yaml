@@ -1,15 +1,11 @@
 id: logistics
-name: Логист
-version: 0.1.0
+name: Логистическая автоматизация
+version: 0.3.0
 kind: specialist
+reasoning_mode: executor
 audience: employee
-description: Отвечает за ежедневный учёт служебных автомобилей, статусы сотрудников и логистические отчёты.
-handoff_description: Использовать для запросов про служебные автомобили, утренний отчёт по машинам, закрепление авто, выезды, смены и логистику.
+handoff_description: Executes exact orchestrator commands for vehicle usage and logistics reports without free-text reasoning.
 entrypoint: backend.ai_server.agents.logistics.LogisticsSpecialist
-instructions_file: agents/logistics/instructions.md
-skills_path: agents/logistics/skills
-knowledge_path: agents/logistics/knowledge/topics
-automations_path: agents/logistics/automations
 capabilities:
   - logistics
   - vehicle_usage
@@ -17,6 +13,7 @@ capabilities:
   - staff_status_tracking
 tools:
   - vehicle_usage_context
+  - vehicle_usage_reference
   - vehicle_usage_get_operators
   - vehicle_usage_set_operators
   - vehicle_usage_start_day
@@ -27,23 +24,24 @@ tools:
   - vehicle_usage_save_report
   - vehicle_usage_update_report
   - vehicle_usage_cancel_day
+description: Детерминированный контур ежедневного учёта служебных автомобилей без LLM и смысловой маршрутизации.
+automations_path: agents/logistics/automations
 automations:
   - id: logistics_vehicle_usage
     name: Утренний учёт служебных машин
     kind: business_workflow
     trigger: schedule
-    description: По расписанию напоминает ответственному о ежедневном отчёте по сотрудникам и служебным автомобилям, разбирает ответы через Логиста и сохраняет подтверждённый отчёт.
+    description: По расписанию отправляет запрос, напоминает и сохраняет структурированный отчёт.
     source_project: BitrixAIAgent
     source_modules:
       - app.agent.vehicle_usage
     entrypoint: backend.ai_server.agent_worker
-    schedule_hint: daily 08:30 request and two reminders at 30/60 minutes from settings
+    schedule_hint: daily request and bounded reminders from settings
     status_endpoint: /logistics/vehicle-usage/status
     enabled_by_default: false
-    uses_llm: true
+    uses_llm: false
     dependencies:
       - bitrix_api
-      - llm_gateway
     tools:
       - vehicle_usage_context
       - vehicle_usage_get_operators
@@ -64,7 +62,6 @@ automations:
       - PostgreSQL schema logistics
     emits:
       - vehicle_usage_request_sent
-      - vehicle_usage_response_parsed
       - vehicle_usage_escalation
 data_scopes:
   - bitrix24_chats
@@ -72,7 +69,4 @@ data_scopes:
   - vehicle_usage
 allowed_actions:
   - read_vehicle_usage
-  - draft_vehicle_report
-approval_required:
-  - send_reminder
-  - save_vehicle_report
+  - write_vehicle_usage

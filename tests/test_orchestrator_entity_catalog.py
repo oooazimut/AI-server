@@ -152,8 +152,8 @@ def test_calendar_template_is_orchestrator_owned():
         now=now,
     )
 
-    assert result["start_iso"] == "2026-07-27T12:00:00+03:00"
-    assert result["end_iso"] == "2026-07-27T12:30:00+03:00"
+    assert result["start_iso"] == "2026-07-29T12:00:00+03:00"
+    assert result["end_iso"] == "2026-07-29T12:30:00+03:00"
     assert result["owner_name"] == "Кулинич Валерий Васильевич"
 
 
@@ -179,6 +179,7 @@ def test_live_bitrix_specialist_cannot_be_called_without_structured_command():
         id="bitrix24",
         name="Bitrix",
         kind="specialist",
+        reasoning_mode="executor",
         description="executor",
         capabilities=["bitrix_warehouse_search"],
     )

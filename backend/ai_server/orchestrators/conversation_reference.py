@@ -20,19 +20,8 @@ _PREFIX = re.compile(
     r"^\s*(?P<number>\d{3,})\s*(?:[,.:;—–-]\s*|\s+)(?P<text>.+)$",
     re.IGNORECASE | re.DOTALL,
 )
-_SUFFIX = re.compile(
-    r"^(?P<text>.+?)(?:\s*[,.:;—–-]\s*|\s+)(?P<number>\d{3,})\s*$",
-    re.IGNORECASE | re.DOTALL,
-)
-_CONTINUATION = re.compile(
-    r"\b(?:следующ|продолж|подтверж|подтверд|отмен|закрыва|измен|да\b|нет\b|покажи\s+ещ[её])",
-    re.IGNORECASE,
-)
 _LEGACY_PART_REFERENCE = re.compile(r"\b\d{3,}\s*(?:[,.:;—–-]\s*|\s+)част(?:ь|и)\s+\d+\b", re.IGNORECASE)
 _COUNTER_FIELD = "conversation_reference_counter"
-_CURRENT_FIELD = "conversation_reference_current"
-_CURRENT_AT_FIELD = "conversation_reference_current_at"
-_RECENT_FIELD = "conversation_reference_recent"
 _FIELD_PREFIX = "conversation_reference:"
 _VISIBLE_START = 100
 _AUTO_CONTINUATION_TTL = timedelta(minutes=15)
@@ -64,38 +53,7 @@ def _explicit_reference(request: str) -> tuple[int | None, str]:
     match = _PREFIX.match(request or "")
     if match:
         return int(match.group("number")), match.group("text").strip()
-    match = _SUFFIX.match(request or "")
-    # A trailing number is commonly an entity ID (for example "close task
-    # 555").  Keep the historical continuation-word guard for suffixes; an
-    # unconditional branch selector is the unambiguous leading number.
-    if match and _looks_like_continuation(match.group("text")):
-        return int(match.group("number")), match.group("text").strip()
     return None, request
-
-
-def _looks_like_continuation(request: str) -> bool:
-    return bool(_CONTINUATION.search((request or "").strip()))
-
-
-def _recent_numbers(value: str | None, *, now: datetime) -> dict[int, datetime]:
-    result: dict[int, datetime] = {}
-    for item in str(value or "").split(","):
-        number, separator, epoch = item.partition("@")
-        if not separator or not number.isdigit() or not epoch.isdigit():
-            continue
-        at = datetime.fromtimestamp(int(epoch), tz=MOSCOW_TZ)
-        if now - at <= _AUTO_CONTINUATION_TTL:
-            result[int(number)] = at
-    return result
-
-
-async def _touch_recent(store: Any, base_key: str, *, number: int, now: datetime) -> None:
-    recent = _recent_numbers(await store.get_kv(base_key, _RECENT_FIELD), now=now)
-    recent[number] = now
-    compact = sorted(recent.items(), key=lambda item: item[1], reverse=True)[:10]
-    await store.set_kv(
-        base_key, _RECENT_FIELD, ",".join(f"{item_number}@{int(at.timestamp())}" for item_number, at in compact)
-    )
 
 
 def _is_live_reference(value: str | None, *, now: datetime) -> bool:
@@ -110,7 +68,6 @@ def _is_live_reference(value: str | None, *, now: datetime) -> bool:
 
 async def _touch_reference(store: Any, base_key: str, *, day: str, number: int, now: datetime) -> None:
     await store.set_kv(base_key, _reference_at_field(day, number), now.isoformat())
-    await _touch_recent(store, base_key, number=number, now=now)
 
 
 def _reference_constraint(task: AgentTask, context: dict[str, Any], message: str) -> ConversationReferenceResolution:
@@ -180,12 +137,6 @@ async def resolve_conversation_reference(task: AgentTask, store: Any) -> Convers
             )
         branch_key, number = str(mapped), explicit_number
         request = clean_request
-    elif _looks_like_continuation(request):
-        return _reference_constraint(
-            task,
-            context,
-            "Для продолжения, подтверждения, отмены или изменения укажите номер диалога: «122 подтвердить».",
-        )
     if not branch_key:
         raw_counter = await store.get_kv(base_key, _COUNTER_FIELD)
         stored_day, separator, stored_number = str(raw_counter or "").partition(":")
@@ -196,8 +147,6 @@ async def resolve_conversation_reference(task: AgentTask, store: Any) -> Convers
         await store.set_kv(base_key, _reference_field(day, number), branch_key)
 
     assert number is not None
-    await store.set_kv(base_key, _CURRENT_FIELD, branch_key)
-    await store.set_kv(base_key, _CURRENT_AT_FIELD, now.isoformat())
     await _touch_reference(store, base_key, day=day, number=number, now=now)
     return ConversationReferenceResolution(
         task=task.model_copy(

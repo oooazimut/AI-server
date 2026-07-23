@@ -283,7 +283,7 @@ def test_task_close_control_discard_does_not_mutate_settings() -> None:
     assert store.get_task_close_control_setting("auto_close_time") is None
 
 
-def test_task_close_control_resolves_exact_name_and_rejects_ambiguity() -> None:
+def test_task_close_control_rejects_name_without_orchestrator_id() -> None:
     store = FakeTaskDraftStore()
     client = _admin_client(
         {"ID": 13, "NAME": "Ivan", "LAST_NAME": "Petrov", "ACTIVE": True},
@@ -299,8 +299,7 @@ def test_task_close_control_resolves_exact_name_and_rejects_ambiguity() -> None:
         )
     )
 
-    assert result.status == ToolStatus.AMBIGUOUS
-    assert [item["user_id"] for item in result.data["matches"]] == [13, 14]
+    assert result.status == ToolStatus.CONTRACT_VIOLATION
     assert store.task_close_operator_ids() == set()
 
 

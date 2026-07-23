@@ -17,7 +17,7 @@ from ..integrations.bitrix.portal_search import (
     format_portal_search_results,
     format_portal_sync_stats,
 )
-from ._common import now_ts, validate_webhook_secret
+from ._common import now_ts, validate_admin_secret, validate_webhook_secret
 
 router = APIRouter()
 
@@ -44,21 +44,10 @@ async def bitrix_status(request: Request) -> dict[str, Any]:
         "portal_search": _portal_search_status(request.app.state.portal_search, request.app.state.settings),
         "portal_search_indexer": request.app.state.portal_search_indexer.public_status(),
         "search_webhook_indexer": dict(request.app.state.search_webhook_indexer_status),
-        "quality_control": dict(request.app.state.quality_control_webhook_status),
-        "task_supervisor": dict(request.app.state.task_supervisor_status),
         "reconciler": dict(request.app.state.reconciler_status),
         "webhook_events": dict(request.app.state.webhook_event_status),
         "webhook_event_queue": {**worker_status, **queue_stats},
         "outbound_queue": await request.app.state.outbound_queue.stats(),
-    }
-
-
-@router.get("/agent/status")
-async def legacy_agent_status(request: Request) -> dict[str, Any]:
-    return {
-        **await bitrix_status(request),
-        "agent_runtime": "multi_agent",
-        "vehicle_usage": dict(request.app.state.vehicle_usage_status),
     }
 
 
@@ -195,11 +184,6 @@ async def outbound_queue_admin_status(
     return await request.app.state.outbound_queue.public_status()
 
 
-@router.get("/agent/webhook-events/status")
-async def legacy_webhook_events_status(request: Request) -> dict[str, Any]:
-    return await bitrix_webhook_events_status(request)
-
-
 def _webhook_worker_status(local_status: dict[str, Any], heartbeat: dict[str, Any] | None) -> dict[str, Any]:
     status = dict(local_status)
     if not heartbeat:
@@ -292,31 +276,9 @@ def bitrix_search_status(request: Request) -> dict[str, Any]:
     }
 
 
-@router.get("/agent/search/status")
-def legacy_bitrix_search_status(request: Request) -> dict[str, Any]:
-    return bitrix_search_status(request)
-
-
-@router.get("/agent/search/readiness")
-def legacy_search_readiness(request: Request) -> dict[str, Any]:
-    data = bitrix_search_status(request)
-    return {"summary": data.get("summary", ""), **data}
-
-
-@router.get("/agent/search/production-status")
-def legacy_search_production_status(request: Request) -> dict[str, Any]:
-    data = bitrix_search_status(request)
-    return {"summary": data.get("summary", ""), **data}
-
-
 @router.get("/bitrix/search/indexer/status")
 def bitrix_search_indexer_status(request: Request) -> dict[str, Any]:
     return request.app.state.portal_search_indexer.public_status()
-
-
-@router.get("/agent/search/indexer/status")
-def legacy_bitrix_search_indexer_status(request: Request) -> dict[str, Any]:
-    return bitrix_search_indexer_status(request)
 
 
 @router.get("/bitrix/search/webhook-indexer/status")
@@ -324,8 +286,12 @@ def bitrix_search_webhook_indexer_status(request: Request) -> dict[str, Any]:
     return dict(request.app.state.search_webhook_indexer_status)
 
 
-@router.post("/bitrix/search/reindex")
-async def bitrix_search_reindex(request: Request) -> dict[str, Any]:
+@router.post("/admin/bitrix/search/reindex")
+async def bitrix_search_reindex(
+    request: Request,
+    x_admin_secret: Annotated[str | None, Header(alias="X-Admin-Secret")] = None,
+) -> dict[str, Any]:
+    validate_admin_secret(request.app.state.settings, x_admin_secret)
     try:
         stats = await request.app.state.portal_search_indexer.run_metadata_once()
     except RuntimeError as exc:
@@ -337,13 +303,12 @@ async def bitrix_search_reindex(request: Request) -> dict[str, Any]:
     }
 
 
-@router.post("/agent/search/reindex")
-async def legacy_bitrix_search_reindex(request: Request) -> dict[str, Any]:
-    return await bitrix_search_reindex(request)
-
-
-@router.post("/bitrix/search/reindex-delta")
-async def bitrix_search_reindex_delta(request: Request) -> dict[str, Any]:
+@router.post("/admin/bitrix/search/reindex-delta")
+async def bitrix_search_reindex_delta(
+    request: Request,
+    x_admin_secret: Annotated[str | None, Header(alias="X-Admin-Secret")] = None,
+) -> dict[str, Any]:
+    validate_admin_secret(request.app.state.settings, x_admin_secret)
     try:
         stats = await request.app.state.portal_search_indexer.run_delta_once()
     except RuntimeError as exc:
@@ -355,11 +320,13 @@ async def bitrix_search_reindex_delta(request: Request) -> dict[str, Any]:
     }
 
 
-@router.post("/bitrix/search/reindex-content")
+@router.post("/admin/bitrix/search/reindex-content")
 async def bitrix_search_reindex_content(
     request: Request,
     extensions: str | None = None,
+    x_admin_secret: Annotated[str | None, Header(alias="X-Admin-Secret")] = None,
 ) -> dict[str, Any]:
+    validate_admin_secret(request.app.state.settings, x_admin_secret)
     try:
         stats = await request.app.state.portal_search_indexer.run_content_once(
             extensions=_extension_set(extensions),
@@ -373,21 +340,15 @@ async def bitrix_search_reindex_content(
     }
 
 
-@router.post("/agent/search/reindex-content")
-async def legacy_bitrix_search_reindex_content(
-    request: Request,
-    extensions: str | None = None,
-) -> dict[str, Any]:
-    return await bitrix_search_reindex_content(request, extensions=extensions)
-
-
-@router.get("/bitrix/search")
+@router.get("/admin/bitrix/search")
 def bitrix_search(
     request: Request,
     q: str = Query(..., min_length=1),
     scope: str = Query(default="all"),
     limit: int = Query(default=10, ge=1, le=30),
+    x_admin_secret: Annotated[str | None, Header(alias="X-Admin-Secret")] = None,
 ) -> dict[str, Any]:
+    validate_admin_secret(request.app.state.settings, x_admin_secret)
     index: PortalSearchIndex = request.app.state.portal_search
     entity_types = entity_types_for_scope(scope)
     if entity_types is None and scope.strip().lower() not in {"", "all"}:
@@ -405,51 +366,21 @@ def bitrix_search(
     }
 
 
-@router.get("/agent/search")
-def legacy_bitrix_search(
-    request: Request,
-    q: str = Query(..., min_length=1),
-    limit: int = Query(default=10, ge=1, le=30),
-) -> dict[str, Any]:
-    return bitrix_search(request, q=q, scope="all", limit=limit)
-
-
 # ---------------------------------------------------------------------------
-# Quality control / supervisor / reconciler
+# Reconciler
 # ---------------------------------------------------------------------------
-
-
-@router.get("/bitrix/quality-control/status")
-def bitrix_quality_control_status(request: Request) -> dict[str, Any]:
-    return dict(request.app.state.quality_control_webhook_status)
-
-
-@router.get("/bitrix/supervisor/status")
-def bitrix_supervisor_status(request: Request) -> dict[str, Any]:
-    return dict(request.app.state.task_supervisor_status)
-
-
-@router.post("/bitrix/supervisor/run-once")
-async def bitrix_supervisor_run_once(request: Request) -> dict[str, Any]:
-    result = await request.app.state.supervisor_fn(status=request.app.state.task_supervisor_status)
-    return {"ok": True, **result, "status": dict(request.app.state.task_supervisor_status)}
-
 
 @router.get("/bitrix/reconciler/status")
 def bitrix_reconciler_status(request: Request) -> dict[str, Any]:
     return dict(request.app.state.reconciler_status)
 
 
-@router.get("/agent/reconcile/status")
-def legacy_reconciler_status(request: Request) -> dict[str, Any]:
-    return {
-        "enabled": request.app.state.settings.reconcile_enabled,
-        "status": dict(request.app.state.reconciler_status),
-    }
-
-
-@router.post("/bitrix/reconciler/run-once")
-async def bitrix_reconciler_run_once(request: Request) -> dict[str, Any]:
+@router.post("/admin/bitrix/reconciler/run-once")
+async def bitrix_reconciler_run_once(
+    request: Request,
+    x_admin_secret: Annotated[str | None, Header(alias="X-Admin-Secret")] = None,
+) -> dict[str, Any]:
+    validate_admin_secret(request.app.state.settings, x_admin_secret)
     result = await request.app.state.reconcile_fn(status=request.app.state.reconciler_status)
     return {"ok": True, "result": result, "status": dict(request.app.state.reconciler_status)}
 

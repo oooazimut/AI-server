@@ -42,7 +42,10 @@ def build_capability_registry(
         tool_contract["version"] = _contract_hash(tool_contract)
         tools.append(tool_contract)
 
-    skills = [
+    # Executor specialists publish only their machine contracts.  Loading
+    # prose skills here would give the planner a second, potentially stale copy
+    # of business meaning owned by the orchestrator policy.
+    skills = [] if manifest.reasoning_mode == "executor" else [
         {
             "id": skill.id,
             "title": skill.title,
@@ -52,7 +55,7 @@ def build_capability_registry(
     ]
     contracts: list[dict[str, Any]] = []
     contracts_path = resolve_project_path(manifest.contracts_path)
-    if contracts_path is not None and contracts_path.exists():
+    if manifest.reasoning_mode != "executor" and contracts_path is not None and contracts_path.exists():
         for path in sorted(contracts_path.glob("*.yaml")):
             value = yaml.safe_load(path.read_text(encoding="utf-8"))
             if isinstance(value, dict):
@@ -61,6 +64,7 @@ def build_capability_registry(
         "schema_version": CAPABILITY_REGISTRY_SCHEMA,
         "specialist_id": manifest.id,
         "specialist_version": manifest.version,
+        "reasoning_mode": manifest.reasoning_mode,
         "description": str(manifest.handoff_description or manifest.description or manifest.name),
         "tools": tools,
         "skills": skills,

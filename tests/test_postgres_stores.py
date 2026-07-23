@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock, patch
 from ai_server.integrations.bitrix.portal_search.types import CONTENT_INDEX_VERSION, CONTENT_TERMINAL_STATUSES
 from ai_server.integrations.postgres.bitrix_agent import PostgresBitrixAgentStore
 from ai_server.integrations.postgres.orchestrator_agent import PostgresOrchestratorStore
-from ai_server.integrations.postgres.pto_agent import PostgresPtoAgentStore
 from ai_server.integrations.postgres.vehicle_usage import PostgresVehicleUsageStore, _parse_row
 from ai_server.tools.vehicle_usage import StaffMember
 
@@ -272,7 +271,7 @@ def test_vehicle_store_get_day_report_falls_back_to_legacy_parsed_json(monkeypat
 
 
 # ---------------------------------------------------------------------------
-# PostgresBitrixAgentStore — proposal methods
+# PostgresBitrixAgentStore
 # ---------------------------------------------------------------------------
 
 
@@ -464,75 +463,6 @@ def test_vehicle_store_auto_close_manual_pending_draft_finalizes_unknowns(monkey
     assert result["reason"] == "pending_draft_finalized_at_day_close"
     assert called["report_date"] == "2026-07-16"
     assert called["actor_user_id"] == 13
-
-
-def test_bitrix_store_save_proposal(monkeypatch):
-    store = PostgresBitrixAgentStore("postgresql://fake")
-    factory, conn = _sync_conn_factory(rows=[{"id": 7}])
-    monkeypatch.setattr(store, "_sync_connect", factory)
-
-    pid = store.save_proposal(task_id=101, task_title="Задача", missing_parts="исполнитель", responsible_id=9)
-    assert pid == 7
-    assert any("INSERT INTO bitrix24.incomplete_proposals" in sql for sql, _ in conn.calls)
-
-
-def test_bitrix_store_get_proposal_by_id(monkeypatch):
-    store = PostgresBitrixAgentStore("postgresql://fake")
-    row = {"id": 3, "task_id": 101, "status": "awaiting_response"}
-    factory, conn = _sync_conn_factory(rows=[row])
-    monkeypatch.setattr(store, "_sync_connect", factory)
-
-    result = store.get_proposal_by_id(3)
-    assert result == row
-
-
-def test_bitrix_store_get_proposal_by_id_missing(monkeypatch):
-    store = PostgresBitrixAgentStore("postgresql://fake")
-    factory, conn = _sync_conn_factory(rows=[])
-    monkeypatch.setattr(store, "_sync_connect", factory)
-
-    assert store.get_proposal_by_id(999) is None
-
-
-def test_bitrix_store_get_proposals_for_manager(monkeypatch):
-    store = PostgresBitrixAgentStore("postgresql://fake")
-    rows = [
-        {"id": 1, "task_id": 10, "status": "awaiting_response"},
-        {"id": 2, "task_id": 11, "status": "proposed"},
-    ]
-    factory, conn = _sync_conn_factory(rows=rows)
-    monkeypatch.setattr(store, "_sync_connect", factory)
-
-    result = store.get_proposals_for_manager()
-    assert len(result) == 2
-    assert any("awaiting_response" in sql or "proposed" in sql for sql, _ in conn.calls)
-
-
-def test_bitrix_store_mark_status(monkeypatch):
-    store = PostgresBitrixAgentStore("postgresql://fake")
-    factory, conn = _sync_conn_factory()
-    monkeypatch.setattr(store, "_sync_connect", factory)
-
-    store.mark_status(3, "proposed")
-    assert any("UPDATE bitrix24.incomplete_proposals SET status" in sql for sql, _ in conn.calls)
-
-
-def test_bitrix_store_delete_proposal(monkeypatch):
-    store = PostgresBitrixAgentStore("postgresql://fake")
-    factory, conn = _sync_conn_factory()
-    monkeypatch.setattr(store, "_sync_connect", factory)
-
-    store.delete_proposal(3)
-    assert any("DELETE FROM bitrix24.incomplete_proposals" in sql for sql, _ in conn.calls)
-
-
-def test_bitrix_store_update_responsible_response(monkeypatch):
-    store = PostgresBitrixAgentStore("postgresql://fake")
-    factory, conn = _sync_conn_factory()
-    monkeypatch.setattr(store, "_sync_connect", factory)
-
-    store.update_responsible_response(3, "Согласен с дедлайном")
-    assert any("responsible_response" in sql for sql, _ in conn.calls)
 
 
 def test_bitrix_store_upserts_task_close_controlled_user_with_stable_controlled_from(monkeypatch):
@@ -827,34 +757,6 @@ def test_orchestrator_store_load_turns_returns_history():
 
     turns = anyio_run(run())
     assert turns == [{"role": "user", "content": "привет"}, {"role": "assistant", "content": "здравствуй"}]
-
-
-def test_pto_store_append_turn_inserts_two_rows():
-    store = PostgresPtoAgentStore("postgresql://fake")
-    inserted_sqls: list[str] = []
-
-    async def _fake_execute(sql, params=()):
-        inserted_sqls.append(str(sql))
-        return AsyncMock()
-
-    async_conn = AsyncMock()
-    async_conn.__aenter__ = AsyncMock(return_value=async_conn)
-    async_conn.__aexit__ = AsyncMock(return_value=False)
-    async_conn.execute = _fake_execute
-
-    async def run():
-        with patch.object(store, "_connect", AsyncMock(return_value=async_conn)):
-            await store.append_turn("dialog:9", "вопрос", "ответ")
-
-    anyio_run(run())
-
-    inserts = [s for s in inserted_sqls if "INSERT INTO" in s]
-    assert len(inserts) == 2
-
-
-def test_pto_store_schema_name():
-    store = PostgresPtoAgentStore("postgresql://fake")
-    assert store._SCHEMA == "pto"
 
 
 def test_orchestrator_store_schema_name():

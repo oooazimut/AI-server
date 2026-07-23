@@ -1,7 +1,7 @@
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
-from ai_server.models import AgentResult, AgentTask, ToolStatus
+from ai_server.models import AgentManifest, AgentResult, AgentTask, ToolStatus
 from ai_server.orchestrators.tools.call_specialist import CallSpecialistTool
 from ai_server.registry import load_agent_manifests
 from tests.fakes import FakeOrchestratorStore
@@ -21,8 +21,31 @@ def _fake_specialist(*, status: str = "completed", answer: str = "Готово."
 
 
 def _make_tool(specialists: dict, store=None) -> CallSpecialistTool:
-    manifests = load_agent_manifests()
+    manifests = [
+        manifest.model_copy(update={"reasoning_mode": "autonomous"})
+        if manifest.id in specialists
+        else manifest
+        for manifest in load_agent_manifests()
+    ]
     return CallSpecialistTool(specialists, manifests, store=store)
+
+
+def test_executor_rejects_free_text_without_structured_command():
+    specialist = _fake_specialist()
+    manifest = AgentManifest(
+        id="executor",
+        name="Executor",
+        kind="specialist",
+        reasoning_mode="executor",
+        description="test",
+    )
+    tool = CallSpecialistTool({"executor": specialist}, [manifest])
+
+    result = asyncio.run(tool.execute({"specialist_id": "executor", "request": "реши сам"}))
+
+    assert result.status == ToolStatus.INVALID_TOOL_CALL
+    assert result.data["reason"] == "ORCHESTRATOR_STRUCTURED_COMMAND_REQUIRED"
+    specialist.handle.assert_not_awaited()
 
 
 def test_routes_to_correct_specialist():

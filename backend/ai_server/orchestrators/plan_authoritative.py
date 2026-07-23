@@ -18,7 +18,7 @@ from typing import Any, Protocol
 
 from ai_server.agents.base import _trace_now_iso
 from ai_server.capability_registry import registry_tool, validate_tool_arguments
-from ai_server.llm import LLMClient, OpenAICompatibleLLMClient
+from ai_server.llm import LLMClient
 from ai_server.models import (
     ActionRecord,
     AgentManifest,
@@ -31,11 +31,11 @@ from ai_server.models import (
 from ai_server.orchestrators.bitrix_response import render_bitrix_tool_results
 from ai_server.orchestrators.bitrix_semantics import (
     SemanticPolicyViolation,
-    normalize_command_arguments,
     normalize_plan,
 )
 from ai_server.orchestrators.conversation_reference import resolve_conversation_reference
-from ai_server.orchestrators.internal import InternalOrchestrator
+from ai_server.orchestrators.internal import OrchestratorTransportRuntime
+from ai_server.orchestrators.logistics_response import render_logistics_tool_result
 from ai_server.orchestrators.orchestrator_policy import selected_bitrix_policy
 from ai_server.orchestrators.tools.call_specialist import CallSpecialistTool
 
@@ -59,6 +59,7 @@ REPAIRABLE_PLAN_REJECTIONS = frozenset(
         "ENTITY_AMBIGUOUS",
         "ENTITY_NOT_FOUND",
         "ENTITY_ID_MISMATCH",
+        "ENTITY_CATALOG_UNAVAILABLE",
     }
 )
 
@@ -76,47 +77,6 @@ _PLANNER_ALWAYS_DETAILED_TOOLS = frozenset(
         "project_create_discard",
     }
 )
-_PLANNER_DOMAINS: tuple[dict[str, object], ...] = (
-    {
-        "markers": ("склад", "остат", "товар", "налич", "warehouse", "stock", "product"),
-        "tools": ("bitrix_warehouse_search",),
-        "skills": ("catalog",),
-        "contracts": ("search_intents",),
-    },
-    {
-        "markers": ("задач", "исполнител", "ответствен", "постанов", "дедлайн", "task"),
-        "tools": (
-            "bitrix_my_tasks",
-            "bitrix_task_search",
-            "task_create_draft",
-            "task_close_draft",
-            "task_close_report_incident",
-            "task_close_control_get",
-            "task_close_control_update",
-        ),
-        "skills": ("tasks_create_edit", "tasks_search", "task_closure", "safe_bitrix_write"),
-        "contracts": ("search_intents",),
-    },
-    {
-        "markers": ("календар", "напом", "событ", "calendar", "remind", "event"),
-        "tools": ("calendar_event_draft",),
-        "skills": ("safe_bitrix_write",),
-        "contracts": (),
-    },
-    {
-        "markers": ("проект", "групп", "project", "workgroup"),
-        "tools": ("bitrix_project_search", "project_create_draft"),
-        "skills": ("projects_crm", "safe_bitrix_write"),
-        "contracts": (),
-    },
-    {
-        "markers": ("диск", "файл", "документ", "папк", "вложен", "disk", "file", "document", "folder"),
-        "tools": ("portal_search",),
-        "skills": ("portal_document_search", "portal_links"),
-        "contracts": ("search_intents",),
-    },
-)
-
 def _normalized_text(value: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s-]", " ", value.casefold())).strip()
 
@@ -158,8 +118,10 @@ class PlanAuthoritativeLLM(Protocol):
 class DeepSeekPlanService:
     """The only live model surface used by the S04 orchestrator."""
 
-    def __init__(self, client: LLMClient | None = None) -> None:
-        self.client = client or OpenAICompatibleLLMClient()
+    def __init__(self, client: LLMClient) -> None:
+        if client is None:
+            raise RuntimeError("PLAN_AUTHORITATIVE_LLM_CLIENT_REQUIRED")
+        self.client = client
 
     async def plan(
         self, *, manifest: AgentManifest, task: AgentTask, catalog: dict[str, Any], constraints: dict[str, Any]
@@ -339,22 +301,18 @@ def _planner_capability_catalog(catalog: dict[str, Any], request: str) -> dict[s
     compaction cannot silently remove a future capability.
     """
 
-    normalized_request = _normalized_text(request)
-    matched_domains = [
-        domain for domain in _PLANNER_DOMAINS if any(str(marker) in normalized_request for marker in domain["markers"])
+    policy = selected_bitrix_policy(request)
+    selected_rules = [
+        rule for rule in policy["rules"] if isinstance(rule, dict) and rule.get("id") != "authority"
     ]
     detailed_tool_ids = set(_PLANNER_ALWAYS_DETAILED_TOOLS)
-    detailed_skill_ids = {"orchestrator_command_contract"}
-    detailed_contract_ids: set[str] = set()
-    for domain in matched_domains:
-        detailed_tool_ids.update(str(item) for item in domain["tools"])
-        detailed_skill_ids.update(str(item) for item in domain["skills"])
-        detailed_contract_ids.update(str(item) for item in domain["contracts"])
+    for rule in selected_rules:
+        detailed_tool_ids.update(str(item) for item in rule.get("tools") or [])
 
     compact: dict[str, Any] = {}
     for specialist_id, entry in catalog.items():
         tools = [item for item in entry.get("tools") or [] if isinstance(item, dict)]
-        if specialist_id != "bitrix24" or not matched_domains:
+        if specialist_id != "bitrix24" or not selected_rules:
             selected_tools = tools
         else:
             selected_tools = [item for item in tools if str(item.get("id") or "") in detailed_tool_ids]
@@ -362,6 +320,7 @@ def _planner_capability_catalog(catalog: dict[str, Any], request: str) -> dict[s
         contracts = [item for item in entry.get("contracts") or [] if isinstance(item, dict)]
         compact[specialist_id] = {
             "description": entry.get("description"),
+            "reasoning_mode": entry.get("reasoning_mode"),
             "capabilities": list(entry.get("capabilities") or []),
             "registry_binding": _PLANNER_REGISTRY_BINDING,
             "tools": [
@@ -374,23 +333,16 @@ def _planner_capability_catalog(catalog: dict[str, Any], request: str) -> dict[s
             ],
             "tool_contracts": selected_tools,
             "skills": [{"id": item.get("id"), "title": item.get("title")} for item in skills],
-            "selected_skill_rules": (
-                [] if specialist_id == "bitrix24" else [
-                    item for item in skills if str(item.get("id") or "") in detailed_skill_ids
-                ]
-            ),
+            "selected_skill_rules": [],
             "contracts": [{"id": item.get("id")} for item in contracts],
-            "selected_contract_rules": (
-                [] if specialist_id == "bitrix24" else [
-                    item for item in contracts if str(item.get("id") or "") in detailed_contract_ids
-                ]
-            ),
+            "selected_contract_rules": [],
             "allowed_actions": list(entry.get("allowed_actions") or []),
             "approval_required": list(entry.get("approval_required") or []),
         }
         if specialist_id == "bitrix24":
-            policy = selected_bitrix_policy(request)
             compact[specialist_id]["orchestrator_policy_version"] = policy["schema_version"]
+            compact[specialist_id]["orchestrator_defaults"] = policy["defaults"]
+            compact[specialist_id]["orchestrator_templates"] = policy["templates"]
             compact[specialist_id]["selected_orchestrator_rules"] = policy["rules"]
     return compact
 
@@ -611,8 +563,19 @@ def _decode_plan(raw: str, *, plan_id: str, request: str, constraints: dict[str,
                 raise PlanRejected("STRUCTURED_COMMAND_TOOL_INVALID")
             if not isinstance(arguments, dict):
                 raise PlanRejected("STRUCTURED_COMMAND_ARGUMENTS_INVALID")
-            arguments = normalize_command_arguments(tool_name, subrequest, arguments)
-            if validate_tool_arguments(dict(tool_contract.get("parameters") or {}), arguments):
+            preliminary_errors = validate_tool_arguments(
+                dict(tool_contract.get("parameters") or {}), arguments
+            )
+            # Required/defaulted fields are completed by the authoritative
+            # semantic layer with task/user/entity context immediately after
+            # decoding. Unknown, malformed and out-of-range values are never
+            # allowed through that normalization boundary.
+            blocking_errors = [
+                error
+                for error in preliminary_errors
+                if not error.endswith(": required") and "no anyOf contract matched" not in error
+            ]
+            if blocking_errors:
                 raise PlanRejected("STRUCTURED_COMMAND_ARGUMENTS_INVALID")
             structured_command = StructuredCommand(registry_version, tool_name, dict(arguments))
         command_fingerprint = (
@@ -655,8 +618,8 @@ def _decode_plan(raw: str, *, plan_id: str, request: str, constraints: dict[str,
     return Plan(plan_id, state, clarification, subtasks, value["max_rounds"])
 
 
-class PlanAuthoritativeOrchestrator(InternalOrchestrator):
-    """Live replacement selected by ``InternalOrchestrator.build`` for S04."""
+class PlanAuthoritativeOrchestrator(OrchestratorTransportRuntime):
+    """The sole live semantic orchestrator runtime."""
 
     def __init__(
         self,
@@ -676,6 +639,10 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
 
         manifests = kwargs.pop("manifests", None) or []
         planner = kwargs.pop("orchestrator_llm")
+        if not callable(getattr(planner, "plan", None)) or not callable(
+            getattr(planner, "finalize", None)
+        ):
+            raise RuntimeError("PLAN_AUTHORITATIVE_PLANNER_REQUIRED")
         store = kwargs.pop("orchestrator_store", None)
         retriever = kwargs.pop("orchestrator_retriever", None)
         channels = kwargs.pop("channels", None)
@@ -715,6 +682,9 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
         """Fail startup when an advertised structured command is incomplete."""
 
         for specialist_id, entry in catalog.items():
+            reasoning_mode = str(entry.get("reasoning_mode") or "")
+            if reasoning_mode not in {"autonomous", "executor"}:
+                raise RuntimeError(f"SPECIALIST_REASONING_MODE_INVALID:{specialist_id}")
             registry_version = str(entry.get("registry_version") or "")
             seen: set[str] = set()
             for tool in entry.get("tools") or []:
@@ -730,6 +700,8 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                     or not isinstance(tool.get("parameters"), dict)
                 ):
                     raise RuntimeError(f"CAPABILITY_REGISTRY_STRUCTURED_TOOL_INVALID:{specialist_id}:{tool_id}")
+                if reasoning_mode == "executor" and not tool.get("structured_command"):
+                    raise RuntimeError(f"EXECUTOR_UNSTRUCTURED_TOOL_FORBIDDEN:{specialist_id}:{tool_id}")
 
     def _catalog(self) -> dict[str, dict[str, Any]]:
         call = self._tool_registry.get("call_specialist")
@@ -749,6 +721,7 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             )
             catalog[agent_id] = {
                 "description": str(manifest.handoff_description or manifest.name),
+                "reasoning_mode": manifest.reasoning_mode,
                 "capabilities": sorted(capabilities),
                 "tools": tools,
                 "skills": [item for item in registry.get("skills") or [] if isinstance(item, dict)],
@@ -960,7 +933,12 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                 validation_t0 = time.monotonic()
                 try:
                     plan = _decode_plan(raw, plan_id=plan_id, request=task.request, constraints=constraints)
-                    plan = normalize_plan(plan, task=task, constraints=constraints)
+                    plan = normalize_plan(
+                        plan,
+                        task=task,
+                        constraints=constraints,
+                        entity_catalog=self._entity_catalog.snapshot() if self._entity_catalog is not None else {},
+                    )
                 except (PlanRejected, SemanticPolicyViolation) as exc:
                     reason = str(exc)
                     await self._record_timing(
@@ -1226,25 +1204,27 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
                 specialist_metadata.get("tool_result"), dict
             ):
                 raw_tool_result = ToolResult.model_validate(specialist_metadata["tool_result"])
-                rendered = render_bitrix_tool_results(
-                    agent_id=self.manifest.id,
-                    tool_results=[raw_tool_result],
-                    portal_base_url=str(specialist_metadata.get("portal_base_url") or ""),
-                    command_arguments=(
-                        specialist_metadata.get("command_arguments")
-                        if isinstance(specialist_metadata.get("command_arguments"), dict)
-                        else {}
-                    ),
-                )
-                branch_status = rendered.status
-                branch_answer = rendered.answer
-                if specialist_status in {"needs_human", "needs_clarification", "failed"}:
-                    branch_status = specialist_status
                 command_arguments = (
                     specialist_metadata.get("command_arguments")
                     if isinstance(specialist_metadata.get("command_arguments"), dict)
                     else {}
                 )
+                if specialist_metadata.get("formatter_domain") == "logistics":
+                    rendered = render_logistics_tool_result(
+                        tool_result=raw_tool_result,
+                        command_arguments=command_arguments,
+                    )
+                else:
+                    rendered = render_bitrix_tool_results(
+                        agent_id=self.manifest.id,
+                        tool_results=[raw_tool_result],
+                        portal_base_url=str(specialist_metadata.get("portal_base_url") or ""),
+                        command_arguments=command_arguments,
+                    )
+                branch_status = rendered.status
+                branch_answer = rendered.answer
+                if specialist_status in {"needs_human", "needs_clarification", "failed"}:
+                    branch_status = specialist_status
                 execution_records.append(
                     {
                         "subtask_id": item.subtask_id,
@@ -1485,7 +1465,13 @@ class PlanAuthoritativeOrchestrator(InternalOrchestrator):
             audit.append(record)
             try:
                 plan = _decode_plan(raw, plan_id=plan_id, request=task.request, constraints=constraints)
-            except PlanRejected as exc:
+                plan = normalize_plan(
+                    plan,
+                    task=planning_task,
+                    constraints=constraints,
+                    entity_catalog=self._entity_catalog.snapshot() if self._entity_catalog is not None else {},
+                )
+            except (PlanRejected, SemanticPolicyViolation) as exc:
                 reason = str(exc)
                 rejections.append(reason)
                 record.update({"status": "rejected", "rejection": reason})

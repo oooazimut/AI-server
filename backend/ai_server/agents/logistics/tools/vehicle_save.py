@@ -222,7 +222,7 @@ class VehicleSaveDraftTool:
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="vehicle_usage_save_draft",
-            description="Save the logistics LLM parsed draft; does not finalize daily report.",
+            description="Save the orchestrator-prepared structured draft; does not finalize the daily report.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -291,7 +291,7 @@ class VehicleSaveReportTool:
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="vehicle_usage_save_report",
-            description="Finalize confirmed daily vehicle/staff report using the JSON chosen by Logistics LLM.",
+            description="Finalize the daily vehicle/staff report using structured data prepared by the orchestrator.",
             parameters={
                 "type": "object",
                 "properties": {

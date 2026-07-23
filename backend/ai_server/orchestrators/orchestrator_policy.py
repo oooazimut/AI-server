@@ -21,9 +21,43 @@ def bitrix_policy_pack() -> dict[str, Any]:
     value = json.loads(_POLICY_PATH.read_text(encoding="utf-8"))
     if value.get("schema_version") != "orchestrator.bitrix_policy.v1":
         raise RuntimeError("ORCHESTRATOR_BITRIX_POLICY_VERSION_INVALID")
-    if value.get("authority") != "internal_orchestrator" or not isinstance(value.get("rules"), list):
+    if (
+        value.get("authority") != "internal_orchestrator"
+        or not isinstance(value.get("rules"), list)
+        or not isinstance(value.get("defaults"), dict)
+        or not isinstance(value.get("templates"), dict)
+    ):
         raise RuntimeError("ORCHESTRATOR_BITRIX_POLICY_INVALID")
+    required_defaults = {
+        "result_limit",
+        "warehouse_page_size",
+        "task_deadline_working_days",
+        "task_deadline_hour",
+        "calendar_start_working_days",
+        "calendar_start_hour",
+        "calendar_duration_minutes",
+    }
+    if set(value["defaults"]) != required_defaults or any(
+        type(value["defaults"][key]) is not int or value["defaults"][key] < 1
+        for key in required_defaults
+    ):
+        raise RuntimeError("ORCHESTRATOR_BITRIX_POLICY_DEFAULTS_INVALID")
+    required_templates = {
+        "task_description",
+        "task_close_unconfirmed_item",
+        "task_close_missing_fields",
+    }
+    if set(value["templates"]) != required_templates:
+        raise RuntimeError("ORCHESTRATOR_BITRIX_POLICY_TEMPLATES_INVALID")
     return value
+
+
+def bitrix_policy_defaults() -> dict[str, int]:
+    return {key: int(value) for key, value in bitrix_policy_pack()["defaults"].items()}
+
+
+def bitrix_policy_templates() -> dict[str, Any]:
+    return dict(bitrix_policy_pack()["templates"])
 
 
 def selected_bitrix_policy(request: str) -> dict[str, Any]:
@@ -37,8 +71,15 @@ def selected_bitrix_policy(request: str) -> dict[str, Any]:
     return {
         "schema_version": pack["schema_version"],
         "authority": pack["authority"],
+        "defaults": dict(pack["defaults"]),
+        "templates": dict(pack["templates"]),
         "rules": selected,
     }
 
 
-__all__ = ["bitrix_policy_pack", "selected_bitrix_policy"]
+__all__ = [
+    "bitrix_policy_defaults",
+    "bitrix_policy_pack",
+    "bitrix_policy_templates",
+    "selected_bitrix_policy",
+]

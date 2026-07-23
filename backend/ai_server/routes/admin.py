@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from ..knowledge import MarkdownKnowledgeBase
 from ..models import AgentManifest
@@ -23,28 +23,25 @@ router = APIRouter()
 
 @router.get("/health")
 def health(request: Request) -> dict[str, Any]:
-    manifests: list[AgentManifest] = request.app.state.manifests
+    manifests = _active_agent_manifests(request.app.state.manifests)
     settings = get_settings()
     entity_catalog = getattr(request.app.state, "orchestrator_entity_catalog", None)
     entity_snapshot = entity_catalog.snapshot() if entity_catalog is not None else {}
     return {
         "status": "ok",
-        "architecture": "orchestrator_plus_modular_specialists",
+        "architecture": "pro_orchestrator_with_structured_executors",
         "agent_count": len(manifests),
         "agents": [agent.id for agent in manifests],
         "bitrix_configured": settings.bitrix_configured,
         "llm_provider": settings.llm_provider,
-        "llm_model": settings.llm_model,
-        "llm_routing_enabled": settings.llm_routing_enabled,
-        "llm_flash_model": settings.llm_flash_model,
-        "llm_pro_model": settings.llm_pro_model,
-        "llm_flash_fallback_to_pro": settings.llm_flash_fallback_to_pro,
+        "orchestrator_model": settings.orchestrator_llm_model,
+        "orchestrator_model_policy": "pro_only_fail_closed",
+        "orchestrator_runtime_owner": "ai-server-worker",
         "llm_configured": settings.llm_configured,
         "tech_footer_enabled": settings.tech_footer_enabled,
         "tech_footer_allowed_user_ids": settings.resolved_tech_footer_allowed_user_ids,
         "deepseek_balance_configured": bool(settings.deepseek_api_key),
         "diagnost_enabled": settings.diagnost_enabled,
-        "diagnost_feedback_enabled": settings.diagnost_feedback_enabled,
         "diagnost_trace_snapshot_enabled": settings.diagnost_trace_snapshot_enabled,
         "conversation_trace_enabled": settings.conversation_trace_enabled,
         "learning_events_enabled": settings.learning_events_enabled,
@@ -53,9 +50,8 @@ def health(request: Request) -> dict[str, Any]:
         "bitrix_webhook_worker_enabled": settings.webhook_event_worker_enabled,
         "agent_orchestrator_worker_count": settings.agent_orchestrator_worker_count,
         "agent_bitrix_worker_count": settings.agent_bitrix_worker_count,
-        "agent_logistics_worker_count": settings.agent_logistics_worker_count,
         "agent_task_timeout_seconds": settings.agent_task_timeout_seconds,
-        "orchestrator_entity_catalog_status": entity_snapshot.get("status", "disabled"),
+        "orchestrator_entity_catalog_status": entity_snapshot.get("status", "worker_owned"),
         "orchestrator_entity_catalog_version": entity_snapshot.get("version"),
         "orchestrator_entity_catalog_counts": {
             key: len(entity_snapshot.get(key) or []) for key in ("users", "projects", "warehouses")
@@ -71,9 +67,6 @@ def health(request: Request) -> dict[str, Any]:
         "bitrix_search_delta_enabled": (
             settings.search_delta_indexer_enabled and settings.search_background_periodic_delta_enabled
         ),
-        "bitrix_quality_control_enabled": settings.quality_control_webhook_enabled,
-        "bitrix_quality_control_dry_run": settings.quality_control_dry_run,
-        "bitrix_task_supervisor_enabled": settings.supervisor_enabled,
         "bitrix_task_close_control_worker_enabled": settings.bitrix_task_close_control_worker_enabled,
         "bitrix_reconciler_enabled": settings.reconcile_enabled,
         "logistics_vehicle_usage_enabled": settings.vehicle_usage_enabled,
@@ -82,12 +75,12 @@ def health(request: Request) -> dict[str, Any]:
 
 @router.get("/agents")
 def agents(request: Request) -> Any:
-    return summarize_agents(request.app.state.manifests)
+    return summarize_agents(_active_agent_manifests(request.app.state.manifests))
 
 
 @router.get("/agents/{agent_id}")
 def agent_detail(agent_id: str, request: Request) -> Any:
-    manifest = manifest_by_id(request.app.state.manifests, agent_id)
+    manifest = manifest_by_id(_active_agent_manifests(request.app.state.manifests), agent_id)
     if manifest is None:
         raise HTTPException(status_code=404, detail="agent not found")
     return manifest
@@ -95,7 +88,7 @@ def agent_detail(agent_id: str, request: Request) -> Any:
 
 @router.get("/agents/{agent_id}/skills")
 def agent_skills(agent_id: str, request: Request) -> Any:
-    manifest = manifest_by_id(request.app.state.manifests, agent_id)
+    manifest = manifest_by_id(_active_agent_manifests(request.app.state.manifests), agent_id)
     if manifest is None:
         raise HTTPException(status_code=404, detail="agent not found")
     return SkillStore().list_skills(manifest)
@@ -103,7 +96,7 @@ def agent_skills(agent_id: str, request: Request) -> Any:
 
 @router.get("/agents/{agent_id}/knowledge/topics")
 def agent_knowledge_topics(agent_id: str, request: Request) -> Any:
-    manifest = manifest_by_id(request.app.state.manifests, agent_id)
+    manifest = manifest_by_id(_active_agent_manifests(request.app.state.manifests), agent_id)
     if manifest is None:
         raise HTTPException(status_code=404, detail="agent not found")
     return MarkdownKnowledgeBase().list_topics(manifest)
@@ -117,7 +110,7 @@ def agent_knowledge_search(
     limit: int = Query(default=5, ge=1, le=20),
     topic: str | None = None,
 ) -> Any:
-    manifest = manifest_by_id(request.app.state.manifests, agent_id)
+    manifest = manifest_by_id(_active_agent_manifests(request.app.state.manifests), agent_id)
     if manifest is None:
         raise HTTPException(status_code=404, detail="agent not found")
     return HybridKnowledgeRetriever().search(manifest, q, limit=limit, topic=topic)
@@ -146,19 +139,5 @@ def automation_detail(automation_id: str) -> Any:
     return automation
 
 
-@router.get("/agent/tools")
-def legacy_agent_tools(request: Request) -> dict[str, Any]:
-    manifests: list[AgentManifest] = request.app.state.manifests
-    return {
-        "tools": [
-            {"agent_id": agent.id, "tools": agent.tools, "capabilities": agent.capabilities} for agent in manifests
-        ]
-    }
-
-
-@router.post("/agent/documents/compare")
-def legacy_documents_compare() -> dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_409_CONFLICT,
-        detail="Document comparison now belongs to the PTO LLM specialist; use the orchestrator/chat flow.",
-    )
+def _active_agent_manifests(manifests: list[AgentManifest]) -> list[AgentManifest]:
+    return [manifest for manifest in manifests if manifest.kind in {"orchestrator", "specialist"}]

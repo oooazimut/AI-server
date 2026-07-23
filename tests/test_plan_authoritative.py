@@ -4,7 +4,6 @@ import json
 import pytest
 
 from ai_server.models import ActionRecord, AgentManifest, AgentResult, AgentTask, ModelUsageRecord
-from ai_server.orchestrators.internal import InternalOrchestrator
 from ai_server.orchestrators.plan_authoritative import (
     FINAL_SCHEMA,
     PLAN_SCHEMA,
@@ -83,7 +82,7 @@ def test_live_factory_selects_plan_authoritative_runtime():
         async def finalize(self, **kwargs):  # pragma: no cover - only factory contract matters here
             raise AssertionError
 
-    subject = InternalOrchestrator.build(
+    subject = PlanAuthoritativeOrchestrator.build(
         AgentManifest(id="internal_orchestrator", name="Оркестр", kind="orchestrator", description="test"),
         manifests=[],
         orchestrator_llm=Planner(),

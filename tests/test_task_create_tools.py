@@ -34,7 +34,7 @@ def test_draft_tool_saves_to_store():
     tool = TaskCreateDraftTool(store=store)
     result = _exec(
         tool,
-        {"title": "Тест", "responsible_id": 9, "no_deadline": True},
+        {"title": "Тест", "description": "Описание", "responsible_id": 9, "no_deadline": True},
         user_id=9,
         dialog_key="d:42",
     )
@@ -49,7 +49,13 @@ def test_draft_tool_returns_plain_preview_without_user_id():
     tool = TaskCreateDraftTool(store=store)
     result = _exec(
         tool,
-        {"title": "Тест", "responsible_self": True, "responsible_name": "Кулинич Валерий"},
+        {
+            "title": "Тест",
+            "description": "Описание",
+            "responsible_self": True,
+            "responsible_name": "Кулинич Валерий",
+            "deadline_iso": "2026-07-30T19:00:00+03:00",
+        },
         user_id=9,
         dialog_key="d:42",
     )
@@ -80,7 +86,7 @@ def test_draft_tool_no_dialog_key_does_not_fail():
     tool = TaskCreateDraftTool(store=store)
     result = _exec(
         tool,
-        {"title": "Задача", "responsible_id": 9, "no_deadline": True},
+        {"title": "Задача", "description": "Описание", "responsible_id": 9, "no_deadline": True},
         user_id=9,
         dialog_key=None,
     )
@@ -95,16 +101,18 @@ def test_draft_tool_prepares_personal_project_before_default_self_task():
             return []
 
     store = FakeTaskDraftStore()
-    tool = TaskCreateDraftTool(store=store, project_client=_NoProjectClient())
+    tool = TaskCreateDraftTool(store=store)
 
     result = _exec(
         tool,
         {
             "title": "Тест",
+            "description": "Описание",
             "responsible_self": True,
             "responsible_name": "Кулинич Валерий",
             "project_name": "Кулинич Валерий",
             "_default_personal_project": True,
+            "_default_personal_project_missing": True,
             "no_deadline": True,
         },
         user_id=9,
@@ -131,17 +139,19 @@ def test_draft_tool_prepares_open_personal_project_for_named_responsible():
             return []
 
     store = FakeTaskDraftStore()
-    tool = TaskCreateDraftTool(store=store, project_client=_NoProjectClient())
+    tool = TaskCreateDraftTool(store=store)
 
     result = _exec(
         tool,
         {
             "title": "Wash the car",
+            "description": "Wash the car",
             "responsible_id": 17,
             "responsible_name": "Borisov Andrey Sergeevich",
             "project_name": "Borisov Andrey",
             "_default_personal_project": True,
             "_default_personal_project_owner_id": 17,
+            "_default_personal_project_missing": True,
             "no_deadline": True,
         },
         user_id=9,
@@ -188,7 +198,7 @@ def test_draft_tool_does_not_create_duplicate_for_ambiguous_personal_project():
 
     store = FakeTaskDraftStore()
     result = _exec(
-        TaskCreateDraftTool(store=store, project_client=_AmbiguousProjectClient()),
+        TaskCreateDraftTool(store=store),
         {
             "title": "Тест",
             "responsible_self": True,
@@ -202,21 +212,47 @@ def test_draft_tool_does_not_create_duplicate_for_ambiguous_personal_project():
         dialog_id="chat42",
     )
 
-    assert result.status == ToolStatus.NOT_FOUND
+    assert result.status == ToolStatus.CONTRACT_VIOLATION
     assert store._drafts == {}
 
 
-def test_explicit_project_draft_requires_one_exact_numeric_project():
+def test_explicit_project_name_without_orchestrator_id_is_rejected():
     class _ProjectClient:
         async def search_projects(self, query: str, *, limit: int = 10):
             return [{"ID": "77", "NAME": "Ларгус-2"}]
 
     store = FakeTaskDraftStore()
-    tool = TaskCreateDraftTool(store=store, project_client=_ProjectClient())
+    tool = TaskCreateDraftTool(store=store)
 
     result = _exec(
         tool,
-        {"title": "Тест", "responsible_self": True, "project_name": "Ларгус-2"},
+        {
+            "title": "Тест",
+            "description": "Описание",
+            "responsible_self": True,
+            "project_name": "Ларгус-2",
+            "no_deadline": True,
+        },
+        user_id=9,
+        dialog_key="d:42",
+    )
+
+    assert result.status == ToolStatus.CONTRACT_VIOLATION
+    assert store._drafts == {}
+
+
+def test_explicit_project_with_orchestrator_id_is_accepted():
+    store = FakeTaskDraftStore()
+    result = _exec(
+        TaskCreateDraftTool(store=store),
+        {
+            "title": "Тест",
+            "description": "Описание",
+            "responsible_self": True,
+            "project_name": "Ларгус-2",
+            "group_id": 77,
+            "no_deadline": True,
+        },
         user_id=9,
         dialog_key="d:42",
     )
@@ -233,23 +269,23 @@ def test_explicit_project_draft_uses_exact_postgres_snapshot_before_live_rest():
     index = FakePortalSearchIndex()
     index.upsert_item(entity_type="project", entity_id="77", title="Ларгус 2")
     store = FakeTaskDraftStore()
-    tool = TaskCreateDraftTool(
-        store=store,
-        project_client=_ForbiddenLiveClient(),
-        portal_search=index,
-    )
+    tool = TaskCreateDraftTool(store=store)
 
     result = _exec(
         tool,
-        {"title": "Тест", "responsible_self": True, "project_name": "Ларгус-2"},
+        {
+            "title": "Тест",
+            "description": "Описание",
+            "responsible_self": True,
+            "project_name": "Ларгус-2",
+            "no_deadline": True,
+        },
         user_id=9,
         dialog_key="d:42",
     )
 
-    assert result.status == ToolStatus.OK
-    assert store._drafts["d:42"]["fields"]["GROUP_ID"] == 77
-    assert store._drafts["d:42"]["_resolved_project"] == {"id": 77, "name": "Ларгус 2"}
-    assert result.data["preview"]["project"] == "Ларгус 2"
+    assert result.status == ToolStatus.CONTRACT_VIOLATION
+    assert store._drafts == {}
 
 
 def test_explicit_project_draft_rejects_ambiguous_exact_postgres_snapshot():
@@ -263,17 +299,19 @@ def test_explicit_project_draft_rejects_ambiguous_exact_postgres_snapshot():
     store = FakeTaskDraftStore()
 
     result = _exec(
-        TaskCreateDraftTool(
-            store=store,
-            project_client=_ForbiddenLiveClient(),
-            portal_search=index,
-        ),
-        {"title": "Тест", "responsible_self": True, "project_name": "Ларгус-2"},
+        TaskCreateDraftTool(store=store),
+        {
+            "title": "Тест",
+            "description": "Описание",
+            "responsible_self": True,
+            "project_name": "Ларгус-2",
+            "no_deadline": True,
+        },
         user_id=9,
         dialog_key="d:42",
     )
 
-    assert result.status == ToolStatus.NOT_FOUND
+    assert result.status == ToolStatus.CONTRACT_VIOLATION
     assert store._drafts == {}
 
 
@@ -292,15 +330,21 @@ def test_explicit_project_draft_falls_back_to_live_for_fuzzy_only_snapshot():
     store = FakeTaskDraftStore()
 
     result = _exec(
-        TaskCreateDraftTool(store=store, project_client=live, portal_search=index),
-        {"title": "Тест", "responsible_self": True, "project_name": "Ларгус-2"},
+        TaskCreateDraftTool(store=store),
+        {
+            "title": "Тест",
+            "description": "Описание",
+            "responsible_self": True,
+            "project_name": "Ларгус-2",
+            "no_deadline": True,
+        },
         user_id=9,
         dialog_key="d:42",
     )
 
-    assert result.status == ToolStatus.OK
-    assert live.calls == [("Ларгус-2", 10)]
-    assert store._drafts["d:42"]["fields"]["GROUP_ID"] == 77
+    assert result.status == ToolStatus.CONTRACT_VIOLATION
+    assert live.calls == []
+    assert store._drafts == {}
 
 
 def test_explicit_project_snapshot_requires_current_user_oauth_actor():
@@ -320,24 +364,19 @@ def test_explicit_project_snapshot_requires_current_user_oauth_actor():
     store = FakeTaskDraftStore()
 
     result = _exec(
-        TaskCreateDraftTool(
-            store=store,
-            project_client=_ForbiddenFallback(),
-            portal_search=index,
-            bitrix_oauth=_MissingOAuth(),
-        ),
+        TaskCreateDraftTool(store=store),
         {"title": "Тест", "responsible_self": True, "project_name": "Ларгус-2"},
         user_id=9,
         dialog_key="d:42",
     )
 
-    assert result.status == ToolStatus.DENIED
+    assert result.status == ToolStatus.CONTRACT_VIOLATION
     assert store._drafts == {}
 
 
 def test_explicit_project_draft_without_resolver_fails_closed():
     store = FakeTaskDraftStore()
-    tool = TaskCreateDraftTool(store=store, project_client=None)
+    tool = TaskCreateDraftTool(store=store)
 
     result = _exec(
         tool,
@@ -346,7 +385,7 @@ def test_explicit_project_draft_without_resolver_fails_closed():
         dialog_key="d:42",
     )
 
-    assert result.status == ToolStatus.NOT_FOUND
+    assert result.status == ToolStatus.CONTRACT_VIOLATION
     assert store._drafts == {}
 
 
@@ -358,15 +397,15 @@ def test_explicit_project_draft_with_zero_or_ambiguous_matches_fails_closed():
         async def search_projects(self, query: str, *, limit: int = 10):
             return self.projects
 
-    for projects in ([], [{"ID": "77", "NAME": "Ларгус-2"}, {"ID": "78", "NAME": "Ларгус-2"}]):
+    for _projects in ([], [{"ID": "77", "NAME": "Ларгус-2"}, {"ID": "78", "NAME": "Ларгус-2"}]):
         store = FakeTaskDraftStore()
         result = _exec(
-            TaskCreateDraftTool(store=store, project_client=_ProjectClient(projects)),
+            TaskCreateDraftTool(store=store),
             {"title": "Тест", "responsible_self": True, "project_name": "Ларгус-2"},
             user_id=9,
             dialog_key="d:42",
         )
-        assert result.status == ToolStatus.NOT_FOUND
+        assert result.status == ToolStatus.CONTRACT_VIOLATION
         assert store._drafts == {}
 
 

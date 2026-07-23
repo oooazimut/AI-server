@@ -1,17 +1,10 @@
 from __future__ import annotations
 
-import logging
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+import time
+from types import SimpleNamespace
 from typing import Any
-from uuid import uuid4
 
-from ai_server.agents.base import BaseSpecialist
-from ai_server.agents.logistics.llm import (
-    LogisticsAgentLLM,
-    LogisticsLLMService,
-    logistics_llm_failure_result,
-)
+from ai_server.agents.base import BaseSpecialist, _trace_now_iso
 from ai_server.agents.logistics.tools import (
     VehicleCancelReportTool,
     VehicleContextTool,
@@ -28,99 +21,61 @@ from ai_server.agents.logistics.tools import (
 )
 from ai_server.agents.ports import SchedulerPort
 from ai_server.agents.tool import AgentTool
-from ai_server.knowledge import MarkdownKnowledgeBase
-from ai_server.models import AgentManifest, AgentResult, AgentTask, ScheduledTask, ToolResult, ToolStatus
-from ai_server.retrieval import HybridKnowledgeRetriever
-from ai_server.skills import SkillStore
+from ai_server.capability_registry import build_capability_registry, registry_tool, validate_tool_arguments
+from ai_server.models import (
+    ActionRecord,
+    AgentManifest,
+    AgentResult,
+    AgentTask,
+    ModelUsageRecord,
+    ToolResult,
+    ToolStatus,
+)
+from ai_server.settings import Settings, get_settings
 from ai_server.tools.vehicle_usage import VehicleUsageStorePort
-from ai_server.utils import MOSCOW_TZ
 
-logger = logging.getLogger(__name__)
-
-_FAST_RETURN_TOOLS = {
-    "vehicle_usage_reference",
-    "vehicle_usage_get_operators",
-    "vehicle_usage_get_report",
-    "vehicle_usage_get_employee_period_report",
-    "vehicle_usage_get_vehicle_period_report",
-    "vehicle_usage_save_report",
-    "vehicle_usage_update_report",
-}
-
-
-def _next_reminder_run_date(context: dict[str, Any], settings: VehicleUsageSettings, reminder_count: int) -> datetime:
-    delays = settings.reminder_delays_minutes or (settings.reminder_interval_minutes,)
-    index = max(0, min(reminder_count - 1, len(delays) - 1))
-    delay_minutes = delays[index]
-    started_at_raw = str(context.get("started_at") or "").strip()
-    if started_at_raw:
-        try:
-            started_at = datetime.fromisoformat(started_at_raw)
-            if started_at.tzinfo is None:
-                started_at = started_at.replace(tzinfo=MOSCOW_TZ)
-            return started_at.astimezone(MOSCOW_TZ) + timedelta(minutes=delay_minutes)
-        except ValueError:
-            pass
-    return datetime.now(MOSCOW_TZ) + timedelta(minutes=delay_minutes)
-
-
-def _manual_start_action_data(result: AgentResult) -> dict[str, Any] | None:
-    for action in result.actions_taken:
-        if action.name != "vehicle_usage_start_day" or str(action.status) != "ok":
-            continue
-        data = action.details.get("data")
-        if isinstance(data, dict):
-            return data
-    return None
-
-
-@dataclass
-class VehicleUsageSettings:
-    manager_user_id: int | None
-    max_reminders: int
-    reminder_interval_minutes: int
-    reminder_delays_minutes: tuple[int, ...] = (30, 60)
-    allowed_user_ids: frozenset[int] = frozenset()
-    admin_user_ids: frozenset[int] = frozenset()
-    dry_run: bool = True
-    request_time: str = "08:30"
-
-    @property
-    def effective_allowed_user_ids(self) -> frozenset[int]:
-        if self.allowed_user_ids:
-            return self.allowed_user_ids
-        return frozenset({self.manager_user_id}) if self.manager_user_id is not None else frozenset()
+_STRUCTURED_TOOL_NAMES = frozenset(
+    {
+        "vehicle_usage_context",
+        "vehicle_usage_reference",
+        "vehicle_usage_get_operators",
+        "vehicle_usage_set_operators",
+        "vehicle_usage_start_day",
+        "vehicle_usage_get_report",
+        "vehicle_usage_get_employee_period_report",
+        "vehicle_usage_get_vehicle_period_report",
+        "vehicle_usage_save_draft",
+        "vehicle_usage_save_report",
+        "vehicle_usage_update_report",
+        "vehicle_usage_cancel_day",
+    }
+)
 
 
 class LogisticsSpecialist(BaseSpecialist):
-    max_steps = 5
+    """Version-bound Logistics executor with no model or free-text reasoning."""
+
     action_prefix = "logistics"
 
     def __init__(
         self,
         manifest: AgentManifest,
         *,
-        knowledge_base: MarkdownKnowledgeBase | None = None,
-        skill_store: SkillStore | None = None,
-        retriever: HybridKnowledgeRetriever | None = None,
         agent_tools: list[AgentTool] | None = None,
-        llm: LogisticsAgentLLM | None = None,
         scheduler: SchedulerPort | None = None,
         store: Any | None = None,
-        vu_settings: VehicleUsageSettings | None = None,
+        settings: Settings | None = None,
         result_publisher: Any | None = None,
+        conversation_trace: Any | None = None,
     ) -> None:
-        self._vu_settings = vu_settings
+        self._settings = settings
         super().__init__(
             manifest,
-            knowledge_base=knowledge_base,
-            skill_store=skill_store,
-            retriever=retriever,
             agent_tools=agent_tools,
-            llm=llm,
             scheduler=scheduler,
             store=store,
             result_publisher=result_publisher,
+            conversation_trace=conversation_trace,
         )
 
     @classmethod
@@ -129,18 +84,15 @@ class LogisticsSpecialist(BaseSpecialist):
         manifest: AgentManifest,
         *,
         vehicle_usage_store: VehicleUsageStorePort | None = None,
-        logistics_retriever: HybridKnowledgeRetriever | None = None,
-        logistics_llm: LogisticsAgentLLM | None = None,
-        logistics_store: Any | None = None,
         scheduler: SchedulerPort | None = None,
-        logistics_vu_settings: VehicleUsageSettings | None = None,
+        settings: Settings | None = None,
         specialist_result_publisher: Any | None = None,
-        **_: Any,
+        conversation_trace: Any | None = None,
+        **_: object,
     ) -> LogisticsSpecialist:
-        allowed_user_ids = (
-            logistics_vu_settings.effective_allowed_user_ids if logistics_vu_settings is not None else frozenset()
-        )
-        admin_user_ids = logistics_vu_settings.admin_user_ids if logistics_vu_settings is not None else frozenset()
+        current_settings = settings or get_settings()
+        allowed_user_ids = frozenset(current_settings.resolved_vehicle_usage_allowed_user_ids)
+        admin_user_ids = frozenset(current_settings.resolved_vehicle_usage_admin_user_ids)
         tools: list[AgentTool] = [
             VehicleContextTool(vehicle_usage_store),
             VehicleReferenceTool(vehicle_usage_store),
@@ -157,118 +109,187 @@ class LogisticsSpecialist(BaseSpecialist):
         ]
         return cls(
             manifest,
-            retriever=logistics_retriever,
             agent_tools=tools,
-            llm=logistics_llm or LogisticsLLMService(),
             scheduler=scheduler,
-            store=logistics_store,
-            vu_settings=logistics_vu_settings,
+            store=vehicle_usage_store,
+            settings=current_settings,
             result_publisher=specialist_result_publisher,
+            conversation_trace=conversation_trace,
         )
 
-    # ------------------------------------------------------------------
-    # Scheduling: declare reminders via AgentResult.scheduled_tasks
-    # ------------------------------------------------------------------
+    def capability_registry(self) -> dict[str, Any]:
+        definitions = self.tool_definitions()
+        available = {str(item.get("name") or "") for item in definitions if isinstance(item, dict)}
+        return build_capability_registry(self.manifest, definitions, structured_tool_names=available)
 
-    async def handle(self, task: AgentTask) -> AgentResult:
-        result = await super().handle(task)
-        scheduled = self._build_scheduled_tasks(task, result)
-        return result.model_copy(update={"scheduled_tasks": scheduled}) if scheduled else result
+    def tool_definitions(self) -> list[dict[str, Any]]:
+        return [
+            tool.definition().model_dump()
+            for tool in self._tool_registry.values()
+            if tool.name in _STRUCTURED_TOOL_NAMES
+        ]
 
-    def _build_scheduled_tasks(self, task: AgentTask, result: AgentResult) -> list[ScheduledTask]:
-        vu = self._vu_settings
-        if vu is None:
-            return []
+    async def execute_structured_command(self, task: AgentTask, command: dict[str, Any]) -> AgentResult:
+        registry = self.capability_registry()
+        failure = self._structured_command_failure(command, registry)
+        if failure is not None:
+            return failure
 
-        today = datetime.now(MOSCOW_TZ).date().isoformat()
-        request_date = str(task.context.get("request_date") or today)
-        job_prefix = f"vu_reminder_{request_date}"
-        recipient_key = str(task.user.id or task.context.get("recipient_id") or "unknown").replace(":", "_")
-        job_id = f"{job_prefix}_{recipient_key}"
+        tool_name = str(command["tool_name"])
+        arguments = dict(command["arguments"])
+        call = SimpleNamespace(name=tool_name, args=arguments, summary="orchestrator structured command")
+        started_at = _trace_now_iso()
+        started = time.monotonic()
+        result, action, approvals = await self._execute_tool_call(call, task)
+        if result is None:
+            result = ToolResult(
+                status=ToolStatus.ERROR,
+                tool=tool_name,
+                error="structured command returned no result",
+            )
+        await self._record_timing(
+            task,
+            stage="structured_tool_execute",
+            started_at=started_at,
+            elapsed_ms=(time.monotonic() - started) * 1000,
+            status=str(result.status),
+            tool=tool_name,
+            details={"registry_version": registry["registry_version"]},
+        )
 
-        # Cancel reminder when report is saved
-        if any(a.name in ("vehicle_usage_save_report", "vehicle_usage_cancel_day") for a in result.actions_taken):
-            return [ScheduledTask(job_id=job_prefix, agent_id="logistics", cancel=True)]
-
-        def _build_reminder(*, reminder_count: int, started_at: str) -> list[ScheduledTask]:
-            if reminder_count > vu.max_reminders:
-                return []
-            run_date = _next_reminder_run_date({"started_at": started_at}, vu, reminder_count)
-            channel_id = str(task.context.get("channel_id") or "")
-            recipient_id = str(task.context.get("recipient_id") or task.context.get("dialog_id") or task.user.id or "")
-            dialog_id = str(task.context.get("dialog_id") or (task.user.raw or {}).get("dialog_id") or recipient_id)
-            reminder_task = AgentTask(
-                task_id=f"vu_reminder_{uuid4().hex[:6]}",
-                user=task.user,
-                request=task.request,
-                context={
-                    "channel_id": channel_id,
-                    "recipient_id": recipient_id,
-                    "dialog_id": dialog_id,
-                    "event": "vehicle_usage_reminder_due",
-                    "request_date": request_date,
-                    "reminder_count": reminder_count,
-                    "started_at": started_at,
+        status = _terminal_status(result)
+        actions = [
+            ActionRecord(
+                name="logistics_capability_contract",
+                status="ok",
+                details={
+                    "registry_version": registry["registry_version"],
+                    "tool": tool_name,
+                    "mode": "structured_command",
                 },
             )
-            return [
-                ScheduledTask(
-                    job_id=job_id,
-                    agent_id="logistics",
-                    trigger={"type": "date", "run_date": run_date.isoformat()},
-                    task=reminder_task,
-                    description=f"Vehicle usage reminder #{reminder_count}",
+        ]
+        if action is not None:
+            actions.append(action)
+        return AgentResult(
+            status="needs_human" if approvals else status,
+            agent_id=self.manifest.id,
+            answer="",
+            actions_taken=actions,
+            actions_requiring_approval=list(approvals),
+            model_usage=[
+                ModelUsageRecord(
+                    agent_id=self.manifest.id,
+                    provider="internal",
+                    model="structured-logistics-executor",
+                    status="not_used",
+                    notes=["No Logistics model call and no specialist-side response rendering."],
                 )
-            ]
+            ],
+            confidence=1.0 if result.status == ToolStatus.OK else 0.0,
+            logs=["Logistics executed one exact orchestrator command."],
+            metadata={
+                "terminal": True,
+                "answer_is_final": False,
+                "safe_to_send": True,
+                "fast_return": True,
+                "fast_return_reason": "orchestrator_structured_command",
+                "terminal_tool": tool_name,
+                "terminal_status": status,
+                "registry_version": registry["registry_version"],
+                "structured_command": True,
+                "formatter_domain": "logistics",
+                "command_arguments": arguments,
+                "tool_result": result.model_dump(),
+            },
+        )
 
-        manual_start = _manual_start_action_data(result)
-        if manual_start is not None:
-            request_date = str(manual_start.get("request_date") or request_date)
-            job_prefix = f"vu_reminder_{request_date}"
-            job_id = f"{job_prefix}_{recipient_key}"
-            started_at = str(manual_start.get("sent_at") or datetime.now(MOSCOW_TZ).isoformat())
-            return _build_reminder(reminder_count=1, started_at=started_at)
-
-        # Schedule follow-up reminder after initial morning request or previous reminder
-        event = str(task.context.get("event") or "")
-        if event in ("vehicle_usage_morning", "vehicle_usage_reminder_due") and result.answer:
-            reminder_count = int(task.context.get("reminder_count") or 0) + 1
-            started_at = str(task.context.get("started_at") or datetime.now(MOSCOW_TZ).isoformat())
-            return _build_reminder(reminder_count=reminder_count, started_at=started_at)
-
-        return []
-
-    # ------------------------------------------------------------------
-    # BaseSpecialist hooks
-    # ------------------------------------------------------------------
-
-    def _llm_failure_result(self, message: str):  # noqa: ANN201
-        return logistics_llm_failure_result(message, agent_id=self.manifest.id)
-
-    def _terminal_response_metadata(
+    def _structured_command_failure(
         self,
-        *,
-        tool_call: Any,
-        result: ToolResult | None,
-        action: Any | None,
-        approvals: list[Any],
-        task: AgentTask,
-    ) -> dict[str, Any] | None:
-        if result is None or approvals:
+        command: dict[str, Any],
+        registry: dict[str, Any],
+    ) -> AgentResult | None:
+        reason = ""
+        details: dict[str, Any] = {}
+        if not isinstance(command, dict) or set(command) != {"registry_version", "tool_name", "arguments"}:
+            reason = "STRUCTURED_COMMAND_SCHEMA_MISMATCH"
+        elif str(command.get("registry_version") or "") != str(registry.get("registry_version") or ""):
+            reason = "CAPABILITY_REGISTRY_VERSION_MISMATCH"
+        elif not isinstance(command.get("arguments"), dict):
+            reason = "STRUCTURED_COMMAND_ARGUMENTS_INVALID"
+        else:
+            tool = registry_tool(registry, str(command.get("tool_name") or ""))
+            if tool is None or not tool.get("structured_command"):
+                reason = "STRUCTURED_COMMAND_TOOL_DISABLED"
+            else:
+                errors = validate_tool_arguments(dict(tool.get("parameters") or {}), command["arguments"])
+                if errors:
+                    reason = "STRUCTURED_COMMAND_ARGUMENTS_INVALID"
+                    details["validation_errors"] = errors
+        if not reason:
             return None
-        if tool_call.name not in _FAST_RETURN_TOOLS:
-            return None
-        if result.status != ToolStatus.OK:
-            return None
-        return {
-            "fast_return_reason": "vehicle_usage_tool_success",
-            "terminal_tool": tool_call.name,
-            "tool_status": str(result.status),
-        }
+        return AgentResult(
+            status="failed",
+            agent_id=self.manifest.id,
+            answer="Logistics отклонил несовместимую команду оркестратора.",
+            actions_taken=[
+                ActionRecord(
+                    name="logistics_capability_contract",
+                    status="rejected",
+                    details={"reason": reason, **details},
+                )
+            ],
+            confidence=0.0,
+            metadata={
+                "terminal": True,
+                "answer_is_final": True,
+                "safe_to_send": True,
+                "fast_return": True,
+                "fast_return_reason": "structured_command_rejected",
+                "reason": reason,
+                "registry_version": registry.get("registry_version"),
+            },
+        )
+
+    async def handle(self, task: AgentTask) -> AgentResult:
+        return AgentResult(
+            status="failed",
+            agent_id=self.manifest.id,
+            answer="Logistics принимает только точную структурированную команду оркестратора.",
+            model_usage=[
+                ModelUsageRecord(
+                    agent_id=self.manifest.id,
+                    provider="internal",
+                    model="logistics-executor-guard",
+                    status="not_used",
+                    notes=["All Logistics free-text reasoning paths are disabled."],
+                )
+            ],
+            actions_taken=[
+                ActionRecord(
+                    name="logistics_executor_guard",
+                    status="rejected",
+                    details={"reason": "ORCHESTRATOR_STRUCTURED_COMMAND_REQUIRED"},
+                )
+            ],
+            metadata={"reason": "ORCHESTRATOR_STRUCTURED_COMMAND_REQUIRED"},
+        )
 
     def _logs(self) -> list[str]:
-        return [
-            "Логист — LLM-специалист; инструменты только читают/пишут структурированное состояние.",
-            "Доставка сообщений пользователю — зона Переговорщика и канального уровня.",
-            "Bitrix остаётся слоем канала/источника; Логист владеет только интерпретацией vehicle_usage.",
-        ]
+        return ["Logistics is a structured executor with no model surface."]
+
+    def _llm_failure_result(self, message: str) -> Any:
+        raise RuntimeError(message)
+
+
+def _terminal_status(result: ToolResult) -> str:
+    if result.status in {ToolStatus.OK, ToolStatus.NOT_FOUND, ToolStatus.DRY_RUN}:
+        if bool(result.data.get("needs_clarification")):
+            return "needs_clarification"
+        return "completed"
+    if result.status in {ToolStatus.INVALID_TOOL_CALL, ToolStatus.AMBIGUOUS, ToolStatus.DENIED}:
+        return "needs_clarification"
+    return "failed"
+
+
+__all__ = ["LogisticsSpecialist"]

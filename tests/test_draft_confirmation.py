@@ -1,4 +1,4 @@
-from ai_server.agents.bitrix24.draft_confirmation import matches_draft_confirmation
+from ai_server.orchestrators.draft_confirmation import matches_draft_confirmation
 
 
 def test_voice_confirmation_ignores_comma_and_case():

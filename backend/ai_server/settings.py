@@ -40,16 +40,13 @@ class Settings:
     bitrix_projects_webhook_url: str
     public_base_url: str
     webhook_secret: str
+    admin_api_secret: str
     llm_provider: str
     llm_model: str
     llm_base_url: str
     llm_api_key: str
     llm_temperature: float | None
     llm_max_tokens: int
-    llm_routing_enabled: bool
-    llm_flash_model: str
-    llm_pro_model: str
-    llm_flash_fallback_to_pro: bool
     orchestrator_llm_model: str
     orchestrator_llm_base_url: str
     orchestrator_llm_api_key: str
@@ -60,8 +57,6 @@ class Settings:
     orchestrator_entity_catalog_user_limit: int
     orchestrator_entity_catalog_project_limit: int
     orchestrator_entity_catalog_warehouse_limit: int
-    bitrix_structured_commands_enabled: bool
-    bitrix_structured_command_tools: str
     deepseek_api_key: str
     deepseek_balance_base_url: str
     deepseek_balance_timeout_seconds: float
@@ -70,7 +65,6 @@ class Settings:
     tech_footer_balance_enabled: bool
     tech_footer_balance_cache_seconds: int
     diagnost_enabled: bool
-    diagnost_feedback_enabled: bool
     diagnost_trace_snapshot_enabled: bool
     diagnost_trace_settle_seconds: float
     diagnost_high_latency_ms: float
@@ -92,7 +86,6 @@ class Settings:
     webhook_event_queue_stale_processing_seconds: int
     agent_orchestrator_worker_count: int
     agent_bitrix_worker_count: int
-    agent_logistics_worker_count: int
     agent_task_timeout_seconds: float
     agent_queue_processing_ttl_seconds: int
     scheduler_enabled: bool
@@ -131,19 +124,6 @@ class Settings:
     search_background_lock_stale_seconds: int
     search_webhook_indexer_enabled: bool
     search_webhook_content_enabled: bool
-    quality_control_webhook_enabled: bool
-    quality_control_dry_run: bool
-    quality_control_actor_user_id: int | None
-    quality_control_exempt_responsible_user_ids: str
-    supervisor_enabled: bool
-    supervisor_dry_run: bool
-    supervisor_interval_seconds: int
-    supervisor_initial_delay_seconds: int
-    supervisor_max_tasks: int
-    supervisor_max_tasks_per_user: int
-    supervisor_admin_user_ids: str
-    supervisor_notify_responsibles: bool
-    supervisor_reminder_cooldown_hours: int
     reconcile_enabled: bool
     reconcile_interval_seconds: int
     reconcile_initial_delay_seconds: int
@@ -167,7 +147,6 @@ class Settings:
     vehicle_usage_excluded_user_ids: str
     vehicle_usage_staff_sync_enabled: bool
     vehicle_usage_dry_run: bool
-    task_proposal_manager_bitrix_id: int | None
     attachment_max_bytes: int
     stt_provider: str
     transcription_max_bytes: int
@@ -197,9 +176,6 @@ class Settings:
     agent_shell_timeout_seconds: float
     agent_shell_max_command_chars: int
     agent_shell_max_output_chars: int
-    kartoteka_data_dir: str
-    kartoteka_protected_user_ids: str
-    kartoteka_secret_user_ids: str
     database_url: str
     redis_url: str
     var_dir: Path
@@ -309,14 +285,6 @@ class Settings:
         return runtime_paths(self.var_dir).learning_events_log
 
     @property
-    def quality_control_state_path(self) -> Path:
-        return runtime_paths(self.var_dir).quality_control_state
-
-    @property
-    def supervisor_state_path(self) -> Path:
-        return runtime_paths(self.var_dir).supervisor_state
-
-    @property
     def attachment_storage_dir(self) -> Path:
         return runtime_paths(self.var_dir).attachments_dir
 
@@ -333,28 +301,12 @@ class Settings:
         )
 
     @property
-    def resolved_supervisor_admin_user_ids(self) -> list[int]:
-        return _id_list(self.supervisor_admin_user_ids)
-
-    @property
     def resolved_task_close_report_admin_user_ids(self) -> list[int]:
         return _id_list(self.bitrix_task_close_report_admin_user_ids) or [1]
 
     @property
     def resolved_task_close_control_admin_user_ids(self) -> list[int]:
         return _id_list(self.bitrix_task_close_control_admin_user_ids) or [1]
-
-    def resolved_bitrix_structured_command_tools(self, available: set[str]) -> set[str]:
-        if not self.bitrix_structured_commands_enabled:
-            return set()
-        configured = {
-            item.strip()
-            for item in self.bitrix_structured_command_tools.replace(";", ",").split(",")
-            if item.strip()
-        }
-        if not configured or "*" in configured:
-            return set(available)
-        return set(available) & configured
 
     @property
     def resolved_agent_private_disk_path_markers(self) -> list[str]:
@@ -369,10 +321,6 @@ class Settings:
     @property
     def resolved_tech_footer_allowed_user_ids(self) -> list[int]:
         return _id_list(self.tech_footer_allowed_user_ids)
-
-    @property
-    def resolved_quality_control_exempt_responsible_user_ids(self) -> list[int]:
-        return _id_list(self.quality_control_exempt_responsible_user_ids)
 
     @property
     def resolved_vehicle_usage_admin_notify_user_ids(self) -> list[int]:
@@ -477,22 +425,17 @@ def get_settings() -> Settings:
         bitrix_projects_webhook_url=_env("BITRIX_PROJECTS_WEBHOOK_URL"),
         public_base_url=_env("PUBLIC_BASE_URL"),
         webhook_secret=_env("WEBHOOK_SECRET"),
+        admin_api_secret=_env("ADMIN_API_SECRET"),
         llm_provider=_env("AI_SERVER_LLM_PROVIDER", _env("LLM_PROVIDER", "deepseek")),
-        llm_model=_env("AI_SERVER_LLM_MODEL", _env("LLM_MODEL", "deepseek-v4-flash")),
+        llm_model=_env("AI_SERVER_LLM_MODEL", _env("LLM_MODEL", "deepseek-v4-pro")),
         llm_base_url=_env("AI_SERVER_LLM_BASE_URL", _env("LLM_BASE_URL")),
         llm_api_key=_env("AI_SERVER_LLM_API_KEY", _env("LLM_API_KEY")),
         llm_temperature=_env_float("AI_SERVER_LLM_TEMPERATURE", _env_float("LLM_TEMPERATURE")),
         llm_max_tokens=_env_int("AI_SERVER_LLM_MAX_TOKENS", _env_int("LLM_MAX_TOKENS", 10000)) or 10000,
-        llm_routing_enabled=_env_bool("AI_SERVER_LLM_ROUTING_ENABLED", _env_bool("LLM_ROUTING_ENABLED", False)),
-        llm_flash_model=_env("AI_SERVER_LLM_FLASH_MODEL", _env("LLM_FLASH_MODEL", "deepseek-v4-flash")),
-        llm_pro_model=_env(
-            "AI_SERVER_LLM_PRO_MODEL",
-            _env("LLM_PRO_MODEL", _env("AI_SERVER_LLM_MODEL", _env("LLM_MODEL", "deepseek-v4-pro"))),
+        orchestrator_llm_model=_env(
+            "AI_SERVER_ORCHESTRATOR_LLM_MODEL",
+            "deepseek-v4-pro",
         ),
-        llm_flash_fallback_to_pro=_env_bool(
-            "AI_SERVER_LLM_FLASH_FALLBACK_TO_PRO", _env_bool("LLM_FLASH_FALLBACK_TO_PRO", True)
-        ),
-        orchestrator_llm_model=_env("AI_SERVER_ORCHESTRATOR_LLM_MODEL"),
         orchestrator_llm_base_url=_env("AI_SERVER_ORCHESTRATOR_LLM_BASE_URL"),
         orchestrator_llm_api_key=_env("AI_SERVER_ORCHESTRATOR_LLM_API_KEY"),
         orchestrator_llm_reasoning=_env_bool("AI_SERVER_ORCHESTRATOR_LLM_REASONING"),
@@ -514,8 +457,6 @@ def get_settings() -> Settings:
             "AI_SERVER_ORCHESTRATOR_ENTITY_CATALOG_WAREHOUSE_LIMIT", 1000
         )
         or 1000,
-        bitrix_structured_commands_enabled=_env_bool("BITRIX_STRUCTURED_COMMANDS_ENABLED", True),
-        bitrix_structured_command_tools=_env("BITRIX_STRUCTURED_COMMAND_TOOLS", "*"),
         deepseek_api_key=_deepseek_api_key(),
         deepseek_balance_base_url=_env("AI_SERVER_DEEPSEEK_BALANCE_BASE_URL", "https://api.deepseek.com"),
         deepseek_balance_timeout_seconds=_env_float("AI_SERVER_DEEPSEEK_BALANCE_TIMEOUT_SECONDS", 10.0) or 10.0,
@@ -524,7 +465,6 @@ def get_settings() -> Settings:
         tech_footer_balance_enabled=_env_bool("AI_SERVER_TECH_FOOTER_BALANCE_ENABLED", True),
         tech_footer_balance_cache_seconds=_env_int("AI_SERVER_TECH_FOOTER_BALANCE_CACHE_SECONDS", 300) or 300,
         diagnost_enabled=_env_bool("DIAGNOST_ENABLED", True),
-        diagnost_feedback_enabled=_env_bool("DIAGNOST_FEEDBACK_ENABLED", False),
         diagnost_trace_snapshot_enabled=_env_bool("DIAGNOST_TRACE_SNAPSHOT_ENABLED", True),
         diagnost_trace_settle_seconds=_env_float("DIAGNOST_TRACE_SETTLE_SECONDS", 1.0) or 1.0,
         diagnost_high_latency_ms=_env_float("DIAGNOST_HIGH_LATENCY_MS", 120000.0) or 120000.0,
@@ -545,9 +485,8 @@ def get_settings() -> Settings:
         webhook_event_queue_retry_max_seconds=_env_int("WEBHOOK_EVENT_QUEUE_RETRY_MAX_SECONDS", 300) or 300,
         webhook_event_queue_stale_processing_seconds=_env_int("WEBHOOK_EVENT_QUEUE_STALE_PROCESSING_SECONDS", 300)
         or 300,
-        agent_orchestrator_worker_count=_env_int("AGENT_ORCHESTRATOR_WORKER_COUNT", 1) or 1,
+        agent_orchestrator_worker_count=_env_int("AGENT_ORCHESTRATOR_WORKER_COUNT", 5) or 5,
         agent_bitrix_worker_count=_env_int("AGENT_BITRIX_WORKER_COUNT", 1) or 1,
-        agent_logistics_worker_count=_env_int("AGENT_LOGISTICS_WORKER_COUNT", 1) or 1,
         agent_task_timeout_seconds=_env_float("AGENT_TASK_TIMEOUT_SECONDS", 300.0) or 300.0,
         agent_queue_processing_ttl_seconds=_env_int("AGENT_QUEUE_PROCESSING_TTL_SECONDS", 600) or 600,
         scheduler_enabled=_env_bool("AI_SERVER_SCHEDULER_ENABLED", True),
@@ -591,19 +530,6 @@ def get_settings() -> Settings:
         or (2 * 60 * 60),
         search_webhook_indexer_enabled=_env_bool("SEARCH_WEBHOOK_INDEXER_ENABLED", False),
         search_webhook_content_enabled=_env_bool("SEARCH_WEBHOOK_CONTENT_ENABLED", True),
-        quality_control_webhook_enabled=_env_bool("QUALITY_CONTROL_WEBHOOK_ENABLED", False),
-        quality_control_dry_run=_env_bool("QUALITY_CONTROL_DRY_RUN", True),
-        quality_control_actor_user_id=_env_int("QUALITY_CONTROL_ACTOR_USER_ID"),
-        quality_control_exempt_responsible_user_ids=_env("QUALITY_CONTROL_EXEMPT_RESPONSIBLE_USER_IDS"),
-        supervisor_enabled=_env_bool("SUPERVISOR_ENABLED", False),
-        supervisor_dry_run=_env_bool("SUPERVISOR_DRY_RUN", True),
-        supervisor_interval_seconds=_env_int("SUPERVISOR_INTERVAL_SECONDS", 60 * 60) or (60 * 60),
-        supervisor_initial_delay_seconds=_env_int("SUPERVISOR_INITIAL_DELAY_SECONDS", 60) or 60,
-        supervisor_max_tasks=_env_int("SUPERVISOR_MAX_TASKS", 50) or 50,
-        supervisor_max_tasks_per_user=_env_int("SUPERVISOR_MAX_TASKS_PER_USER", 10) or 10,
-        supervisor_admin_user_ids=_env("SUPERVISOR_ADMIN_USER_IDS"),
-        supervisor_notify_responsibles=_env_bool("SUPERVISOR_NOTIFY_RESPONSIBLES", False),
-        supervisor_reminder_cooldown_hours=_env_int("SUPERVISOR_REMINDER_COOLDOWN_HOURS", 12) or 12,
         reconcile_enabled=_env_bool("RECONCILE_ENABLED", False),
         reconcile_interval_seconds=_env_int("RECONCILE_INTERVAL_SECONDS", 15 * 60) or (15 * 60),
         reconcile_initial_delay_seconds=_env_int("RECONCILE_INITIAL_DELAY_SECONDS", 120) or 120,
@@ -627,7 +553,6 @@ def get_settings() -> Settings:
         vehicle_usage_excluded_user_ids=_env("VEHICLE_USAGE_EXCLUDED_USER_IDS"),
         vehicle_usage_staff_sync_enabled=_env_bool("VEHICLE_USAGE_STAFF_SYNC_ENABLED", False),
         vehicle_usage_dry_run=_env_bool("VEHICLE_USAGE_DRY_RUN", True),
-        task_proposal_manager_bitrix_id=_env_int("TASK_PROPOSAL_MANAGER_BITRIX_ID"),
         attachment_max_bytes=_env_int("ATTACHMENT_MAX_BYTES", 30 * 1024 * 1024) or (30 * 1024 * 1024),
         stt_provider=_env("STT_PROVIDER", "yandex_speechkit"),
         transcription_max_bytes=_env_int("TRANSCRIPTION_MAX_BYTES", 25 * 1024 * 1024) or (25 * 1024 * 1024),
@@ -657,9 +582,6 @@ def get_settings() -> Settings:
         agent_shell_timeout_seconds=_env_float("AGENT_SHELL_TIMEOUT_SECONDS", 30.0) or 30.0,
         agent_shell_max_command_chars=_env_int("AGENT_SHELL_MAX_COMMAND_CHARS", 500) or 500,
         agent_shell_max_output_chars=_env_int("AGENT_SHELL_MAX_OUTPUT_CHARS", 4000) or 4000,
-        kartoteka_data_dir=_env("KARTOTEKA_DATA_DIR"),
-        kartoteka_protected_user_ids=_env("KARTOTEKA_PROTECTED_USER_IDS"),
-        kartoteka_secret_user_ids=_env("KARTOTEKA_SECRET_USER_IDS"),
         database_url=_env("DATABASE_URL"),
         redis_url=_env("REDIS_URL"),
         var_dir=paths.root,

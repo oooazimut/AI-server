@@ -21,5 +21,12 @@ def validate_webhook_secret(settings: Settings, value: str | None) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="invalid webhook secret")
 
 
+def validate_admin_secret(settings: Settings, value: str | None) -> None:
+    if not settings.admin_api_secret:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="admin API is not configured")
+    if value != settings.admin_api_secret:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="invalid admin secret")
+
+
 def now_ts() -> str:
     return datetime.now(UTC).isoformat()

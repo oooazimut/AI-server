@@ -5,29 +5,8 @@
 -- Create target schemas (ensure_schema() also does this, but this is explicit)
 CREATE SCHEMA IF NOT EXISTS bitrix24;
 CREATE SCHEMA IF NOT EXISTS logistics;
-CREATE SCHEMA IF NOT EXISTS pto;
 
 -- ── bitrix24 ──────────────────────────────────────────────────────────────────
-
-CREATE TABLE IF NOT EXISTS bitrix24.incomplete_proposals (
-    id SERIAL PRIMARY KEY,
-    task_id INTEGER NOT NULL,
-    title TEXT NOT NULL DEFAULT '',
-    responsible_id INTEGER,
-    deadline TEXT,
-    description TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'pending_review',
-    created_at TEXT NOT NULL,
-    manager_notified_at TEXT,
-    responsible_response TEXT,
-    responded_at TEXT
-);
-
-INSERT INTO bitrix24.incomplete_proposals
-SELECT * FROM public.incomplete_proposals
-ON CONFLICT DO NOTHING;
-
-DROP TABLE IF EXISTS public.incomplete_proposals;
 
 -- ── logistics ─────────────────────────────────────────────────────────────────
 

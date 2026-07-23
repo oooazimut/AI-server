@@ -10,12 +10,6 @@ from ai_server.agents.bitrix24.tools.project_create import (
     ProjectCreateDiscardTool,
     ProjectCreateDraftTool,
 )
-from ai_server.agents.bitrix24.tools.proposals import (
-    DeleteIncompleteProposalTool,
-    SaveIncompleteProposalTool,
-    SaveResponsibleResponseTool,
-    proposal_context,
-)
 from ai_server.agents.bitrix24.tools.task_close import (
     TaskCloseConfirmTool,
     TaskCloseDiscardTool,
@@ -56,8 +50,4 @@ __all__ = [
     "TaskCloseReportIncidentTool",
     "TaskCloseControlGetTool",
     "TaskCloseControlUpdateTool",
-    "SaveIncompleteProposalTool",
-    "DeleteIncompleteProposalTool",
-    "SaveResponsibleResponseTool",
-    "proposal_context",
 ]

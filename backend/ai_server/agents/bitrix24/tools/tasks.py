@@ -7,8 +7,6 @@ from typing import Any
 
 from ai_server.agents.bitrix24.tools.bitrix_api import (
     _extract_sonet_groups,
-    _match_sonet_groups,
-    _normalize_project_name,
 )
 from ai_server.agents.bitrix24.tools.read_client import resolve_current_user_read_client
 from ai_server.integrations.bitrix.client import BitrixApiError, BitrixConfigError
@@ -90,6 +88,7 @@ class BitrixMyTasksTool:
                         "description": "Offset after sorting, for the next page.",
                     },
                 },
+                "required": ["status", "limit", "offset"],
             },
         )
 
@@ -234,7 +233,7 @@ class BitrixTaskSearchTool:
                     "project_id": {"type": "integer", "description": "Bitrix workgroup/project ID."},
                     "project_name": {
                         "type": "string",
-                        "description": "Project/workgroup name. The tool normalizes hyphens, case, and known aliases.",
+                        "description": "Display label for an exact project_id already selected by the orchestrator.",
                     },
                     "created_from": {
                         "type": "string",
@@ -278,6 +277,7 @@ class BitrixTaskSearchTool:
                         "description": "Safety cap for how many candidate tasks may load comments. Default: 50.",
                     },
                 },
+                "required": ["scope", "status", "include_closed", "include_comments", "limit", "offset"],
             },
         )
 
@@ -348,39 +348,11 @@ class BitrixTaskSearchTool:
         errors: list[dict[str, str]] = []
 
         if project_id is None and project_query:
-            read_client, access_actor, access_error = await resolve_current_user_read_client(
-                self.name,
-                fallback_client=self._client,
-                bitrix_oauth=self._bitrix_oauth,
-                user_id=user_id,
+            return ToolResult(
+                status=ToolStatus.CONTRACT_VIOLATION,
+                tool=self.name,
+                error="bitrix_task_search requires exact project_id selected by the orchestrator",
             )
-            if access_error is not None:
-                return access_error
-            project_matches, project_errors = await _search_projects(read_client, project_query, limit=1)
-            errors.extend(project_errors)
-            if not project_matches:
-                return ToolResult(
-                    status=ToolStatus.OK,
-                    tool=self.name,
-                    data={
-                        "mode": "list",
-                        "source": "live_bitrix_rest",
-                        "access_actor": access_actor,
-                        "scope": scope,
-                        "status": status,
-                        "query": query,
-                        "project_query": project_query,
-                        "project_not_found": True,
-                        "items": [],
-                        "total": 0,
-                        "limit": limit,
-                        "offset": offset,
-                        "has_more": False,
-                        "errors": errors,
-                    },
-                )
-            project = _project_summary(project_matches[0])
-            project_id = _safe_int(project.get("id"))
         elif project_id is not None:
             project = {"id": str(project_id), "name": project_query or ""}
 
@@ -848,25 +820,21 @@ class BitrixProjectSearchTool:
     def __init__(
         self,
         client: BitrixToolClientPort | None = None,
-        portal_search: PortalSearchPort | None = None,
         bitrix_oauth: BitrixOAuthService | None = None,
     ) -> None:
         self._client = client
-        self._portal_search = portal_search
         self._bitrix_oauth = bitrix_oauth
 
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name=self.name,
             description=(
-                "Deterministic read-only Bitrix project/workgroup search by name. Use instead of generic bitrix_api "
-                "for project reads like 'найди проект Ларгус 2'. The tool normalizes hyphens, case, and known car "
-                "project aliases before returning project links."
+                "Read one exact Bitrix project/workgroup selected by the orchestrator entity catalog."
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Project/workgroup name to search."},
+                    "query": {"type": "string", "description": "Display label for the exact project_id."},
                     "project_id": {
                         "type": "integer",
                         "description": "Exact project ID selected by the orchestrator entity catalog.",
@@ -878,7 +846,7 @@ class BitrixProjectSearchTool:
                         "description": "Maximum projects to return. Default: 10.",
                     },
                 },
-                "anyOf": [{"required": ["query"]}, {"required": ["project_id"]}],
+                "required": ["project_id", "limit"],
             },
         )
 
@@ -890,19 +858,19 @@ class BitrixProjectSearchTool:
         dialog_key: str | None = None,
         dialog_id: str | None = None,
     ) -> ToolResult:
-        if self._client is None and self._portal_search is None:
+        if self._client is None and self._bitrix_oauth is None:
             return ToolResult(
                 status=ToolStatus.NOT_CONFIGURED,
                 tool=self.name,
-                error="BitrixClient or PortalSearchIndex is required",
+                error="BitrixClient or Bitrix OAuth is required",
             )
         query = _first_arg_text(args, "query", "project", "name")
         project_id = _safe_int(args.get("project_id"))
-        if not query and project_id is None:
+        if project_id is None:
             return ToolResult(
-                status=ToolStatus.ERROR,
+                status=ToolStatus.CONTRACT_VIOLATION,
                 tool=self.name,
-                error="Project query or exact project_id is required.",
+                error="exact project_id selected by the orchestrator is required",
                 data={"query": ""},
             )
         limit = _bounded_int(
@@ -932,24 +900,24 @@ class BitrixProjectSearchTool:
             )
             if access_error is not None:
                 return access_error
-        snapshot_matches = _search_projects_snapshot(self._portal_search, query, limit=limit) if query else None
-        if project_id is not None:
-            try:
-                raw = await read_client.result(
-                    "sonet_group.get",
-                    {"FILTER": {"ID": project_id}, "ORDER": {"NAME": "ASC"}},
-                )
-                matches = _extract_sonet_groups(raw)[:1]
-                errors = []
-            except (BitrixApiError, BitrixConfigError) as exc:
-                matches, errors = [], [{"source": "sonet_group.get", "error": str(exc)}]
-        else:
-            matches, errors = await _search_projects(read_client, query, limit=limit)
+        try:
+            raw = await read_client.result(
+                "sonet_group.get",
+                {"FILTER": {"ID": project_id}, "ORDER": {"NAME": "ASC"}},
+            )
+            matches = [
+                group
+                for group in _extract_sonet_groups(raw)
+                if _safe_int(group.get("ID") or group.get("id")) == project_id
+            ][:1]
+            errors = []
+        except (BitrixApiError, BitrixConfigError) as exc:
+            matches, errors = [], [{"source": "sonet_group.get", "error": str(exc)}]
         return ToolResult(
             status=ToolStatus.OK,
             tool=self.name,
             data={
-                "source": "postgres_candidates_live_acl" if snapshot_matches is not None else "live_bitrix_rest",
+                "source": "live_bitrix_rest",
                 "access_actor": access_actor,
                 "access_verified_at": datetime.now(UTC).isoformat(),
                 "query": query,
@@ -1074,96 +1042,6 @@ def _task_search_calls(
     ]
 
 
-async def _search_projects(
-    client: BitrixToolClientPort,
-    query: str,
-    *,
-    limit: int,
-) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    errors: list[dict[str, str]] = []
-    initial_params = {"FILTER": {"%NAME": query}, "ORDER": {"NAME": "ASC"}}
-    try:
-        initial_result = await client.result("sonet_group.get", initial_params)
-    except (BitrixApiError, BitrixConfigError) as exc:
-        errors.append({"source": "sonet_group.get", "error": str(exc)})
-        initial_result = []
-
-    initial_groups = _extract_sonet_groups(initial_result)
-    matches = _match_sonet_groups(initial_groups, query=query, limit=limit)
-    if matches:
-        return matches, errors
-
-    fallback_params = {"FILTER": {}, "ORDER": {"NAME": "ASC"}}
-    try:
-        fallback_result = await client.result("sonet_group.get", fallback_params)
-    except (BitrixApiError, BitrixConfigError) as exc:
-        errors.append({"source": "sonet_group.get:fallback", "error": str(exc)})
-        return [], errors
-    return _match_sonet_groups(_extract_sonet_groups(fallback_result), query=query, limit=limit), errors
-
-
-def _search_projects_snapshot(
-    portal_search: PortalSearchPort | None,
-    query: str,
-    *,
-    limit: int,
-) -> list[dict[str, Any]] | None:
-    if portal_search is None:
-        return None
-    try:
-        if not portal_search.stats().exists:
-            return None
-        results = []
-        seen: set[tuple[str, str]] = set()
-        for variant in _project_search_variants(query):
-            for item in portal_search.search(variant, entity_types={"project"}, limit=limit):
-                key = (str(getattr(item, "entity_type", "")), str(getattr(item, "entity_id", "")))
-                if key in seen:
-                    continue
-                seen.add(key)
-                results.append(item)
-                if len(results) >= limit:
-                    break
-            if len(results) >= limit:
-                break
-    except Exception:
-        return None
-    results = _filter_project_snapshot_results(results, query=query, limit=limit)
-    if not results:
-        return None
-    return [_project_summary_from_index(item) for item in results]
-
-
-def _project_search_variants(query: str) -> list[str]:
-    variants = [query]
-    normalized = _normalize_project_name(query)
-    if normalized and normalized not in {item.casefold() for item in variants}:
-        variants.append(normalized)
-    return variants
-
-
-def _filter_project_snapshot_results(items: list[Any], *, query: str, limit: int) -> list[Any]:
-    normalized_query = _normalize_project_name(query)
-    query_terms = set(normalized_query.split())
-    scored: list[tuple[int, str, Any]] = []
-    for item in items:
-        name = str(getattr(item, "title", "") or "")
-        normalized_name = _normalize_project_name(name)
-        if not normalized_name:
-            continue
-        score = 0
-        if normalized_name == normalized_query:
-            score = 100
-        elif normalized_query and normalized_query in normalized_name:
-            score = 80
-        elif query_terms and query_terms.issubset(set(normalized_name.split())):
-            score = 70
-        if score:
-            scored.append((score, normalized_name, item))
-    scored.sort(key=lambda row: (-row[0], row[1]))
-    return [item for _score, _name, item in scored[:limit]]
-
-
 def _extract_tasks(result: Any) -> list[dict[str, Any]]:
     if isinstance(result, list):
         return [item for item in result if isinstance(item, dict)]
@@ -1233,22 +1111,6 @@ def _project_summary(group: dict[str, Any]) -> dict[str, Any]:
         "name": name,
         "description": _first_text(group, "DESCRIPTION", "description"),
     }
-
-
-def _project_summary_from_index(item: Any) -> dict[str, Any]:
-    return {
-        "id": str(getattr(item, "entity_id", "") or ""),
-        "name": str(getattr(item, "title", "") or ""),
-        "description": _project_description_from_index(getattr(item, "body", "") or ""),
-    }
-
-
-def _project_description_from_index(body: object) -> str:
-    lines = [line.strip() for line in str(body or "").splitlines() if line.strip()]
-    if not lines:
-        return ""
-    first = lines[0]
-    return "" if first.startswith("Проект:") or first.startswith("Владелец:") else first
 
 
 def _person_label(value: object) -> str:

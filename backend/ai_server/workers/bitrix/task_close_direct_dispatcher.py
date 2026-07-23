@@ -3,33 +3,22 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 from typing import Any
 
-from ai_server.agents.bitrix24.tools.draft_lifecycle import renew_exact_draft_claim
-from ai_server.agents.bitrix24.tools.task_close import (
-    TASK_CLOSE_DRAFT_TYPE,
-    _execute_task_close,
-    build_task_close_draft_from_args,
-    format_task_close_draft_message,
-)
-from ai_server.agents.bitrix24.tools.task_close_control import (
-    TASK_CLOSE_AUTO_CLOSE_TIME_KEY,
-    TASK_CLOSE_DEFAULT_AUTO_CLOSE_TIME,
-)
-from ai_server.integrations.bitrix.oauth import BitrixOAuthError
 from ai_server.integrations.bitrix.task_close_direct_queue import (
-    TASK_CLOSE_DIRECT_OPEN_STATUSES,
     TASK_CLOSE_DIRECT_QUEUE_PREFIX,
     TASK_CLOSE_DIRECT_STATUS_ACTIVE,
-    auto_close_direct_close_event_as_unconfirmed,
 )
-from ai_server.models import AgentResult, AgentTask
+from ai_server.models import AgentResult, AgentTask, UserContext
 from ai_server.settings import Settings
 from ai_server.utils import MOSCOW_TZ
 
 logger = logging.getLogger(__name__)
+
+OrchestratorHandler = Callable[[AgentTask], Awaitable[AgentResult]]
 
 
 @dataclass
@@ -57,7 +46,7 @@ class DirectTaskCloseDraftDispatchStats:
 @dataclass
 class DirectTaskCloseAutoCloseStats:
     due: bool = False
-    auto_close_time: str = TASK_CLOSE_DEFAULT_AUTO_CLOSE_TIME
+    auto_close_time: str = "20:00"
     candidates: int = 0
     reports_written: int = 0
     closed: int = 0
@@ -86,13 +75,14 @@ class DirectTaskCloseAutoCloseStats:
 
 async def run_task_close_direct_control_worker(
     *,
-    bitrix: Any,
-    bitrix_oauth: Any | None = None,
     store: Any,
     settings: Settings,
     status: dict[str, Any],
-    outbound_queue: Any = None,
+    orchestrator_handler: OrchestratorHandler | None,
+    **_: Any,
 ) -> None:
+    """Dispatch task-close facts through the sole semantic owner: the orchestrator."""
+
     interval_seconds = max(int(settings.bitrix_task_close_control_interval_seconds), 30)
     status.update(
         {
@@ -112,12 +102,10 @@ async def run_task_close_direct_control_worker(
     while True:
         try:
             result = await run_task_close_direct_control_once(
-                bitrix=bitrix,
-                bitrix_oauth=bitrix_oauth,
                 store=store,
                 settings=settings,
                 status=status,
-                outbound_queue=outbound_queue,
+                orchestrator_handler=orchestrator_handler,
             )
             status["last_success_at"] = _now().isoformat()
             status["last_error"] = None
@@ -128,7 +116,7 @@ async def run_task_close_direct_control_worker(
             status["running"] = False
             raise
         except Exception as exc:
-            logger.exception("Task close direct control tick failed")
+            logger.exception("Task-close orchestrator dispatcher tick failed")
             status["last_error"] = f"{type(exc).__name__}: {exc}"
             status["errors"] = int(status.get("errors") or 0) + 1
             await _sleep_until_next(status, min(interval_seconds, 300))
@@ -136,38 +124,31 @@ async def run_task_close_direct_control_worker(
 
 async def run_task_close_direct_control_once(
     *,
-    bitrix: Any,
-    bitrix_oauth: Any | None = None,
     store: Any,
     settings: Settings,
+    orchestrator_handler: OrchestratorHandler | None,
     status: dict[str, Any] | None = None,
     now: datetime | None = None,
-    outbound_queue: Any = None,
+    **_: Any,
 ) -> dict[str, Any]:
     now_dt = now or _now()
     if status is not None:
         status["last_check_at"] = now_dt.isoformat()
-    dispatch_stats = await dispatch_direct_task_close_drafts(
-        bitrix=bitrix,
+    dispatch = await dispatch_direct_task_close_drafts(
         store=store,
         settings=settings,
+        orchestrator_handler=orchestrator_handler,
         limit=max(int(settings.bitrix_task_close_control_direct_limit), 1),
         now=now_dt,
-        outbound_queue=outbound_queue,
     )
-    auto_close_stats = await auto_close_direct_task_close_reports(
-        bitrix=bitrix,
-        bitrix_oauth=bitrix_oauth,
+    auto_close = await auto_close_direct_task_close_reports(
         store=store,
         settings=settings,
+        orchestrator_handler=orchestrator_handler,
         limit=max(int(settings.bitrix_task_close_control_auto_close_limit), 1),
         now=now_dt,
     )
-    result = {
-        "checked_at": now_dt.isoformat(),
-        "dispatch": dispatch_stats.as_dict(),
-        "auto_close": auto_close_stats.as_dict(),
-    }
+    result = {"checked_at": now_dt.isoformat(), "dispatch": dispatch.as_dict(), "auto_close": auto_close.as_dict()}
     if status is not None:
         status.update(result)
     return result
@@ -175,353 +156,236 @@ async def run_task_close_direct_control_once(
 
 async def dispatch_direct_task_close_drafts(
     *,
-    bitrix: Any,
     store: Any,
     settings: Settings,
+    orchestrator_handler: OrchestratorHandler | None,
     limit: int = 20,
     now: datetime | None = None,
-    outbound_queue: Any = None,
+    **_: Any,
 ) -> DirectTaskCloseDraftDispatchStats:
     stats = DirectTaskCloseDraftDispatchStats()
-    lister = getattr(store, "list_task_close_processing_states", None)
-    if not callable(lister):
-        return stats
-    states = lister(
-        statuses=[TASK_CLOSE_DIRECT_STATUS_ACTIVE],
-        state_key_prefix=TASK_CLOSE_DIRECT_QUEUE_PREFIX,
-        limit=limit,
-    )
+    states = _list_states(store, statuses=[TASK_CLOSE_DIRECT_STATUS_ACTIVE], limit=limit)
     stats.candidates = len(states)
-    now_iso = (now or datetime.now(MOSCOW_TZ)).isoformat(timespec="seconds")
+    now_iso = (now or _now()).isoformat(timespec="seconds")
     for state in states:
+        payload = dict(state.get("payload") or {})
+        if payload.get("direct_close_draft_orchestrated_at"):
+            stats.skipped += 1
+            continue
+        task = _draft_event_task(state, payload)
+        if task is None or orchestrator_handler is None:
+            _record_dispatch_failure(store, state, payload, now_iso, "orchestrator_unavailable")
+            stats.blocked += 1
+            continue
         try:
-            result = await _dispatch_one(
-                bitrix=bitrix,
-                store=store,
-                settings=settings,
-                state=state,
-                now_iso=now_iso,
-                outbound_queue=outbound_queue,
-            )
-        except Exception as exc:  # pragma: no cover - defensive: one bad task must not stop metadata sync
+            result = await orchestrator_handler(task)
+        except Exception as exc:
             stats.errors.append(f"{state.get('task_id')}:{type(exc).__name__}: {exc}")
             continue
-        if result == "created":
-            stats.drafts_created += 1
-            stats.messages_sent += 1
-        elif result == "created_queued":
-            stats.drafts_created += 1
-            stats.messages_queued += 1
-        elif result == "sent_existing":
-            stats.messages_sent += 1
-        elif result == "queued_existing":
-            stats.messages_queued += 1
-        elif result == "blocked":
+        if result.status != "needs_human":
+            _record_dispatch_failure(store, state, payload, now_iso, f"orchestrator_status:{result.status}")
             stats.blocked += 1
-        else:
-            stats.skipped += 1
+            continue
+        _update_state(
+            store,
+            state,
+            {
+                **payload,
+                "direct_close_draft_orchestrated_at": now_iso,
+                "direct_close_orchestrator_task_id": task.task_id,
+            },
+        )
+        stats.drafts_created += 1
+        stats.messages_sent += 1
     return stats
 
 
 async def auto_close_direct_task_close_reports(
     *,
-    bitrix: Any,
-    bitrix_oauth: Any | None = None,
     store: Any,
     settings: Settings,
+    orchestrator_handler: OrchestratorHandler | None,
     limit: int = 100,
     now: datetime | None = None,
+    **_: Any,
 ) -> DirectTaskCloseAutoCloseStats:
-    now_dt = now or datetime.now(MOSCOW_TZ)
+    now_dt = now or _now()
     auto_close_time = _configured_auto_close_time(store)
     stats = DirectTaskCloseAutoCloseStats(
         due=_is_auto_close_due(now_dt, auto_close_time),
         auto_close_time=auto_close_time,
     )
-    lister = getattr(store, "list_task_close_processing_states", None)
-    states = (
-        lister(
-            statuses=list(TASK_CLOSE_DIRECT_OPEN_STATUSES),
-            state_key_prefix=TASK_CLOSE_DIRECT_QUEUE_PREFIX,
-            limit=limit,
-        )
-        if stats.due and callable(lister)
-        else []
-    )
-    stats.candidates = len(states)
+    # A started numbered draft expires after its own TTL and is finalized on
+    # the next control tick.  The configured control time is only telemetry
+    # for queue-level policy; it must not prolong or shorten the branch TTL.
+    rows = await _list_expired_task_close_drafts(store, limit=limit)
+    stats.open_drafts = len(rows)
+    stats.candidates = len(rows)
     if settings.agent_dry_run:
-        stats.skipped = len(states)
+        stats.skipped = len(rows)
         return stats
-    now_iso = now_dt.isoformat(timespec="seconds")
-    for state in states:
-        payload = dict(state.get("payload") or {})
-        close_event_key = str(payload.get("close_event_key") or "").strip()
-        task_id = safe_int(state.get("task_id") or payload.get("task_id"))
-        if task_id is None or not close_event_key:
+    for row in rows:
+        task = _auto_finalize_task(row)
+        if task is None or orchestrator_handler is None:
             stats.skipped += 1
             continue
         try:
-            draft_dialog_key = str(
-                payload.get("draft_dialog_key") or _private_dialog_key(safe_int(payload.get("responsible_id")))
-            )
-            existing_draft = await _existing_draft(store, draft_dialog_key)
-            if existing_draft:
-                stats.skipped += 1
-                continue
-            draft = _auto_close_draft_from_state(state=state, payload=payload, existing_draft=None)
-            result = await _execute_task_close(close_call=bitrix.call, report_call=bitrix.call, draft=draft)
-            auto_close_direct_close_event_as_unconfirmed(
-                store,
-                task_id=task_id,
-                close_event_key=close_event_key,
-                now_iso=now_iso,
-                payload_updates={
-                    "auto_close_report_method": result.get("report_method"),
-                    "auto_close_report_file_name": result.get("report_file_name"),
-                },
-            )
-        except Exception as exc:  # pragma: no cover - defensive: one bad task must not stop the queue
-            stats.errors.append(f"{task_id}:{type(exc).__name__}: {exc}")
+            result = await orchestrator_handler(task)
+        except Exception as exc:
+            stats.errors.append(f"draft:{row.get('dialog_key')}:{type(exc).__name__}: {exc}")
+            continue
+        if result.status != "completed":
+            stats.errors.append(f"draft:{row.get('dialog_key')}:orchestrator_status:{result.status}")
             continue
         stats.reports_written += 1
         stats.closed += 1
-    draft_rows = await _list_task_close_drafts(store, limit=limit, expired_only=True)
-    stats.open_drafts = len(draft_rows)
-    for row in draft_rows:
-        dialog_key = str(row.get("dialog_key") or "")
-        draft = row.get("params")
-        if not isinstance(draft, dict):
-            stats.skipped += 1
-            continue
-        task_id = safe_int(draft.get("task_id"))
-        if task_id is None:
-            stats.skipped += 1
-            continue
-        if _truthy(draft.get("_direct_close_auto_closed")):
-            stats.skipped += 1
-            continue
-        row_status = str(row.get("status") or "active")
-        claim_name = "reclaim_stale_finalizing_task_draft" if row_status == "finalizing" else "claim_expired_task_draft"
-        claim = getattr(store, claim_name, None)
-        claimed = None
-        if callable(claim):
-            draft_id = str(draft.get("_draft_id") or "")
-            draft_version = safe_int(draft.get("_draft_version"))
-            if not draft_id or draft_version is None:
-                stats.errors.append(f"draft:{task_id}:missing_cas_identity")
-                continue
-            claimed = await claim(
-                dialog_key,
-                expected_draft_id=draft_id,
-                expected_version=draft_version,
-                expected_type=TASK_CLOSE_DRAFT_TYPE,
-            )
-            if not isinstance(claimed, dict):
-                stats.skipped += 1
-                continue
-            draft = claimed
-        try:
-            prepared = _auto_close_open_draft(draft)
-            user_id = _user_id_from_dialog_key(dialog_key)
-            result, actor_mode = await _execute_auto_close_with_fallback(
-                bitrix=bitrix,
-                bitrix_oauth=bitrix_oauth,
-                draft=prepared,
-                user_id=user_id,
-                claim_guard=lambda dialog_key=dialog_key, draft=draft: renew_exact_draft_claim(
-                    store,
-                    dialog_key=dialog_key,
-                    draft=draft,
-                    expected_status="finalizing",
-                ),
-            )
-            deleter = getattr(store, "delete_task_draft", None)
-            if callable(deleter) and dialog_key:
-                deleted = deleter(
-                    dialog_key,
-                    status="finalized",
-                    expected_draft_id=str(draft.get("_draft_id") or ""),
-                    expected_version=safe_int(draft.get("_draft_version")),
-                    expected_claim_token=str(draft.get("_draft_claim_token") or ""),
-                )
-                if inspect.isawaitable(deleted):
-                    await deleted
-            if actor_mode == "oauth_user":
-                stats.oauth_closed += 1
-            close_event_key = str(draft.get("_direct_close_close_event_key") or "").strip()
-            if not close_event_key:
-                matching_states = [
-                    state
-                    for state in states
-                    if safe_int(state.get("task_id") or (state.get("payload") or {}).get("task_id")) == task_id
-                    and str((state.get("payload") or {}).get("draft_dialog_key") or "") == dialog_key
-                    and str((state.get("payload") or {}).get("close_event_key") or "").strip()
-                ]
-                if len(matching_states) == 1:
-                    close_event_key = str(matching_states[0]["payload"]["close_event_key"]).strip()
-            if not close_event_key:
-                close_event_key = f"open_draft:{dialog_key or task_id}"
-            payload_updates = {
-                "auto_close_report_method": result.get("report_method"),
-                "auto_close_report_file_name": result.get("report_file_name"),
-                "auto_close_actor_mode": actor_mode,
-                "close_event_key": close_event_key,
-            }
-            auto_close_direct_close_event_as_unconfirmed(
-                store,
-                task_id=task_id,
-                close_event_key=payload_updates["close_event_key"],
-                now_iso=now_iso,
-                payload_updates=payload_updates,
-            )
-        except BitrixOAuthError as exc:
-            if isinstance(claimed, dict):
-                releaser = getattr(store, "release_task_draft", None)
-                if callable(releaser):
-                    await releaser(
-                        dialog_key,
-                        draft_id=str(claimed.get("_draft_id") or ""),
-                        claim_token=str(claimed.get("_draft_claim_token") or ""),
-                    )
-            stats.errors.append(f"draft:{task_id}:{type(exc).__name__}: {exc}")
-            continue
-        except Exception as exc:  # pragma: no cover - unknown remote outcome remains finalizing
-            stats.errors.append(f"draft:{task_id}:{type(exc).__name__}: {exc}")
-            continue
-        stats.reports_written += 1
-        stats.closed += 1
+        stats.oauth_closed += 1
     return stats
 
 
-async def _dispatch_one(
-    *,
-    bitrix: Any,
-    store: Any,
-    settings: Settings,
-    state: dict[str, Any],
-    now_iso: str,
-    outbound_queue: Any = None,
-) -> str:
-    payload = dict(state.get("payload") or {})
-    if payload.get("direct_close_draft_sent_at") or payload.get("direct_close_draft_queued_at"):
-        return "skipped"
-    task_id = safe_int(state.get("task_id") or payload.get("task_id"))
-    close_event_key = str(payload.get("close_event_key") or "").strip()
-    responsible_id = safe_int(payload.get("responsible_id"))
+def _draft_event_task(state: dict[str, Any], payload: dict[str, Any]) -> AgentTask | None:
+    task_id = _safe_int(state.get("task_id") or payload.get("task_id"))
+    responsible_id = _safe_int(payload.get("responsible_id"))
     recipient_id = str(payload.get("recipient_id") or responsible_id or "").strip()
-    draft_dialog_key = str(payload.get("draft_dialog_key") or _private_dialog_key(responsible_id)).strip()
-    if task_id is None or not close_event_key or not recipient_id or not draft_dialog_key:
-        _update_state(
-            store,
-            state=state,
-            payload={**payload, "dispatch_blocked_at": now_iso, "dispatch_blocked_reason": "missing_routing"},
-        )
-        return "blocked"
-
-    draft = await _existing_draft(store, draft_dialog_key)
-    if draft and not _same_task_close_draft(draft, task_id):
-        _update_state(
-            store,
-            state=state,
-            payload={
-                **payload,
-                "dispatch_blocked_at": now_iso,
-                "dispatch_blocked_reason": "another_active_draft",
-                "draft_dialog_key": draft_dialog_key,
-                "recipient_id": recipient_id,
-            },
-        )
-        return "blocked"
-
-    created = False
-    if not draft:
-        draft = _build_direct_close_draft(state=state, payload=payload)
-        saver = getattr(store, "save_task_draft", None)
-        if not callable(saver):
-            _update_state(
-                store,
-                state=state,
-                payload={**payload, "dispatch_blocked_at": now_iso, "dispatch_blocked_reason": "draft_store_missing"},
-            )
-            return "blocked"
-        await saver(draft_dialog_key, draft)
-        created = True
-
-    message = _direct_close_draft_message(draft)
-    if not settings.agent_dry_run:
-        if outbound_queue is not None:
-            delivery_key = f"task_close_direct:{task_id}:{close_event_key}:draft"
-            outbound_task = AgentTask(
-                task_id=f"task-close-direct:{task_id}:{close_event_key}",
-                request="task_close_direct_draft",
-                context={
-                    "channel_id": "bitrix24",
-                    "recipient_id": recipient_id,
-                    "dialog_key": draft_dialog_key,
-                    "event": "task_close_direct",
-                },
-            )
-            outbound_result = AgentResult(
-                status="completed",
-                agent_id="bitrix24",
-                answer=message,
-            )
-            delivery_id, _ = await outbound_queue.enqueue(
-                delivery_key=delivery_key,
-                channel_id="bitrix24",
-                recipient_id=recipient_id,
-                body=message,
-                task=outbound_task.model_dump(),
-                result=outbound_result.model_dump(),
-            )
-        else:
-            await bitrix.send_bot_message(recipient_id, message, bot_id=settings.bitrix_bot_id)
-            delivery_id = ""
-    _update_state(
-        store,
-        state=state,
-        payload={
-            **payload,
+    close_event_key = str(payload.get("close_event_key") or "").strip()
+    if task_id is None or responsible_id is None or not recipient_id or not close_event_key:
+        return None
+    title = str(payload.get("task_title") or f"#{task_id}").strip()
+    return AgentTask(
+        task_id=f"task-close-direct:{task_id}:{close_event_key}",
+        source="task_close_direct_control",
+        user=UserContext(id=str(responsible_id), channel="bitrix24"),
+        request=(
+            f"Задача #{task_id} «{title}» уже закрыта напрямую в Bitrix. "
+            "Подготовь для ответственного четырёхблочный черновик проверки результата; "
+            "не закрывай задачу повторно и не придумывай отсутствующие сведения."
+        ),
+        context={
+            "channel_id": "bitrix24",
             "recipient_id": recipient_id,
-            "draft_dialog_key": draft_dialog_key,
-            "direct_close_draft_sent_at": now_iso if outbound_queue is None else "",
-            "direct_close_draft_queued_at": now_iso if outbound_queue is not None else "",
-            "direct_close_draft_delivery_id": delivery_id if not settings.agent_dry_run else "",
+            "dialog_id": recipient_id,
+            "base_dialog_key": str(payload.get("draft_dialog_key") or f"dialog:{responsible_id}:user:{responsible_id}"),
+            "event": "task_close_direct",
+            "orchestrator_internal_event": True,
+            "orchestrator_required_tool": "task_close_draft",
+            "task_close_event": {
+                "task_id": task_id,
+                "task_title": title,
+                "close_event_key": close_event_key,
+                "closed_at": payload.get("closed_at"),
+                "task_results": list(payload.get("task_results") or []),
+                "task_points": list(payload.get("task_points") or []),
+                "source_task_description_empty": bool(payload.get("source_task_description_empty")),
+            },
         },
     )
-    if outbound_queue is not None:
-        return "created_queued" if created else "queued_existing"
-    return "created" if created else "sent_existing"
+
+
+def _auto_finalize_task(row: dict[str, Any]) -> AgentTask | None:
+    dialog_key = str(row.get("dialog_key") or "").strip()
+    draft = row.get("params")
+    if not dialog_key or not isinstance(draft, dict):
+        return None
+    task_id = _safe_int(draft.get("task_id"))
+    user_id = _safe_int(draft.get("_draft_user_id")) or _user_id_from_dialog_key(dialog_key)
+    if task_id is None or user_id is None:
+        return None
+    return AgentTask(
+        task_id=f"task-close-auto-finalize:{task_id}:{draft.get('_draft_id') or dialog_key}",
+        source="task_close_direct_control",
+        user=UserContext(id=str(user_id), channel="bitrix24"),
+        request=(
+            f"Контрольное время черновика закрытия задачи #{task_id} истекло. "
+            "Заверши ровно этот черновик как неподтверждённый, сохрани неизвестные сведения неизвестными."
+        ),
+        context={
+            "dialog_key": dialog_key,
+            "dialog_id": str(user_id),
+            "event": "task_close_auto_finalize",
+            "orchestrator_internal_event": True,
+            "orchestrator_required_tool": "task_close_confirm",
+            "task_close_confirmation_mode": "auto_unconfirmed",
+        },
+    )
+
+
+def _list_states(store: Any, *, statuses: list[str], limit: int) -> list[dict[str, Any]]:
+    lister = getattr(store, "list_task_close_processing_states", None)
+    if not callable(lister):
+        return []
+    return [
+        dict(item)
+        for item in lister(statuses=statuses, state_key_prefix=TASK_CLOSE_DIRECT_QUEUE_PREFIX, limit=limit)
+        if isinstance(item, dict)
+    ]
+
+
+async def _list_expired_task_close_drafts(store: Any, *, limit: int) -> list[dict[str, Any]]:
+    lister = getattr(store, "list_task_drafts", None)
+    if not callable(lister):
+        return []
+    rows = lister(draft_type="task_close", limit=limit, expired_only=True)
+    if inspect.isawaitable(rows):
+        rows = await rows
+    return [dict(row) for row in rows if isinstance(row, dict)]
+
+
+def _record_dispatch_failure(
+    store: Any, state: dict[str, Any], payload: dict[str, Any], now_iso: str, reason: str
+) -> None:
+    _update_state(
+        store,
+        state,
+        {**payload, "dispatch_blocked_at": now_iso, "dispatch_blocked_reason": reason},
+    )
+
+
+def _update_state(store: Any, state: dict[str, Any], payload: dict[str, Any]) -> None:
+    upsert = getattr(store, "upsert_task_close_processing_state", None)
+    if callable(upsert):
+        upsert(
+            task_id=state.get("task_id"),
+            state_key=str(state.get("state_key") or ""),
+            status=str(state.get("status") or TASK_CLOSE_DIRECT_STATUS_ACTIVE),
+            payload=payload,
+            actor_user_id=_safe_int(state.get("actor_user_id")),
+        )
 
 
 def _configured_auto_close_time(store: Any) -> str:
     getter = getattr(store, "get_task_close_control_setting", None)
-    if not callable(getter):
-        return TASK_CLOSE_DEFAULT_AUTO_CLOSE_TIME
-    setting = getter(TASK_CLOSE_AUTO_CLOSE_TIME_KEY)
-    if not isinstance(setting, dict):
-        return TASK_CLOSE_DEFAULT_AUTO_CLOSE_TIME
-    value = str(setting.get("value") or "").strip()
-    return value if _parse_hhmm(value) is not None else TASK_CLOSE_DEFAULT_AUTO_CLOSE_TIME
+    setting = getter("task_close_auto_close_time") if callable(getter) else None
+    value = str((setting or {}).get("value") or "20:00").strip()
+    return value if _parse_hhmm(value) is not None else "20:00"
 
 
-def _is_auto_close_due(now: datetime, auto_close_time: str) -> bool:
-    configured = _parse_hhmm(auto_close_time) or time(hour=20)
+def _is_auto_close_due(now: datetime, value: str) -> bool:
+    configured = _parse_hhmm(value) or time(hour=20)
     return now.timetz().replace(tzinfo=None) >= configured
 
 
 def _parse_hhmm(value: str) -> time | None:
-    parts = value.split(":")
-    if len(parts) != 2:
-        return None
     try:
-        hour = int(parts[0])
-        minute = int(parts[1])
-    except ValueError:
+        hour_text, minute_text = value.split(":", 1)
+        hour, minute = int(hour_text), int(minute_text)
+    except (TypeError, ValueError):
         return None
-    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+    return time(hour=hour, minute=minute) if 0 <= hour <= 23 and 0 <= minute <= 59 else None
+
+
+def _safe_int(value: object) -> int | None:
+    try:
+        return int(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
         return None
-    return time(hour=hour, minute=minute)
+
+
+def _user_id_from_dialog_key(value: object) -> int | None:
+    for part in reversed(str(value or "").split(":")):
+        result = _safe_int(part)
+        if result is not None and result > 0:
+            return result
+    return None
 
 
 def _now() -> datetime:
@@ -529,334 +393,5 @@ def _now() -> datetime:
 
 
 async def _sleep_until_next(status: dict[str, Any], seconds: int) -> None:
-    next_check_at = _now() + timedelta(seconds=seconds)
-    status["next_check_at"] = next_check_at.isoformat()
+    status["next_check_at"] = (_now() + timedelta(seconds=seconds)).isoformat()
     await asyncio.sleep(seconds)
-
-
-def _auto_close_draft_from_state(
-    *,
-    state: dict[str, Any],
-    payload: dict[str, Any],
-    existing_draft: dict[str, Any] | None,
-) -> dict[str, Any]:
-    task_id = safe_int(state.get("task_id") or payload.get("task_id"))
-    if existing_draft and task_id is not None and _same_task_close_draft(existing_draft, task_id):
-        draft_args = dict(existing_draft)
-        unconfirmed_items = _unique_strings(
-            [
-                *_string_list(existing_draft.get("unconfirmed_items")),
-                *_string_list(existing_draft.get("unresolved_items")),
-                "Draft was not confirmed before the auto-close time.",
-            ]
-        )
-        draft_args.update(
-            {
-                "already_closed": True,
-                "unconfirmed_items": unconfirmed_items,
-            }
-        )
-        draft = build_task_close_draft_from_args(draft_args).payload
-    else:
-        draft = _build_direct_close_draft(state=state, payload=payload)
-        draft["unconfirmed_items"] = _unique_strings(
-            [
-                *_string_list(draft.get("unconfirmed_items")),
-                "No confirmed draft was received before the auto-close time.",
-            ]
-        )
-        draft["problem_types"] = _unique_strings([*_string_list(draft.get("problem_types")), "unconfirmed"])
-        draft["ai_close_incomplete"] = True
-        draft["ai_close_marker"] = "AI_SERVER_TASK_CLOSE_INCOMPLETE"
-    draft.update(
-        {
-            "already_closed": True,
-            "_direct_close_already_closed": True,
-            "_direct_close_queue_state_key": state.get("state_key"),
-            "_direct_close_close_event_key": payload.get("close_event_key"),
-            "_direct_close_closed_at": payload.get("closed_at"),
-            "_direct_close_detected_at": payload.get("seen_at"),
-            "_direct_close_task_url": payload.get("task_url"),
-            "_direct_close_auto_closed": True,
-        }
-    )
-    return draft
-
-
-def _auto_close_open_draft(draft: dict[str, Any]) -> dict[str, Any]:
-    draft_args = dict(draft)
-    unknown_fields = [f"unknown: {item}" for item in _string_list(draft.get("missing_fields"))]
-    unconfirmed_items = _unique_strings(
-        [
-            *_string_list(draft.get("unconfirmed_items")),
-            *_string_list(draft.get("unresolved_items")),
-            *unknown_fields,
-            "Draft was not confirmed before the auto-close time.",
-        ]
-    )
-    draft_args.update(
-        {
-            "already_closed": _truthy(draft.get("already_closed")),
-            "unconfirmed_items": unconfirmed_items,
-        }
-    )
-    prepared = build_task_close_draft_from_args(draft_args).payload
-    prepared.update(
-        {
-            "_direct_close_auto_closed": True,
-            "_auto_close_open_draft": True,
-        }
-    )
-    return prepared
-
-
-async def _execute_auto_close_with_fallback(
-    *,
-    bitrix: Any,
-    bitrix_oauth: Any | None,
-    draft: dict[str, Any],
-    user_id: int | None,
-    claim_guard: Any | None = None,
-) -> tuple[dict[str, Any], str]:
-    if bitrix_oauth is None or user_id is None:
-        raise BitrixOAuthError("OAuth user context is required for task auto-close.")
-    oauth_client = await bitrix_oauth.client_for_user(user_id)
-    task_id = safe_int(draft.get("task_id"))
-    if task_id is None:
-        raise ValueError("task closing draft has no task_id")
-    status_response = await oauth_client.call(
-        "tasks.task.get",
-        {"taskId": task_id, "select": ["ID", "STATUS", "CLOSED_DATE"]},
-    )
-    status_task = _task_from_status_response(status_response)
-    if not status_task:
-        raise BitrixOAuthError("Fresh current-user task status proof is required for task auto-close.")
-    status = str(status_task.get("STATUS") or status_task.get("status") or "").strip()
-    closed_date = status_task.get("CLOSED_DATE") or status_task.get("closedDate")
-    verified_draft = dict(draft)
-    verified_closed = status == "5" or bool(closed_date)
-    verified_draft["already_closed"] = verified_closed
-    verified_draft["_direct_close_already_closed"] = verified_closed
-    result = await _execute_task_close(
-        close_call=oauth_client.call,
-        report_call=bitrix.call,
-        draft=verified_draft,
-        claim_guard=claim_guard,
-    )
-    result["auto_close_actor_mode"] = "oauth_user"
-    result["auto_close_actor_user_id"] = user_id
-    return result, "oauth_user"
-
-
-def _task_from_status_response(response: object) -> dict[str, Any]:
-    if not isinstance(response, dict):
-        return {}
-    result = response.get("result")
-    if isinstance(result, dict) and isinstance(result.get("task"), dict):
-        return dict(result["task"])
-    if isinstance(response.get("task"), dict):
-        return dict(response["task"])
-    if isinstance(result, dict):
-        return dict(result)
-    return {}
-
-
-def _system_fallback_draft(draft: dict[str, Any], *, reason: str) -> dict[str, Any]:
-    draft_args = dict(draft)
-    unconfirmed_items = _unique_strings(
-        [
-            *_string_list(draft.get("unconfirmed_items")),
-            f"Auto-close used system webhook fallback: {reason}",
-        ]
-    )
-    draft_args.update(
-        {
-            "unconfirmed_items": unconfirmed_items,
-            "_auto_close_system_webhook_fallback": True,
-            "_auto_close_system_webhook_fallback_reason": reason,
-        }
-    )
-    prepared = build_task_close_draft_from_args(draft_args).payload
-    prepared["_auto_close_system_webhook_fallback"] = True
-    prepared["_auto_close_system_webhook_fallback_reason"] = reason
-    return prepared
-
-
-async def _notify_admin_system_fallback(
-    *,
-    bitrix: Any,
-    settings: Settings,
-    draft: dict[str, Any],
-    result: dict[str, Any],
-) -> int:
-    sender = getattr(bitrix, "send_bot_message", None)
-    if not callable(sender):
-        return 0
-    admin_ids = sorted(settings.resolved_task_close_report_admin_user_ids)
-    if not admin_ids:
-        return 0
-    task_id = str(draft.get("task_id") or "")
-    task_title = str(draft.get("task_title") or f"#{task_id}").strip()
-    reason = str(result.get("auto_close_system_webhook_fallback_reason") or "")
-    if not reason:
-        reason = str(draft.get("_auto_close_system_webhook_fallback_reason") or "")
-    report_file_name = str(result.get("report_file_name") or "")
-    message = "\n".join(
-        [
-            "Автозакрытие задачи выполнено системным webhook.",
-            f"Задача: {task_title}",
-            f"ID: {task_id}",
-            f"AI-close файл: {report_file_name or 'создан/обновлен'}",
-            f"Причина fallback: {reason or 'OAuth закрытие недоступно'}",
-        ]
-    )
-    sent = 0
-    for admin_id in admin_ids:
-        await sender(str(admin_id), message, bot_id=settings.bitrix_bot_id)
-        sent += 1
-    return sent
-
-
-async def _existing_draft(store: Any, dialog_key: str) -> dict[str, Any] | None:
-    getter = getattr(store, "get_task_draft_for_finalizer", None)
-    if not callable(getter):
-        getter = getattr(store, "get_task_draft", None)
-    if not callable(getter):
-        return None
-    draft = await getter(dialog_key)
-    return dict(draft) if isinstance(draft, dict) else None
-
-
-async def _list_task_close_drafts(
-    store: Any,
-    *,
-    limit: int,
-    expired_only: bool = False,
-) -> list[dict[str, Any]]:
-    lister = getattr(store, "list_task_drafts", None)
-    if not callable(lister):
-        return []
-    rows = lister(draft_type=TASK_CLOSE_DRAFT_TYPE, limit=limit, expired_only=expired_only)
-    if inspect.isawaitable(rows):
-        rows = await rows
-    return [dict(row) for row in rows if isinstance(row, dict)]
-
-
-def _same_task_close_draft(draft: dict[str, Any], task_id: int) -> bool:
-    return draft.get("_draft_type") == TASK_CLOSE_DRAFT_TYPE and safe_int(draft.get("task_id")) == task_id
-
-
-def _build_direct_close_draft(*, state: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
-    task_id = safe_int(state.get("task_id") or payload.get("task_id"))
-    task_results = _string_list(payload.get("task_results"))
-    task_points = _string_list(payload.get("task_points"))
-    result_summary = "\n".join(task_results).strip()
-    source_empty = bool(payload.get("source_task_description_empty"))
-    missing_fields = [
-        "Подтвердите, что результат закрытия соответствует задаче.",
-        "Укажите оборудование и расходники, если они использовались.",
-    ]
-    if not result_summary:
-        missing_fields.insert(0, "Кратко напишите, что было сделано по задаче.")
-    draft = build_task_close_draft_from_args(
-        {
-            "task_id": task_id,
-            "task_title": payload.get("task_title"),
-            "completion_summary": result_summary,
-            "task_points": task_points,
-            "source_task_description_empty": source_empty,
-            "equipment_consumables": "",
-            "overall_status": "unconfirmed",
-            "unconfirmed_items": [
-                "Результат закрытия задачи не подтверждён через AI-черновик.",
-            ],
-            "missing_fields": missing_fields,
-            "action": "complete",
-        }
-    ).payload
-    draft.update(
-        {
-            "already_closed": True,
-            "_direct_close_already_closed": True,
-            "_direct_close_queue_state_key": state.get("state_key"),
-            "_direct_close_close_event_key": payload.get("close_event_key"),
-            "_direct_close_closed_at": payload.get("closed_at"),
-            "_direct_close_detected_at": payload.get("seen_at"),
-            "_direct_close_task_url": payload.get("task_url"),
-        }
-    )
-    return draft
-
-
-def _direct_close_draft_message(draft: dict[str, Any]) -> str:
-    return format_task_close_draft_message(
-        draft,
-        intro_lines=[
-            "Задача закрыта напрямую в Bitrix.",
-            "Нужно подтвердить результат для AI-контроля.",
-        ],
-    )
-
-
-def _update_state(store: Any, *, state: dict[str, Any], payload: dict[str, Any]) -> None:
-    upsert = getattr(store, "upsert_task_close_processing_state", None)
-    if not callable(upsert):
-        return
-    upsert(
-        task_id=state.get("task_id"),
-        state_key=str(state.get("state_key") or ""),
-        status=str(state.get("status") or TASK_CLOSE_DIRECT_STATUS_ACTIVE),
-        payload=payload,
-        actor_user_id=safe_int(state.get("actor_user_id")),
-    )
-
-
-def _private_dialog_key(user_id: int | None) -> str:
-    if user_id is None or user_id <= 0:
-        return ""
-    return f"dialog:{user_id}:user:{user_id}"
-
-
-def _string_list(value: object) -> list[str]:
-    if isinstance(value, list | tuple | set):
-        return [str(item).strip() for item in value if str(item).strip()]
-    if value:
-        return [str(value).strip()]
-    return []
-
-
-def _user_id_from_dialog_key(value: object) -> int | None:
-    parts = str(value or "").split(":")
-    for part in reversed(parts):
-        user_id = safe_int(part)
-        if user_id is not None and user_id > 0:
-            return user_id
-    return None
-
-
-def _truthy(value: object) -> bool:
-    if isinstance(value, bool):
-        return value
-    return str(value or "").strip().casefold() in {"1", "true", "yes", "y", "да"}
-
-
-def _unique_strings(values: list[str]) -> list[str]:
-    result: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        text = str(value or "").strip()
-        key = text.casefold()
-        if not text or key in seen:
-            continue
-        seen.add(key)
-        result.append(text)
-    return result
-
-
-def safe_int(value: object | None) -> int | None:
-    if value is None or value == "":
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None

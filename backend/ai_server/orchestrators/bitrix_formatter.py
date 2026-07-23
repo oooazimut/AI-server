@@ -1,7 +1,7 @@
 """Deterministic user-facing rendering owned by the orchestrator.
 
-This is intentionally independent from the Bitrix specialist model. The legacy
-Bitrix model keeps a compatibility copy only for autonomous QC events.
+This is intentionally independent from every specialist model. It is the sole
+user-facing Bitrix formatter and is owned by the orchestrator.
 """
 
 from __future__ import annotations
@@ -12,13 +12,13 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from ai_server.agents.bitrix24.draft_confirmation import draft_confirmation_phrase
 from ai_server.models import ModelUsageRecord, ToolResult
+from ai_server.orchestrators.draft_confirmation import draft_confirmation_phrase
 from ai_server.utils import compact_text
 
 
 @dataclass(frozen=True)
-class BitrixLLMFinalResult:
+class BitrixFormattedResult:
     status: str
     answer: str
     model_usage: ModelUsageRecord
@@ -30,11 +30,11 @@ def _direct_task_create_response(
     agent_id: str,
     tool_results: list[ToolResult],
     portal_base_url: str = "",
-) -> BitrixLLMFinalResult | None:
+) -> BitrixFormattedResult | None:
     successful_results = [result for result in tool_results if result.status == "ok"]
     warehouse_results = [result for result in successful_results if result.tool == "bitrix_warehouse_search"]
     if len(warehouse_results) > 1 and len(warehouse_results) == len(successful_results):
-        return BitrixLLMFinalResult(
+        return BitrixFormattedResult(
             status="completed",
             answer="\n\n".join(
                 _format_warehouse_answer(result.data, portal_base_url=portal_base_url) for result in warehouse_results
@@ -46,7 +46,7 @@ def _direct_task_create_response(
             "ACTIVE_DRAFT_CONFLICT",
             "ACTIVE_DRAFT_IN_PROGRESS",
         }:
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="needs_clarification",
                 answer=str(result.data.get("answer") or result.error or "Уточните действие с активным черновиком."),
                 model_usage=_local_model_usage(agent_id, "active_draft_conflict_response"),
@@ -57,7 +57,7 @@ def _direct_task_create_response(
             "bitrix_task_search",
             "bitrix_project_search",
         }:
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="completed",
                 answer=_format_read_denied_answer(result.data, result.error),
                 model_usage=_local_model_usage(agent_id, "read_authorization_response"),
@@ -65,37 +65,37 @@ def _direct_task_create_response(
         if result.status != "ok":
             continue
         if result.tool == "bitrix_warehouse_search":
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="completed",
                 answer=_format_warehouse_answer(result.data, portal_base_url=portal_base_url),
                 model_usage=_local_model_usage(agent_id, "warehouse_response"),
             )
         if result.tool == "bitrix_my_tasks":
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="completed",
                 answer=_format_my_tasks_answer(result.data, portal_base_url=portal_base_url),
                 model_usage=_local_model_usage(agent_id, "my_tasks_response"),
             )
         if result.tool == "bitrix_task_search":
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="completed",
                 answer=_format_task_search_answer(result.data, portal_base_url=portal_base_url),
                 model_usage=_local_model_usage(agent_id, "task_search_response"),
             )
         if result.tool == "bitrix_project_search":
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="completed",
                 answer=_format_project_search_answer(result.data, portal_base_url=portal_base_url),
                 model_usage=_local_model_usage(agent_id, "project_search_response"),
             )
         if result.tool == "portal_search":
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="completed",
                 answer=_format_portal_search_answer(result.data, portal_base_url=portal_base_url),
                 model_usage=_local_model_usage(agent_id, "portal_search_response"),
             )
         if result.tool == "project_create_draft":
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="needs_human",
                 answer=_format_project_create_draft_answer(result.data),
                 model_usage=_local_model_usage(agent_id, "project_create_draft_response"),
@@ -103,14 +103,14 @@ def _direct_task_create_response(
         if result.tool == "project_create_confirm":
             confirm_data = result.data if isinstance(result.data, dict) else {}
             has_followup_task = isinstance(confirm_data.get("followup_task_draft"), dict)
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="needs_human" if has_followup_task else "completed",
                 answer=_format_project_create_confirm_answer(result.data, portal_base_url=portal_base_url),
                 model_usage=_local_model_usage(agent_id, "project_create_confirm_response"),
             )
         if result.tool == "project_create_discard":
             data = result.data if isinstance(result.data, dict) else {}
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="completed",
                 answer=(
                     "Черновик проекта и связанной задачи удалён."
@@ -120,73 +120,73 @@ def _direct_task_create_response(
                 model_usage=_local_model_usage(agent_id, "project_create_discard_response"),
             )
         if result.tool == "task_create_draft":
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="needs_human",
                 answer=_format_task_create_draft_answer(result.data),
                 model_usage=_local_model_usage(agent_id, "task_create_draft_response"),
             )
         if result.tool == "task_create_confirm":
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="completed",
                 answer=_format_task_create_confirm_answer(result.data, portal_base_url=portal_base_url),
                 model_usage=_local_model_usage(agent_id, "task_create_confirm_response"),
             )
         if result.tool == "task_draft_discard":
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="completed",
                 answer="Черновик задачи удалён.",
                 model_usage=_local_model_usage(agent_id, "task_draft_discard_response"),
             )
         if result.tool == "task_close_draft":
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="needs_human",
                 answer=_format_task_close_draft_answer(result.data),
                 model_usage=_local_model_usage(agent_id, "task_close_draft_response"),
             )
         if result.tool == "task_close_confirm":
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="completed",
                 answer=_format_task_close_confirm_answer(result.data, portal_base_url=portal_base_url),
                 model_usage=_local_model_usage(agent_id, "task_close_confirm_response"),
             )
         if result.tool == "task_close_discard":
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="completed",
                 answer="Черновик закрытия задачи удалён.",
                 model_usage=_local_model_usage(agent_id, "task_close_discard_response"),
             )
         if result.tool == "task_close_report_incident":
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="completed",
                 answer=_format_task_close_report_incident_answer(result.data),
                 model_usage=_local_model_usage(agent_id, "task_close_report_incident_response"),
             )
         if result.tool == "task_close_control_get":
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="completed",
                 answer=_format_task_close_control_get_answer(result.data),
                 model_usage=_local_model_usage(agent_id, "task_close_control_get_response"),
             )
         if result.tool == "task_close_control_update":
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="completed",
                 answer=_format_task_close_control_update_answer(result.data),
                 model_usage=_local_model_usage(agent_id, "task_close_control_update_response"),
             )
         if result.tool == "calendar_event_draft":
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="needs_human",
                 answer=_format_calendar_event_draft_answer(result.data),
                 model_usage=_local_model_usage(agent_id, "calendar_event_draft_response"),
             )
         if result.tool == "calendar_event_confirm":
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="completed",
                 answer=_format_calendar_event_confirm_answer(result.data),
                 model_usage=_local_model_usage(agent_id, "calendar_event_confirm_response"),
             )
         if result.tool == "calendar_event_discard":
-            return BitrixLLMFinalResult(
+            return BitrixFormattedResult(
                 status="completed",
                 answer="Черновик события календаря удалён.",
                 model_usage=_local_model_usage(agent_id, "calendar_event_discard_response"),
@@ -200,7 +200,7 @@ def direct_tool_results_response(
     tool_results: list[ToolResult],
     portal_base_url: str = "",
     command_arguments: dict[str, Any] | None = None,
-) -> BitrixLLMFinalResult:
+) -> BitrixFormattedResult:
     """Render one exact orchestrator command without another Bitrix model call."""
 
     direct = _direct_task_create_response(
@@ -212,7 +212,7 @@ def direct_tool_results_response(
         return direct
     result = tool_results[-1] if tool_results else None
     if result is None:
-        return BitrixLLMFinalResult(
+        return BitrixFormattedResult(
             status="failed",
             answer="Bitrix не вернул результат выполнения команды.",
             model_usage=_local_model_usage(agent_id, "structured_command_empty_result"),
@@ -223,7 +223,7 @@ def direct_tool_results_response(
         status = "needs_clarification"
     else:
         status = "completed"
-    return BitrixLLMFinalResult(
+    return BitrixFormattedResult(
         status=status,
         answer=_format_generic_tool_answer(result, command_arguments=command_arguments or {}),
         model_usage=_local_model_usage(agent_id, "structured_command_generic_response"),
@@ -243,9 +243,6 @@ def _format_generic_tool_answer(result: ToolResult, *, command_arguments: dict[s
             return f"Bitrix выполнил {method}. Получено записей: {count}."
         return f"Bitrix выполнил {method}."
     messages = {
-        "save_incomplete_proposal": "Предложение по незавершённой части задачи сохранено.",
-        "delete_incomplete_proposal": "Предложение удалено.",
-        "save_responsible_response": "Ответ ответственного сохранён.",
     }
     return messages.get(result.tool) or summary or f"Команда {result.tool} выполнена."
 
@@ -774,6 +771,20 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
         return _format_task_close_draft_conflict_answer(data)
     preview = data.get("preview") if isinstance(data.get("preview"), dict) else {}
     draft = data.get("draft") if isinstance(data.get("draft"), dict) else {}
+    answer = format_task_close_report(draft, preview=preview, include_instruction=True)
+    return answer + _draft_confirmation_suffix({**data, "_draft_type": "task_close"})
+
+
+def format_task_close_report(
+    draft: dict[str, Any],
+    *,
+    preview: dict[str, Any] | None = None,
+    heading: str | None = None,
+    include_instruction: bool = False,
+) -> str:
+    """Render the four-block task-close template owned by the orchestrator."""
+
+    preview = preview if isinstance(preview, dict) else {}
     task_id = _text(draft.get("task_id"))
     task_title = _text(preview.get("task_title")) or _text(draft.get("task_title")) or _task_fallback_title(task_id)
     raw_result_text = (
@@ -799,7 +810,7 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
     if not unconfirmed and unresolved:
         unconfirmed = unresolved
     unconfirmed = _task_close_visible_unconfirmed(unconfirmed, task_points=task_points, result_text=result_text)
-    lines = [f"Черновик #{task_id or '?'}: {task_title}"]
+    lines = [heading or f"Черновик #{task_id or '?'}: {task_title}"]
     lines.append("")
     lines.append("1. Выполняемые работы")
     if source_task_description_empty:
@@ -851,9 +862,51 @@ def _format_task_close_draft_answer(data: dict[str, Any]) -> str:
     if additional_items and not _task_close_absent_value(additional_info):
         lines.extend(f"4.{index} {item}" for index, item in enumerate(additional_items, start=1))
         lines.append(f"4.{len(additional_items) + 1} Еще информация - ... ???")
-    lines.append("")
-    lines.append("Внести изменения (укажите пункт или подпункт и нужную информацию) либо подтвердить закрытие.")
-    return "\n".join(lines) + _draft_confirmation_suffix({**data, "_draft_type": "task_close"})
+    if include_instruction:
+        lines.append("")
+        lines.append("Внести изменения (укажите пункт или подпункт и нужную информацию) либо подтвердить закрытие.")
+    return "\n".join(lines)
+
+
+def format_task_close_result_text(
+    *,
+    completion_summary: str,
+    task_points: list[str],
+    equipment_consumables: str,
+    additional_info: str,
+    overall_status_label: str,
+    not_done_items: list[str],
+    unconfirmed_items: list[str],
+    status_reasons: list[str],
+) -> str:
+    """Render the exact task result payload that Bitrix stores."""
+
+    lines: list[str] = []
+    if completion_summary:
+        lines.append(completion_summary)
+    if task_points:
+        lines.extend(["", "Пункты задачи:", *(f"- {item}" for item in task_points)])
+    if equipment_consumables:
+        lines.extend(["", f"Оборудование, расходники: {equipment_consumables}"])
+    if additional_info:
+        lines.extend(["", f"Дополнительная информация: {additional_info}"])
+    if overall_status_label:
+        lines.extend(["", f"Общий итог: {overall_status_label}"])
+    if status_reasons:
+        lines.extend(["", "Причины неполного выполнения:", *(f"- {item}" for item in status_reasons)])
+    if not_done_items or unconfirmed_items:
+        if not_done_items and unconfirmed_items:
+            close_status = "выполнена частично, неподтвержденная"
+        elif not_done_items:
+            close_status = "выполнена частично"
+        else:
+            close_status = "неподтвержденная"
+        lines.extend(["", f"Статус AI-закрытия: {close_status}"])
+    if not_done_items:
+        lines.extend(["Невыполненные пункты:", *(f"- {item}" for item in not_done_items)])
+    if unconfirmed_items:
+        lines.extend(["Неподтверждённые пункты:", *(f"- {item}" for item in unconfirmed_items)])
+    return "\n".join(lines).strip()
 
 
 def _task_close_status_prompt(status: str) -> str:

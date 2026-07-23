@@ -80,20 +80,6 @@ MIGRATION_ITEMS: tuple[VarMigrationItem, ...] = (
         sensitive=True,
     ),
     VarMigrationItem(
-        path="quality_control_state.json",
-        item_type="file",
-        category="quality_control",
-        description="State контроля качества закрытия задач.",
-        sensitive=True,
-    ),
-    VarMigrationItem(
-        path="supervisor_state.json",
-        item_type="file",
-        category="task_supervisor",
-        description="State cooldown-уведомлений по просроченным задачам.",
-        sensitive=True,
-    ),
-    VarMigrationItem(
         path="vehicle_usage.sqlite",
         item_type="file",
         category="vehicle_usage",

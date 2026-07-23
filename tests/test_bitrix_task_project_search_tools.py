@@ -215,7 +215,9 @@ def test_project_search_oauth_missing_returns_authorization_link():
     fallback_client = _FakeBitrixSearchClient()
     tool = BitrixProjectSearchTool(client=fallback_client, bitrix_oauth=_FakeMissingBitrixOAuth())
 
-    result = anyio.run(lambda: tool.execute({"query": "Ларгус"}, user_id=1))
+    result = anyio.run(
+        lambda: tool.execute({"query": "Ларгус", "project_id": 45, "limit": 10}, user_id=1)
+    )
 
     assert result.status == "denied"
     assert "Меню справа внизу -> Маркет -> ИИ Агент-помощник" in result.error
@@ -698,31 +700,37 @@ def test_task_search_closed_date_range_includes_date_only_upper_bound():
     assert result.data["items"][0]["closed_date"] == "2026-07-08T10:00:00+03:00"
 
 
-def test_task_search_resolves_hyphenated_project_name_before_task_lookup():
+def test_task_search_uses_exact_orchestrator_project_id():
     client = _FakeBitrixSearchClient()
     tool = BitrixTaskSearchTool(client=client)
 
-    result = anyio.run(lambda: tool.execute({"scope": "my", "project_name": "Ларгус-2"}, user_id=13))
+    result = anyio.run(
+        lambda: tool.execute(
+            {"scope": "my", "project_id": 45, "project_name": "Ларгус 2"},
+            user_id=13,
+        )
+    )
 
     assert result.status == "ok"
-    assert result.data["project"] == {"id": "45", "name": "Ларгус 2", "description": ""}
+    assert result.data["project"] == {"id": "45", "name": "Ларгус 2"}
     assert [item["title"] for item in result.data["items"]] == ["Поставленная мной", "Ответственная задача"]
     task_calls = [payload for method, payload in client.calls if method == "tasks.task.list"]
     assert task_calls[0]["filter"] == {"STATUS": [1, 2, 3, 4], "GROUP_ID": 45, "MEMBER": 13}
     assert task_calls[1]["filter"] == {"STATUS": [1, 2, 3, 4], "GROUP_ID": 45, "CREATED_BY": 13}
 
 
-def test_project_search_resolves_hyphenated_project_name():
+def test_project_search_executes_exact_orchestrator_project_id():
     client = _FakeBitrixSearchClient()
     tool = BitrixProjectSearchTool(client=client)
 
-    result = anyio.run(lambda: tool.execute({"query": "Ларгус-2"}, user_id=13))
+    result = anyio.run(
+        lambda: tool.execute({"query": "Ларгус 2", "project_id": 45, "limit": 10}, user_id=13)
+    )
 
     assert result.status == "ok"
     assert result.data["items"] == [{"id": "45", "name": "Ларгус 2", "description": ""}]
     assert client.calls == [
-        ("sonet_group.get", {"FILTER": {"%NAME": "Ларгус-2"}, "ORDER": {"NAME": "ASC"}}),
-        ("sonet_group.get", {"FILTER": {}, "ORDER": {"NAME": "ASC"}}),
+        ("sonet_group.get", {"FILTER": {"ID": 45}, "ORDER": {"NAME": "ASC"}}),
     ]
 
 
@@ -732,15 +740,16 @@ def test_project_search_uses_oauth_client_for_live_current_user_reads():
     oauth = _FakeBitrixOAuth(oauth_client)
     tool = BitrixProjectSearchTool(client=fallback_client, bitrix_oauth=oauth)
 
-    result = anyio.run(lambda: tool.execute({"query": "Ларгус-2"}, user_id=13))
+    result = anyio.run(
+        lambda: tool.execute({"query": "Ларгус 2", "project_id": 45, "limit": 10}, user_id=13)
+    )
 
     assert result.status == "ok"
     assert result.data["access_actor"] == "oauth_current_user"
     assert oauth.user_ids == [13]
     assert fallback_client.calls == []
     assert oauth_client.calls == [
-        ("sonet_group.get", {"FILTER": {"%NAME": "Ларгус-2"}, "ORDER": {"NAME": "ASC"}}),
-        ("sonet_group.get", {"FILTER": {}, "ORDER": {"NAME": "ASC"}}),
+        ("sonet_group.get", {"FILTER": {"ID": 45}, "ORDER": {"NAME": "ASC"}}),
     ]
 
 
@@ -749,7 +758,7 @@ def test_project_search_oauth_read_denies_live_lookup_without_user_id():
     oauth_client = _FakeBitrixSearchClient()
     tool = BitrixProjectSearchTool(client=fallback_client, bitrix_oauth=_FakeBitrixOAuth(oauth_client))
 
-    result = anyio.run(lambda: tool.execute({"query": "Ларгус-2"}))
+    result = anyio.run(lambda: tool.execute({"query": "Ларгус 2", "project_id": 45, "limit": 10}))
 
     assert result.status == "denied"
     assert fallback_client.calls == []
@@ -773,12 +782,14 @@ def test_project_search_intersects_snapshot_candidates_with_live_bitrix():
         body="Другой автомобильный проект\nПроект: ларгус 3\nВладелец: 1",
         metadata={"owner_id": 1},
     )
-    tool = BitrixProjectSearchTool(client=client, portal_search=index)
+    tool = BitrixProjectSearchTool(client=client)
 
-    result = anyio.run(lambda: tool.execute({"query": "Ларгус-2"}, user_id=13))
+    result = anyio.run(
+        lambda: tool.execute({"query": "Ларгус 2", "project_id": 45, "limit": 10}, user_id=13)
+    )
 
     assert result.status == "ok"
-    assert result.data["source"] == "postgres_candidates_live_acl"
+    assert result.data["source"] == "live_bitrix_rest"
     assert result.data["items"] == [{"id": "45", "name": "Ларгус 2", "description": ""}]
     assert any(method == "sonet_group.get" for method, _ in client.calls)
 
@@ -795,12 +806,14 @@ def test_project_search_snapshot_uses_oauth_actor_before_returning_index_data():
         body="РђРІС‚РѕРјРѕР±РёР»СЊРЅС‹Р№ РїСЂРѕРµРєС‚\nРџСЂРѕРµРєС‚: Р›Р°СЂРіСѓСЃ 2",
         metadata={"owner_id": 1},
     )
-    tool = BitrixProjectSearchTool(client=fallback_client, portal_search=index, bitrix_oauth=oauth)
+    tool = BitrixProjectSearchTool(client=fallback_client, bitrix_oauth=oauth)
 
-    result = anyio.run(lambda: tool.execute({"query": "Р›Р°СЂРіСѓСЃ-2"}, user_id=13))
+    result = anyio.run(
+        lambda: tool.execute({"query": "Р›Р°СЂРіСѓСЃ 2", "project_id": 45, "limit": 10}, user_id=13)
+    )
 
     assert result.status == "ok"
-    assert result.data["source"] == "postgres_candidates_live_acl"
+    assert result.data["source"] == "live_bitrix_rest"
     assert result.data["access_actor"] == "oauth_current_user"
     assert oauth.user_ids == [13]
     assert fallback_client.calls == []
@@ -820,11 +833,12 @@ def test_project_search_snapshot_oauth_denies_without_user_id():
     )
     tool = BitrixProjectSearchTool(
         client=fallback_client,
-        portal_search=index,
         bitrix_oauth=_FakeBitrixOAuth(oauth_client),
     )
 
-    result = anyio.run(lambda: tool.execute({"query": "Р›Р°СЂРіСѓСЃ-2"}))
+    result = anyio.run(
+        lambda: tool.execute({"query": "Р›Р°СЂРіСѓСЃ 2", "project_id": 45, "limit": 10})
+    )
 
     assert result.status == "denied"
     assert fallback_client.calls == []

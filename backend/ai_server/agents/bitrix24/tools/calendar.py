@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta
+from datetime import datetime
 from typing import Any
 
 from ai_server.agents.bitrix24.ports import TaskDraftStorePort
@@ -23,8 +23,6 @@ from ai_server.tools.bitrix_ports import BitrixWritePort
 from ai_server.utils import MOSCOW_TZ, compact_text, optional_int
 
 CALENDAR_EVENT_DRAFT_TYPE = "calendar_event"
-DEFAULT_CALENDAR_EVENT_HOUR = 12
-DEFAULT_CALENDAR_EVENT_DURATION_MINUTES = 30
 DEFAULT_CALENDAR_TIMEZONE = "Europe/Moscow"
 
 
@@ -72,7 +70,7 @@ def build_calendar_event_draft_from_args(
     if end_error:
         contract_errors.append(end_error)
     if start_at is None:
-        contract_errors.append("calendar_event_draft.start_iso or date_iso is required")
+        contract_errors.append("calendar_event_draft.start_iso is required")
 
     params: dict[str, Any] = {}
     if title and owner_id is not None and start_at is not None and end_at is not None:
@@ -134,7 +132,7 @@ class CalendarEventDraftTool:
         return ToolDefinition(
             name=self.name,
             description=(
-                "Prepare a Bitrix calendar event/reminder draft. Use for requests like 'remind me tomorrow'. "
+                "Prepare a Bitrix calendar event/reminder draft from exact orchestrator fields. "
                 "The event is saved as a draft and must be confirmed by the user before calendar.event.add."
             ),
             parameters={
@@ -143,13 +141,12 @@ class CalendarEventDraftTool:
                     "title": {"type": "string"},
                     "description": {"type": "string"},
                     "start_iso": {"type": "string"},
-                    "date_iso": {"type": "string"},
                     "end_iso": {"type": "string"},
                     "attendee_ids": {"type": "array", "items": {"type": "integer"}},
                     "owner_name": {"type": "string"},
                     "reminder_minutes": {"type": "integer"},
                 },
-                "required": ["title"],
+                "required": ["title", "start_iso", "end_iso"],
             },
         )
 
@@ -409,7 +406,7 @@ async def _execute_calendar_event_create(
 
 
 def _start_from_args(args: dict[str, Any]) -> tuple[datetime | None, str]:
-    raw = str(args.get("start_iso") or args.get("from") or args.get("date_iso") or args.get("date") or "").strip()
+    raw = str(args.get("start_iso") or "").strip()
     if not raw:
         return None, ""
     parsed, error = _parse_datetime_or_date(raw)
@@ -417,7 +414,7 @@ def _start_from_args(args: dict[str, Any]) -> tuple[datetime | None, str]:
 
 
 def _end_from_args(args: dict[str, Any], start_at: datetime | None) -> tuple[datetime | None, str]:
-    raw = str(args.get("end_iso") or args.get("to") or "").strip()
+    raw = str(args.get("end_iso") or "").strip()
     if raw:
         parsed, error = _parse_datetime_or_date(raw)
         if error or parsed is None:
@@ -425,9 +422,7 @@ def _end_from_args(args: dict[str, Any], start_at: datetime | None) -> tuple[dat
         if start_at is not None and parsed <= start_at:
             return None, "calendar_event_draft.end_iso must be after start_iso"
         return parsed, ""
-    if start_at is None:
-        return None, ""
-    return start_at + timedelta(minutes=DEFAULT_CALENDAR_EVENT_DURATION_MINUTES), ""
+    return None, "calendar_event_draft.end_iso is required"
 
 
 def _parse_datetime_or_date(value: str) -> tuple[datetime | None, str]:
@@ -435,9 +430,6 @@ def _parse_datetime_or_date(value: str) -> tuple[datetime | None, str]:
     if not raw:
         return None, ""
     try:
-        if len(raw) == 10:
-            parsed_date = date.fromisoformat(raw)
-            return datetime.combine(parsed_date, time(DEFAULT_CALENDAR_EVENT_HOUR, 0), tzinfo=MOSCOW_TZ), ""
         parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
         return None, "calendar_event_draft.start_iso/end_iso must be ISO 8601"

@@ -33,8 +33,8 @@ class BitrixWarehouseSearchTool:
                 "Read-only warehouse/store lookup in Bitrix catalog. Use it for requests about warehouses, "
                 "stores, stock locations, inventory leftovers, or phrases like 'find warehouse Borisov'. "
                 "It calls catalog.store.list and optionally catalog.storeproduct.list. Product rows include "
-                "only items with a positive available amount. Use product_limit=50 by default and product_offset "
-                "for follow-up requests asking for the next items."
+                "only items with a positive available amount. The orchestrator must provide the exact page size "
+                "and offset for every command."
             ),
             parameters={
                 "type": "object",
@@ -57,7 +57,11 @@ class BitrixWarehouseSearchTool:
                     "product_limit": {"type": "integer", "minimum": 1, "maximum": 50},
                     "product_offset": {"type": "integer", "minimum": 0},
                 },
-                "anyOf": [{"required": ["query"]}, {"required": ["store_id"]}],
+                "required": ["include_products", "list_all", "limit", "product_limit", "product_offset"],
+                "anyOf": [
+                    {"required": ["store_id"]},
+                    {"required": ["list_all"], "properties": {"list_all": {"const": True}}},
+                ],
             },
         )
 
@@ -79,18 +83,18 @@ class BitrixWarehouseSearchTool:
         store_id = _safe_int(args.get("store_id"))
         product_query = str(args.get("product_query") or "").strip()
         list_all = bool(args.get("list_all"))
-        if not query and store_id is None and not list_all:
+        if store_id is None and not list_all:
             return ToolResult(
                 status=ToolStatus.INVALID_TOOL_CALL,
                 tool=self.name,
-                error="query or exact store_id is required",
+                error="exact store_id is required unless list_all=true",
             )
         if list_all:
             query = query or "все"
 
-        limit = max(1, min(int(args.get("limit") or 10), 20))
-        product_limit = max(1, min(int(args.get("product_limit") or 50), 50))
-        product_offset = max(0, int(args.get("product_offset") or args.get("offset") or 0))
+        limit = max(1, min(int(args["limit"]), 20))
+        product_limit = max(1, min(int(args["product_limit"]), 50))
+        product_offset = max(0, int(args["product_offset"]))
         include_products = bool(args.get("include_products"))
 
         read_client, access_actor, access_error = await resolve_current_user_read_client(
@@ -123,7 +127,7 @@ class BitrixWarehouseSearchTool:
                     if _safe_int(_first(store, "id", "ID")) == store_id
                 ][:1]
                 if store_id is not None
-                else _match_stores(stores, query=query, limit=limit)
+                else []
             )
         )
         data: dict[str, Any] = {
@@ -363,26 +367,6 @@ class BitrixWarehouseSearchTool:
         return {}
 
 
-def _match_stores(stores: list[dict[str, Any]], *, query: str, limit: int) -> list[dict[str, Any]]:
-    terms = _query_terms(query)
-    scored: list[tuple[int, dict[str, Any]]] = []
-    for store in stores:
-        title = str(_first(store, "title", "TITLE", "name", "NAME") or "")
-        address = str(_first(store, "address", "ADDRESS") or "")
-        description = str(_first(store, "description", "DESCRIPTION") or "")
-        search_text = f"{title} {address} {description}".casefold()
-        score = 0
-        for term in terms:
-            if term in title.casefold():
-                score += 10
-            elif term in search_text:
-                score += 3
-        if score > 0:
-            scored.append((score, _compact_store(store)))
-    scored.sort(key=lambda item: (-item[0], str(item[1].get("title") or "")))
-    return [store for _, store in scored[:limit]]
-
-
 def _safe_int(value: object) -> int | None:
     try:
         return int(value) if value not in (None, "") else None
@@ -474,31 +458,6 @@ def _stores_summary(matches: list[dict[str, Any]], *, query: str) -> str:
         suffix = f" — {address}" if address else ""
         lines.append(f"- {title} (id: {store.get('id')}){suffix}")
     return "\n".join(lines)
-
-
-def _query_terms(query: str) -> list[str]:
-    ignored = {
-        "warehouse",
-        "store",
-        "stock",
-        "find",
-        "search",
-        "склад",
-        "склада",
-        "складе",
-        "склады",
-        "найди",
-        "поиск",
-        "битрикс",
-        "bitrix",
-    }
-    terms = []
-    for raw in query.replace(",", " ").split():
-        term = raw.strip().casefold()
-        if len(term) < 2 or term in ignored:
-            continue
-        terms.append(term)
-    return terms or [query.casefold()]
 
 
 def _matches_product_query(product_name: str, product_query: str) -> bool:

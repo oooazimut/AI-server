@@ -67,7 +67,13 @@ def attach_draft_metadata(
     user_id: int | None,
 ) -> dict[str, Any]:
     result = dict(payload)
-    for key in ("_original_request", "_draft_specialist"):
+    for key in (
+        "_original_request",
+        "_draft_specialist",
+        "_direct_close_close_event_key",
+        "_direct_close_closed_at",
+        "_direct_close_already_closed",
+    ):
         if source_args.get(key) not in (None, ""):
             result[key] = source_args[key]
     actor = source_args.get("_draft_user_id", user_id)

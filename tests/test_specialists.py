@@ -44,13 +44,11 @@ def test_manifest_by_id_with_fake_manifests():
 
 # build_specialist_registry — audience filter
 # Uses monkeypatch to bypass entrypoint loading (some manifests are placeholders with no real module).
-def test_build_specialist_registry_employee_audience_contains_known_specialists(monkeypatch):
+def test_build_specialist_registry_skips_executor_without_structured_entrypoint(monkeypatch):
     monkeypatch.setattr(_specialists_module, "_load_entrypoint", lambda ep: _FakeSpecialist)
     manifests = load_agent_manifests()
     registry = build_specialist_registry(manifests, audience="employee")
-    assert "bitrix24" in registry
-    assert "pto" in registry
-    assert "logistics" in registry
+    assert registry == {}
 
 
 def test_build_specialist_registry_customer_audience_returns_empty():

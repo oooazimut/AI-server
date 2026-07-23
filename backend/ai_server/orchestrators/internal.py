@@ -18,16 +18,10 @@ from ai_server.agents.ports import (
     SchedulerPort,
 )
 from ai_server.integrations.redis.outbound_queue import outbound_delivery_key
-from ai_server.models import AgentManifest, AgentResult, AgentTask, ScheduledTask, ToolResult, ToolStatus
-from ai_server.orchestrators.orchestrator_llm import (
-    OrchestratorFinalResult,
-    OrchestratorLLM,
-    OrchestratorLLMService,
-    orchestrator_llm_failure_result,
-)
-from ai_server.orchestrators.tools import CallSpecialistTool, ManageSuspendedTool, ScheduleTaskTool
+from ai_server.models import AgentManifest, AgentResult, AgentTask, ScheduledTask
+from ai_server.orchestrators.tools import CallSpecialistTool
 from ai_server.retrieval import HybridKnowledgeRetriever
-from ai_server.specialists import Specialist, build_specialist_registry
+from ai_server.specialists import Specialist
 from ai_server.technical_footer import TechnicalFooterService, append_footer
 from ai_server.utils import MOSCOW_TZ
 
@@ -68,13 +62,8 @@ def _append_conversation_reference(message: str, task: AgentTask) -> str:
     return f"{rendered}\n\n{reference}" if rendered else reference
 
 
-class InternalOrchestrator(BaseSpecialist):
-    """Senior agent: routes requests to specialists and synthesises answers.
-
-    Inherits the decide→execute→compose loop from BaseSpecialist.
-    Overrides handle() to add post-compose side-effects (channel delivery, learning).
-    Overrides run() to handle "result" messages from proactive specialists.
-    """
+class OrchestratorTransportRuntime(BaseSpecialist):
+    """Shared transport/lifecycle base for the sole plan-authoritative runtime."""
 
     action_prefix = "orchestrator"
     max_steps = 4
@@ -84,7 +73,7 @@ class InternalOrchestrator(BaseSpecialist):
         manifest: AgentManifest,
         *,
         agent_tools: list | None = None,
-        llm: OrchestratorLLM | None = None,
+        llm: Any | None = None,
         store: OrchestratorStorePort | None = None,
         scheduler: SchedulerPort | None = None,
         retriever: HybridKnowledgeRetriever | None = None,
@@ -98,7 +87,7 @@ class InternalOrchestrator(BaseSpecialist):
         super().__init__(
             manifest,
             agent_tools=agent_tools,
-            llm=llm or OrchestratorLLMService(),
+            llm=llm,
             store=store,
             scheduler=scheduler,
             retriever=retriever,
@@ -118,112 +107,15 @@ class InternalOrchestrator(BaseSpecialist):
     def _logs(self) -> list[str]:
         return []
 
-    def _llm_failure_result(self, message: str) -> OrchestratorFinalResult:
-        return orchestrator_llm_failure_result(message)
-
-    async def _load_extra_context(self, task: AgentTask) -> tuple[AgentTask, dict[str, Any]]:
-        """Inject pending_specialist from KV so LLM sees it in task.context."""
-        dialog_key = str(task.context.get("dialog_key") or "")
-        if self.store is not None and dialog_key and hasattr(self.store, "get_kv"):
-            try:
-                pending = await self.store.get_kv(dialog_key, "pending_specialist")  # type: ignore[attr-defined]
-                if pending:
-                    task = task.model_copy(update={"context": {**task.context, "pending_specialist": pending}})
-            except Exception:
-                logger.exception("_load_extra_context: failed to load pending_specialist")
-        return task, {}
-
-    def _terminal_response_metadata(
-        self,
-        *,
-        tool_call: Any,
-        result: ToolResult | None,
-        action: Any | None,
-        approvals: list[Any],
-        task: AgentTask,
-    ) -> dict[str, Any] | None:
-        if tool_call.name != "call_specialist" or result is None or result.status != ToolStatus.OK or approvals:
-            return None
-        data = result.data if isinstance(result.data, dict) else {}
-        if not (data.get("terminal") and data.get("answer_is_final") and data.get("safe_to_send")):
-            specialist_status = str(data.get("status") or "")
-            answer = str(data.get("answer") or "").strip()
-            if specialist_status not in {"completed", "needs_clarification", "needs_human"} or not answer:
-                return None
-            return {
-                "fast_return_reason": "specialist_answer_terminal",
-                "terminal_tool": "call_specialist",
-                "terminal_specialist": str(data.get("specialist") or ""),
-                "specialist_status": specialist_status,
-                "terminal_status": specialist_status,
-            }
-        return {
-            "fast_return_reason": str(data.get("fast_return_reason") or "specialist_terminal_response"),
-            "terminal_tool": "call_specialist",
-            "terminal_specialist": str(data.get("specialist") or ""),
-            "specialist_terminal_tool": str(data.get("terminal_tool") or ""),
-            "terminal_status": str(data.get("status") or "completed"),
-        }
+    def _llm_failure_result(self, message: str) -> Any:
+        raise RuntimeError("PLAN_AUTHORITATIVE_HANDLER_REQUIRED")
 
     # ------------------------------------------------------------------
     # Lifecycle overrides
     # ------------------------------------------------------------------
 
     async def handle(self, task: AgentTask) -> AgentResult:
-        t_start = time.monotonic()
-        started_at = _trace_now_iso()
-        dialog_key = task.context.get("dialog_key", "")
-        logger.info("Orchestrator.handle: start task_id=%s dialog_key=%s", task.task_id, dialog_key)
-        active_marked = False
-        try:
-            if self._dialog_guard is not None and dialog_key:
-                generation = await self._dialog_guard.mark_active(task, ttl_seconds=3600)
-                task = task.model_copy(
-                    update={"context": {**task.context, "dialog_cancel_generation": int(generation)}}
-                )
-                active_marked = True
-            result = await super().handle(task)
-            # Extract specialist IDs called during this turn for handoff_to
-            specialist_ids = [
-                a.details.get("data", {}).get("specialist")
-                for a in result.actions_taken
-                if a.name == "call_specialist" and a.status == "ok"
-            ]
-            specialist_ids = [s for s in specialist_ids if s]
-            if specialist_ids:
-                result = result.model_copy(update={"handoff_to": specialist_ids})
-            elapsed_ms = {"total_ms": round((time.monotonic() - t_start) * 1000, 1)}
-            logger.info(
-                "Orchestrator.handle: done task_id=%s dialog_key=%s elapsed_ms=%.0f status=%s",
-                task.task_id,
-                dialog_key,
-                elapsed_ms["total_ms"],
-                result.status,
-            )
-            await self._send_to_channel(task, result)
-            await self._publish_result(task, result)
-            await self._record_timing(
-                task,
-                stage="handle_total",
-                started_at=started_at,
-                elapsed_ms=(time.monotonic() - t_start) * 1000,
-                status=result.status,
-                details={"handoff_to": specialist_ids},
-            )
-            return result
-        except Exception as exc:
-            await self._record_timing(
-                task,
-                stage="handle_total",
-                started_at=started_at,
-                elapsed_ms=(time.monotonic() - t_start) * 1000,
-                status="error",
-                details={"error": f"{type(exc).__name__}: {exc}"},
-            )
-            raise
-        finally:
-            if active_marked and self._dialog_guard is not None:
-                await self._dialog_guard.clear_active(task)
+        raise RuntimeError("PLAN_AUTHORITATIVE_HANDLER_REQUIRED")
 
     async def run(
         self,
@@ -294,77 +186,6 @@ class InternalOrchestrator(BaseSpecialist):
                 await self._release_queue_partition(partition_key)
 
     # ------------------------------------------------------------------
-    # Factory
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def build(
-        cls,
-        manifest: AgentManifest | None,
-        *,
-        manifests: list[AgentManifest] | None = None,
-        orchestrator_llm: OrchestratorLLM | None = None,
-        orchestrator_store: OrchestratorStorePort | None = None,
-        orchestrator_retriever: HybridKnowledgeRetriever | None = None,
-        channels: dict[str, ChannelPort] | None = None,
-        footer_service: TechnicalFooterService | None = None,
-        result_publisher: ResultPublisherPort | None = None,
-        **specialist_deps: Any,
-    ) -> InternalOrchestrator:
-        # S04 staging runtime is plan-authoritative.  The legacy BaseSpecialist
-        # decision loop is not retained as a fallback when this planner is wired.
-        if hasattr(orchestrator_llm, "plan") and hasattr(orchestrator_llm, "finalize"):
-            from ai_server.orchestrators.plan_authoritative import PlanAuthoritativeOrchestrator
-
-            return PlanAuthoritativeOrchestrator.build(
-                manifest,
-                manifests=manifests,
-                orchestrator_llm=orchestrator_llm,
-                orchestrator_store=orchestrator_store,
-                orchestrator_retriever=orchestrator_retriever,
-                channels=channels,
-                footer_service=footer_service,
-                result_publisher=result_publisher,
-                **specialist_deps,
-            )
-        _manifests = manifests or []
-        if not specialist_deps.get("bitrix_bot"):
-            specialist_deps["bitrix_bot"] = specialist_deps.get("bitrix_client")
-        specialists = build_specialist_registry(
-            _manifests,
-            audience="employee",
-            **{k: v for k, v in specialist_deps.items() if v is not None},
-        )
-        _manifest = manifest or _dummy_manifest()
-
-        call_tool = CallSpecialistTool(
-            specialists,
-            _manifests,
-            scheduler=specialist_deps.get("scheduler"),
-            store=orchestrator_store,
-        )
-        manage_tool = ManageSuspendedTool(store=orchestrator_store)
-        schedule_tool = ScheduleTaskTool(scheduler=specialist_deps.get("scheduler"))
-
-        orch = cls(
-            _manifest,
-            agent_tools=[call_tool, manage_tool, schedule_tool],
-            llm=orchestrator_llm,
-            store=orchestrator_store,
-            scheduler=specialist_deps.get("scheduler"),
-            retriever=orchestrator_retriever,
-            channels=channels,
-            footer_service=footer_service,
-            result_publisher=result_publisher,
-            conversation_trace=specialist_deps.get("conversation_trace"),
-            dialog_guard=specialist_deps.get("dialog_guard"),
-            outbound_queue=specialist_deps.get("outbound_queue"),
-        )
-        # Break circular dep: CallSpecialistTool needs orch to schedule specialist tasks
-        call_tool.schedule_fn = orch._apply_scheduled_tasks_from_specialist
-        return orch
-
-    # ------------------------------------------------------------------
     # Specialist-initiated scheduling (called from CallSpecialistTool)
     # ------------------------------------------------------------------
 
@@ -381,7 +202,7 @@ class InternalOrchestrator(BaseSpecialist):
             elif sched.task is not None:
                 _task = sched.task
 
-                async def _run(_t: AgentTask = _task, _o: InternalOrchestrator = _orch) -> None:
+                async def _run(_t: AgentTask = _task, _o: OrchestratorTransportRuntime = _orch) -> None:
                     await _o.handle(_t)
 
                 try:

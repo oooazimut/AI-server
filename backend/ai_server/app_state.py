@@ -52,39 +52,6 @@ class SearchWebhookIndexerStatus(TypedDict):
     last_result: dict[str, Any] | None
 
 
-class QualityControlWebhookStatus(TypedDict):
-    enabled: bool
-    auto_managed_only: bool
-    auto_manage_project_id: int | None
-    dry_run: bool
-    actor_user_id: int | None
-    last_received_at: str | None
-    last_event: str | None
-    last_task_id: str | None
-    last_reason: str | None
-    last_error: str | None
-    last_actions: list[Any]
-    events_seen: int
-    tasks_processed: int
-    duplicates_seen: int
-    ignored: int
-    errors: int
-
-
-class TaskSupervisorStatus(TypedDict):
-    enabled: bool
-    running: bool
-    dry_run: bool
-    interval_seconds: int
-    last_check_at: str | None
-    last_success_at: str | None
-    last_error: str | None
-    last_result: dict[str, Any] | None
-    next_check_at: str | None
-    runs: int
-    errors: int
-
-
 class ReconcilerStatus(TypedDict):
     enabled: bool
     running: bool
