@@ -724,11 +724,6 @@ def canonicalize_plan(
     arguments = dict(existing or {})
     if expected == "task_create_draft":
         named_users = find_entities_in_text(catalog, "users", task.request)
-        if len(named_users) > 1:
-            return _clarification_plan(
-                plan_id,
-                "Уточните, пожалуйста, для какого сотрудника нужно создать задачу.",
-            )
         arguments.setdefault("title", _creation_title(task.request, "task_create_draft", named_users))
         if not str(arguments.get("title") or "").strip():
             return _clarification_plan(plan_id, "Уточните, пожалуйста, название задачи.")
@@ -774,7 +769,7 @@ def _canonical_warehouse_plan(
                 "query": "все",
                 "list_all": True,
                 "include_products": False,
-                "limit": 20,
+                "limit": DEFAULT_RESULT_LIMIT,
                 "product_limit": DEFAULT_WAREHOUSE_PRODUCT_LIMIT,
                 "product_offset": 0,
             },
@@ -847,6 +842,25 @@ def _canonical_warehouse_continuation_plan(
     branches = list(state.get("branches") or []) if isinstance(state, dict) else []
     if not branches:
         return None
+    list_branches = [
+        branch for branch in branches if branch.get("kind") == "warehouse_list" and bool(branch.get("has_more"))
+    ]
+    if list_branches:
+        branch = list_branches[0]
+        return _single_bitrix_plan(
+            plan_id=plan_id,
+            request=task.request,
+            tool_name="bitrix_warehouse_search",
+            arguments={
+                "query": "все",
+                "list_all": True,
+                "include_products": False,
+                "limit": int(branch.get("page_size") or DEFAULT_RESULT_LIMIT),
+                "product_limit": DEFAULT_WAREHOUSE_PRODUCT_LIMIT,
+                "product_offset": int(branch.get("next_offset") or 0),
+            },
+            registry_version=registry_version,
+        )
     requested = find_entities_in_text(entity_catalog, "warehouses", task.request)
     requested_ids = {int(item["id"]) for item in requested}
     selected = [

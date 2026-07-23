@@ -62,6 +62,10 @@ def _aliases(*values: object, include_surname_stem: bool = False) -> list[str]:
         normalized = normalize_entity_text(value)
         if not normalized:
             continue
+        # A bare initial ("М.") is not a safe person reference in free text:
+        # it can be matched accidentally inside an ordinary task title.
+        if len(normalized) == 1:
+            continue
         aliases.add(normalized)
         stem = _surname_stem(normalized)
         if stem and include_surname_stem and _looks_like_surname(normalized):
@@ -285,19 +289,55 @@ def find_entities_in_text(
     else:
         best = max((score for score, _ in scored), default=0)
         selected = [(score, item) for score, item in scored if score == best and score > 0]
+    spans_by_id = {
+        int(item.get("id") or 0): _entity_match_spans(item, normalized)
+        for _, item in selected
+    }
     result: list[dict[str, Any]] = []
     for score, item in selected:
         name = normalize_entity_text(item.get("name"))
+        item_spans = spans_by_id.get(int(item.get("id") or 0), [])
         shadowed = any(
-            other_score > score
-            and name
-            and name != normalize_entity_text(other.get("name"))
-            and normalize_entity_text(other.get("name")).startswith(name + " ")
-            for other_score, other in selected
+            name != normalize_entity_text(other.get("name"))
+            and any(
+                span[0] >= other_span[0]
+                and span[1] <= other_span[1]
+                and span != other_span
+                for span in item_spans
+                for other_span in spans_by_id.get(int(other.get("id") or 0), [])
+            )
+            for _, other in selected
         )
         if not shadowed:
             result.append(item)
     return result
+
+
+def _entity_match_spans(item: dict[str, Any], normalized: str) -> list[tuple[int, int]]:
+    request_tokens = normalized.split()
+    spans: list[tuple[int, int]] = []
+    candidates = {
+        normalize_entity_text(item.get("name")),
+        *(normalize_entity_text(alias) for alias in item.get("aliases") or []),
+    }
+    for candidate in candidates:
+        candidate_tokens = candidate.split()
+        if not candidate_tokens or any(len(token) == 1 for token in candidate_tokens):
+            continue
+        width = len(candidate_tokens)
+        for start in range(max(0, len(request_tokens) - width + 1)):
+            window = request_tokens[start : start + width]
+            if all(_entity_token_matches(left, right) for left, right in zip(candidate_tokens, window, strict=True)):
+                spans.append((start, start + width))
+    return spans
+
+
+def _entity_token_matches(candidate: str, request_token: str) -> bool:
+    return candidate == request_token or (
+        _looks_like_surname(candidate)
+        and _looks_like_surname(request_token)
+        and _surname_stem(candidate) == _surname_stem(request_token)
+    )
 
 
 def _entity_match_score(item: dict[str, Any], entity_type: str, normalized: str) -> int:
@@ -306,7 +346,11 @@ def _entity_match_score(item: dict[str, Any], entity_type: str, normalized: str)
         return 10_000
 
     name = normalize_entity_text(item.get("name"))
-    aliases = {normalize_entity_text(alias) for alias in item.get("aliases") or []}
+    aliases = {
+        alias
+        for raw_alias in item.get("aliases") or []
+        if len(alias := normalize_entity_text(raw_alias)) > 1
+    }
     candidates = {name, *aliases}
     candidates.discard("")
     phrase_scores: list[int] = []

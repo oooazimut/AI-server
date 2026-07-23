@@ -95,6 +95,10 @@ class BitrixWarehouseSearchTool:
         limit = max(1, min(int(args["limit"]), 20))
         product_limit = max(1, min(int(args["product_limit"]), 50))
         product_offset = max(0, int(args["product_offset"]))
+        # ``product_offset`` is the established pagination cursor in this
+        # structured command. A list-only request has no product rows, so the
+        # same cursor safely represents its store-list page.
+        store_offset = product_offset if list_all else 0
         include_products = bool(args.get("include_products"))
 
         # The orchestrator has already selected an exact store ID.  Prefer the
@@ -140,8 +144,12 @@ class BitrixWarehouseSearchTool:
                 data={"query": query},
             )
 
+        ordered_stores = sorted(
+            stores,
+            key=lambda store: str(_first(store, "title", "TITLE", "name", "NAME") or "").casefold(),
+        )
         matches = (
-            [_compact_store(store) for store in stores[:limit]]
+            [_compact_store(store) for store in ordered_stores[store_offset : store_offset + limit]]
             if list_all
             else (
                 [
@@ -160,6 +168,9 @@ class BitrixWarehouseSearchTool:
             "access_verified_at": datetime.now(UTC).isoformat(),
             "matches": matches,
             "total_stores_seen": len(stores),
+            "offset": store_offset if list_all else 0,
+            "limit": limit,
+            "has_more": bool(list_all and store_offset + len(matches) < len(ordered_stores)),
             "summary": _stores_summary(matches, query=query),
             "list_all": list_all,
         }
@@ -515,12 +526,31 @@ def _stores_summary(matches: list[dict[str, Any]], *, query: str) -> str:
 
 
 def _matches_product_query(product_name: str, product_query: str) -> bool:
-    """Keep a warehouse product filter deterministic and transparent."""
+    """Match a warehouse product before pagination, including Russian word forms."""
     terms = [term for term in re.findall(r"[\w-]+", product_query.casefold()) if len(term) >= 2]
     if not terms:
         return True
-    normalized_name = product_name.casefold()
-    return all(term in normalized_name for term in terms)
+    name_tokens = [term for term in re.findall(r"[\w-]+", product_name.casefold()) if len(term) >= 2]
+    return all(any(_product_term_matches(term, candidate) for candidate in name_tokens) for term in terms)
+
+
+def _product_term_matches(term: str, candidate: str) -> bool:
+    if term in candidate or candidate in term:
+        return True
+    term_stem = _product_word_stem(term)
+    candidate_stem = _product_word_stem(candidate)
+    return len(term_stem) >= 4 and term_stem == candidate_stem
+
+
+def _product_word_stem(value: str) -> str:
+    """Small deterministic normalizer for inventory names, not a global NLP layer."""
+    for suffix in (
+        "иями", "ями", "ами", "иях", "ах", "ях", "ого", "ему", "ыми", "ими",
+        "ов", "ев", "ам", "ям", "ом", "ем", "ой", "ей", "ы", "и", "а", "я", "у", "ю", "е", "о",
+    ):
+        if value.endswith(suffix) and len(value) - len(suffix) >= 4:
+            return value[: -len(suffix)]
+    return value
 
 
 def _extract_items(raw: Any, preferred_key: str) -> list[dict[str, Any]]:

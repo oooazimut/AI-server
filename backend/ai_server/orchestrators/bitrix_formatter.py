@@ -380,6 +380,8 @@ def _format_warehouse_answer(data: dict[str, Any], *, portal_base_url: str = "")
         query = _text(data.get("query"))
         return f"Склад по запросу «{query}» не найден." if query else "Склад не найден."
     if data.get("list_all"):
+        # The executor returns an already alphabetized page. Preserve that
+        # order so the item numbers remain stable between "следующая" calls.
         titles = sorted(
             {
                 _text(item.get("title"))
@@ -390,7 +392,15 @@ def _format_warehouse_answer(data: dict[str, Any], *, portal_base_url: str = "")
         )
         if not titles:
             return "Склады не найдены."
-        return "Список складов:\n" + "\n".join(f"{index}. {title}" for index, title in enumerate(titles, start=1))
+        offset = _int_value(data.get("offset")) or 0
+        total = _int_value(data.get("total_stores_seen")) or len(titles)
+        lines = [
+            f"Список складов ({offset + 1}-{offset + len(titles)} из {total}):",
+            *(f"{index}. {title}" for index, title in enumerate(titles, start=offset + 1)),
+        ]
+        if bool(data.get("has_more")):
+            lines.append("Есть ещё склады. Для продолжения: «следующая».")
+        return "\n".join(lines)
     store = matches[0] if isinstance(matches[0], dict) else {}
     store_title = _text(store.get("title")) or "склад"
     store_label = store_title

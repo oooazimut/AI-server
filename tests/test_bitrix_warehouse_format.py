@@ -6,6 +6,7 @@ from ai_server.orchestrators.bitrix_formatter import (
     _format_warehouse_answer,
     direct_tool_results_response,
 )
+from ai_server.agents.bitrix24.tools.warehouse import _matches_product_query
 
 
 def test_warehouse_page_uses_absolute_item_numbers_after_offset():
@@ -80,7 +81,13 @@ def test_list_all_warehouses_contains_only_alphabetical_names_without_addresses(
         }
     )
 
-    assert answer.splitlines() == ["Список складов:", "1. Борисов", "2. Гараж"]
+    assert answer.splitlines() == ["Список складов (1-2 из 2):", "1. Борисов", "2. Гараж"]
+
+
+def test_warehouse_product_filter_matches_common_russian_word_forms_before_pagination():
+    assert _matches_product_query("Втулка стабилизатора", "втулки")
+    assert _matches_product_query("Амортизатор передний", "амортизаторы")
+    assert not _matches_product_query("Подшипник", "втулки")
 
 
 def test_empty_narrow_search_offers_explicit_global_expansion_without_running_it():

@@ -36,6 +36,7 @@ class _DirectoryBitrix:
         return [
             {"ID": 501, "TITLE": "Склад Борисова", "ADDRESS": "Борисов"},
             {"ID": 601, "TITLE": "Гараж", "ADDRESS": "Российская, 8"},
+            {"ID": 603, "TITLE": "Смородин А.С.", "ADDRESS": ""},
             {"ID": 602, "TITLE": "Гараж Смородин", "ADDRESS": "Кагальницкое шоссе"},
         ]
 
@@ -170,10 +171,31 @@ def test_exact_warehouse_name_wins_over_longer_partial_name():
         item["id"]
         for item in find_entities_in_text(catalog, "warehouses", "Покажи склад гараж смородин")
     ] == [602]
+
+
+def test_inflected_longest_warehouse_name_wins_over_two_shorter_store_names():
+    catalog = _catalog()
+
     assert [
         item["id"]
         for item in find_entities_in_text(catalog, "warehouses", "Покажи склад гараж смородина")
     ] == [602]
+
+
+def test_bare_user_initials_are_not_entity_matches_inside_task_title():
+    catalog = {
+        "users": [
+            {"id": 27, "name": "Борисов Андрей", "aliases": ["борисов", "борисов андрей"]},
+            {"id": 9, "name": "Марат", "aliases": ["м"]},
+            {"id": 85, "name": "Роман", "aliases": ["р"]},
+            {"id": 41, "name": "Тигран", "aliases": ["т"]},
+        ]
+    }
+
+    assert [
+        item["id"]
+        for item in find_entities_in_text(catalog, "users", "Создай задачу для Борисова проверить амортизатор")
+    ] == [27]
 
 
 def test_warehouse_address_is_not_a_semantic_alias():

@@ -291,6 +291,47 @@ def test_task_defaults_replace_unnecessary_pro_clarification_without_second_mode
     assert arguments["deadline_iso"] == "2026-07-29T19:00:00+03:00"
 
 
+def test_named_task_owner_replaces_pro_clarification_after_exact_catalog_resolution():
+    plan = Plan("p1", "CLARIFICATION_REQUIRED", "Уточните ответственного.", [], 1)
+    task = AgentTask(
+        task_id="t1",
+        request="Создай задачу для Борисова проверить амортизатор",
+        user=UserContext(id="1", display_name="Кулинич Валерий Васильевич"),
+    )
+    entity_catalog = {
+        "status": "ready",
+        "users": [
+            {"id": 27, "name": "Борисов Андрей", "aliases": ["борисов", "борисов андрей"]},
+            {"id": 9, "name": "Марат", "aliases": ["м"]},
+            {"id": 85, "name": "Роман", "aliases": ["р"]},
+        ],
+        "projects": [{"id": 77, "name": "Борисов Андрей", "aliases": ["борисов андрей"]}],
+        "warehouses": [],
+    }
+    constraints = {
+        "capability_catalog": {
+            "bitrix24": {
+                "registry_version": "registry-v1",
+                "tools": [{"id": "task_create_draft", "parameters": {"type": "object"}, "structured_command": True}],
+            }
+        }
+    }
+
+    canonical = canonicalize_plan(plan, plan_id="p1", task=task, constraints=constraints, entity_catalog=entity_catalog)
+    normalized = normalize_plan(
+        canonical,
+        task=task,
+        constraints=constraints,
+        now=datetime(2026, 7, 24, 9, 0, tzinfo=MOSCOW_TZ),
+        entity_catalog=entity_catalog,
+    )
+
+    args = normalized.subtasks[0].structured_command.arguments
+    assert args["responsible_id"] == 27
+    assert args["group_id"] == 77
+    assert args["deadline_iso"] == "2026-07-29T19:00:00+03:00"
+
+
 def test_task_template_discards_model_only_project_and_no_deadline_values():
     now = datetime(2026, 7, 24, 9, 0, tzinfo=MOSCOW_TZ)
     task = AgentTask(

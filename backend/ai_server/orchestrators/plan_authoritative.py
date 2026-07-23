@@ -781,6 +781,18 @@ class PlanAuthoritativeOrchestrator(OrchestratorTransportRuntime):
             saw_warehouse = True
             arguments = record.get("arguments") if isinstance(record.get("arguments"), dict) else {}
             data = (record.get("result") or {}).get("data") if isinstance(record.get("result"), dict) else {}
+            if bool(arguments.get("list_all")) and isinstance(data, dict):
+                matches = data.get("matches") if isinstance(data.get("matches"), list) else []
+                offset = int(arguments.get("product_offset") or 0)
+                branches.append(
+                    {
+                        "kind": "warehouse_list",
+                        "page_size": int(arguments.get("limit") or 10),
+                        "next_offset": offset + len(matches),
+                        "has_more": bool(data.get("has_more")),
+                    }
+                )
+                continue
             products = data.get("products") if isinstance(data, dict) else {}
             if not isinstance(products, dict) or not bool(arguments.get("include_products", True)):
                 continue

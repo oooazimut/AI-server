@@ -434,6 +434,42 @@ def test_bitrix_warehouse_search_tool_lists_all_stores_without_literal_name_sear
     assert "products" not in result.data
 
 
+def test_bitrix_warehouse_store_list_keeps_total_and_page_cursor():
+    fake_bitrix = FakeBitrixClient()
+    tool = BitrixWarehouseSearchTool(client=fake_bitrix)
+
+    first = anyio_run(
+        tool.execute(
+            {
+                "query": "все",
+                "list_all": True,
+                "include_products": False,
+                "limit": 1,
+                "product_limit": 50,
+                "product_offset": 0,
+            }
+        )
+    )
+    second = anyio_run(
+        tool.execute(
+            {
+                "query": "все",
+                "list_all": True,
+                "include_products": False,
+                "limit": 1,
+                "product_limit": 50,
+                "product_offset": 1,
+            }
+        )
+    )
+
+    assert first.data["total_stores_seen"] == 2
+    assert first.data["offset"] == 0
+    assert first.data["has_more"] is True
+    assert second.data["offset"] == 1
+    assert second.data["has_more"] is False
+
+
 def test_bitrix_warehouse_search_tool_uses_oauth_client_for_live_reads():
     fallback_bitrix = FakeBitrixClient()
     oauth_bitrix = FakeBitrixClient()
