@@ -25,9 +25,32 @@ def test_health_includes_config_flags():
     assert "bitrix_configured" in data
     assert "llm_configured" in data
     assert "logistics_vehicle_usage_enabled" in data
-    assert data["orchestrator_entity_catalog_status"] in {"worker_owned", "ready", "stale", "error"}
+    assert data["orchestrator_entity_catalog_status"] in {"missing", "ready", "stale", "error"}
     assert data["orchestrator_runtime_owner"] == "ai-server-worker"
     assert set(data["orchestrator_entity_catalog_counts"]) == {"users", "projects", "warehouses"}
+
+
+def test_health_reads_worker_catalog_snapshot():
+    class _CatalogHealth:
+        async def read(self):
+            return {
+                "status": "ready",
+                "version": "worker-catalog-v1",
+                "counts": {"users": 12, "projects": 4, "warehouses": 7},
+            }
+
+    with TestClient(app) as client:
+        app.state.orchestrator_catalog_health = _CatalogHealth()
+        response = client.get("/health")
+
+    data = response.json()
+    assert data["orchestrator_entity_catalog_status"] == "ready"
+    assert data["orchestrator_entity_catalog_version"] == "worker-catalog-v1"
+    assert data["orchestrator_entity_catalog_counts"] == {
+        "users": 12,
+        "projects": 4,
+        "warehouses": 7,
+    }
 
 
 def test_health_reports_split_search_indexer_flags(monkeypatch):

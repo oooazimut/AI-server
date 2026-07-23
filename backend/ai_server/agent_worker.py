@@ -30,6 +30,7 @@ from ai_server.integrations.redis.conversation_trace import RedisConversationTra
 from ai_server.integrations.redis.diagnost_queue import RedisDiagnostQueue
 from ai_server.integrations.redis.dialog_guard import RedisDialogGuard
 from ai_server.integrations.redis.event_queue import RedisEventQueue
+from ai_server.integrations.redis.orchestrator_catalog_health import RedisOrchestratorCatalogHealth
 from ai_server.integrations.redis.outbound_queue import RedisOutboundQueue
 from ai_server.llm import build_orchestrator_llm_client
 from ai_server.orchestrators.bitrix_formatter import format_task_close_report, format_task_close_result_text
@@ -55,6 +56,18 @@ from ai_server.workers.orchestrator.outbound_delivery import run_outbound_delive
 from ai_server.workers.orchestrator.result_publisher import OrchestratorResultPublisher, SpecialistResultPublisher
 
 logger = logging.getLogger(__name__)
+
+
+async def _run_entity_catalog_refresh(
+    entity_catalog: OrchestratorEntityCatalog,
+    catalog_health: RedisOrchestratorCatalogHealth,
+    *,
+    refresh_interval_seconds: int,
+) -> None:
+    while True:
+        await asyncio.sleep(max(60, int(refresh_interval_seconds)))
+        snapshot = await entity_catalog.refresh()
+        await catalog_health.publish(snapshot)
 
 
 def _parse_hhmm(value: str) -> tuple[int, int]:
@@ -107,6 +120,10 @@ async def main() -> None:
     result_publisher = OrchestratorResultPublisher(diagnost_queue, conversation_trace=conversation_trace)
     specialist_result_publisher = SpecialistResultPublisher(diagnost_queue, conversation_trace=conversation_trace)
     webhook_event_queue = RedisEventQueue(settings.redis_url)
+    catalog_health = RedisOrchestratorCatalogHealth(
+        settings.redis_url,
+        ttl_seconds=(settings.orchestrator_entity_catalog_refresh_seconds * 2) + 60,
+    )
 
     vehicle_usage_store = None
     if settings.vehicle_usage_enabled:
@@ -143,7 +160,7 @@ async def main() -> None:
             project_limit=settings.orchestrator_entity_catalog_project_limit,
             warehouse_limit=settings.orchestrator_entity_catalog_warehouse_limit,
         )
-        await entity_catalog.refresh()
+        await catalog_health.publish(await entity_catalog.refresh())
 
         specialist_deps = SpecialistDeps(
             settings=settings,
@@ -175,7 +192,15 @@ async def main() -> None:
             orch_manifest,
             **specialist_deps.as_build_kwargs(),
         )
-        agent_tasks.append(asyncio.create_task(entity_catalog.run_periodic()))
+        agent_tasks.append(
+            asyncio.create_task(
+                _run_entity_catalog_refresh(
+                    entity_catalog,
+                    catalog_health,
+                    refresh_interval_seconds=settings.orchestrator_entity_catalog_refresh_seconds,
+                )
+            )
+        )
 
         agent_queue = RedisAgentQueue(
             settings.redis_url,
@@ -500,6 +525,7 @@ async def main() -> None:
         t.cancel()
     await asyncio.gather(*agent_tasks, return_exceptions=True)
     scheduler.stop()
+    await catalog_health.close()
     await outbound_queue.close()
     logger.info("Agent worker stopped")
 

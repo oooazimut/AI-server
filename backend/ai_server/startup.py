@@ -11,6 +11,7 @@ from .integrations.postgres.bitrix_agent import PostgresBitrixAgentStore
 from .integrations.postgres.vehicle_usage import PostgresVehicleUsageStore
 from .integrations.redis.conversation_trace import RedisConversationTrace
 from .integrations.redis.event_queue import RedisEventQueue
+from .integrations.redis.orchestrator_catalog_health import RedisOrchestratorCatalogHealth
 from .integrations.redis.outbound_queue import RedisOutboundQueue
 from .registry import load_agent_manifests
 from .runtime import ensure_runtime_dirs
@@ -68,6 +69,10 @@ async def lifespan(app: FastAPI):
     webhook_event_queue = _make_event_queue(settings)
     conversation_trace = _make_conversation_trace(settings)
     outbound_queue = _make_outbound_queue(settings)
+    orchestrator_catalog_health = RedisOrchestratorCatalogHealth(
+        settings.redis_url,
+        ttl_seconds=(settings.orchestrator_entity_catalog_refresh_seconds * 2) + 60,
+    )
 
     app.state.settings = settings
     app.state.manifests = manifests
@@ -78,6 +83,7 @@ async def lifespan(app: FastAPI):
     app.state.webhook_event_queue = webhook_event_queue
     app.state.conversation_trace = conversation_trace
     app.state.outbound_queue = outbound_queue
+    app.state.orchestrator_catalog_health = orchestrator_catalog_health
     app.state.webhook_event_status = {
         "enabled": True,
         "mode": "webhook",
@@ -157,4 +163,5 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await orchestrator_catalog_health.close()
         await outbound_queue.close()

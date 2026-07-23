@@ -22,11 +22,19 @@ router = APIRouter()
 
 
 @router.get("/health")
-def health(request: Request) -> dict[str, Any]:
+async def health(request: Request) -> dict[str, Any]:
     manifests = _active_agent_manifests(request.app.state.manifests)
     settings = get_settings()
-    entity_catalog = getattr(request.app.state, "orchestrator_entity_catalog", None)
-    entity_snapshot = entity_catalog.snapshot() if entity_catalog is not None else {}
+    catalog_health = getattr(request.app.state, "orchestrator_catalog_health", None)
+    entity_snapshot = (
+        await catalog_health.read()
+        if catalog_health is not None
+        else {
+            "status": "missing",
+            "version": None,
+            "counts": {key: 0 for key in ("users", "projects", "warehouses")},
+        }
+    )
     return {
         "status": "ok",
         "architecture": "pro_orchestrator_with_structured_executors",
@@ -51,11 +59,9 @@ def health(request: Request) -> dict[str, Any]:
         "agent_orchestrator_worker_count": settings.agent_orchestrator_worker_count,
         "agent_bitrix_worker_count": settings.agent_bitrix_worker_count,
         "agent_task_timeout_seconds": settings.agent_task_timeout_seconds,
-        "orchestrator_entity_catalog_status": entity_snapshot.get("status", "worker_owned"),
+        "orchestrator_entity_catalog_status": entity_snapshot.get("status", "missing"),
         "orchestrator_entity_catalog_version": entity_snapshot.get("version"),
-        "orchestrator_entity_catalog_counts": {
-            key: len(entity_snapshot.get(key) or []) for key in ("users", "projects", "warehouses")
-        },
+        "orchestrator_entity_catalog_counts": entity_snapshot["counts"],
         "bitrix_dialog_guard_enabled": settings.bitrix_dialog_guard_enabled,
         "bitrix_dialog_stuck_seconds": settings.bitrix_dialog_stuck_seconds,
         "bitrix_dialog_pending_ttl_seconds": settings.bitrix_dialog_pending_ttl_seconds,
