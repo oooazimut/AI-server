@@ -10,6 +10,10 @@
     "calendar_start_hour": 12,
     "calendar_duration_minutes": 30
   },
+  "request_verbs": {
+    "search_or_show": ["найди", "найдите", "ищи", "отыщи", "покажи", "покажите", "выведи", "подскажи"],
+    "search_noun": ["поиск"]
+  },
   "templates": {
     "task_description": "Краткое содержание: {title}",
     "task_close_unconfirmed_item": "результат выполнения не указан",

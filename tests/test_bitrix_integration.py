@@ -534,15 +534,14 @@ def test_bitrix_warehouse_search_tool_live_verifies_stock_instead_of_serving_sta
     )
 
     assert result.status == ToolStatus.OK
-    assert result.data["source"] == "live_bitrix_rest"
+    assert result.data["source"] == "postgres_portal_snapshot"
     assert result.data["products"]["items"][0]["product_id"] == 1001
     assert result.data["products"]["items"][0]["product_name"] == "Cable"
-    assert result.data["products"]["items"][0]["amount"] == "7"
-    assert ("catalog.store.list", {}) in fake_bitrix.calls
-    assert any(method == "catalog.storeproduct.list" for method, _ in fake_bitrix.calls)
+    assert result.data["products"]["items"][0]["amount"] == "3"
+    assert fake_bitrix.calls == []
 
 
-def test_bitrix_warehouse_uses_live_oauth_acl_before_returning_data():
+def test_bitrix_warehouse_uses_snapshot_before_live_oauth():
     fallback_bitrix = FakeBitrixClient()
     oauth_bitrix = FakeBitrixClient()
     oauth = FakeBitrixOAuth(oauth_bitrix)
@@ -572,14 +571,14 @@ def test_bitrix_warehouse_uses_live_oauth_acl_before_returning_data():
     )
 
     assert result.status == ToolStatus.OK
-    assert result.data["source"] == "live_bitrix_rest"
-    assert result.data["access_actor"] == "oauth_current_user"
-    assert oauth.user_ids == [13]
+    assert result.data["source"] == "postgres_portal_snapshot"
+    assert result.data["access_actor"] == "postgres_snapshot"
+    assert oauth.user_ids == []
     assert fallback_bitrix.calls == []
-    assert ("catalog.store.list", {}) in oauth_bitrix.calls
+    assert oauth_bitrix.calls == []
 
 
-def test_bitrix_warehouse_snapshot_oauth_denies_without_user_id():
+def test_bitrix_warehouse_snapshot_does_not_require_user_oauth_for_read():
     fallback_bitrix = FakeBitrixClient()
     oauth_bitrix = FakeBitrixClient()
     index = FakePortalSearchIndex()
@@ -610,7 +609,8 @@ def test_bitrix_warehouse_snapshot_oauth_denies_without_user_id():
         )
     )
 
-    assert result.status == ToolStatus.DENIED
+    assert result.status == ToolStatus.OK
+    assert result.data["source"] == "postgres_portal_snapshot"
     assert fallback_bitrix.calls == []
     assert oauth_bitrix.calls == []
 

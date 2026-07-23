@@ -26,6 +26,7 @@ class BitrixFormattedResult:
 
 
 WAREHOUSE_RESPONSE_ITEM_LIMIT = 50
+COMPOSITE_WAREHOUSE_BRANCH_ITEM_LIMIT = 10
 
 
 def _direct_task_create_response(
@@ -37,19 +38,14 @@ def _direct_task_create_response(
     successful_results = [result for result in tool_results if result.status == "ok"]
     warehouse_results = [result for result in successful_results if result.tool == "bitrix_warehouse_search"]
     if len(warehouse_results) > 1 and len(warehouse_results) == len(successful_results):
-        limited_results, omitted = _limit_multi_warehouse_results(
-            warehouse_results,
-            total_limit=WAREHOUSE_RESPONSE_ITEM_LIMIT,
-        )
+        limited_results = [
+            _limit_warehouse_result(result, limit=COMPOSITE_WAREHOUSE_BRANCH_ITEM_LIMIT)
+            for result in warehouse_results
+        ]
         parts = [
             _format_warehouse_answer(result.data, portal_base_url=portal_base_url)
             for result in limited_results
         ]
-        if omitted:
-            parts.append(
-                f"Ещё {omitted} {_ru_warehouse_word(omitted)} не поместились в общий предел "
-                f"{WAREHOUSE_RESPONSE_ITEM_LIMIT} позиций. Их можно запросить продолжением."
-            )
         return BitrixFormattedResult(
             status="completed",
             answer="\n\n".join(parts),
@@ -208,6 +204,34 @@ def _direct_task_create_response(
     return None
 
 
+def _limit_warehouse_result(result: ToolResult, *, limit: int) -> ToolResult:
+    if not isinstance(result.data, dict):
+        return result
+    data = dict(result.data)
+    products = data.get("products")
+    if not isinstance(products, dict):
+        return result
+    items = list(products.get("items") or [])
+    if len(items) <= limit:
+        return result
+    normalized = dict(products)
+    offset = _int_value(normalized.get("offset")) or 0
+    total = (
+        _int_value(normalized.get("available_items_with_names"))
+        or _int_value(normalized.get("available_items_seen"))
+        or len(items)
+    )
+    normalized.update(
+        {
+            "items": items[:limit],
+            "limit": limit,
+            "has_more": offset + limit < total,
+        }
+    )
+    data["products"] = normalized
+    return result.model_copy(update={"data": data})
+
+
 def _limit_multi_warehouse_results(
     results: list[ToolResult],
     *,
@@ -355,10 +379,21 @@ def _format_warehouse_answer(data: dict[str, Any], *, portal_base_url: str = "")
     if not matches:
         query = _text(data.get("query"))
         return f"Склад по запросу «{query}» не найден." if query else "Склад не найден."
+    if data.get("list_all"):
+        titles = sorted(
+            {
+                _text(item.get("title"))
+                for item in matches
+                if isinstance(item, dict) and _text(item.get("title"))
+            },
+            key=str.casefold,
+        )
+        if not titles:
+            return "Склады не найдены."
+        return "Список складов:\n" + "\n".join(f"{index}. {title}" for index, title in enumerate(titles, start=1))
     store = matches[0] if isinstance(matches[0], dict) else {}
     store_title = _text(store.get("title")) or "склад"
-    address = _text(store.get("address"))
-    store_label = f"{store_title} ({address})" if address else store_title
+    store_label = store_title
 
     products = data.get("products") if isinstance(data.get("products"), dict) else {}
     if not products:
@@ -526,7 +561,10 @@ def _format_portal_search_answer(data: dict[str, Any], *, portal_base_url: str =
     items = data.get("results") if isinstance(data.get("results"), list) else []
     title = _portal_search_title(scope=scope, query=query)
     if not items:
-        return title.replace(":", " не найдены.")
+        answer = title.replace(":", " не найдены.")
+        if scope != "all" and query:
+            answer += f" Могу поискать шире: «Битрикс, найди {query} везде»."
+        return answer
 
     offset = _int_value(data.get("offset")) or 0
     lines = [title]
@@ -615,6 +653,7 @@ def _portal_search_title(*, scope: str, query: str) -> str:
     scope_label = {
         "documents": "Документы",
         "files": "Файлы",
+        "tasks": "Задачи",
         "projects": "Проекты",
         "catalog": "Каталог",
         "stores": "Склады",
@@ -778,7 +817,7 @@ def _format_task_create_draft_answer(data: dict[str, Any]) -> str:
     params = data.get("params") if isinstance(data.get("params"), dict) else {}
     fields = params.get("fields") if isinstance(params.get("fields"), dict) else {}
     title = _text(preview.get("title")) or _text(fields.get("TITLE")) or "задача"
-    responsible = _text(preview.get("responsible")) or "указанный сотрудник"
+    responsible = _text(preview.get("responsible"))
     project = _text(preview.get("project"))
     deadline = _text(preview.get("deadline")) or _deadline_label_from_fields(fields)
     description = _clean_task_description(
@@ -812,7 +851,7 @@ def _format_task_create_requires_project_answer(data: dict[str, Any]) -> str:
     task_fields = task_params.get("fields") if isinstance(task_params.get("fields"), dict) else {}
 
     title = _text(task_preview.get("title")) or _text(task_fields.get("TITLE")) or "задача"
-    responsible = _text(task_preview.get("responsible")) or "указанный сотрудник"
+    responsible = _text(task_preview.get("responsible"))
     deadline = _text(task_preview.get("deadline")) or _deadline_label_from_fields(task_fields)
     description = _clean_task_description(
         _text(task_preview.get("description"))

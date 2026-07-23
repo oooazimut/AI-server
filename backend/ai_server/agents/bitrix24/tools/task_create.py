@@ -66,9 +66,6 @@ def build_task_create_draft_from_args(args: dict[str, Any], *, user_id: int | No
             responsible_note = "Ответственным выбран пользователь Bitrix из текущего диалога."
         else:
             responsible_note = "Оркестратор выбрал текущего пользователя, но канал не передал Bitrix user id."
-    if not responsible_label and responsible_id is not None:
-        responsible_label = "указанный сотрудник"
-
     deadline, deadline_note, no_deadline, deadline_error = _deadline_from_args(args)
 
     contract_errors: list[str] = []
@@ -655,13 +652,13 @@ def _draft_preview(fields: dict[str, Any], *, responsible_label: str = "", proje
     preview = {
         "title": title,
         "description": description,
-        "responsible": responsible_label or "указанный сотрудник",
+        "responsible": responsible_label,
         "deadline": deadline_label,
     }
     if project_label:
         preview["project"] = project_label
     elif fields.get("GROUP_ID") is not None:
-        preview["project"] = "выбранный проект"
+        preview["project"] = ""
     return preview
 
 

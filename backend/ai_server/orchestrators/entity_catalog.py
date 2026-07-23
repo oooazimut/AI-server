@@ -129,7 +129,9 @@ def _warehouse_entry(item: dict[str, Any]) -> dict[str, Any] | None:
     if entity_id is None or not name:
         return None
     address = str(_first(item, "ADDRESS", "address") or "").strip()
-    aliases = set(_aliases(name, address))
+    # A warehouse address is transport metadata only.  It must neither choose
+    # a warehouse nor appear as a semantic alias in an orchestrator request.
+    aliases = set(_aliases(name))
     if _looks_like_surname(name):
         aliases.update(_aliases(name, include_surname_stem=True))
     return {"id": entity_id, "name": name, "address": address, "aliases": sorted(aliases)}
@@ -318,7 +320,31 @@ def _entity_match_score(item: dict[str, Any], entity_type: str, normalized: str)
     if phrase_scores:
         return max(phrase_scores)
 
+    # A multi-word warehouse/project name may contain an inflected surname in
+    # the last token ("Гараж Смородина" -> "Гараж Смородин").  Resolve the
+    # complete longest phrase before falling back to a shorter embedded name.
     request_tokens = normalized.split()
+    morphology_scores = [
+        1_200 + 100 * len(candidate_tokens)
+        for candidate in candidates
+        if (candidate_tokens := candidate.split())
+        and len(candidate_tokens) >= 2
+        and any(
+            len(window) == len(candidate_tokens)
+            and all(
+                left == right
+                or (_looks_like_surname(left) and _looks_like_surname(right) and _surname_stem(left) == _surname_stem(right))
+                for left, right in zip(candidate_tokens, window, strict=True)
+            )
+            for window in (
+                request_tokens[index : index + len(candidate_tokens)]
+                for index in range(max(0, len(request_tokens) - len(candidate_tokens) + 1))
+            )
+        )
+    ]
+    if morphology_scores:
+        return max(morphology_scores)
+
     if entity_type == "users":
         name_tokens = normalize_entity_text(item.get("name")).split()
         matched = sum(
@@ -352,6 +378,10 @@ def _entity_match_score(item: dict[str, Any], entity_type: str, normalized: str)
 
 
 def _person_tokens_match(left: str, right: str) -> bool:
+    return entity_tokens_match(left, right)
+
+
+def entity_tokens_match(left: str, right: str) -> bool:
     if left == right:
         return True
     left_stem = _surname_stem(left)
@@ -368,6 +398,7 @@ def _person_tokens_match(left: str, right: str) -> bool:
 
 __all__ = [
     "OrchestratorEntityCatalog",
+    "entity_tokens_match",
     "find_entities_in_text",
     "normalize_entity_text",
     "resolve_entity",

@@ -14,15 +14,25 @@ from typing import Any
 
 from ai_server.capability_registry import registry_tool, validate_tool_arguments
 from ai_server.orchestrators.entity_catalog import (
+    entity_tokens_match,
     find_entities_in_text,
     normalize_entity_text,
     resolve_entity,
 )
-from ai_server.orchestrators.orchestrator_policy import bitrix_policy_defaults, bitrix_policy_templates
+from ai_server.orchestrators.orchestrator_policy import (
+    bitrix_policy_defaults,
+    bitrix_policy_request_verbs,
+    bitrix_policy_templates,
+)
 from ai_server.utils import MOSCOW_TZ
 
 _DEFAULTS = bitrix_policy_defaults()
 _TEMPLATES = bitrix_policy_templates()
+_REQUEST_VERBS = bitrix_policy_request_verbs()
+_SEARCH_OR_SHOW_VERBS = tuple(_REQUEST_VERBS["search_or_show"])
+_SEARCH_WORDS = tuple([*_SEARCH_OR_SHOW_VERBS, *_REQUEST_VERBS["search_noun"]])
+_SEARCH_OR_SHOW_PATTERN = "(?:" + "|".join(re.escape(item) for item in sorted(_SEARCH_OR_SHOW_VERBS, key=len, reverse=True)) + ")"
+_SEARCH_WORD_PATTERN = "(?:" + "|".join(re.escape(item) for item in sorted(_SEARCH_WORDS, key=len, reverse=True)) + ")"
 DEFAULT_RESULT_LIMIT = _DEFAULTS["result_limit"]
 DEFAULT_WAREHOUSE_PRODUCT_LIMIT = _DEFAULTS["warehouse_page_size"]
 DEFAULT_TASK_DEADLINE_WORKING_DAYS = _DEFAULTS["task_deadline_working_days"]
@@ -179,7 +189,7 @@ def _warehouse_semantics(
     list_all = bool(re.search(r"\b(?:все|список)\s+(?:склад|склады|складов)\b", text))
     result["list_all"] = list_all
     product_match = re.search(
-        r"\b(?:найди|найдите|покажи|покажите)\s+(.+?)\s+(?:на|в)\s+склад(?:е|у)?\s+(.+)$",
+        rf"\b{_SEARCH_OR_SHOW_PATTERN}\s+(.+?)\s+(?:на|в)\s+склад(?:е|у)?\s+(.+)$",
         text,
     )
     warehouse_match = re.search(r"\bсклад(?:е|у|а|ов|ы)?\s+(.+)$", text)
@@ -202,19 +212,15 @@ def _warehouse_semantics(
     if product_match:
         product = product_match.group(1).strip(" .,:;-")
         warehouse = product_match.group(2).strip(" .,:;-")
-        result.update(
-            {
-                "query": warehouse,
-                "product_query": product,
-                "include_products": True,
-                "product_limit": DEFAULT_WAREHOUSE_PRODUCT_LIMIT,
-            }
-        )
-    elif any(
-        marker in text
-        for marker in ("покажи склад", "найди склад", "выведи склад", "ищи склад", "остат", "товар", "налич")
+        result["query"] = warehouse
+        result["product_query"] = product
+        result.setdefault("include_products", True)
+        result.setdefault("product_limit", DEFAULT_WAREHOUSE_PRODUCT_LIMIT)
+    elif re.search(rf"\b{_SEARCH_OR_SHOW_PATTERN}\s+склад", text) or any(
+        marker in text for marker in ("остат", "товар", "налич")
     ):
-        result.update({"include_products": True, "product_limit": DEFAULT_WAREHOUSE_PRODUCT_LIMIT})
+        result.setdefault("include_products", True)
+        result.setdefault("product_limit", DEFAULT_WAREHOUSE_PRODUCT_LIMIT)
 
     page_match = re.search(r"\b(\d+)\s*(?:-?ю|страниц)", text)
     if page_match:
@@ -310,6 +316,10 @@ def _task_create_semantics(
     entity_catalog: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     result = dict(arguments)
+    # The Pro planner can describe a task, but it is not allowed to cancel a
+    # template deadline.  Only an explicit user phrase may select this mode.
+    if not _explicit_no_deadline(task.request if task is not None else ""):
+        result.pop("no_deadline", None)
     task_user_id = None
     if task is not None:
         try:
@@ -366,9 +376,13 @@ def _task_create_semantics(
     project_was_explicit = bool(
         task is not None and re.search(r"\b(?:проект|групп)\w*\b", _text(task.request))
     )
-    if explicit_project_name and not project_was_explicit and not result.get("group_id"):
+    # A project is never inferred from the task title or supplied by Pro on
+    # its own.  Without the explicit "project/group" wording it is always the
+    # selected responsible person's personal project.
+    if not project_was_explicit:
         result.pop("project_name", None)
         result.pop("group_name", None)
+        result.pop("group_id", None)
         explicit_project_name = ""
     if explicit_project_name and not result.get("group_id"):
         if not _catalog_available(entity_catalog):
@@ -396,6 +410,15 @@ def _task_create_semantics(
             if project is not None:
                 result["group_id"] = int(project["id"])
     return result
+
+
+def _explicit_no_deadline(request: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:без\s+срока|срок\s+не\s+(?:ставь|ставьте|нужен)|не\s+ставь\s+срок)\b",
+            _text(request),
+        )
+    )
 
 
 def _calendar_semantics(arguments: dict[str, Any], now: datetime, *, task: Any | None = None) -> dict[str, Any]:
@@ -476,8 +499,19 @@ def _task_close_semantics(request: str, arguments: dict[str, Any]) -> dict[str, 
 
 def _portal_search_semantics(request: str, arguments: dict[str, Any]) -> dict[str, Any]:
     result = dict(arguments)
-    result.setdefault("scope", "documents")
-    result.setdefault("limit", DEFAULT_RESULT_LIMIT)
+    text = _text(request)
+    if re.search(r"\b(?:везде|повсюду|глобально)\b", text):
+        result["scope"] = "all"
+    elif any(marker in text for marker in ("диск", "файл", "документ", "папк")):
+        result["scope"] = "documents"
+    elif "задач" in text:
+        result["scope"] = "tasks"
+    elif "проект" in text or "групп" in text:
+        result["scope"] = "projects"
+    else:
+        result["scope"] = "all"
+    result["query"] = _search_query(request)
+    result.setdefault("limit", 50)
     result.setdefault("offset", 0)
     result.setdefault("show_all", False)
     return result
@@ -590,14 +624,14 @@ def _task_close_report_incident_semantics(arguments: dict[str, Any]) -> dict[str
 
 def _expected_tool(request: str, entity_catalog: dict[str, Any] | None = None) -> str | None:
     text = _text(request)
-    if "склад" in text or "остат" in text:
-        return "bitrix_warehouse_search"
     if any(marker in text for marker in ("напомни", "напоминани", "календар")):
         return "calendar_event_draft"
     if re.search(r"\bсозда(?:й|ть|йте)\s+задач", text):
         return "task_create_draft"
     if re.search(r"\b(?:закрой|закрыть|заверши|завершить)\s+задач", text):
         return "task_close_draft"
+    if "склад" in text or "остат" in text:
+        return "bitrix_warehouse_search"
     if any(marker in text for marker in ("диск", "файл", "документ", "папк")):
         return "portal_search"
     if (
@@ -610,6 +644,8 @@ def _expected_tool(request: str, entity_catalog: dict[str, Any] | None = None) -
         return "bitrix_my_tasks"
     if "задач" in text:
         return "bitrix_task_search"
+    if re.search(rf"\b{_SEARCH_WORD_PATTERN}\b", text):
+        return "portal_search"
     return None
 
 
@@ -631,6 +667,26 @@ def canonicalize_plan(
     if constraints.get("conversation_reference_error"):
         return plan
     catalog = entity_catalog or {}
+    if _warehouse_address_request(task.request):
+        return _direct_response_plan(
+            plan_id,
+            "Адреса складов в боте не используются. Для поиска укажите название склада.",
+        )
+    continuation = _canonical_warehouse_continuation_plan(
+        plan_id=plan_id,
+        task=task,
+        registry_version=str(
+            (constraints.get("capability_catalog", {}).get("bitrix24") or {}).get("registry_version") or "CURRENT"
+        ),
+        entity_catalog=catalog,
+    )
+    if continuation is not None:
+        return continuation
+    if _unsupported_mixed_domain_request(task.request):
+        return _clarification_plan(
+            plan_id,
+            "Пожалуйста, отправьте складской поиск, задачи, Диск или календарь отдельными сообщениями.",
+        )
     expected = _expected_tool(task.request, catalog)
     if (
         plan is not None
@@ -703,7 +759,8 @@ def _canonical_warehouse_plan(
     request = str(task.request)
     text = _text(request)
     list_all = bool(re.search(r"\b(?:все|список)\s+(?:склад|склады|складов)\b", text))
-    product_query = _warehouse_product_query(request)
+    named_warehouses = find_entities_in_text(entity_catalog, "warehouses", request)
+    product_query = _warehouse_product_query(request, named_warehouses)
     all_scope = bool(
         product_query
         and re.search(r"\b(?:на|по)\s+(?:всех\s+)?склад(?:ах|ам)\b", text)
@@ -717,14 +774,13 @@ def _canonical_warehouse_plan(
                 "query": "все",
                 "list_all": True,
                 "include_products": False,
-                "limit": DEFAULT_RESULT_LIMIT,
+                "limit": 20,
                 "product_limit": DEFAULT_WAREHOUSE_PRODUCT_LIMIT,
                 "product_offset": 0,
             },
             registry_version=registry_version,
         )
 
-    named_warehouses = find_entities_in_text(entity_catalog, "warehouses", request)
     warehouses = (
         list(entity_catalog.get("warehouses") or [])
         if all_scope and not named_warehouses
@@ -739,6 +795,7 @@ def _canonical_warehouse_plan(
     from ai_server.orchestrators.plan_authoritative import Plan, StructuredCommand, Subtask
 
     subtasks = []
+    branch_limit = 10 if len(warehouses) > 1 else DEFAULT_WAREHOUSE_PRODUCT_LIMIT
     for index, warehouse in enumerate(warehouses, start=1):
         name = str(warehouse.get("name") or "").strip()
         store_id = int(warehouse["id"])
@@ -753,7 +810,7 @@ def _canonical_warehouse_plan(
             "list_all": False,
             "include_products": True,
             "limit": DEFAULT_RESULT_LIMIT,
-            "product_limit": DEFAULT_WAREHOUSE_PRODUCT_LIMIT,
+            "product_limit": branch_limit,
             "product_offset": 0,
         }
         if product_query:
@@ -774,6 +831,83 @@ def _canonical_warehouse_plan(
             )
         )
     return Plan(plan_id, "EXECUTE", None, subtasks, 1)
+
+
+def _canonical_warehouse_continuation_plan(
+    *,
+    plan_id: str,
+    task: Any,
+    registry_version: str,
+    entity_catalog: dict[str, Any],
+) -> Any | None:
+    text = _text(task.request)
+    if not re.search(r"\b(?:следующ|дальше|еще|ещё)\w*\b", text):
+        return None
+    state = task.context.get("orchestrator_warehouse_page_state") if isinstance(task.context, dict) else None
+    branches = list(state.get("branches") or []) if isinstance(state, dict) else []
+    if not branches:
+        return None
+    requested = find_entities_in_text(entity_catalog, "warehouses", task.request)
+    requested_ids = {int(item["id"]) for item in requested}
+    selected = [
+        branch
+        for branch in branches
+        if bool(branch.get("has_more"))
+        and (not requested_ids or int(branch.get("store_id") or 0) in requested_ids)
+    ]
+    if not selected:
+        return _clarification_plan(plan_id, "В этом диалоге больше нет следующих складских позиций.")
+    from ai_server.orchestrators.plan_authoritative import Plan, StructuredCommand, Subtask
+
+    subtasks = []
+    for index, branch in enumerate(selected, start=1):
+        store_id = int(branch["store_id"])
+        name = str(branch.get("store_name") or "").strip()
+        arguments = {
+            "query": name,
+            "store_id": store_id,
+            "list_all": False,
+            "include_products": True,
+            "limit": DEFAULT_RESULT_LIMIT,
+            "product_limit": int(branch.get("page_size") or DEFAULT_WAREHOUSE_PRODUCT_LIMIT),
+            "product_offset": int(branch.get("next_offset") or 0),
+        }
+        product_query = str(branch.get("product_query") or "").strip()
+        if product_query:
+            arguments["product_query"] = product_query
+        subtasks.append(
+            Subtask(
+                f"warehouse-next-{index}",
+                None,
+                "bitrix24",
+                "bitrix_warehouse_search",
+                f"Следующая страница склада {name}",
+                StructuredCommand(registry_version, "bitrix_warehouse_search", arguments),
+            )
+        )
+    return Plan(plan_id, "EXECUTE", None, subtasks, 1)
+
+
+def _unsupported_mixed_domain_request(request: str) -> bool:
+    text = _text(request)
+    if any(marker in text for marker in ("напомни", "напоминани", "календар")) or re.search(
+        r"\bсозда(?:й|ть|йте)\s+задач", text
+    ):
+        return False
+    domains = 0
+    domains += int(bool("склад" in text or "остат" in text))
+    domains += int(bool("задач" in text))
+    domains += int(bool(any(marker in text for marker in ("диск", "файл", "документ", "папк"))))
+    domains += int(bool(any(marker in text for marker in ("напомни", "напоминани", "календар"))))
+    return domains > 1
+
+
+def _warehouse_address_request(request: str) -> bool:
+    text = _text(request)
+    return bool(
+        "склад" in text
+        and re.search(r"\b(?:адрес|где\s+находится|местонахождени)\w*", text)
+    )
 
 
 def _single_bitrix_plan(
@@ -802,6 +936,12 @@ def _clarification_plan(plan_id: str, clarification: str) -> Any:
     return Plan(plan_id, "CLARIFICATION_REQUIRED", clarification, [], 1)
 
 
+def _direct_response_plan(plan_id: str, answer: str) -> Any:
+    from ai_server.orchestrators.plan_authoritative import Plan
+
+    return Plan(plan_id, "DIRECT_RESPONSE", answer, [], 1)
+
+
 def _existing_command_arguments(plan: Any | None, tool_name: str) -> dict[str, Any] | None:
     if plan is None or getattr(plan, "state", None) != "EXECUTE":
         return None
@@ -814,17 +954,47 @@ def _existing_command_arguments(plan: Any | None, tool_name: str) -> dict[str, A
     return dict(command.arguments)
 
 
-def _warehouse_product_query(request: str) -> str:
+def _warehouse_product_query(request: str, warehouses: list[dict[str, Any]] | None = None) -> str:
     text = _text(request)
     match = re.search(
-        r"\b(?:найди|найдите|покажи|покажите)\s+(.+?)\s+"
+        rf"\b{_SEARCH_OR_SHOW_PATTERN}\s+(.+?)\s+"
         r"(?:на|по|в)\s+(?:всех\s+)?склад(?:е|у|ах|ам)\b",
         text,
     )
     if not match:
+        reverse = re.search(
+            rf"\b{_SEARCH_OR_SHOW_PATTERN}\s+"
+            r"(?:на|в)\s+склад(?:е|у)\s+(.+)$",
+            text,
+        )
+        if not reverse:
+            return ""
+        tail = reverse.group(1).strip(" .,:;-")
+        for warehouse in warehouses or []:
+            product = _product_after_warehouse(tail, warehouse)
+            if product:
+                return product
         return ""
     product = match.group(1).strip(" .,:;-")
     return "" if product in {"склад", "склады", "остатки", "товары"} else product
+
+
+def _product_after_warehouse(tail: str, warehouse: dict[str, Any]) -> str:
+    tail_tokens = normalize_entity_text(tail).split()
+    if not tail_tokens:
+        return ""
+    candidates = [str(warehouse.get("name") or ""), *(warehouse.get("aliases") or [])]
+    for candidate in candidates:
+        candidate_tokens = normalize_entity_text(candidate).split()
+        if not candidate_tokens or len(tail_tokens) <= len(candidate_tokens):
+            continue
+        if all(
+            left == right
+            or entity_tokens_match(left, right)
+            for left, right in zip(candidate_tokens, tail_tokens[: len(candidate_tokens)], strict=True)
+        ):
+            return " ".join(tail_tokens[len(candidate_tokens) :]).strip(" .,:;-")
+    return ""
 
 
 def _creation_title(request: str, tool_name: str, named_users: list[dict[str, Any]]) -> str:
@@ -864,9 +1034,17 @@ def _name_token_matches(left: str, right: str) -> bool:
 
 def _search_query(request: str) -> str:
     text = _text(request)
-    text = re.sub(r"^\s*(?:найди|найдите|покажи|покажите)\s+", "", text)
+    text = re.sub(
+        rf"^\s*(?:(?:оркестратор|битрикс)\s*,?\s*)?{_SEARCH_OR_SHOW_PATTERN}\s+",
+        "",
+        text,
+    )
+    text = re.sub(r"^\s*битрикс\s*,?\s*", "", text)
     text = re.sub(r"\b(?:на|в)\s+диск(?:е|у)?\b", "", text)
     text = re.sub(r"\b(?:документ|документы|файл|файлы)\s+(?:по\s+)?", "", text)
+    text = re.sub(r"\b(?:на|в)\s+диск(?:е|у)?\b", "", text)
+    text = re.sub(r"\b(?:документ|документы|файл|файлы)\s+(?:по\s+)?", "", text)
+    text = re.sub(r"\b(?:везде|повсюду|глобально)\b", "", text)
     return text.strip(" .,:;-")
 
 

@@ -37,7 +37,10 @@ from ai_server.orchestrators.bitrix_semantics import (
 from ai_server.orchestrators.conversation_reference import resolve_conversation_reference
 from ai_server.orchestrators.internal import OrchestratorTransportRuntime
 from ai_server.orchestrators.logistics_response import render_logistics_tool_result
-from ai_server.orchestrators.orchestrator_policy import selected_bitrix_policy
+from ai_server.orchestrators.orchestrator_policy import (
+    bitrix_policy_request_verbs,
+    selected_bitrix_policy,
+)
 from ai_server.orchestrators.tools.call_specialist import CallSpecialistTool
 
 PLAN_SCHEMA = "t0007.plan.v2"
@@ -155,7 +158,7 @@ class DeepSeekPlanService:
                 "schema_version": PLAN_SCHEMA,
                 "plan_id": constraints["plan_id"],
                 "request_hash": constraints["request_hash"],
-                "state": "EXECUTE|CLARIFICATION_REQUIRED|CATALOG|NOT_SUPPORTED",
+                "state": "EXECUTE|CLARIFICATION_REQUIRED|DIRECT_RESPONSE|CATALOG|NOT_SUPPORTED",
                 "clarification": "string or null",
                 "max_rounds": "integer 1..3",
                 "subtasks": [
@@ -408,7 +411,10 @@ def _required_warehouse_labels(request: str, catalog: dict[str, Any]) -> list[st
     if "bitrix_warehouse_search" not in capabilities:
         return []
     text = _normalized_text(request)
-    if not re.search(r"\b(?:покажи|найди|выведи)\b", text):
+    search_or_show = "|".join(
+        re.escape(word) for word in bitrix_policy_request_verbs()["search_or_show"]
+    )
+    if not re.search(rf"\b(?:{search_or_show})\b", text):
         return []
     match = re.search(r"\bсклад\w*\b\s+(.+)", text)
     if not match:
@@ -483,7 +489,7 @@ def _decode_plan(raw: str, *, plan_id: str, request: str, constraints: dict[str,
     if value["schema_version"] != PLAN_SCHEMA or value["plan_id"] != plan_id or value["request_hash"] != _hash(request):
         raise PlanRejected("PLAN_BINDING_MISMATCH")
     state = value["state"]
-    if state not in {"EXECUTE", "CLARIFICATION_REQUIRED", "CATALOG", "NOT_SUPPORTED"}:
+    if state not in {"EXECUTE", "CLARIFICATION_REQUIRED", "DIRECT_RESPONSE", "CATALOG", "NOT_SUPPORTED"}:
         raise PlanRejected("PLAN_STATE_INVALID")
     if type(value["max_rounds"]) is not int or not 1 <= value["max_rounds"] <= constraints["max_round_trips"]:
         raise PlanRejected("ROUND_LIMIT_INVALID")
@@ -497,8 +503,8 @@ def _decode_plan(raw: str, *, plan_id: str, request: str, constraints: dict[str,
         raise PlanRejected("EXECUTE_WITHOUT_SUBTASK")
     if state != "EXECUTE" and (
         items
-        or (state == "CLARIFICATION_REQUIRED" and not clarification)
-        or (state != "CLARIFICATION_REQUIRED" and clarification is not None)
+        or (state in {"CLARIFICATION_REQUIRED", "DIRECT_RESPONSE"} and not clarification)
+        or (state not in {"CLARIFICATION_REQUIRED", "DIRECT_RESPONSE"} and clarification is not None)
     ):
         raise PlanRejected("NON_EXECUTION_PLAN_INVALID")
     if constraints.get("conversation_reference_error") and state != "CLARIFICATION_REQUIRED":
@@ -740,10 +746,102 @@ class PlanAuthoritativeOrchestrator(OrchestratorTransportRuntime):
         history = await self.store.load_turns(dialog_key, limit=12)  # type: ignore[attr-defined]
         return task.model_copy(update={"context": {**task.context, "dialog_history": list(history)}})
 
+    async def _load_warehouse_page_state(self, task: AgentTask) -> AgentTask:
+        """Load only the page cursor for this exact numbered dialog branch."""
+        dialog_key = str(task.context.get("dialog_key") or "")
+        if self.store is None or not dialog_key or not hasattr(self.store, "get_kv"):
+            return task
+        raw = await self.store.get_kv(dialog_key, "orchestrator_warehouse_page_state")  # type: ignore[attr-defined]
+        if not raw:
+            return task
+        try:
+            state = json.loads(raw)
+        except (TypeError, ValueError):
+            if hasattr(self.store, "delete_kv"):
+                await self.store.delete_kv(dialog_key, "orchestrator_warehouse_page_state")  # type: ignore[attr-defined]
+            return task
+        if not isinstance(state, dict) or not isinstance(state.get("branches"), list):
+            return task
+        return task.model_copy(update={"context": {**task.context, "orchestrator_warehouse_page_state": state}})
+
+    async def _save_warehouse_page_state(
+        self,
+        task: AgentTask,
+        execution_records: list[dict[str, Any]],
+    ) -> None:
+        """Persist independent warehouse cursors without mixing dialog branches."""
+        dialog_key = str(task.context.get("dialog_key") or "")
+        if self.store is None or not dialog_key or not hasattr(self.store, "set_kv"):
+            return
+        branches: list[dict[str, Any]] = []
+        saw_warehouse = False
+        for record in execution_records:
+            if str(record.get("tool_name") or "") != "bitrix_warehouse_search":
+                continue
+            saw_warehouse = True
+            arguments = record.get("arguments") if isinstance(record.get("arguments"), dict) else {}
+            data = (record.get("result") or {}).get("data") if isinstance(record.get("result"), dict) else {}
+            products = data.get("products") if isinstance(data, dict) else {}
+            if not isinstance(products, dict) or not bool(arguments.get("include_products", True)):
+                continue
+            store_id = arguments.get("store_id")
+            try:
+                store_id = int(store_id)
+            except (TypeError, ValueError):
+                continue
+            offset = int(arguments.get("product_offset") or 0)
+            shown = len(products.get("items") or []) if isinstance(products.get("items"), list) else 0
+            branches.append(
+                {
+                    "store_id": store_id,
+                    "store_name": str(arguments.get("query") or ""),
+                    "product_query": str(arguments.get("product_query") or ""),
+                    "page_size": int(arguments.get("product_limit") or 50),
+                    "next_offset": offset + shown,
+                    "has_more": bool(products.get("has_more")),
+                }
+            )
+        if not saw_warehouse:
+            return
+        if not any(branch["has_more"] for branch in branches):
+            if hasattr(self.store, "delete_kv"):
+                await self.store.delete_kv(dialog_key, "orchestrator_warehouse_page_state")  # type: ignore[attr-defined]
+            return
+        value = json.dumps({"branches": branches}, ensure_ascii=False, separators=(",", ":"))
+        await self.store.set_kv(dialog_key, "orchestrator_warehouse_page_state", value)  # type: ignore[attr-defined]
+
     async def _append_authoritative_dialog_turn(self, task: AgentTask, answer: str) -> None:
         dialog_key = str(task.context.get("dialog_key") or "")
         if self.store is not None and dialog_key and answer and hasattr(self.store, "append_turn"):
             await self.store.append_turn(dialog_key, task.request, answer)  # type: ignore[attr-defined]
+
+    async def _refresh_entity_catalog_after_miss(
+        self,
+        candidate: Plan,
+        *,
+        plan_id: str,
+        task: AgentTask,
+        constraints: dict[str, Any],
+    ) -> Plan | None:
+        """Refresh a stale directory once, without a second Pro call."""
+        if self._entity_catalog is None:
+            return None
+        snapshot = await self._entity_catalog.refresh()
+        if snapshot.get("status") not in {"ready", "stale"}:
+            return None
+        canonical = canonicalize_plan(
+            candidate,
+            plan_id=plan_id,
+            task=task,
+            constraints=constraints,
+            entity_catalog=snapshot,
+        )
+        return normalize_plan(
+            canonical,
+            task=task,
+            constraints=constraints,
+            entity_catalog=snapshot,
+        )
 
     async def _guard_active_draft(self, task: AgentTask) -> tuple[AgentTask, AgentResult | None]:
         """Attach branch-local draft state; the mandatory Pro planner decides meaning."""
@@ -797,6 +895,7 @@ class PlanAuthoritativeOrchestrator(OrchestratorTransportRuntime):
             try:
                 task, _ = await self._load_authoritative_pending_specialist(task)
                 task = await self._load_authoritative_dialog_history(task)
+                task = await self._load_warehouse_page_state(task)
             except Exception:
                 await self._record_timing(
                     task,
@@ -923,6 +1022,30 @@ class PlanAuthoritativeOrchestrator(OrchestratorTransportRuntime):
                     )
                 except (PlanRejected, SemanticPolicyViolation) as exc:
                     reason = str(exc)
+                    if reason == "ENTITY_NOT_FOUND":
+                        try:
+                            refreshed_plan = await self._refresh_entity_catalog_after_miss(
+                                candidate,
+                                plan_id=plan_id,
+                                task=task,
+                                constraints=constraints,
+                            )
+                        except (PlanRejected, SemanticPolicyViolation):
+                            refreshed_plan = None
+                        if refreshed_plan is not None:
+                            plan = refreshed_plan
+                            deterministic_route = "orchestrator_entity_catalog_refresh"
+                            attempt_audit.update({"status": "accepted", "catalog_refreshed": True})
+                            await self._record_timing(
+                                task,
+                                stage="plan_validation",
+                                started_at=validation_started_at,
+                                elapsed_ms=(time.monotonic() - validation_t0) * 1000,
+                                status="accepted",
+                                step=attempt,
+                                details={"plan_state": plan.state, "subtasks": len(plan.subtasks), "catalog_refreshed": True},
+                            )
+                            break
                     await self._record_timing(
                         task,
                         stage="plan_validation",
@@ -1059,6 +1182,15 @@ class PlanAuthoritativeOrchestrator(OrchestratorTransportRuntime):
                 answer=str(
                     task.context.get("conversation_reference_error") or plan.clarification or "Уточните запрос."
                 ),
+                model_usage=list(planner_usages),
+                actions_taken=[ActionRecord(name="plan_validation", status="ok", details=base_meta)],
+                metadata=base_meta,
+            )
+        if plan.state == "DIRECT_RESPONSE":
+            return AgentResult(
+                status="completed",
+                agent_id=self.manifest.id,
+                answer=str(plan.clarification or ""),
                 model_usage=list(planner_usages),
                 actions_taken=[ActionRecord(name="plan_validation", status="ok", details=base_meta)],
                 metadata=base_meta,
@@ -1342,6 +1474,7 @@ class PlanAuthoritativeOrchestrator(OrchestratorTransportRuntime):
                 handoff_to=sorted({record["specialist_id"] for record in execution_records}),
                 metadata={"reason": "FOLLOWUP_PLAN_UNAVAILABLE", "structured_command_rounds": 1},
             )
+        await self._save_warehouse_page_state(task, execution_records)
         render_started_at = _trace_now_iso()
         render_t0 = time.monotonic()
         aggregate_warehouse = (

@@ -14,18 +14,9 @@ from ai_server.tools.bitrix_ports import BitrixFileDownloadPort
 from ai_server.tools.bitrix_search import PortalSearchPort, entity_types_for_scope, format_portal_search_results
 from ai_server.utils import optional_int
 
-_DENIED_AGENT_SCOPES = {
-    "",
-    "all",
-    "tasks",
-    "projects",
-    "catalog",
-    "stores",
-    "products",
-    "stock",
-}
 _ACCESS_CHECKED_SCOPES = {"documents", "files"}
 _DOCUMENT_ENTITY_TYPES = {"disk_file", "task_attachment"}
+_WAREHOUSE_ONLY_SCOPES = {"catalog", "stores", "products", "stock"}
 _PAGINATION_FIELD = "portal_search_page"
 _DEFAULT_PAGE_SIZE = 10
 _SHOW_ALL_LIMIT = 50
@@ -61,8 +52,9 @@ class PortalSearchTool:
         return ToolDefinition(
             name="portal_search",
             description=(
-                "Search the PostgreSQL Bitrix document/file index. Every result is verified live through the "
-                "requester's OAuth before return. Use dedicated structured tools for tasks, projects and catalog."
+                "Search the PostgreSQL Bitrix index across documents, task attachments, tasks and projects. "
+                "The orchestrator chooses a narrow scope or the broad Bitrix scope; warehouse stock remains "
+                "a separate exact-store tool."
             ),
             parameters={
                 "type": "object",
@@ -70,10 +62,7 @@ class PortalSearchTool:
                     "query": {"type": "string"},
                     "scope": {
                         "type": "string",
-                        "enum": [
-                            "documents",
-                            "files",
-                        ],
+                        "enum": ["all", "documents", "files", "tasks", "projects"],
                     },
                     "limit": {"type": "integer", "minimum": 1, "maximum": _SHOW_ALL_LIMIT},
                     "offset": {"type": "integer", "minimum": 0},
@@ -126,16 +115,11 @@ class PortalSearchTool:
         offset = max(0, int((page_state or {}).get("next_offset") or args.get("offset") or 0))
         if not query:
             return ToolResult(status=ToolStatus.INVALID_TOOL_CALL, tool="portal_search", error="query is required")
-        if scope in _DENIED_AGENT_SCOPES:
+        if scope in _WAREHOUSE_ONLY_SCOPES:
             return ToolResult(
                 status=ToolStatus.DENIED,
-                tool="portal_search",
-                error=(
-                    "portal_search requires a focused non-task scope: documents/files only. "
-                    "Use bitrix_task_search for tasks and dedicated structured tools for projects, "
-                    "warehouses and catalog."
-                ),
-                data={"query": query, "scope": scope, "limit": limit},
+                tool=self.name,
+                error="portal_search does not search warehouses or catalog stock; use bitrix_warehouse_search.",
             )
         entity_types = entity_types_for_scope(scope)
         if entity_types is None and scope not in {"", "all"}:

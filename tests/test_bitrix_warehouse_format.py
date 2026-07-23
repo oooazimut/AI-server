@@ -2,6 +2,7 @@ import re
 
 from ai_server.models import ToolResult
 from ai_server.orchestrators.bitrix_formatter import (
+    _format_portal_search_answer,
     _format_warehouse_answer,
     direct_tool_results_response,
 )
@@ -30,7 +31,7 @@ def test_warehouse_page_uses_absolute_item_numbers_after_offset():
     assert not any(line.startswith("1. Позиция 51") for line in lines)
 
 
-def test_multi_warehouse_response_has_one_global_fifty_item_budget():
+def test_multi_warehouse_response_has_ten_items_per_independent_branch():
     def result(name: str, available: int, returned: int) -> ToolResult:
         return ToolResult(
             status="ok",
@@ -61,8 +62,31 @@ def test_multi_warehouse_response_has_one_global_fifty_item_budget():
     )
 
     item_lines = [line for line in rendered.answer.splitlines() if re.match(r"^\d+\. ", line)]
-    assert len(item_lines) == 50
-    assert "Показаны первые 23 позиции из 100" in rendered.answer
-    assert rendered.answer.count("Показаны первые 23 позиции из 100") == 2
+    assert len(item_lines) == 24
+    assert "Показаны первые 10 позиций из 100" in rendered.answer
+    assert rendered.answer.count("Показаны первые 10 позиций из 100") == 2
     assert "Показаны все 4 позиции" in rendered.answer
     assert "Источник bitrix24" not in rendered.answer
+
+
+def test_list_all_warehouses_contains_only_alphabetical_names_without_addresses():
+    answer = _format_warehouse_answer(
+        {
+            "list_all": True,
+            "matches": [
+                {"title": "Гараж", "address": "Российская, 8"},
+                {"title": "Борисов", "address": "Любой адрес"},
+            ],
+        }
+    )
+
+    assert answer.splitlines() == ["Список складов:", "1. Борисов", "2. Гараж"]
+
+
+def test_empty_narrow_search_offers_explicit_global_expansion_without_running_it():
+    answer = _format_portal_search_answer(
+        {"scope": "documents", "query": "сертификат", "results": []}
+    )
+
+    assert "не найдены" in answer
+    assert "Битрикс, найди сертификат везде" in answer

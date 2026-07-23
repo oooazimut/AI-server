@@ -97,6 +97,25 @@ class BitrixWarehouseSearchTool:
         product_offset = max(0, int(args["product_offset"]))
         include_products = bool(args.get("include_products"))
 
+        # The orchestrator has already selected an exact store ID.  Prefer the
+        # Bitrix PostgreSQL snapshot for this read: it keeps a 500-row store
+        # from turning into dozens of REST requests on the user path.  The
+        # live API below is only the fallback when the index cannot answer.
+        snapshot = self._snapshot_search(
+            query=query,
+            store_id=store_id,
+            list_all=list_all,
+            include_products=include_products,
+            limit=limit,
+            product_limit=product_limit,
+            product_offset=product_offset,
+            product_query=product_query,
+            access_actor="postgres_snapshot",
+        )
+        if snapshot is not None:
+            snapshot["list_all"] = list_all
+            return ToolResult(status=ToolStatus.OK, tool=self.name, data=snapshot)
+
         read_client, access_actor, access_error = await resolve_current_user_read_client(
             self.name,
             fallback_client=self._client,
@@ -162,6 +181,8 @@ class BitrixWarehouseSearchTool:
         self,
         *,
         query: str,
+        store_id: int | None,
+        list_all: bool,
         include_products: bool,
         limit: int,
         product_limit: int,
@@ -174,7 +195,11 @@ class BitrixWarehouseSearchTool:
         try:
             if not self._portal_search.stats().exists:
                 return None
-            store_results = self._portal_search.search(query, entity_types={"catalog_store"}, limit=limit)
+            if list_all:
+                # The durable store directory is the authoritative list view;
+                # a free-text index search cannot safely enumerate all rows.
+                return None
+            store_results = self._portal_search.search(query, entity_types={"catalog_store"}, limit=max(limit, 50))
             stock_seed_results = self._portal_search.search(
                 query,
                 entity_types={"catalog_store_stock"},
@@ -186,7 +211,10 @@ class BitrixWarehouseSearchTool:
         matches = [_snapshot_store_match(item) for item in store_results]
         if not matches and stock_seed_results:
             matches = [_snapshot_store_match_from_stock(item) for item in stock_seed_results[:limit]]
-        matches = _dedupe_store_matches(matches)[:limit]
+        matches = _dedupe_store_matches(matches)
+        if store_id is not None:
+            matches = [item for item in matches if str(item.get("id")) == str(store_id)]
+        matches = matches[:limit]
         if not matches:
             return None
 
@@ -199,12 +227,18 @@ class BitrixWarehouseSearchTool:
             "summary": _stores_summary(matches, query=query),
         }
         if include_products:
-            data["products"] = self._snapshot_store_products(
+            products = self._snapshot_store_products(
                 matches[0],
                 limit=product_limit,
                 offset=product_offset,
                 product_query=product_query,
             )
+            # An index that has the store row but no stock rows is incomplete,
+            # not evidence that the warehouse is empty.  Use live Bitrix only
+            # in this recovery case.
+            if not int(products.get("total_rows_seen") or 0):
+                return None
+            data["products"] = products
         return data
 
     def _snapshot_store_products(
@@ -214,7 +248,9 @@ class BitrixWarehouseSearchTool:
             return {"status": "not_available", "items": [], "message": "portal search index is missing"}
         store_id = store.get("id")
         store_title = str(store.get("title") or "")
-        query = store_title or str(store_id or "")
+        # A product filter must narrow the index before pagination.  Without
+        # it, stock rows are selected by the exact store title and sorted below.
+        query = product_query or store_title or str(store_id or "")
         try:
             rows = self._portal_search.search(
                 query,

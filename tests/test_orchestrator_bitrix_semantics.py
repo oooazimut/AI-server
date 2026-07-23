@@ -5,6 +5,7 @@ import pytest
 from ai_server.models import AgentTask, UserContext
 from ai_server.orchestrators.bitrix_semantics import (
     SemanticPolicyViolation,
+    _expected_tool,
     canonicalize_plan,
     normalize_plan,
 )
@@ -51,11 +52,26 @@ def test_warehouse_search_verbs_have_the_same_contents_semantics():
     shown = _args("Покажи склад Борисова", "bitrix_warehouse_search", {"query": "Борисова"})
     found = _args("Найди склад Борисова", "bitrix_warehouse_search", {"query": "Борисова"})
     listed = _args("Выведи склад Борисова", "bitrix_warehouse_search", {"query": "Борисова"})
+    advised = _args("Подскажи склад Борисова", "bitrix_warehouse_search", {"query": "Борисова"})
 
-    for result in (shown, found, listed):
+    for result in (shown, found, listed, advised):
         assert result["store_id"] == 7
         assert result["include_products"] is True
         assert result["product_limit"] == 50
+
+
+def test_warehouse_address_request_is_a_direct_orchestrator_response():
+    task = AgentTask(task_id="t-address", request="Покажи адрес склада Борисова")
+    canonical = canonicalize_plan(
+        None,
+        plan_id="p-address",
+        task=task,
+        constraints={"capability_catalog": {"bitrix24": {"registry_version": "CURRENT"}}},
+        entity_catalog=_ENTITY_CATALOG,
+    )
+
+    assert canonical.state == "DIRECT_RESPONSE"
+    assert canonical.subtasks == []
 
 
 def test_product_on_warehouse_is_canonical_and_not_left_to_specialist_reasoning():
@@ -172,7 +188,22 @@ def test_document_lookup_has_focused_scope():
     result = _args("Найди договор на диске", "portal_search", {"query": "договор"})
 
     assert result["scope"] == "documents"
-    assert result["limit"] == 10
+    assert result["limit"] == 50
+
+
+def test_plain_find_uses_global_bitrix_search_with_fifty_result_limit():
+    result = _args("Найди сертификат", "portal_search", {"query": "сертификат"})
+
+    assert result["scope"] == "all"
+    assert result["query"] == "сертификат"
+    assert result["limit"] == 50
+
+
+def test_bitrix_marker_routes_broad_search_but_is_not_part_of_query():
+    result = _args("Битрикс, найди сертификат", "portal_search", {"query": "Битрикс сертификат"})
+
+    assert result["scope"] == "all"
+    assert result["query"] == "сертификат"
 
 
 def test_named_warehouse_never_falls_back_to_bitrix_when_catalog_is_unavailable():
@@ -260,6 +291,57 @@ def test_task_defaults_replace_unnecessary_pro_clarification_without_second_mode
     assert arguments["deadline_iso"] == "2026-07-29T19:00:00+03:00"
 
 
+def test_task_template_discards_model_only_project_and_no_deadline_values():
+    now = datetime(2026, 7, 24, 9, 0, tzinfo=MOSCOW_TZ)
+    task = AgentTask(
+        task_id="t1",
+        request="Создай задачу поменять амортизаторы на Ларгус 2",
+        user=UserContext(id="1", display_name="Кулинич Валерий Васильевич"),
+    )
+    entity_catalog = {
+        "status": "ready",
+        "users": [{"id": 1, "name": "Кулинич Валерий Васильевич", "aliases": ["кулинич валерий"]}],
+        "projects": [
+            {"id": 71, "name": "Кулинич Валерий", "aliases": ["кулинич валерий"]},
+            {"id": 99, "name": "Ларгус 2", "aliases": ["ларгус 2"]},
+        ],
+        "warehouses": [],
+    }
+    plan, _, constraints = _plan(
+        task.request,
+        "task_create_draft",
+        {"title": "Поменять амортизаторы на Ларгус 2", "project_name": "Ларгус 2", "group_id": 99, "no_deadline": True},
+    )
+    result = normalize_plan(
+        plan,
+        task=task,
+        constraints=constraints,
+        now=now,
+        entity_catalog=entity_catalog,
+    ).subtasks[0].structured_command.arguments
+
+    assert result["responsible_id"] == 1
+    assert result["responsible_name"] == "Кулинич Валерий Васильевич"
+    assert result["group_id"] == 71
+    assert result["project_name"] == "Кулинич Валерий"
+    assert result["deadline_iso"] == "2026-07-29T19:00:00+03:00"
+    assert "no_deadline" not in result
+
+
+def test_explicit_no_deadline_is_preserved_only_when_the_user_says_so():
+    result = _args(
+        "Создай задачу без срока проверить договор",
+        "task_create_draft",
+        {"title": "Проверить договор", "no_deadline": True},
+    )
+
+    assert result["no_deadline"] is True
+
+
+def test_calendar_action_wins_over_warehouse_word_in_its_title():
+    assert _expected_tool("Создай напоминание проверить склад") == "calendar_event_draft"
+
+
 def test_orchestrator_rebuilds_composite_and_all_warehouse_plans_from_exact_catalog_ids():
     entity_catalog = {
         "status": "ready",
@@ -318,7 +400,7 @@ def test_orchestrator_rebuilds_composite_and_all_warehouse_plans_from_exact_cata
     )
 
     assert [item.structured_command.arguments["store_id"] for item in normalized.subtasks] == [7, 8, 9]
-    assert all(item.structured_command.arguments["product_limit"] == 50 for item in normalized.subtasks)
+    assert all(item.structured_command.arguments["product_limit"] == 10 for item in normalized.subtasks)
     assert normalized.max_rounds == 1
 
     all_task = AgentTask(task_id="t2", request="Найди амортизатор на складах и покажи")
@@ -341,3 +423,32 @@ def test_orchestrator_rebuilds_composite_and_all_warehouse_plans_from_exact_cata
         item.structured_command.arguments["product_query"] == "амортизатор"
         for item in normalized_all.subtasks
     )
+    assert all(item.structured_command.arguments["product_limit"] == 10 for item in normalized_all.subtasks)
+
+
+def test_canonical_warehouse_plan_keeps_reverse_order_product_after_exact_store_name():
+    entity_catalog = {
+        "status": "ready",
+        "users": [],
+        "projects": [],
+        "warehouses": [
+            {"id": 9, "name": "Гараж", "aliases": ["гараж"]},
+            {"id": 33, "name": "Гараж Смородин", "aliases": ["гараж смородин"]},
+        ],
+    }
+    constraints = {
+        "capability_catalog": {
+            "bitrix24": {
+                "registry_version": "registry-v1",
+                "tools": [{"id": "bitrix_warehouse_search", "parameters": {"type": "object"}, "structured_command": True}],
+            }
+        }
+    }
+    task = AgentTask(task_id="t1", request="Найди на складе Гараж Смородина втулки")
+    canonical = canonicalize_plan(None, plan_id="p1", task=task, constraints=constraints, entity_catalog=entity_catalog)
+    normalized = normalize_plan(canonical, task=task, constraints=constraints, entity_catalog=entity_catalog)
+    arguments = normalized.subtasks[0].structured_command.arguments
+
+    assert arguments["store_id"] == 33
+    assert arguments["query"] == "Гараж Смородин"
+    assert arguments["product_query"] == "втулки"

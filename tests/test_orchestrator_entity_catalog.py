@@ -170,6 +170,16 @@ def test_exact_warehouse_name_wins_over_longer_partial_name():
         item["id"]
         for item in find_entities_in_text(catalog, "warehouses", "Покажи склад гараж смородин")
     ] == [602]
+    assert [
+        item["id"]
+        for item in find_entities_in_text(catalog, "warehouses", "Покажи склад гараж смородина")
+    ] == [602]
+
+
+def test_warehouse_address_is_not_a_semantic_alias():
+    catalog = _catalog()
+
+    assert find_entities_in_text(catalog, "warehouses", "Покажи склад Российская 8") == []
 
 
 def test_full_employee_name_and_explicit_id_win_over_shared_surname():

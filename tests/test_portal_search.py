@@ -473,26 +473,26 @@ def test_portal_search_tool_oauth_store_scope_denies_without_user_id():
     assert oauth_files.calls == []
 
 
-def test_portal_search_tool_denies_unrestricted_all_scope():
+def test_portal_search_tool_accepts_global_all_scope():
     import asyncio
 
     tool = PortalSearchTool(portal_search=_create_index())
 
     result = asyncio.run(tool.execute({"query": "камера", "scope": "all", "limit": 5}, user_id=13))
 
-    assert result.status == "denied"
-    assert "focused non-task scope" in result.error
+    assert result.status == "ok"
+    assert result.data["scope"] == "all"
 
 
-def test_portal_search_tool_denies_task_scope():
+def test_portal_search_tool_accepts_task_scope():
     import asyncio
 
     tool = PortalSearchTool(portal_search=_create_index())
 
     result = asyncio.run(tool.execute({"query": "камера", "scope": "tasks", "limit": 5}, user_id=13))
 
-    assert result.status == "denied"
-    assert "bitrix_task_search" in result.error
+    assert result.status == "ok"
+    assert result.data["scope"] == "tasks"
 
 
 def test_bitrix_search_endpoint(monkeypatch):

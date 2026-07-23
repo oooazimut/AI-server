@@ -347,8 +347,8 @@ def test_single_pro_pass_is_canonicalized_before_one_bitrix_execution():
     assert planner.calls == 1
     assert result.metadata["planner_attempts"] == 1
     assert result.metadata["structured_command_rounds"] == 1
-    assert "Cable" in result.answer
     assert [method for method, _ in client.calls].count("catalog.storeproduct.list") == 1
+    assert "Cable" in result.answer
 
 
 class _StructuredSpecialist:

@@ -25,6 +25,7 @@ def bitrix_policy_pack() -> dict[str, Any]:
         value.get("authority") != "internal_orchestrator"
         or not isinstance(value.get("rules"), list)
         or not isinstance(value.get("defaults"), dict)
+        or not isinstance(value.get("request_verbs"), dict)
         or not isinstance(value.get("templates"), dict)
     ):
         raise RuntimeError("ORCHESTRATOR_BITRIX_POLICY_INVALID")
@@ -49,6 +50,14 @@ def bitrix_policy_pack() -> dict[str, Any]:
     }
     if set(value["templates"]) != required_templates:
         raise RuntimeError("ORCHESTRATOR_BITRIX_POLICY_TEMPLATES_INVALID")
+    required_verb_groups = {"search_or_show", "search_noun"}
+    if set(value["request_verbs"]) != required_verb_groups or any(
+        not isinstance(value["request_verbs"][key], list)
+        or not value["request_verbs"][key]
+        or any(not isinstance(item, str) or not item.strip() for item in value["request_verbs"][key])
+        for key in required_verb_groups
+    ):
+        raise RuntimeError("ORCHESTRATOR_BITRIX_POLICY_VERBS_INVALID")
     return value
 
 
@@ -58,6 +67,13 @@ def bitrix_policy_defaults() -> dict[str, int]:
 
 def bitrix_policy_templates() -> dict[str, Any]:
     return dict(bitrix_policy_pack()["templates"])
+
+
+def bitrix_policy_request_verbs() -> dict[str, list[str]]:
+    return {
+        key: [str(item) for item in values]
+        for key, values in bitrix_policy_pack()["request_verbs"].items()
+    }
 
 
 def selected_bitrix_policy(request: str) -> dict[str, Any]:
@@ -72,6 +88,7 @@ def selected_bitrix_policy(request: str) -> dict[str, Any]:
         "schema_version": pack["schema_version"],
         "authority": pack["authority"],
         "defaults": dict(pack["defaults"]),
+        "request_verbs": bitrix_policy_request_verbs(),
         "templates": dict(pack["templates"]),
         "rules": selected,
     }
@@ -80,6 +97,7 @@ def selected_bitrix_policy(request: str) -> dict[str, Any]:
 __all__ = [
     "bitrix_policy_defaults",
     "bitrix_policy_pack",
+    "bitrix_policy_request_verbs",
     "bitrix_policy_templates",
     "selected_bitrix_policy",
 ]
