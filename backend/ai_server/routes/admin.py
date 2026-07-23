@@ -61,6 +61,7 @@ async def health(request: Request) -> dict[str, Any]:
         "agent_task_timeout_seconds": settings.agent_task_timeout_seconds,
         "orchestrator_entity_catalog_status": entity_snapshot.get("status", "missing"),
         "orchestrator_entity_catalog_version": entity_snapshot.get("version"),
+        "orchestrator_entity_catalog_published_at": entity_snapshot.get("published_at"),
         "orchestrator_entity_catalog_counts": entity_snapshot["counts"],
         "bitrix_dialog_guard_enabled": settings.bitrix_dialog_guard_enabled,
         "bitrix_dialog_stuck_seconds": settings.bitrix_dialog_stuck_seconds,

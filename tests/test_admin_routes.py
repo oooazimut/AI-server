@@ -36,6 +36,7 @@ def test_health_reads_worker_catalog_snapshot():
             return {
                 "status": "ready",
                 "version": "worker-catalog-v1",
+                "published_at": "2026-07-23T12:00:00+03:00",
                 "counts": {"users": 12, "projects": 4, "warehouses": 7},
             }
 
@@ -46,6 +47,7 @@ def test_health_reads_worker_catalog_snapshot():
     data = response.json()
     assert data["orchestrator_entity_catalog_status"] == "ready"
     assert data["orchestrator_entity_catalog_version"] == "worker-catalog-v1"
+    assert data["orchestrator_entity_catalog_published_at"] == "2026-07-23T12:00:00+03:00"
     assert data["orchestrator_entity_catalog_counts"] == {
         "users": 12,
         "projects": 4,
